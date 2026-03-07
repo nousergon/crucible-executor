@@ -35,6 +35,7 @@ AWS SES → your inbox
 - IB Gateway credentials (username + password)
 - A verified email address in AWS SES
 - SSH key pair created in EC2
+- A signals pipeline that writes `signals/{date}/signals.json` to S3 — see [alpha-engine-research](https://github.com/cipher813/alpha-engine-research) for the reference implementation
 
 ---
 
@@ -380,6 +381,8 @@ sudo chown ec2-user:ec2-user /var/log/executor.log /var/log/eod.log
 ## 10. Signals interface
 
 The executor reads `signals/{YYYY-MM-DD}/signals.json` from the research S3 bucket each morning. If today's file is missing it falls back up to 5 calendar days (skipping weekends) with a warning log.
+
+[alpha-engine-research](https://github.com/cipher813/alpha-engine-research) is the reference implementation — a LangGraph pipeline that runs on AWS Lambda each trading day and writes a compliant signals file to S3. You can use it directly or build your own source that conforms to the schema below.
 
 The file must conform to this schema:
 
