@@ -1,0 +1,43 @@
+# Alpha Engine — Executor Risk Parameters
+# Copy this file to config/risk.yaml and fill in your values.
+# config/risk.yaml is gitignored and should never be committed.
+
+# Position limits
+max_position_pct: 0.05           # 5% NAV per position (hard cap)
+max_sector_pct: 0.25             # 25% NAV per sector
+max_equity_pct: 0.90             # 90% NAV in equities — always hold some cash
+
+# Bear-regime overrides (applied when market_regime == "bear")
+bear_max_position_pct: 0.025     # 2.5% in bear regime
+bear_block_underweight: true     # no new entries in UW sectors in bear
+
+# Circuit breaker
+drawdown_circuit_breaker: 0.08   # halt new entries if portfolio is -8% from peak NAV
+
+# Entry gates
+min_score_to_enter: 70           # score threshold for new positions
+min_conviction_to_enter:         # only these conviction levels allow new entries
+  - rising
+  - stable
+
+# Sizing adjustments
+min_price_target_upside: 0.05    # below this: reduce new position size to 50%
+
+# IBKR connection (IB Gateway defaults for paper trading)
+ibkr_host: "127.0.0.1"
+ibkr_port: 4002
+ibkr_client_id: 1
+
+# S3
+# Executor reads signals from the research bucket (read-only access to signals/ prefix).
+# Executor writes trade backups to its own bucket.
+signals_bucket: "your-research-bucket-name"
+trades_bucket: "your-executor-bucket-name"
+
+# Email (AWS SES — sender must be verified in your AWS account)
+email_sender: "you@example.com"
+email_recipients:
+  - "you@example.com"
+
+# Paths
+db_path: "/path/to/trades.db"

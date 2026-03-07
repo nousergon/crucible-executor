@@ -1,0 +1,42 @@
+# Secrets / local config
+.env
+config/risk.yaml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+trading-env/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files (synced via S3, not tracked in git)
+trading.db
+trades.db
+
+# Lambda build artifacts (rebuilt by deploy.sh)
+lambda/package/
+lambda/deployment.zip
+
+# Archive (historical/superseded files, kept locally only)
+archive/
+
+# Nested repo clone (EC2 deployment copy, not part of source)
+alpha-engine/
+
+# Internal planning docs (not for public repo)
+PROJECT_PLAN.md
+alpha-engine-design-*.md
+alpha-engine-tasks-*.md
