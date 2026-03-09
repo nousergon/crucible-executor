@@ -24,7 +24,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from executor.ibkr import IBKRClient
+from executor.ibkr import IBKRClient, SimulatedIBKRClient
 from executor.position_sizer import compute_position_size
 from executor.risk_guard import check_order
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
@@ -44,24 +44,39 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def run(dry_run: bool = False):
+def run(
+    dry_run: bool = False,
+    simulate: bool = False,
+    ibkr_client=None,           # injected by backtester when simulate=True
+    signals_override: dict = None,  # injected signals dict (skips S3 read)
+) -> "list[dict] | None":
+    """
+    Returns list of order dicts when simulate=True, else None.
+    All other behaviour (risk guard, position sizer, trade logger) is unchanged.
+    """
+    orders = []
     run_date = str(date.today())
-    logger.info(f"Executor starting | date={run_date} | dry_run={dry_run}")
+    logger.info(f"Executor starting | date={run_date} | dry_run={dry_run} | simulate={simulate}")
 
     config = load_config()
     db_path = config["db_path"]
     signals_bucket = config["signals_bucket"]
     trades_bucket = config["trades_bucket"]
 
-    conn = init_db(db_path)
+    conn = None if simulate else init_db(db_path)
 
-    # ── 1. Read signals from S3 ──────────────────────────────────────────────
-    try:
-        signals_raw = read_signals_with_fallback(signals_bucket, run_date)
-    except RuntimeError as e:
-        logger.error(f"Cannot proceed without signals: {e}")
-        conn.close()
-        return
+    # ── 1. Read signals from S3 (or use injected override) ──────────────────
+    if signals_override is not None:
+        signals_raw = signals_override
+        run_date = signals_raw.get("date", run_date)
+    else:
+        try:
+            signals_raw = read_signals_with_fallback(signals_bucket, run_date)
+        except RuntimeError as e:
+            logger.error(f"Cannot proceed without signals: {e}")
+            if conn:
+                conn.close()
+            return
     signals = get_actionable_signals(signals_raw)
     market_regime = signals["market_regime"]
     sector_ratings = signals["sector_ratings"]
@@ -72,12 +87,15 @@ def run(dry_run: bool = False):
         f"REDUCE={len(signals['reduce'])} HOLD={len(signals['hold'])}"
     )
 
-    # ── 2. Connect to IBKR ───────────────────────────────────────────────────
-    ibkr = IBKRClient(
-        host=config["ibkr_host"],
-        port=config["ibkr_port"],
-        client_id=config["ibkr_client_id"],
-    )
+    # ── 2. Connect to IBKR (or use injected simulated client) ───────────────
+    if simulate:
+        ibkr = ibkr_client
+    else:
+        ibkr = IBKRClient(
+            host=config["ibkr_host"],
+            port=config["ibkr_port"],
+            client_id=config["ibkr_client_id"],
+        )
     portfolio_nav = ibkr.get_portfolio_nav()
     current_positions = ibkr.get_positions()
     peak_nav = ibkr.get_peak_nav(conn)
@@ -149,7 +167,24 @@ def run(dry_run: bool = False):
             f"(${sizing['dollar_size']:.0f}, {sizing['position_pct']*100:.1f}% NAV)"
         )
 
-        if not dry_run:
+        if simulate:
+            orders.append({
+                "date": run_date,
+                "ticker": ticker,
+                "action": "ENTER",
+                "shares": sizing["shares"],
+                "price_at_order": current_price,
+                "portfolio_nav_at_order": portfolio_nav,
+                "position_pct": sizing["position_pct"],
+                "research_score": sig.get("score"),
+                "research_conviction": sig.get("conviction"),
+                "research_rating": sig.get("rating"),
+                "sector_rating": sector_rating_str,
+                "market_regime": market_regime,
+                "price_target_upside": sig.get("price_target_upside"),
+                "thesis_summary": sig.get("thesis_summary"),
+            })
+        elif not dry_run:
             order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
             log_trade(conn, {
                 "date": run_date,
@@ -179,7 +214,23 @@ def run(dry_run: bool = False):
         shares_held = int(current_positions[ticker]["shares"])
         logger.info(f"{'[DRY RUN] ' if dry_run else ''}ORDER EXIT {ticker} {shares_held} shares")
 
-        if not dry_run:
+        if simulate:
+            current_price = ibkr.get_current_price(ticker)
+            orders.append({
+                "date": run_date,
+                "ticker": ticker,
+                "action": "EXIT",
+                "shares": shares_held,
+                "price_at_order": current_price,
+                "portfolio_nav_at_order": portfolio_nav,
+                "position_pct": 0.0,
+                "research_score": sig.get("score"),
+                "research_conviction": sig.get("conviction"),
+                "research_rating": sig.get("rating"),
+                "sector_rating": current_positions[ticker].get("sector", ""),
+                "market_regime": market_regime,
+            })
+        elif not dry_run:
             current_price = ibkr.get_current_price(ticker)
             order_result = ibkr.place_market_order(ticker, "SELL", shares_held)
             log_trade(conn, {
@@ -215,7 +266,24 @@ def run(dry_run: bool = False):
             f"{shares_to_sell} shares (50% reduction)"
         )
 
-        if not dry_run:
+        if simulate:
+            current_price = ibkr.get_current_price(ticker)
+            remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
+            orders.append({
+                "date": run_date,
+                "ticker": ticker,
+                "action": "REDUCE",
+                "shares": shares_to_sell,
+                "price_at_order": current_price,
+                "portfolio_nav_at_order": portfolio_nav,
+                "position_pct": remaining_value / portfolio_nav if portfolio_nav else 0,
+                "research_score": sig.get("score"),
+                "research_conviction": sig.get("conviction"),
+                "research_rating": sig.get("rating"),
+                "sector_rating": current_positions[ticker].get("sector", ""),
+                "market_regime": market_regime,
+            })
+        elif not dry_run:
             current_price = ibkr.get_current_price(ticker)
             order_result = ibkr.place_market_order(ticker, "SELL", shares_to_sell)
             remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
@@ -236,12 +304,16 @@ def run(dry_run: bool = False):
             })
 
     # ── 6. Backup and disconnect ─────────────────────────────────────────────
-    if not dry_run:
+    if not dry_run and not simulate:
         backup_to_s3(db_path, run_date, trades_bucket)
 
     ibkr.disconnect()
-    conn.close()
-    logger.info(f"Executor complete | dry_run={dry_run}")
+    if conn:
+        conn.close()
+    logger.info(f"Executor complete | dry_run={dry_run} | simulate={simulate}")
+
+    if simulate:
+        return orders
 
 
 if __name__ == "__main__":

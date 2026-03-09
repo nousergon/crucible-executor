@@ -127,3 +127,39 @@ class IBKRClient:
     def disconnect(self):
         self.ib.disconnect()
         logger.info("Disconnected from IB Gateway")
+
+
+class SimulatedIBKRClient:
+    """Drop-in replacement for IBKRClient used in backtesting.
+    Reads prices from a pre-loaded dict; never connects to IB Gateway."""
+
+    def __init__(self, prices: dict[str, float], nav: float = 1_000_000.0):
+        self._prices = prices      # {ticker: price}
+        self._nav = nav
+        self._positions: dict = {}
+
+    def get_portfolio_nav(self) -> float:
+        return self._nav
+
+    def get_positions(self) -> dict:
+        return self._positions
+
+    def get_peak_nav(self, conn) -> float:
+        return self._nav
+
+    def get_current_price(self, ticker: str) -> float | None:
+        return self._prices.get(ticker)
+
+    def place_market_order(self, ticker: str, action: str, shares: int) -> dict:
+        # Record fill for portfolio tracking; return stub order ID
+        price = self._prices.get(ticker, 0)
+        if action == "BUY":
+            self._positions[ticker] = {"shares": shares, "avg_cost": price}
+            self._nav -= shares * price
+        elif action == "SELL":
+            self._positions.pop(ticker, None)
+            self._nav += shares * price
+        return {"ib_order_id": None}
+
+    def disconnect(self):
+        pass
