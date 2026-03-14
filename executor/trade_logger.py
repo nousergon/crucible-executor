@@ -146,6 +146,25 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
     conn.commit()
 
 
+def get_entry_dates(conn: sqlite3.Connection, tickers: list[str]) -> dict[str, str]:
+    """
+    Look up the most recent ENTER date for each ticker from trades.db.
+
+    Returns:
+        {ticker: "YYYY-MM-DD"} for tickers that have an ENTER record.
+        Tickers with no ENTER record are omitted.
+    """
+    entry_dates = {}
+    for ticker in tickers:
+        row = conn.execute(
+            "SELECT date FROM trades WHERE ticker=? AND action='ENTER' ORDER BY date DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+        if row:
+            entry_dates[ticker] = row[0]
+    return entry_dates
+
+
 def backup_to_s3(db_path: str, run_date: str, s3_bucket: str) -> None:
     """Upload trades.db to S3 under trades/trades_{date}.db and trades/trades_latest.db."""
     s3 = boto3.client("s3")

@@ -3,13 +3,66 @@ Hard rule enforcement. All orders must clear this before reaching IBKR.
 
 Rules are evaluated in order — first failure blocks the order.
 All thresholds loaded from config/risk.yaml.
+
+Graduated drawdown response (added 2026-03-14):
+  Instead of a binary -8% circuit breaker, position sizing scales down
+  through tiers as drawdown deepens. The hard halt at -8% is preserved
+  as the final tier.
 """
 
 from __future__ import annotations
 
 import logging
 
+from executor.strategies.config import load_strategy_config
+
 logger = logging.getLogger(__name__)
+
+
+def compute_drawdown_multiplier(
+    portfolio_nav: float,
+    peak_nav: float,
+    config: dict,
+) -> tuple[float, str]:
+    """
+    Compute position sizing multiplier based on current drawdown tier.
+
+    Returns:
+        (multiplier, description)
+        multiplier=0.0 means full halt (circuit breaker).
+    """
+    if peak_nav <= 0:
+        return 1.0, "no peak NAV recorded"
+
+    drawdown = (portfolio_nav - peak_nav) / peak_nav  # negative number
+
+    strategy_cfg = load_strategy_config(config)
+
+    if not strategy_cfg.get("graduated_drawdown_enabled", True):
+        # Fall back to original binary circuit breaker
+        threshold = -config.get("drawdown_circuit_breaker", 0.08)
+        if drawdown <= threshold:
+            return 0.0, f"circuit breaker: {drawdown:.1%} from peak (limit {threshold:.1%})"
+        return 1.0, f"drawdown {drawdown:.1%} — within limit"
+
+    tiers = strategy_cfg.get("drawdown_tiers", [])
+
+    # Tiers are sorted by threshold ascending (most negative last).
+    # Walk through tiers; the last tier whose threshold is breached applies.
+    active_multiplier = 1.0
+    active_desc = f"drawdown {drawdown:.1%} — full sizing"
+
+    for threshold, multiplier, description in tiers:
+        if drawdown <= threshold:
+            active_multiplier = multiplier
+            active_desc = f"drawdown {drawdown:.1%} — {description} (multiplier={multiplier})"
+
+    # Hard halt at the deepest configured tier (circuit breaker preserved)
+    hard_halt = -config.get("drawdown_circuit_breaker", 0.08)
+    if drawdown <= hard_halt:
+        return 0.0, f"circuit breaker: {drawdown:.1%} from peak (limit {hard_halt:.1%})"
+
+    return active_multiplier, active_desc
 
 
 def check_order(
@@ -65,12 +118,12 @@ def check_order(
     if conviction not in allowed_convictions:
         return False, f"Conviction '{conviction}' not in allowed set {allowed_convictions}"
 
-    # 3. Drawdown circuit breaker
-    if peak_nav > 0:
-        drawdown = (portfolio_nav - peak_nav) / peak_nav
-        threshold = -config.get("drawdown_circuit_breaker", 0.08)
-        if drawdown <= threshold:
-            return False, f"Drawdown circuit breaker: portfolio is {drawdown:.1%} from peak (limit {threshold:.1%})"
+    # 3. Graduated drawdown response (replaces binary circuit breaker)
+    dd_multiplier, dd_reason = compute_drawdown_multiplier(portfolio_nav, peak_nav, config)
+    if dd_multiplier <= 0.0:
+        return False, f"Drawdown halt: {dd_reason}"
+    if dd_multiplier < 1.0:
+        logger.info(f"Drawdown tier active for {ticker}: {dd_reason}")
 
     # 4. Max single position size
     effective_max_pct = (
@@ -83,7 +136,6 @@ def check_order(
 
     # 5. Bear regime: block new entries in underweight sectors
     if market_regime == "bear" and config.get("bear_block_underweight", True):
-        # sector_rating is passed via signal or looked up in calling code
         sector_rating_str = signal.get("sector_rating", "market_weight")
         if sector_rating_str == "underweight":
             return False, f"Bear regime: new entries blocked in underweight sector ({sector})"
@@ -108,5 +160,5 @@ def check_order(
 
     return True, (
         f"ENTER approved | score={score:.1f} conviction={conviction} "
-        f"size={position_pct:.1%} NAV"
+        f"size={position_pct:.1%} NAV | dd_multiplier={dd_multiplier}"
     )

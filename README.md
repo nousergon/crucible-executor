@@ -119,9 +119,41 @@ All parameters are in `config/risk.yaml`. Key defaults:
 | Max position size | 5% NAV |
 | Max sector exposure | 25% NAV |
 | Max total equity | 90% NAV |
-| Drawdown circuit breaker | −8% from peak NAV |
+| Graduated drawdown (0% to -3%) | Full sizing |
+| Graduated drawdown (-3% to -5%) | 50% sizing |
+| Graduated drawdown (-5% to -8%) | 25% sizing |
+| Drawdown circuit breaker (beyond -8%) | Full halt |
 | Bear regime position cap | 2.5% NAV |
 | Min signal score to enter | 70 |
+
+---
+
+## Strategy layer
+
+The executor includes a strategy layer (`executor/strategies/`) that adds backtestable quantitative exit and risk rules. These operate on OHLCV price data and require no LLM calls.
+
+### ATR trailing stop
+
+Exits a position when price falls below `highest_high_since_entry - ATR(14) * 3.0`. The stop adapts to each stock's volatility — wide for volatile names, tight for calm ones.
+
+### Time-based exit decay
+
+- After 5 trading days with signal = HOLD: reduces position 50%
+- After 10 trading days with signal = HOLD: full exit
+- Resets if Research reaffirms the position (signal = ENTER)
+
+### Graduated drawdown response
+
+Replaces the original binary -8% circuit breaker with tiered sizing:
+
+| Drawdown | Sizing multiplier |
+|---|---|
+| 0% to -3% | 1.0 (full) |
+| -3% to -5% | 0.5 (half) |
+| -5% to -8% | 0.25 (quarter) |
+| Beyond -8% | 0.0 (full halt) |
+
+All strategy parameters are configurable in `config/risk.yaml` under the `strategy` key.
 
 ---
 
@@ -143,13 +175,18 @@ All parameters are in `config/risk.yaml`. Key defaults:
 executor/
   main.py           # daily trading loop
   signal_reader.py  # reads signals.json from S3
-  risk_guard.py     # hard rule enforcement (all orders pass through here)
-  position_sizer.py # equal-weight base sizing with sector/conviction/upside adjustments
+  risk_guard.py     # hard rule enforcement + graduated drawdown response
+  position_sizer.py # equal-weight base sizing with sector/conviction/upside/drawdown adjustments
   ibkr.py           # ib_insync wrapper (NAV, positions, prices, orders)
-  trade_logger.py   # SQLite trades.db + S3 backup
+  trade_logger.py   # SQLite trades.db + S3 backup + entry_date lookup
+  price_cache.py    # loads OHLCV from predictor S3 slim cache for ATR
   eod_reconcile.py  # daily P&L vs SPY, emails summary via SES
   eod_emailer.py    # HTML/plain email builder
   connection_test.py # quick IB Gateway connection test
+  strategies/       # strategy layer (added 2026-03-14)
+    __init__.py     # module docstring
+    config.py       # strategy defaults + YAML override loader
+    exit_manager.py # ATR trailing stops + time-based exit decay
 config/
   risk.yaml.example # template — copy to risk.yaml and fill in values
 infrastructure/

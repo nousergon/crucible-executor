@@ -3,6 +3,11 @@ Position sizing algorithm per design doc section B.3.
 
 Inputs: portfolio NAV, signal data, sector rating, current price, config.
 Output: shares, dollar_size, position_pct.
+
+Graduated drawdown multiplier (added 2026-03-14):
+  When portfolio is in a drawdown tier, all position sizes are scaled
+  down by the tier's multiplier. This is applied after all other
+  adjustments but before the max position cap.
 """
 
 from __future__ import annotations
@@ -27,18 +32,20 @@ def compute_position_size(
     sector_rating: str,
     current_price: float,
     config: dict,
+    drawdown_multiplier: float = 1.0,
 ) -> dict:
     """
     Compute position size for a new ENTER order.
 
-    Algorithm (design doc B.3):
+    Algorithm (design doc B.3 + graduated drawdown):
       1. base_weight = 1 / n_enter_signals  (equal weight across all entries today)
       2. sector_adj: overweight→1.10, market_weight→1.00, underweight→0.75
       3. conviction_adj: rising/stable→1.00, declining→0.50
       4. upside_adj: price_target_upside < min_price_target_upside → 0.50
-      5. position_weight = min(base * sector * conviction * upside, max_position_pct)
-      6. dollar_size = portfolio_nav * position_weight
-      7. shares = floor(dollar_size / current_price)
+      5. drawdown_adj: multiplier from graduated drawdown tiers (1.0/0.50/0.25)
+      6. position_weight = min(base * sector * conviction * upside * dd, max_position_pct)
+      7. dollar_size = portfolio_nav * position_weight
+      8. shares = floor(dollar_size / current_price)
 
     Returns:
         {"shares": int, "dollar_size": float, "position_pct": float}
@@ -56,7 +63,7 @@ def compute_position_size(
     upside_adj = 0.50 if (upside is not None and upside < min_upside) else 1.00
 
     max_pct = config.get("max_position_pct", 0.05)
-    raw_weight = base_weight * sector_adj * conviction_adj * upside_adj
+    raw_weight = base_weight * sector_adj * conviction_adj * upside_adj * drawdown_multiplier
     position_weight = min(raw_weight, max_pct)
 
     dollar_size = portfolio_nav * position_weight
@@ -65,6 +72,7 @@ def compute_position_size(
     logger.debug(
         f"{ticker} sizing: n={n} base={base_weight:.3f} sector_adj={sector_adj} "
         f"conviction_adj={conviction_adj} upside_adj={upside_adj} "
+        f"dd_mult={drawdown_multiplier} "
         f"→ {position_weight:.3f} NAV = ${dollar_size:.0f} = {shares} shares"
     )
 

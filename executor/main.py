@@ -4,6 +4,11 @@ Alpha Engine Executor — daily morning trading loop.
 Reads signals.json from S3, applies risk rules and position sizing,
 places market orders via IB Gateway (paper trading).
 
+Strategy layer (added 2026-03-14):
+  - Graduated drawdown response scales position sizes by drawdown tier
+  - ATR trailing stops exit positions when price falls below trailing stop
+  - Time-based decay reduces/exits stale positions after N trading days
+
 Cron (EC2, America/Los_Angeles):
     30 6 * * 1-5  python /home/ec2-user/alpha-engine/executor/main.py >> /var/log/executor.log 2>&1
 
@@ -26,9 +31,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from executor.ibkr import IBKRClient, SimulatedIBKRClient
 from executor.position_sizer import compute_position_size
-from executor.risk_guard import check_order
+from executor.risk_guard import check_order, compute_drawdown_multiplier
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
-from executor.trade_logger import backup_to_s3, init_db, log_trade
+from executor.strategies.config import load_strategy_config
+from executor.strategies.exit_manager import evaluate_exits
+from executor.price_cache import load_price_histories
+from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +57,7 @@ def run(
     simulate: bool = False,
     ibkr_client=None,           # injected by backtester when simulate=True
     signals_override: dict = None,  # injected signals dict (skips S3 read)
+    price_histories: dict = None,   # injected by backtester for exit manager
 ) -> "list[dict] | None":
     """
     Returns list of order dicts when simulate=True, else None.
@@ -109,6 +118,50 @@ def run(
     for ticker, pos in current_positions.items():
         pos["sector"] = universe_sectors.get(ticker, "")
 
+    # ── 2b. Enrich positions with entry_date from trades.db ──────────────────
+    if conn and current_positions:
+        entry_dates = get_entry_dates(conn, list(current_positions.keys()))
+        for ticker, pos in current_positions.items():
+            pos["entry_date"] = entry_dates.get(ticker)
+        logger.info(f"Entry dates resolved for {len(entry_dates)}/{len(current_positions)} positions")
+
+    # ── 2c. Compute graduated drawdown multiplier ──────────────────────────
+    dd_multiplier, dd_reason = compute_drawdown_multiplier(portfolio_nav, peak_nav, config)
+    if dd_multiplier < 1.0:
+        logger.info(f"Drawdown tier active: {dd_reason}")
+
+    # ── 2d. Strategy layer: evaluate exit rules on held positions ──────────
+    strategy_config = load_strategy_config(config)
+
+    # Build signals lookup for exit manager
+    signals_by_ticker = {}
+    for s in (signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])):
+        t = s.get("ticker")
+        if t and t not in signals_by_ticker:
+            signals_by_ticker[t] = s
+
+    # Load price histories from predictor S3 cache (unless injected by backtester)
+    if price_histories is None and current_positions:
+        price_histories = load_price_histories(
+            tickers=list(current_positions.keys()),
+            signals_bucket=signals_bucket,
+        )
+
+    strategy_exits = evaluate_exits(
+        current_positions=current_positions,
+        signals_by_ticker=signals_by_ticker,
+        run_date=run_date,
+        price_histories=price_histories or {},
+        ibkr_client=ibkr,
+        strategy_config=strategy_config,
+    )
+
+    if strategy_exits:
+        logger.info(
+            f"Strategy layer generated {len(strategy_exits)} exit signal(s): "
+            + ", ".join(f"{s['ticker']}({s['action']}: {s['reason']})" for s in strategy_exits)
+        )
+
     enter_signals = signals["enter"]
 
     # ── 3. Process ENTER signals ─────────────────────────────────────────────
@@ -135,6 +188,7 @@ def run(
             sector_rating=sector_rating_str,
             current_price=current_price,
             config=config,
+            drawdown_multiplier=dd_multiplier,
         )
 
         if sizing["shares"] == 0:
@@ -204,15 +258,29 @@ def run(
                 "ib_order_id": order_result.get("ib_order_id"),
             })
 
-    # ── 4. Process EXIT signals ──────────────────────────────────────────────
+    # ── 4. Process EXIT signals (Research + Strategy) ───────────────────────
+    # Merge Research exits with strategy-generated exits (deduplicate by ticker)
+    all_exit_tickers = set()
+    all_exits = []
     for sig in signals["exit"]:
+        t = sig["ticker"]
+        if t not in all_exit_tickers:
+            all_exit_tickers.add(t)
+            all_exits.append(sig)
+    for strat_sig in strategy_exits:
+        if strat_sig["action"] == "EXIT" and strat_sig["ticker"] not in all_exit_tickers:
+            all_exit_tickers.add(strat_sig["ticker"])
+            all_exits.append(strat_sig)
+
+    for sig in all_exits:
         ticker = sig["ticker"]
         if ticker not in current_positions:
             logger.info(f"SKIP EXIT {ticker} — not in portfolio")
             continue
 
         shares_held = int(current_positions[ticker]["shares"])
-        logger.info(f"{'[DRY RUN] ' if dry_run else ''}ORDER EXIT {ticker} {shares_held} shares")
+        reason_tag = f" ({sig.get('reason', 'research')})" if sig.get("reason") else ""
+        logger.info(f"{'[DRY RUN] ' if dry_run else ''}ORDER EXIT {ticker} {shares_held} shares{reason_tag}")
 
         if simulate:
             current_price = ibkr.get_current_price(ticker)
@@ -229,6 +297,7 @@ def run(
                 "research_rating": sig.get("rating"),
                 "sector_rating": current_positions[ticker].get("sector", ""),
                 "market_regime": market_regime,
+                "exit_reason": sig.get("reason"),
             })
         elif not dry_run:
             current_price = ibkr.get_current_price(ticker)
@@ -249,8 +318,22 @@ def run(
                 "ib_order_id": order_result.get("ib_order_id"),
             })
 
-    # ── 5. Process REDUCE signals ────────────────────────────────────────────
+    # ── 5. Process REDUCE signals (Research + Strategy) ─────────────────────
+    all_reduce_tickers = set()
+    all_reduces = []
     for sig in signals["reduce"]:
+        t = sig["ticker"]
+        if t not in all_reduce_tickers:
+            all_reduce_tickers.add(t)
+            all_reduces.append(sig)
+    for strat_sig in strategy_exits:
+        if strat_sig["action"] == "REDUCE" and strat_sig["ticker"] not in all_reduce_tickers:
+            # Also skip if we already have an EXIT for this ticker
+            if strat_sig["ticker"] not in all_exit_tickers:
+                all_reduce_tickers.add(strat_sig["ticker"])
+                all_reduces.append(strat_sig)
+
+    for sig in all_reduces:
         ticker = sig["ticker"]
         if ticker not in current_positions:
             continue
@@ -261,9 +344,10 @@ def run(
             logger.info(f"SKIP REDUCE {ticker} — position too small to halve")
             continue
 
+        reason_tag = f" ({sig.get('reason', 'research')})" if sig.get("reason") else ""
         logger.info(
             f"{'[DRY RUN] ' if dry_run else ''}ORDER REDUCE {ticker} "
-            f"{shares_to_sell} shares (50% reduction)"
+            f"{shares_to_sell} shares (50% reduction){reason_tag}"
         )
 
         if simulate:
@@ -282,6 +366,7 @@ def run(
                 "research_rating": sig.get("rating"),
                 "sector_rating": current_positions[ticker].get("sector", ""),
                 "market_regime": market_regime,
+                "exit_reason": sig.get("reason"),
             })
         elif not dry_run:
             current_price = ibkr.get_current_price(ticker)
