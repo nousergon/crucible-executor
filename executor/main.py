@@ -58,6 +58,7 @@ def run(
     ibkr_client=None,           # injected by backtester when simulate=True
     signals_override: dict = None,  # injected signals dict (skips S3 read)
     price_histories: dict = None,   # injected by backtester for exit manager
+    config_override: dict = None,   # injected by backtester param sweep
 ) -> "list[dict] | None":
     """
     Returns list of order dicts when simulate=True, else None.
@@ -68,6 +69,16 @@ def run(
     logger.info(f"Executor starting | date={run_date} | dry_run={dry_run} | simulate={simulate}")
 
     config = load_config()
+    if config_override:
+        for key, val in config_override.items():
+            if key == "strategy" and isinstance(val, dict) and "strategy" in config:
+                for sub_key, sub_val in val.items():
+                    if isinstance(sub_val, dict) and isinstance(config["strategy"].get(sub_key), dict):
+                        config["strategy"][sub_key].update(sub_val)
+                    else:
+                        config["strategy"][sub_key] = sub_val
+            else:
+                config[key] = val
     db_path = config["db_path"]
     signals_bucket = config["signals_bucket"]
     trades_bucket = config["trades_bucket"]

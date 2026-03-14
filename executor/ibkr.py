@@ -188,39 +188,65 @@ class IBKRClient:
 
 class SimulatedIBKRClient:
     """Drop-in replacement for IBKRClient used in backtesting.
-    Reads prices from a pre-loaded dict; never connects to IB Gateway."""
+    Reads prices from a pre-loaded dict; never connects to IB Gateway.
+
+    Tracks cash separately from positions so get_portfolio_nav() returns
+    correct mark-to-market NAV (cash + position values at current prices).
+    """
 
     def __init__(self, prices: dict[str, float], nav: float = 1_000_000.0):
-        self._prices = prices      # {ticker: price}
-        self._nav = nav
+        self._prices = prices      # {ticker: price} — swapped per date by backtester
+        self._cash = nav
         self._positions: dict = {}
+        self._simulation_date: str | None = None  # set by backtester before each iteration
+        self._peak_nav: float = nav
 
     def get_portfolio_nav(self) -> float:
-        return self._nav
+        mtm = sum(
+            pos["shares"] * self._prices.get(ticker, pos.get("avg_cost", 0))
+            for ticker, pos in self._positions.items()
+        )
+        nav = self._cash + mtm
+        self._peak_nav = max(self._peak_nav, nav)
+        return nav
 
     def get_positions(self) -> dict:
-        return self._positions
+        enriched = {}
+        for ticker, pos in self._positions.items():
+            price = self._prices.get(ticker, pos.get("avg_cost", 0))
+            enriched[ticker] = {
+                **pos,
+                "market_value": pos["shares"] * price,
+            }
+        return enriched
 
     def get_peak_nav(self, conn) -> float:
-        return self._nav
+        return self._peak_nav
 
     def get_current_price(self, ticker: str) -> float | None:
         return self._prices.get(ticker)
 
     def place_market_order(self, ticker: str, action: str, shares: int) -> dict:
-        # Record fill for portfolio tracking; return stub order ID
         price = self._prices.get(ticker, 0)
         if action == "BUY":
-            self._positions[ticker] = {"shares": shares, "avg_cost": price}
-            self._nav -= shares * price
+            self._positions[ticker] = {
+                "shares": shares,
+                "avg_cost": price,
+                "entry_date": self._simulation_date,
+            }
+            self._cash -= shares * price
         elif action == "SELL":
-            self._positions.pop(ticker, None)
-            self._nav += shares * price
+            held = self._positions.get(ticker)
+            if held:
+                held_shares = held["shares"]
+                if shares >= held_shares:
+                    self._positions.pop(ticker, None)
+                else:
+                    held["shares"] = held_shares - shares
+            self._cash += shares * price
         return {"ib_order_id": None}
 
     def get_historical_bar(self, ticker: str, date: str) -> dict | None:
-        # SimulatedIBKRClient only holds a single close price per ticker.
-        # Return it for all OHLCV fields — sufficient for backtester fallback use.
         price = self._prices.get(ticker)
         if price is None:
             return None
