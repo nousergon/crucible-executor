@@ -70,19 +70,20 @@ Autonomous investment research pipeline. Five LLM agents orchestrated by LangGra
 
 LightGBM gradient-boosted model that predicts 5-day market-relative returns for each ticker. Produces directional predictions (UP/FLAT/DOWN) with confidence scores.
 
-- 29 engineered features across technical indicators, macro context, volume analysis, and cross-sectional measures
+- Engineered features across technical indicators, macro context, volume analysis, and cross-sectional measures
 - Trains on sector-neutral labels (stock returns minus sector ETF returns)
-- Weekly retraining with 10 years of price history; new weights promote only if IC > 0.03
+- Weekly retraining with multi-year price history; new weights promote only if IC gate passes
 - Veto gate: high-confidence DOWN predictions override BUY signals from Research
 
 ### 3. Executor — [`alpha-engine`](https://github.com/cipher813/alpha-engine) *(this repo)*
 
 Reads signals and predictions from S3, applies hard risk rules, sizes positions, and executes market orders on Interactive Brokers (paper trading).
 
-- Graduated drawdown response: full → half → quarter sizing → full halt at -8%
+- Graduated drawdown response: tiered sizing reduction with configurable halt threshold
 - ATR-based trailing stops (volatility-adaptive) with time-decay exit rules
-- Position caps (5% NAV, 2.5% in bear), sector concentration limits (25% NAV)
+- Configurable position caps, sector concentration limits, and equity exposure limits
 - Deterministic execution — no reasoning, no prediction, just parameter application
+- Auto-tuned by backtester via S3-delivered `config/executor_params.json`
 
 ### 4. Backtester — [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester)
 
@@ -102,14 +103,14 @@ Read-only Streamlit application for monitoring the full system: portfolio perfor
 
 ## Key Metrics
 
-| Metric | What it measures | Target |
-|--------|-----------------|--------|
-| Daily alpha | Portfolio return − SPY return | Positive |
-| Signal accuracy (10d) | % of BUY signals beating SPY over 10 days | > 55% |
-| Signal accuracy (30d) | % of BUY signals beating SPY over 30 days | > 55% |
-| GBM IC | Rank correlation of predicted vs actual 5d returns | > 0.03 |
-| Max drawdown | Peak-to-trough portfolio decline | < −8% |
-| Sharpe ratio | Risk-adjusted return (annualized) | > 1.0 |
+| Metric | What it measures |
+|--------|-----------------|
+| Total alpha | Portfolio cumulative return − SPY cumulative return |
+| Sharpe ratio | Risk-adjusted return (annualized) — primary optimization target |
+| Daily alpha | Portfolio daily return − SPY daily return |
+| Signal accuracy | % of BUY signals beating SPY over configurable windows |
+| GBM IC | Rank correlation of predicted vs actual forward returns |
+| Max drawdown | Peak-to-trough portfolio decline (circuit breaker threshold configurable) |
 
 ---
 
@@ -134,7 +135,9 @@ s3://alpha-engine-research/
 │   ├── trades_full.csv                  ← Complete trade audit log
 │   └── eod_pnl.csv                      ← Daily NAV, return, alpha
 ├── backtest/{date}/                     ← Weekly backtester outputs
-├── config/scoring_weights.json          ← Auto-updated by backtester
+├── config/scoring_weights.json          ← Auto-updated by backtester → Research
+├── config/executor_params.json          ← Auto-updated by backtester → Executor
+├── config/predictor_params.json         ← Auto-updated by backtester → Predictor
 └── research.db                          ← SQLite (signal history, theses)
 ```
 
