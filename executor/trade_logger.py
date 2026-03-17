@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS trades (
     ib_order_id              INTEGER,
     predicted_direction      TEXT,
     prediction_confidence    REAL,
+    rationale_json           TEXT,
     created_at               TEXT NOT NULL
 );
 """
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS trades (
 _TRADES_MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN predicted_direction TEXT",
     "ALTER TABLE trades ADD COLUMN prediction_confidence REAL",
+    "ALTER TABLE trades ADD COLUMN rationale_json TEXT",
 ]
 
 CREATE_EOD_TABLE = """
@@ -91,8 +93,9 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             research_score, research_conviction, research_rating,
             sector_rating, market_regime, price_target_upside,
             thesis_summary, fill_price, fill_time, ib_order_id,
-            predicted_direction, prediction_confidence, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            predicted_direction, prediction_confidence, rationale_json,
+            created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -115,6 +118,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("ib_order_id"),
             trade.get("predicted_direction"),
             trade.get("prediction_confidence"),
+            trade.get("rationale_json"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )
@@ -163,6 +167,27 @@ def get_entry_dates(conn: sqlite3.Connection, tickers: list[str]) -> dict[str, s
         if row:
             entry_dates[ticker] = row[0]
     return entry_dates
+
+
+def get_todays_trades(conn: sqlite3.Connection, run_date: str) -> list[dict]:
+    """Return all trades for a given date as dicts (including rationale_json)."""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM trades WHERE date=? ORDER BY created_at", (run_date,)
+    ).fetchall()
+    conn.row_factory = None
+    return [dict(r) for r in rows]
+
+
+def get_entry_trade(conn: sqlite3.Connection, ticker: str) -> dict | None:
+    """Return the most recent ENTER trade for a ticker, or None."""
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM trades WHERE ticker=? AND action='ENTER' ORDER BY date DESC LIMIT 1",
+        (ticker,),
+    ).fetchone()
+    conn.row_factory = None
+    return dict(row) if row else None
 
 
 def backup_to_s3(db_path: str, run_date: str, s3_bucket: str) -> None:

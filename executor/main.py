@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -215,6 +216,16 @@ def run(
     market_regime = signals["market_regime"]
     sector_ratings = signals["sector_ratings"]
 
+    # Load GBM predictions for rationale capture (reuse if already loaded in population path)
+    if not simulate:
+        try:
+            from executor.signal_generator import read_predictions
+            predictions_by_ticker = read_predictions(signals_bucket)
+        except Exception:
+            predictions_by_ticker = {}
+    else:
+        predictions_by_ticker = {}
+
     logger.info(
         f"Signals | regime={market_regime} "
         f"| ENTER={len(signals['enter'])} EXIT={len(signals['exit'])} "
@@ -365,6 +376,7 @@ def run(
             })
         elif not dry_run:
             order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
+            pred = predictions_by_ticker.get(ticker, {})
             log_trade(conn, {
                 "date": run_date,
                 "ticker": ticker,
@@ -381,6 +393,27 @@ def run(
                 "price_target_upside": sig.get("price_target_upside"),
                 "thesis_summary": sig.get("thesis_summary"),
                 "ib_order_id": order_result.get("ib_order_id"),
+                "predicted_direction": pred.get("predicted_direction"),
+                "prediction_confidence": pred.get("prediction_confidence"),
+                "rationale_json": json.dumps({
+                    "action": "ENTER",
+                    "research_score": sig.get("score"),
+                    "conviction": sig.get("conviction"),
+                    "thesis_summary": sig.get("thesis_summary"),
+                    "price_target_upside": sig.get("price_target_upside"),
+                    "sector_rating": sector_rating_str,
+                    "market_regime": market_regime,
+                    "predicted_direction": pred.get("predicted_direction"),
+                    "prediction_confidence": pred.get("prediction_confidence"),
+                    "predicted_alpha": pred.get("predicted_alpha"),
+                    "sizing_factors": {
+                        "sector_adj": sizing.get("sector_adj"),
+                        "conviction_adj": sizing.get("conviction_adj"),
+                        "upside_adj": sizing.get("upside_adj"),
+                        "dd_multiplier": sizing.get("dd_multiplier"),
+                    },
+                    "risk_guard_reason": reason,
+                }),
             })
 
     # ── 4. Process EXIT signals (Research + Strategy) ───────────────────────
@@ -427,6 +460,7 @@ def run(
         elif not dry_run:
             current_price = ibkr.get_current_price(ticker)
             order_result = ibkr.place_market_order(ticker, "SELL", shares_held)
+            pred = predictions_by_ticker.get(ticker, {})
             log_trade(conn, {
                 "date": run_date,
                 "ticker": ticker,
@@ -441,6 +475,16 @@ def run(
                 "sector_rating": current_positions[ticker].get("sector", ""),
                 "market_regime": market_regime,
                 "ib_order_id": order_result.get("ib_order_id"),
+                "predicted_direction": pred.get("predicted_direction"),
+                "prediction_confidence": pred.get("prediction_confidence"),
+                "rationale_json": json.dumps({
+                    "action": "EXIT",
+                    "exit_reason": sig.get("reason", "research_signal"),
+                    "exit_detail": sig.get("detail", ""),
+                    "research_score": sig.get("score"),
+                    "predicted_direction": pred.get("predicted_direction"),
+                    "predicted_alpha": pred.get("predicted_alpha"),
+                }),
             })
 
     # ── 5. Process REDUCE signals (Research + Strategy) ─────────────────────
@@ -497,6 +541,7 @@ def run(
             current_price = ibkr.get_current_price(ticker)
             order_result = ibkr.place_market_order(ticker, "SELL", shares_to_sell)
             remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
+            pred = predictions_by_ticker.get(ticker, {})
             log_trade(conn, {
                 "date": run_date,
                 "ticker": ticker,
@@ -511,6 +556,16 @@ def run(
                 "sector_rating": current_positions[ticker].get("sector", ""),
                 "market_regime": market_regime,
                 "ib_order_id": order_result.get("ib_order_id"),
+                "predicted_direction": pred.get("predicted_direction"),
+                "prediction_confidence": pred.get("prediction_confidence"),
+                "rationale_json": json.dumps({
+                    "action": "REDUCE",
+                    "exit_reason": sig.get("reason", "research_signal"),
+                    "exit_detail": sig.get("detail", ""),
+                    "research_score": sig.get("score"),
+                    "predicted_direction": pred.get("predicted_direction"),
+                    "predicted_alpha": pred.get("predicted_alpha"),
+                }),
             })
 
     # ── 6. Backup and disconnect ─────────────────────────────────────────────

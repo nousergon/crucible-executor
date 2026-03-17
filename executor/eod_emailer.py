@@ -80,6 +80,7 @@ def build_eod_email(
     alpha: float | None,
     positions: dict,
     conn: sqlite3.Connection,
+    position_narratives: dict[str, str] | None = None,
 ) -> tuple[str, str, str]:
     """
     Build the EOD email subject + (html_body, plain_body).
@@ -130,6 +131,22 @@ def build_eod_email(
         html_parts.append("<p>No open positions.</p>")
         plain_parts.append("  No open positions.")
     plain_parts.append("")
+
+    # ── Position rationale ─────────────────────────────────────────────────
+    if position_narratives and positions:
+        html_parts.append("<h2>Position Rationale</h2>")
+        html_parts.append("<table>")
+        html_parts.append("<tr><th>Ticker</th><th>Rationale</th></tr>")
+        plain_parts.append("POSITION RATIONALE")
+        plain_parts.append("-" * 40)
+        for ticker in sorted(positions.keys()):
+            narrative = position_narratives.get(ticker, "No rationale available.")
+            html_parts.append(
+                f"<tr><td><b>{ticker}</b></td><td>{narrative}</td></tr>"
+            )
+            plain_parts.append(f"  {ticker}: {narrative}")
+        html_parts.append("</table>")
+        plain_parts.append("")
 
     # ── Trades today ─────────────────────────────────────────────────────────
     trades_today = conn.execute(
@@ -201,9 +218,11 @@ def send_eod_email(
     sender: str,
     recipients: list[str],
     region: str = "us-east-1",
+    position_narratives: dict[str, str] | None = None,
 ) -> None:
     subject, html_body, plain_body = build_eod_email(
-        run_date, nav, daily_return, spy_return, alpha, positions, conn
+        run_date, nav, daily_return, spy_return, alpha, positions, conn,
+        position_narratives=position_narratives,
     )
 
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")

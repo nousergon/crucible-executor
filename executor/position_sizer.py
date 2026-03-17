@@ -83,4 +83,8 @@ def compute_position_size(
         "shares": shares,
         "dollar_size": round(dollar_size, 2),
         "position_pct": round(position_weight, 4),
+        "sector_adj": sector_adj,
+        "conviction_adj": conviction_adj,
+        "upside_adj": upside_adj,
+        "dd_multiplier": drawdown_multiplier,
     }
