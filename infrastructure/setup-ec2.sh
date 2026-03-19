@@ -44,7 +44,10 @@ if [ ! -f config/risk.yaml ]; then
     echo ""
 fi
 
-# ── 4. Cron ───────────────────────────────────────────────────────────────────
+# ── 4. Boot-pull service (auto-update all repos on instance start) ─────────
+sudo bash "$REPO_DIR/infrastructure/install-boot-pull.sh"
+
+# ── 5. Cron ───────────────────────────────────────────────────────────────────
 bash "$REPO_DIR/infrastructure/add-cron.sh"
 
 echo ""
