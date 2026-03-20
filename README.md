@@ -286,7 +286,7 @@ The executor shares an EC2 instance with other system components:
 | Executor (`main.py`) | Cron | 9:30 AM ET weekdays | — |
 | Intraday Daemon (`daemon.py`) | Cron | 9:45 AM – 4:00 PM ET weekdays | — |
 | EOD Reconcile (`eod_reconcile.py`) | Cron | 4:05 PM ET weekdays | — |
-| Backtester | Cron | Monday 3:00 AM ET | — |
+| Backtester (spot launcher) | Cron | Monday 3:00 AM ET | — |
 
 The instance runs 24/7 to serve the public website, dashboard, and IB Gateway.
 
@@ -301,6 +301,7 @@ The backtester writes three S3 config files that upstream modules read on cold-s
 | `config/scoring_weights.json` | Backtester | Research | Sub-score composite weights |
 | `config/executor_params.json` | Backtester | Executor | Risk parameters and sizing |
 | `config/predictor_params.json` | Backtester | Predictor | Veto confidence threshold |
+| `config/research_params.json` | Backtester | Research | Signal boost parameters (deferred until 200+ samples) |
 
 ---
 
