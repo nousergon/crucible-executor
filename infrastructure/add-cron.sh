@@ -14,6 +14,8 @@
 # Secrets file (~/.alpha-engine.env, chmod 600):
 #   GMAIL_APP_PASSWORD=xxx
 #   ANTHROPIC_API_KEY=yyy
+#   TELEGRAM_BOT_TOKEN=xxx
+#   TELEGRAM_CHAT_ID=xxx
 #
 # Usage:
 #   bash infrastructure/add-cron.sh
@@ -22,6 +24,8 @@
 #   cat > ~/.alpha-engine.env << 'EOF'
 #   GMAIL_APP_PASSWORD=your-app-password
 #   ANTHROPIC_API_KEY=your-api-key
+#   TELEGRAM_BOT_TOKEN=your-bot-token
+#   TELEGRAM_CHAT_ID=your-chat-id
 #   EOF
 #   chmod 600 ~/.alpha-engine.env
 
@@ -41,22 +45,25 @@ fi
 SOURCE_ENV=". ${ENV_FILE} &&"
 
 EXECUTOR_CRON="30 13 * * 1-5  cd ${REPO_DIR} && git pull --ff-only >> /var/log/executor.log 2>&1 && ${SOURCE_ENV} .venv/bin/python executor/main.py >> /var/log/executor.log 2>&1"
+DAEMON_CRON="45 13 * * 1-5  cd ${REPO_DIR} && ${SOURCE_ENV} .venv/bin/python -m executor.daemon >> /var/log/daemon.log 2>&1"
 EOD_CRON="5 21 * * 1-5  cd ${REPO_DIR} && git pull --ff-only >> /var/log/eod.log 2>&1 && ${SOURCE_ENV} .venv/bin/python executor/eod_reconcile.py >> /var/log/eod.log 2>&1"
 
 # ── Replace existing entries ─────────────────────────────────────────────────
-# Remove any existing alpha-engine executor/eod lines, then add new ones.
+# Remove any existing alpha-engine executor/eod/daemon lines, then add new ones.
 # Preserve backtester and other cron entries.
 EXISTING=$(crontab -l 2>/dev/null || true)
-FILTERED=$(echo "$EXISTING" | grep -v "alpha-engine/.*executor/main.py" | grep -v "alpha-engine/.*executor/eod_reconcile.py" || true)
+FILTERED=$(echo "$EXISTING" | grep -v "alpha-engine/.*executor/main.py" | grep -v "alpha-engine/.*executor/eod_reconcile.py" | grep -v "alpha-engine/.*executor.daemon" || true)
 
 {
     echo "$FILTERED"
     echo "$EXECUTOR_CRON"
+    echo "$DAEMON_CRON"
     echo "$EOD_CRON"
 } | crontab -
 
 echo "Executor cron jobs registered:"
-echo "  Executor: weekdays 13:30 UTC (6:30 AM PT)"
+echo "  Executor: weekdays 13:30 UTC (9:30 AM ET)"
+echo "  Daemon:   weekdays 13:45 UTC (9:45 AM ET) — self-terminates at 4:00 PM ET"
 echo "  EOD:      weekdays 21:05 UTC (4:05 PM ET)"
 echo "  Secrets:  sourced from ${ENV_FILE}"
 echo ""

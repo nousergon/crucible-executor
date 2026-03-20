@@ -1,0 +1,18 @@
+[Unit]
+Description=Alpha Engine Intraday Trading Daemon
+After=network.target ibgateway.service
+Wants=ibgateway.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine
+ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.daemon
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/var/log/daemon.log
+StandardError=append:/var/log/daemon.log
+Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+
+[Install]
+WantedBy=multi-user.target

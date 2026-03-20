@@ -1,0 +1,10 @@
+[Unit]
+Description=Start Alpha Engine Intraday Daemon at market open
+
+[Timer]
+# Start at 6:45 AM ET on weekdays (15 min after executor morning batch)
+OnCalendar=Mon..Fri 06:45 America/New_York
+Persistent=false
+
+[Install]
+WantedBy=timers.target

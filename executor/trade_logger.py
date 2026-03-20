@@ -51,6 +51,7 @@ _TRADES_MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN exit_reason TEXT",
     "ALTER TABLE trades ADD COLUMN filled_shares INTEGER",
     "ALTER TABLE trades ADD COLUMN execution_latency_ms INTEGER",
+    "ALTER TABLE trades ADD COLUMN source TEXT",
 ]
 
 _EOD_MIGRATIONS = [
@@ -116,8 +117,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             sector_rating, market_regime, price_target_upside,
             thesis_summary, fill_price, fill_time, ib_order_id,
             predicted_direction, prediction_confidence, rationale_json,
-            status, exit_reason, filled_shares, execution_latency_ms, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            status, exit_reason, filled_shares, execution_latency_ms, source, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -145,6 +146,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("exit_reason"),
             trade.get("filled_shares"),
             trade.get("execution_latency_ms"),
+            trade.get("source"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )

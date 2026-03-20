@@ -9,6 +9,7 @@
 #   - ~/.netrc with GitHub PAT (for git pull in cron)
 #   - IB Gateway running on port 4002 (ibgateway.service)
 #   - config/risk.yaml must be created manually (gitignored)
+#   - ~/.alpha-engine.env must include TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
 
 set -euo pipefail
 
@@ -29,11 +30,11 @@ echo "Installing dependencies..."
 .venv/bin/pip install --quiet -r requirements.txt
 
 # ── 2. Log files ──────────────────────────────────────────────────────────────
-for log in executor.log eod.log; do
+for log in executor.log eod.log daemon.log; do
     sudo touch "/var/log/$log"
     sudo chown ec2-user:ec2-user "/var/log/$log"
 done
-echo "Log files ready: /var/log/executor.log, /var/log/eod.log"
+echo "Log files ready: /var/log/executor.log, /var/log/eod.log, /var/log/daemon.log"
 
 # ── 3. Config check ──────────────────────────────────────────────────────────
 if [ ! -f config/risk.yaml ]; then

@@ -26,6 +26,7 @@ trading-env/
 # Data files (synced via S3, not tracked in git)
 trading.db
 trades.db
+data/order_book.json
 
 # Lambda build artifacts (rebuilt by deploy.sh)
 lambda/package/

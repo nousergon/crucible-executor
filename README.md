@@ -1,6 +1,6 @@
 # Nous Ergon: Alpha Engine
 
-**See the Nous Ergon blog series on [Hashnode](https://nous-ergon.hashnode.dev/)**
+**See the Nous Ergon public dashboard at [nousergon.ai](nousergon.ai) and blog series on [Hashnode](https://nous-ergon.hashnode.dev/)**
 
 **Nous Ergon** (νοῦς ἔργον — "intelligence at work") is a fully autonomous trading system that combines AI-driven research, quantitative prediction, and rule-based execution to generate market alpha.
 
@@ -38,6 +38,9 @@ Five modules run on AWS, connected through a shared S3 bucket. Each module reads
 │       │                                                             │
 │       ▼  predictions.json                                           │
 │  Executor (6:30 AM PT) ──── trades ───► Interactive Brokers        │
+│       │                                                             │
+│       ▼  order book (approved entries + stop state)                 │
+│  Intraday Daemon (6:45 AM – 1:00 PM PT) ──── monitor + execute    │
 │       │                                                             │
 │       ▼  (market close)                                             │
 │  EOD Reconcile (1:05 PM PT) ──── NAV, return, alpha ───► email     │
@@ -78,12 +81,14 @@ LightGBM model that predicts 5-day market-relative returns for each ticker. Prod
 
 ### 3. Executor — [`alpha-engine`](https://github.com/cipher813/alpha-engine) *(this repo)*
 
-Reads signals and predictions from S3, applies hard risk rules, sizes positions, and executes market orders on Interactive Brokers (paper trading).
+Reads signals and predictions from S3, applies hard risk rules, sizes positions, and executes orders on Interactive Brokers (paper trading). Includes an intraday daemon for continuous position monitoring and optimized entry/exit timing.
 
+- Morning batch: signal ingestion, risk evaluation, position sizing, bracket order placement
+- Intraday daemon: 15-minute delayed streaming via IB Gateway for exit monitoring and entry triggers
 - Graduated drawdown response with configurable halt threshold
 - ATR-based trailing stops (volatility-adaptive) with time-decay exit rules
-- Configurable position caps, sector limits, and equity exposure limits
-- Deterministic execution — no reasoning, no prediction, just parameter application
+- Broker-side trailing stops via bracket orders for crash protection
+- Telegram push notifications for all intraday trades
 - Auto-tuned by backtester via S3-delivered `config/executor_params.json`
 
 ### 4. Backtester — [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester)
@@ -145,11 +150,19 @@ python executor/main.py --dry-run    # full loop, no orders placed
 ```
 executor/main.py              # Daily trading loop (entry point)
 executor/signal_reader.py     # Reads signals.json from S3
-executor/risk_guard.py        # Hard rule enforcement + graduated drawdown
-executor/position_sizer.py    # Equal-weight base with adjustments
+executor/risk_guard.py        # 8-rule enforcement + graduated drawdown
+executor/position_sizer.py    # Equal-weight base with 9 sizing adjustments
 executor/ibkr.py              # IB Gateway wrapper (ib_insync)
-executor/strategies/          # ATR trailing stops + time-decay exits
+executor/bracket_orders.py    # BUY + trailing stop as parent/child IB orders
+executor/strategies/          # ATR trailing stops, time-decay, profit-take, momentum exits
+executor/daemon.py            # Intraday monitoring loop (9:45 AM – 4:00 PM ET)
+executor/order_book.py        # JSON-based intraday order book (entries, stops)
+executor/price_monitor.py     # 15-min delayed streaming subscriptions
+executor/intraday_exit_manager.py  # Intraday exit rules (trail, profit-take, collapse)
+executor/entry_triggers.py    # Intraday entry triggers (pullback, VWAP, support, expiry)
+executor/notifier.py          # Telegram push notifications for trades
 executor/eod_reconcile.py     # EOD P&L vs SPY + email
+executor/price_cache.py       # OHLCV from predictor S3 slim cache for ATR
 config/risk.yaml.example      # Safe template — copy to config/risk.yaml
 ```
 
@@ -159,12 +172,15 @@ config/risk.yaml.example      # Safe template — copy to config/risk.yaml
 
 ### Daily Execution Flow
 
-The executor is **not a continuous trading system**. It runs a single ~5-minute pass at market open, places all orders, and exits. No intraday monitoring, no price checks, no order adjustments.
+The executor operates in two phases: a morning batch that makes all trading decisions, and an intraday daemon that optimizes execution timing and monitors positions in real time.
 
 | Step | Time (ET) | What happens |
 |------|-----------|--------------|
-| **Executor** | 9:30 AM | Single morning pass — read signals, evaluate exits, apply risk rules, size positions, place all orders |
+| **Morning Batch** | 9:30 AM | Read signals, evaluate exits, apply risk rules, size positions, place bracket orders, write order book |
+| **Intraday Daemon** | 9:45 AM – 4:00 PM | Monitor positions via 15-min delayed streaming; execute entry triggers and exit rules |
 | **EOD Reconcile** | 4:05 PM | Capture final NAV, compute daily return vs SPY, log alpha, send email report |
+
+The morning batch is the **decision-maker** (what to buy/sell and how much). The daemon is the **execution optimizer** (when to buy/sell during the day). Both write to the same SQLite trade log and S3 backup.
 
 ### Decision Pipeline
 
@@ -177,35 +193,70 @@ signals.json (S3)
 Signal Reader ──── read today's signals; fall back up to 5 prior trading days
        │
        ▼
-Exit Manager ──── evaluate held positions against ATR stops + time decay
+Exit Manager ──── evaluate held positions against 5 exit strategies:
+  1. ATR trailing stop (volatility-adaptive)
+  2. Fallback stop (fixed % when ATR unavailable)
+  3. Time-based decay (reduce/exit stale HOLD positions)
+  4. Profit-taking (trim at configurable gain threshold)
+  5. Momentum exit (20d momentum flip + RSI below threshold)
+  + Sector-relative veto (skip exit if stock outperforms sector)
        │
        ▼
-Risk Guard ──── 7 rule layers (all must pass):
-  1. Score minimum (score >= min_score_to_enter, default 70)
+Risk Guard ──── 8 rule layers (all must pass):
+  1. Score minimum (score >= min_score_to_enter)
   2. Conviction gate (blocks "declining" conviction)
-  3. Graduated drawdown (tiered sizing reduction → halt at circuit breaker)
-  4. Max single position (% of NAV, adjustable by regime)
-  5. Bear regime block (blocks new entries in underweight sectors)
-  6. Sector exposure limit (default 25% NAV)
-  7. Max total equity (default 90% NAV)
+  3. Momentum gate (20d return must exceed threshold)
+  4. Graduated drawdown (tiered sizing reduction → halt at circuit breaker)
+  5. Max single position (% of NAV, adjustable by regime)
+  6. Bear regime block (blocks new entries in underweight sectors)
+  7. Sector exposure limit (default 25% NAV)
+  8. Cross-ticker correlation (alerts on concentrated correlated holdings)
        │
        ▼
 Position Sizer ──── compute shares:
   base_weight = 1 / n_enter_signals
-  × sector_adj (overweight 1.05, market 1.0, underweight 0.85)
-  × conviction_adj (declining → 0.70)
-  × upside_adj (< min_upside → 0.70)
-  × confidence_adj (from GBM p_up, configurable tiers)
-  × atr_adj (inverse volatility scaling, if enabled)
+  × sector_adj (overweight/market/underweight)
+  × conviction_adj (declining → reduced)
+  × upside_adj (low price target → reduced)
+  × confidence_adj (from GBM p_up, continuous scaling)
+  × atr_adj (inverse volatility sizing)
   × drawdown_multiplier (from graduated drawdown tier)
+  × staleness_adj (decay for aged signals)
+  × earnings_adj (reduced sizing near earnings)
   → capped at max_position_pct
        │
        ▼
-IBKR ──── place BUY/SELL market orders on paper account (port 4002)
+Bracket Orders ──── place BUY market order + trailing stop as parent/child
        │
        ▼
 Trade Logger ──── persist to SQLite + S3 backup
 ```
+
+### Intraday Daemon
+
+After the morning batch completes, the intraday daemon starts at 9:45 AM ET and runs until market close. It connects to IB Gateway on a separate `clientId` (2) to avoid conflicts with the morning batch (clientId 1).
+
+**Price monitoring:** Subscribes to IB Gateway's free 15-minute delayed streaming data (`reqMarketDataType(3)`) for all tracked tickers. Prices update via `pendingTickersEvent` callbacks.
+
+**Exit rules** (evaluated on each price update):
+
+| Rule | Trigger | Action |
+|------|---------|--------|
+| ATR trailing stop | Price drops below `high_water - ATR × multiple` | SELL full position |
+| Profit-taking | Price up > 8% from entry | SELL 50% position |
+| Intraday collapse | Price drops > 5% from intraday high | SELL full position |
+| Time-based tightening | After 3+ days held, tighten trail to 1.5× ATR | Update stop |
+
+**Entry triggers** (any one fires — OR logic):
+
+| Trigger | Logic | Default |
+|---------|-------|---------|
+| Pullback entry | Price drops ≥ 2% from intraday high | `pullback_pct: 0.02` |
+| VWAP discount | Price < VWAP by ≥ 0.5% | `vwap_discount_pct: 0.005` |
+| Support bounce | Price within 1% of 20-day support level | `support_pct: 0.01` |
+| Time expiry | No trigger by 3:30 PM ET → execute at market | `expiry_time: "15:30"` |
+
+**Notifications:** Every intraday trade sends a Telegram push notification via bot API (fire-and-forget, never blocks execution).
 
 ### Data Sources
 
@@ -220,16 +271,6 @@ The executor consumes six data streams — all read-only, no feedback during exe
 | `trades.db` (SQLite) | Peak NAV, entry dates, trade history | After each execution |
 | `config/executor_params.json` (S3) | Backtester-tuned parameters | Weekly (Monday, by Backtester) |
 
-### Exit Strategies
-
-Three backtestable exit rules run independently on held positions:
-
-| Strategy | Trigger | Default | Config key |
-|----------|---------|---------|------------|
-| **ATR trailing stop** | Price falls below `highest_high - ATR(period) × multiplier` | period=14, multiplier=2.5 | `strategy.exit_manager.atr_*` |
-| **Time-based decay** | Position held > N trading days AND Research signal is HOLD (not reaffirming) | reduce at 7d, exit at 14d | `strategy.exit_manager.time_decay_*` |
-| **Graduated drawdown** | Portfolio drawdown exceeds tier thresholds | 1.0× at -2%, 0.5× at -4%, 0.25× at -6%, halt at -8% | `strategy.graduated_drawdown.*` |
-
 EXIT and REDUCE signals from Research always bypass all risk rules — reducing exposure is never blocked.
 
 ### EC2 Infrastructure
@@ -243,10 +284,11 @@ The executor shares an EC2 instance with other system components:
 | dashboard.nousergon.ai (Streamlit) | Always-on | 24/7 | 8501 |
 | IB Gateway (paper trading) | Always-on | 24/7 | 4002 |
 | Executor (`main.py`) | Cron | 9:30 AM ET weekdays | — |
+| Intraday Daemon (`daemon.py`) | Cron | 9:45 AM – 4:00 PM ET weekdays | — |
 | EOD Reconcile (`eod_reconcile.py`) | Cron | 4:05 PM ET weekdays | — |
 | Backtester | Cron | Monday 3:00 AM ET | — |
 
-The executor uses ~7 minutes of compute per day (two cron jobs). The instance runs 24/7 to serve the public website and dashboard.
+The instance runs 24/7 to serve the public website, dashboard, and IB Gateway.
 
 ---
 
@@ -315,38 +357,7 @@ s3://alpha-engine-research/
 | Cloud | AWS (Lambda, S3, SES, EC2) |
 | Dashboard | Streamlit + Plotly |
 | Databases | SQLite per-module (backed up to S3) |
-
----
-
-## Opportunities for Improvement
-
-### Execution Quality
-
-- **No connection heartbeat** — IB Gateway connection is created once at startup. If Gateway restarts mid-execution, the executor crashes with no recovery. Plan: add connection health check before each order block, with automatic reconnect on failure.
-
-### Risk Management
-
-- **No volatility-adjusted position sizing** — position sizes don't scale with VIX or realized volatility. Plan: add ATR-based sizing layer (`risk_per_trade / (ATR_14 * price)`) that naturally sizes smaller in volatile names.
-- **No cross-ticker correlation monitoring** — hidden concentration risk when multiple correlated positions are held (e.g., MSFT + AAPL + GOOGL all correlated >0.8). Plan: compute pairwise rolling correlations and alert or reduce when portfolio-level correlation exceeds a threshold.
-- **No profit-taking mechanism** — positions that gain 25%+ have no trim mechanism. Plan: add configurable profit-taking rules (e.g., trim 25% at +20%, trim 50% at +30%).
-- **Graduated drawdown only adjusts new entry sizing** — existing positions are untouched during drawdowns. Plan: add forced exit of lowest-conviction holdings when drawdown exceeds a configurable threshold, raising cash for recovery.
-- **Confidence-weighted sizing from predictor** — currently the predictor veto is binary (block or pass). Plan: map `p_up` to a continuous sizing multiplier (e.g., p_up 0.50-0.55 = 0.25x, 0.75+ = 1.0x) to extract more value from the ML signal.
-
-### Entry/Exit Strategy
-
-- **No entry momentum confirmation gate** — Plan: require 5d momentum > 0 and price above 20d MA before entering, reducing bad entries by an estimated 15-25%.
-- **No sector-relative exit** — ATR stop is absolute price-based. A stock dropping -15% while its sector drops -20% is actually outperforming. Plan: add sector-relative exit option that triggers only when the stock underperforms its sector.
-- **No momentum-based exit** — no trigger when 20-day momentum flips negative or RSI drops below 30.
-- **REDUCE always sells exactly 50%** — no configuration for partial reduction amounts. Plan: make reduction percentage configurable.
-
-### Signal Integration
-
-- **No signal staleness discount** — a 5-day-old signal is treated identically to today's signal. Plan: add a score decay factor proportional to signal age.
-- **No earnings date awareness** — positions hold through earnings with no volatility adjustment. Plan: reduce position size or tighten stops ahead of known earnings dates (available from FMP calendar).
-
-### EOD Reconciliation
-
-- **No alpha attribution by sector** — EOD email shows total alpha but not sector breakdown. Plan: compute per-sector contribution to daily alpha.
+| Notifications | Telegram Bot API |
 
 ---
 

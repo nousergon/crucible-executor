@@ -110,7 +110,7 @@ def compute_position_size(
     position_weight = min(raw_weight, max_pct)
 
     dollar_size = portfolio_nav * position_weight
-    shares = math.floor(dollar_size / current_price) if current_price > 0 else 0
+    shares = math.floor(dollar_size / current_price) if current_price and current_price > 0 else 0
 
     # Minimum position size check (Task 1.2)
     if dollar_size < config.get("min_position_dollar", 500):

@@ -32,7 +32,9 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from executor.bracket_orders import place_bracket_with_stop
 from executor.ibkr import IBKRClient, SimulatedIBKRClient
+from executor.order_book import OrderBook
 from executor.market_hours import is_market_hours
 from executor.position_sizer import compute_position_size
 from executor.risk_guard import check_order, compute_drawdown_multiplier
@@ -591,7 +593,31 @@ def run(
                 })
             elif not dry_run:
                 t_before = datetime.now()
-                order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
+
+                # Use bracket order (BUY + trailing stop) when enabled and ATR is available
+                use_bracket = strategy_config.get("bracket_stop_enabled", True) and atr_pct is not None
+                if use_bracket:
+                    from executor.strategies.exit_manager import _compute_atr
+                    ticker_hist = (price_histories or {}).get(ticker, [])
+                    atr_dollar = _compute_atr(ticker_hist, period=14) if ticker_hist else None
+                    if atr_dollar and atr_dollar > 0:
+                        bracket_mult = strategy_config.get("bracket_trail_atr_multiple", 2.0)
+                        order_result = place_bracket_with_stop(
+                            ibkr, ticker, sizing["shares"],
+                            atr_value=atr_dollar,
+                            atr_multiple=bracket_mult,
+                        )
+                        if order_result.get("trail_amount"):
+                            logger.info(
+                                f"Bracket stop placed for {ticker}: "
+                                f"trail=${order_result['trail_amount']:.2f} "
+                                f"(ATR=${atr_dollar:.2f} × {bracket_mult})"
+                            )
+                    else:
+                        order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
+                else:
+                    order_result = ibkr.place_market_order(ticker, "BUY", sizing["shares"])
+
                 latency_ms = int((datetime.now() - t_before).total_seconds() * 1000)
                 if order_result["status"] in ("Rejected", "Timeout"):
                     logger.warning(
@@ -852,11 +878,48 @@ def run(
                     "execution_latency_ms": latency_ms,
                 })
     
-        # ── 6. Backup and disconnect ─────────────────────────────────────────
+        # ── 6. Write intraday order book for daemon ────────────────────────────
+        if not simulate and not dry_run and strategy_config.get("intraday_enabled", False):
+            try:
+                from executor.strategies.exit_manager import _compute_atr
+                ob = OrderBook.load()
+                ob.set_date(run_date)
+
+                # Add stop records for all current positions (after ENTER fills)
+                refreshed_positions = ibkr.get_positions()
+                for t, pos in refreshed_positions.items():
+                    shares_held = int(pos.get("shares", 0))
+                    if shares_held <= 0:
+                        continue
+                    ticker_hist = (price_histories or {}).get(t, [])
+                    atr_val = _compute_atr(ticker_hist, period=14) if ticker_hist else None
+                    entry_price = pos.get("avg_cost", 0)
+                    atr_mult = strategy_config.get("intraday_trailing_stop_atr_multiple", 2.0)
+                    stop_price = round(entry_price - atr_val * atr_mult, 2) if atr_val else 0
+                    ob.add_stop({
+                        "ticker": t,
+                        "entry_price": entry_price,
+                        "current_stop": stop_price,
+                        "trail_atr": atr_val or 0,
+                        "atr_multiple": atr_mult,
+                        "high_water": entry_price,
+                        "entry_date": (conn and get_entry_dates(conn, [t]).get(t)) or run_date,
+                        "shares": shares_held,
+                    })
+
+                ob.save()
+                logger.info(
+                    "Order book written: %d stops, %d pending entries",
+                    len(ob.active_stops()), len(ob.pending_entries()),
+                )
+            except Exception as e:
+                logger.warning("Failed to write intraday order book: %s", e)
+
+        # ── 7. Backup and disconnect ─────────────────────────────────────────
         if not dry_run and not simulate:
             backup_to_s3(db_path, run_date, trades_bucket)
 
-        # ── 7. Write health status ────────────────────────────────────────────
+        # ── 8. Write health status ────────────────────────────────────────────
         if not simulate:
             try:
                 from executor.health_status import write_health

@@ -125,6 +125,44 @@ strategy:
   drawdown_forced_exit_tier2_count: 1   # force-exit N lowest-conviction positions at tier 2
   drawdown_forced_exit_tier3_count: 2   # force-exit N lowest-conviction positions at tier 3
 
+  # Bracket stop: broker-side trailing stop on every ENTER order
+  bracket:
+    enabled: true
+    trail_atr_multiple: 2.0             # trailing stop = ATR(14) * this value
+
+# ── Intraday Daemon ─────────────────────────────────────────────────────────
+# Monitors positions and approved entries during market hours using 15-min
+# delayed streaming data from IB Gateway. Runs as a separate process (clientId=2).
+intraday:
+  enabled: false                        # opt-in: set true to activate daemon
+  client_id: 2                          # separate from morning batch (clientId=1)
+  poll_interval_sec: 60                 # how often to check prices (data updates ~15 min)
+
+  entry_triggers:
+    enabled: true
+    pullback_pct: 0.02                  # 2% pullback from intraday high
+    vwap_discount_pct: 0.005            # 0.5% below VWAP
+    support_pct: 0.01                   # within 1% of support level
+    support_lookback_days: 20           # days to look back for support
+    expiry_time: "15:30"                # execute at market if no trigger by 3:30 PM ET
+
+  exit_rules:
+    trailing_stop_atr_multiple: 2.0     # intraday trailing stop (software-side)
+    profit_take_pct: 0.08               # take 50% profit at 8% gain
+    collapse_pct: 0.05                  # full exit on 5% intraday drop
+    tighten_after_days: 3               # tighten trail to 1.5x ATR after 3 days
+    tighten_atr_multiple: 1.5
+
+# ── Notifications ───────────────────────────────────────────────────────────
+# Telegram bot push notifications for intraday trades.
+# Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env (never in this file).
+notifications:
+  telegram:
+    enabled: true
+    notify_entries: true
+    notify_exits: true
+    notify_morning_batch: false
+
 # ── Earnings proximity (O10) ──────────────────────────────────────────────
 # Warn (log + email mention) when entering a position within N days of earnings.
 # Informational only — not a gate. The predictor features handle the signal.
