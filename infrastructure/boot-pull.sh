@@ -45,4 +45,25 @@ for repo in "${REPOS[@]}"; do
     fi
 done
 
+# Sync systemd service files from repo (if alpha-engine has them)
+SYSTEMD_SRC="/home/ec2-user/alpha-engine/infrastructure/systemd"
+if [ -d "$SYSTEMD_SRC" ]; then
+    CHANGED=false
+    for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
+        [ -f "$unit" ] || continue
+        name=$(basename "$unit")
+        if [ -f "/etc/systemd/system/$name" ]; then
+            if ! diff -q "$unit" "/etc/systemd/system/$name" >/dev/null 2>&1; then
+                sudo cp "$unit" /etc/systemd/system/
+                log "OK   systemd: updated $name"
+                CHANGED=true
+            fi
+        fi
+    done
+    if $CHANGED; then
+        sudo systemctl daemon-reload
+        log "OK   systemd: daemon-reload"
+    fi
+fi
+
 log "=== boot-pull complete ==="
