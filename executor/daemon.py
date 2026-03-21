@@ -108,6 +108,27 @@ def run_daemon(dry_run: bool = False) -> None:
         reconnect_attempts=config.get("ibkr_reconnect_attempts", 3),
     )
 
+    # ── Paper account safety check ────────────────────────────────────
+    # IB paper accounts start with "D" (e.g., DU1234567). Hard-exit if
+    # connected to a live account to prevent real-money trades.
+    try:
+        accounts = ibkr.ib.managedAccounts()
+        if accounts:
+            acct = accounts[0]
+            if not acct.startswith("D"):
+                logger.critical(
+                    "SAFETY HALT: connected to live account %s — daemon refusing to trade. "
+                    "Paper accounts start with 'D'. Check TRADING_MODE and ibkr_port.",
+                    acct,
+                )
+                ibkr.disconnect()
+                if conn:
+                    conn.close()
+                return
+            logger.info("Paper account verified: %s", acct)
+    except Exception as e:
+        logger.warning("Could not verify paper account (non-blocking): %s", e)
+
     monitor = PriceMonitor(ibkr.ib)
     exit_mgr = IntradayExitManager(strategy_config)
     entry_engine = EntryTriggerEngine(strategy_config)

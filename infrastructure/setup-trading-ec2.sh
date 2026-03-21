@@ -1,16 +1,16 @@
 #!/bin/bash
 # Full setup for the trading EC2 instance (t3.small, market hours only).
 #
-# This instance runs IB Gateway (Docker), the morning batch (main.py),
+# This instance runs IB Gateway (IBC + Xvfb), the morning batch (main.py),
 # the intraday daemon, and EOD reconciliation. It is started/stopped
-# daily by the micro instance's cron.
+# daily by EventBridge Scheduler.
 #
 # Prerequisites:
 #   - Amazon Linux 2023 AMI
 #   - ~/.netrc with GitHub PAT (for git pull)
-#   - ~/.alpha-engine.env with secrets (IB_USER, IB_PASS, GMAIL_APP_PASSWORD,
-#     ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-#   - TOTP secret stored in AWS Secrets Manager (alpha-engine/ib-gateway-totp)
+#   - ~/.alpha-engine.env with secrets (GMAIL_APP_PASSWORD, ANTHROPIC_API_KEY,
+#     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+#   - IB Gateway + IBC installed at ~/ibgateway and ~/ibc
 #   - config/risk.yaml created manually (gitignored)
 #
 # Usage:
@@ -23,25 +23,9 @@ ENV_FILE="/home/ec2-user/.alpha-engine.env"
 
 echo "=== Alpha Engine Trading Instance Setup ==="
 
-# ── 1. Docker ────────────────────────────────────────────────────────────────
-if ! command -v docker &>/dev/null; then
-    echo "Installing Docker..."
-    sudo dnf install -y docker
-    sudo systemctl enable docker
-    sudo systemctl start docker
-    sudo usermod -aG docker ec2-user
-    echo "Docker installed. You may need to log out and back in for group changes."
-fi
-
-# Install docker compose plugin if not present
-if ! docker compose version &>/dev/null; then
-    echo "Installing Docker Compose plugin..."
-    sudo mkdir -p /usr/local/lib/docker/cli-plugins
-    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name"' | head -1 | sed 's/.*"v\(.*\)".*/\1/')
-    sudo curl -SL "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
-        -o /usr/local/lib/docker/cli-plugins/docker-compose
-    sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-fi
+# ── 1. System packages ──────────────────────────────────────────────────────
+echo "Installing system packages..."
+sudo dnf install -y git python3.11 python3.11-pip xorg-x11-server-Xvfb 2>&1 | tail -3
 
 # ── 2. Python venv ───────────────────────────────────────────────────────────
 cd "$REPO_DIR"
@@ -50,8 +34,11 @@ if [ ! -d ".venv" ]; then
     python3.11 -m venv .venv
 fi
 echo "Installing dependencies..."
+# flow-doctor is optional (local package) — install what's available
+grep -v flow-doctor requirements.txt > /tmp/req_filtered.txt
 .venv/bin/pip install --quiet --upgrade pip
-.venv/bin/pip install --quiet -r requirements.txt
+.venv/bin/pip install --quiet -r /tmp/req_filtered.txt
+rm /tmp/req_filtered.txt
 
 # ── 3. Log files ─────────────────────────────────────────────────────────────
 for log in executor.log eod.log daemon.log; do
@@ -71,7 +58,12 @@ fi
 if [ ! -f "$ENV_FILE" ]; then
     echo ""
     echo "WARNING: $ENV_FILE not found."
-    echo "  Create it with IB_USER, IB_PASS, and other secrets."
+    echo ""
+fi
+
+if [ ! -d "/home/ec2-user/ibc" ]; then
+    echo ""
+    echo "WARNING: ~/ibc not found. Copy IBC installation from the micro instance."
     echo ""
 fi
 
@@ -81,15 +73,14 @@ sudo bash "$REPO_DIR/infrastructure/install-boot-pull.sh"
 # ── 6. Systemd services ────────────────────────────────────────────────────
 SYSTEMD_DIR="$REPO_DIR/infrastructure/systemd"
 
-# Copy all service and timer files
-for unit in ibgateway.service alpha-engine-morning.service alpha-engine-daemon.service \
-            alpha-engine-eod.service alpha-engine-eod.timer; do
+for unit in xvfb.service ibgateway.service alpha-engine-morning.service \
+            alpha-engine-daemon.service alpha-engine-eod.service alpha-engine-eod.timer; do
     sudo cp "$SYSTEMD_DIR/$unit" /etc/systemd/system/
 done
 
 sudo systemctl daemon-reload
 
-# Enable services (they start on boot via dependencies)
+sudo systemctl enable xvfb.service
 sudo systemctl enable ibgateway.service
 sudo systemctl enable alpha-engine-morning.service
 sudo systemctl enable alpha-engine-daemon.service
@@ -98,12 +89,12 @@ sudo systemctl enable alpha-engine-eod.timer
 echo ""
 echo "=== Trading Instance Setup Complete ==="
 echo ""
-echo "Services enabled (boot-triggered):"
-echo "  1. boot-pull.service     — git pull all repos"
-echo "  2. ibgateway.service     — IB Gateway Docker + TOTP auth"
-echo "  3. alpha-engine-morning  — order book planner (main.py)"
-echo "  4. alpha-engine-daemon   — intraday order executor"
-echo "  5. alpha-engine-eod      — EOD reconciliation (1:05 PM PT timer)"
+echo "Boot sequence (systemd):"
+echo "  1. xvfb.service           — virtual display for IB Gateway"
+echo "  2. ibgateway.service      — IB Gateway via IBC (needs 2FA on first login)"
+echo "  3. alpha-engine-morning   — order book planner (main.py)"
+echo "  4. alpha-engine-daemon    — intraday order executor"
+echo "  5. alpha-engine-eod       — EOD reconciliation (1:05 PM PT timer)"
 echo ""
-echo "Test: sudo systemctl start ibgateway && sleep 30 && python executor/connection_test.py"
-echo "Dry run: python executor/main.py --dry-run"
+echo "First login: IB Gateway will send a 2FA push to your phone."
+echo "Approve it within 2 minutes of instance start."
