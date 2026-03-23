@@ -1,8 +1,10 @@
 [Unit]
-Description=Trigger Alpha Engine EOD Reconciliation at 1:05 PM PT
+Description=Trigger Alpha Engine EOD Reconciliation at 1:20 PM PT
 
 [Timer]
-OnCalendar=Mon..Fri 13:05 America/Los_Angeles
+# Run after 4:15 PM ET (1:15 PM PT) to ensure all 15-min delayed
+# market data has arrived before computing NAV and daily P&L.
+OnCalendar=Mon..Fri 13:20 America/Los_Angeles
 Persistent=false
 
 [Install]

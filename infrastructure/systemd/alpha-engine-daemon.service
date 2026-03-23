@@ -1,6 +1,6 @@
 [Unit]
 Description=Alpha Engine Intraday Trading Daemon
-After=alpha-engine-morning.service ibgateway.service
+After=ibgateway.service
 Requires=ibgateway.service
 
 [Service]

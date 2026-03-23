@@ -1,9 +1,10 @@
 [Unit]
-Description=Start Alpha Engine Intraday Daemon at market open
+Description=Start Alpha Engine Intraday Daemon before market open
 
 [Timer]
-# Start at 6:45 AM ET on weekdays (15 min after executor morning batch)
-OnCalendar=Mon..Fri 06:45 America/New_York
+# Start at 9:29 AM ET (6:29 AM PT), 1 min before market open.
+# Safety net — daemon also starts on boot via multi-user.target.
+OnCalendar=Mon..Fri 09:29 America/New_York
 Persistent=false
 
 [Install]

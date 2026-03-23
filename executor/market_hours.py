@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 
 _ET = pytz.timezone("US/Eastern")
 _MARKET_OPEN = time(9, 30)
-_MARKET_CLOSE = time(16, 0)
+# NYSE closes at 4:00 PM ET, but IB Gateway free data is 15-min delayed,
+# so the last real-time trades don't arrive until ~4:15 PM ET.
+_MARKET_CLOSE = time(16, 15)
 
 
 def is_market_hours(now: datetime | None = None) -> bool:

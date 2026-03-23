@@ -32,6 +32,7 @@ import sys
 import time as _time
 from datetime import date, datetime
 
+import pytz
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -91,11 +92,55 @@ def run_daemon(dry_run: bool = False) -> None:
         run_date, dry_run, client_id, poll_interval,
     )
 
-    # Load order book
+    # Wait for order book — polls every 2 minutes until one appears or market closes.
+    # This allows the daemon to recover from a late predictor inference or morning batch.
+    _ET = pytz.timezone("US/Eastern")
+    order_book_poll_secs = strategy_config.get("order_book_poll_interval_sec", 120)
     order_book = OrderBook.load()
-    if not order_book.has_content():
-        logger.info("Order book is empty — nothing to monitor. Exiting.")
+    notified_no_order_book = False
+
+    while not order_book.has_content() and not _shutdown_requested:
+        now_et = datetime.now(_ET)
+
+        # Notify once at market open that we have no order book
+        if not notified_no_order_book and (now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)):
+            send_daemon_status(
+                "\u26a0\ufe0f *No order book at market open*\n"
+                f"Date: {run_date}\n"
+                "Waiting for morning batch to write order book..."
+            )
+            notified_no_order_book = True
+
+        # Give up once market session ends (4:15 PM ET, accounts for 15-min data delay)
+        if not is_market_hours(now_et) and (now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)):
+            send_daemon_status(
+                "\u274c *No order book received today*\n"
+                f"Date: {run_date}\n"
+                "Market closed — daemon exiting."
+            )
+            logger.info("Order book never arrived and market has closed — exiting.")
+            return
+
+        logger.info(
+            "Order book is empty — waiting %ds for morning batch to write it...",
+            order_book_poll_secs,
+        )
+        _time.sleep(order_book_poll_secs)
+        order_book = OrderBook.load()
+
+    if _shutdown_requested:
         return
+
+    # Notify that order book has arrived (especially useful on late-start days)
+    if notified_no_order_book:
+        send_daemon_status(
+            "\u2705 *Order book received (late start)*\n"
+            f"Date: {run_date}\n"
+            f"Entries: {len(order_book.pending_entries())}\n"
+            f"Urgent exits: {len(order_book.pending_urgent_exits())}\n"
+            f"Stops: {len(order_book.active_stops())}"
+        )
+        logger.info("Order book arrived after market open — proceeding with late start")
 
     # Connect to IB Gateway
     db_path = config["db_path"]
