@@ -45,6 +45,41 @@ for repo in "${REPOS[@]}"; do
     fi
 done
 
+# ── Restore trades.db from S3 if missing or empty ──────────────────────────
+# The trading instance is stopped/started daily by EventBridge. If a new
+# instance is launched (or EBS is recreated), trades.db will be missing and
+# init_db() creates an empty one — losing all trade history and EOD data.
+# This restores trades_latest.db from S3 as a safety net.
+RISK_YAML="/home/ec2-user/alpha-engine/config/risk.yaml"
+if [ -f "$RISK_YAML" ]; then
+    # Parse db_path and trades_bucket from risk.yaml
+    DB_PATH=$(grep -E '^\s*db_path:' "$RISK_YAML" | head -1 | sed 's/.*db_path:\s*["]*\([^"]*\)["]*\s*/\1/' | tr -d "'\"")
+    TRADES_BUCKET=$(grep -E '^\s*trades_bucket:' "$RISK_YAML" | head -1 | sed 's/.*trades_bucket:\s*["]*\([^"]*\)["]*\s*/\1/' | tr -d "'\"")
+
+    if [ -n "$DB_PATH" ] && [ -n "$TRADES_BUCKET" ]; then
+        # Restore if db doesn't exist or is ≤ 20KB (empty schema only)
+        DB_SIZE=0
+        [ -f "$DB_PATH" ] && DB_SIZE=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
+
+        if [ "$DB_SIZE" -le 20480 ]; then
+            S3_KEY="trades/trades_latest.db"
+            log "trades.db missing or empty (${DB_SIZE}B) — restoring from s3://${TRADES_BUCKET}/${S3_KEY}"
+            if aws s3 cp "s3://${TRADES_BUCKET}/${S3_KEY}" "$DB_PATH" >> "$LOG" 2>&1; then
+                NEW_SIZE=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
+                log "OK   trades.db restored (${NEW_SIZE}B)"
+            else
+                log "WARN trades.db restore failed — executor will start with empty db"
+            fi
+        else
+            log "OK   trades.db exists (${DB_SIZE}B) — no restore needed"
+        fi
+    else
+        log "WARN could not parse db_path/trades_bucket from risk.yaml"
+    fi
+else
+    log "SKIP trades.db restore (no risk.yaml)"
+fi
+
 # Sync systemd service files from repo (if alpha-engine has them)
 SYSTEMD_SRC="/home/ec2-user/alpha-engine/infrastructure/systemd"
 if [ -d "$SYSTEMD_SRC" ]; then
