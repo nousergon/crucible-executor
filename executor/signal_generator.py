@@ -233,11 +233,19 @@ def _compute_gbm_adjustment(
 
 def _check_gbm_veto(prediction: dict, veto_confidence: float) -> bool:
     """
-    Check if GBM predicts DOWN with high enough confidence to veto ENTER.
+    Check if GBM veto flag is set (negative alpha + bottom-half combined rank).
+
+    Falls back to legacy check (DOWN + high confidence) if gbm_veto flag
+    is not present in the prediction (backward compatibility).
     """
     if not prediction:
         return False
 
+    # New veto: predictor computes and sets gbm_veto directly
+    if "gbm_veto" in prediction:
+        return bool(prediction["gbm_veto"])
+
+    # Legacy fallback: direction + confidence threshold
     return (
         prediction.get("predicted_direction") == "DOWN"
         and prediction.get("prediction_confidence", 0.0) >= veto_confidence

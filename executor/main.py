@@ -580,9 +580,18 @@ def run(
                 logger.info(f"SKIP ENTER {ticker} — position too small (${sizing['dollar_size']:.0f})")
                 continue
     
+            # GBM veto check: predictor flags stocks with negative alpha + poor rank
+            pred_data = predictions_by_ticker.get(ticker, {})
+            if pred_data.get("gbm_veto"):
+                logger.info(
+                    f"VETO {ticker} — GBM: negative alpha + bottom-half rank "
+                    f"(α={pred_data.get('predicted_alpha', 0):.2%}, rank={pred_data.get('combined_rank')})"
+                )
+                continue
+
             # Inject sector_rating into signal for risk guard
             sig_with_sector = {**sig, "sector_rating": sector_rating_str}
-    
+
             approved, reason = check_order(
                 ticker=ticker,
                 action="ENTER",
