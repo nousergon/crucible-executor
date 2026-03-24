@@ -887,5 +887,28 @@ if __name__ == "__main__":
         action="store_true",
         help="Print orders without placing them",
     )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Run locally with simulated IB client (no IB Gateway needed). "
+             "Uses synthetic positions and real signals from S3.",
+    )
     args = parser.parse_args()
-    run(dry_run=args.dry_run)
+
+    if args.simulate:
+        from executor.ibkr import SimulatedIBKRClient
+        sim_prices = {}  # daemon/main will fetch prices via S3 cache
+        sim_client = SimulatedIBKRClient(prices=sim_prices, nav=1_000_000.0)
+        logger.info("SIMULATE MODE: using SimulatedIBKRClient (no IB Gateway)")
+        orders = run(simulate=True, ibkr_client=sim_client, dry_run=True)
+        if orders:
+            logger.info("Simulated orders: %d", len(orders))
+            for o in orders:
+                logger.info(
+                    "  %s %s shares=%s",
+                    o.get("action", "?"), o.get("ticker", "?"), o.get("shares", "?"),
+                )
+        else:
+            logger.info("No simulated orders generated")
+    else:
+        run(dry_run=args.dry_run)
