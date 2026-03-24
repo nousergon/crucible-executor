@@ -459,7 +459,7 @@ def run(
                 def _conviction_rank(ticker_pos):
                     t, pos = ticker_pos
                     sig_data = signals_by_ticker.get(t, {})
-                    score = sig_data.get("score", 50)
+                    score = sig_data.get("score") or 50
                     mv = pos.get("market_value", 0)
                     return (score, mv)
     

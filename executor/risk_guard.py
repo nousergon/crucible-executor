@@ -213,7 +213,7 @@ def check_order(
     # ── ENTER rules ───────────────────────────────────────────────────────────
 
     # 1. Score minimum
-    score = signal.get("score", 0)
+    score = signal.get("score") or 0
     min_score = config.get("min_score_to_enter", 70)
     if score < min_score:
         return False, f"Score {score:.1f} < minimum {min_score}"
