@@ -935,7 +935,29 @@ if __name__ == "__main__":
 
     if args.simulate:
         from executor.ibkr import SimulatedIBKRClient
-        sim_prices = {}  # daemon/main will fetch prices via S3 cache
+        # Seed prices from S3 slim cache (last close for each ticker)
+        sim_prices = {}
+        try:
+            config = load_config()
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            from executor.price_cache import load_price_histories
+            import json
+            import subprocess
+            # Read signals to know which tickers to price
+            result = subprocess.run(
+                ["aws", "s3", "cp", f"s3://{bucket}/signals/{date.today()}/signals.json", "-"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                sig_data = json.loads(result.stdout)
+                tickers = [s["ticker"] for s in sig_data.get("universe", [])]
+                histories = load_price_histories(tickers=tickers, signals_bucket=bucket)
+                for t, hist in histories.items():
+                    if hist and len(hist) > 0:
+                        sim_prices[t] = hist[-1]["close"]
+                logger.info("Seeded %d simulated prices from S3 slim cache", len(sim_prices))
+        except Exception as e:
+            logger.warning("Could not seed simulated prices: %s — entries will show no price", e)
         sim_client = SimulatedIBKRClient(prices=sim_prices, nav=1_000_000.0)
         logger.info("SIMULATE MODE: using SimulatedIBKRClient (no IB Gateway)")
         orders = run(simulate=True, ibkr_client=sim_client, dry_run=True)
