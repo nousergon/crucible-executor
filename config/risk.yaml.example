@@ -65,6 +65,7 @@ ibkr_host: "127.0.0.1"
 ibkr_port: 4002                  # 4002 = paper trading, 4001 = live
 ibkr_client_id: 1
 ibkr_reconnect_attempts: 3       # max reconnect attempts before failing
+ibkr_daemon_max_connect_attempts: 10  # daemon reconnect attempts on IB Gateway drop
 
 # ── S3 ───────────────────────────────────────────────────────────────────────
 signals_bucket: "your-research-bucket-name"

@@ -74,7 +74,8 @@ sudo bash "$REPO_DIR/infrastructure/install-boot-pull.sh"
 SYSTEMD_DIR="$REPO_DIR/infrastructure/systemd"
 
 for unit in xvfb.service ibgateway.service alpha-engine-morning.service \
-            alpha-engine-daemon.service alpha-engine-eod.service alpha-engine-eod.timer; do
+            alpha-engine-daemon.service alpha-engine-daemon.timer \
+            alpha-engine-eod.service alpha-engine-eod.timer; do
     sudo cp "$SYSTEMD_DIR/$unit" /etc/systemd/system/
 done
 

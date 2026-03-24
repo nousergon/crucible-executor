@@ -29,10 +29,10 @@ for repo in "${REPOS[@]}"; do
 
     log "Pulling $repo ..."
     cd "$repo"
-    if git pull --ff-only >> "$LOG" 2>&1; then
+    if git fetch origin >> "$LOG" 2>&1 && git reset --hard origin/main >> "$LOG" 2>&1; then
         log "OK   $repo — $(git log --oneline -1)"
     else
-        log "WARN $repo — pull failed (merge conflict or network issue)"
+        log "WARN $repo — fetch/reset failed (network issue?)"
     fi
 
     # Update pip deps if venv + requirements.txt exist
