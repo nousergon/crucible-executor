@@ -45,6 +45,11 @@ def read_predictions(s3_bucket: str) -> dict[str, dict]:
             Bucket=s3_bucket, Key="predictor/predictions/latest.json"
         )
         data = json.loads(obj["Body"].read())
+        if data.get("timed_out"):
+            logger.warning(
+                "Predictions timed out — using partial set (%d tickers)",
+                len(data.get("predictions", [])),
+            )
         preds = data.get("predictions", [])
         result = {p["ticker"]: p for p in preds if "ticker" in p}
         logger.info("Predictions loaded | n=%d", len(result))

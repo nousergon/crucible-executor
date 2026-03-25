@@ -75,6 +75,26 @@ _PARAM_MAP = {
 }
 
 
+# (type, min, max) for each S3-delivered param — values outside range are rejected
+_PARAM_VALIDATORS = {
+    "atr_multiplier":              (float, 0.5, 10.0),
+    "time_decay_reduce_days":      (int,   1,   30),
+    "time_decay_exit_days":        (int,   1,   60),
+    "min_score":                   (float, 0,   100),
+    "max_position_pct":            (float, 0.01, 0.25),
+    "reduce_fraction":             (float, 0.1,  1.0),
+    "atr_sizing_target_risk":      (float, 0.005, 0.10),
+    "confidence_sizing_min":       (float, 0.3,  1.0),
+    "confidence_sizing_range":     (float, 0.1,  1.0),
+    "staleness_decay_per_day":     (float, 0.0,  0.2),
+    "earnings_sizing_reduction":   (float, 0.0,  1.0),
+    "earnings_proximity_days":     (int,   1,    30),
+    "momentum_gate_threshold":     (float, -30,  0),
+    "correlation_block_threshold": (float, 0.3,  1.0),
+    "profit_take_pct":             (float, 0.05, 1.0),
+    "momentum_exit_threshold":     (float, -50,  0),
+}
+
 _EXECUTOR_PARAMS_CACHE_PATH = Path(__file__).resolve().parent.parent / "config" / ".executor_params_cache.json"
 
 
@@ -128,11 +148,21 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
 
 
 def _merge_s3_params(config: dict, s3_params: dict) -> dict:
-    """Merge flat S3 param names into nested config structure."""
+    """Merge flat S3 param names into nested config structure with validation."""
     for param, value in s3_params.items():
         path = _PARAM_MAP.get(param)
         if not path:
             continue
+        validator = _PARAM_VALIDATORS.get(param)
+        if validator:
+            expected_type, lo, hi = validator
+            if not isinstance(value, (int, float)):
+                logger.warning("S3 param %s: invalid type %s — skipping", param, type(value).__name__)
+                continue
+            value = expected_type(value)
+            if not (lo <= value <= hi):
+                logger.warning("S3 param %s=%s out of range [%s, %s] — skipping", param, value, lo, hi)
+                continue
         target = config
         for key in path[:-1]:
             target = target.setdefault(key, {})
