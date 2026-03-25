@@ -6,5 +6,4 @@ numpy<2
 pandas~=2.2
 pyarrow~=14.0
 anthropic~=0.40
-flow-doctor~=0.1
 exchange-calendars~=4.5

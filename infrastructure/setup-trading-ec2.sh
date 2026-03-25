@@ -34,11 +34,8 @@ if [ ! -d ".venv" ]; then
     python3.11 -m venv .venv
 fi
 echo "Installing dependencies..."
-# flow-doctor is optional (local package) — install what's available
-grep -v flow-doctor requirements.txt > /tmp/req_filtered.txt
 .venv/bin/pip install --quiet --upgrade pip
-.venv/bin/pip install --quiet -r /tmp/req_filtered.txt
-rm /tmp/req_filtered.txt
+.venv/bin/pip install --quiet -r requirements.txt
 
 # ── 3. Log files ─────────────────────────────────────────────────────────────
 for log in executor.log eod.log daemon.log; do

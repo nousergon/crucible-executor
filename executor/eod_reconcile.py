@@ -49,7 +49,7 @@ def _spy_close(run_date: str) -> float | None:
     return None
 
 
-def _load_signals_from_s3(bucket: str, run_date: str, fd=None, max_lookback: int = 5) -> tuple[dict, str | None]:
+def _load_signals_from_s3(bucket: str, run_date: str, max_lookback: int = 5) -> tuple[dict, str | None]:
     """Load signals.json from S3, falling back to prior trading days.
 
     Research only runs on Mondays, so on Tue–Fri the exact run_date won't
@@ -71,16 +71,10 @@ def _load_signals_from_s3(bucket: str, run_date: str, fd=None, max_lookback: int
         except Exception:
             continue
     logger.error("No signals found within %d days of %s", max_lookback, run_date)
-    if fd:
-        fd.report(
-            RuntimeError(f"Signals unavailable within {max_lookback}d of {run_date}"),
-            severity="warning",
-            context={"site": "load_signals_s3", "date": run_date},
-        )
     return {}, f"Signals unavailable from S3 for {run_date} (checked {max_lookback} days back)"
 
 
-def _load_predictions_from_s3(bucket: str, fd=None) -> tuple[dict, str | None]:
+def _load_predictions_from_s3(bucket: str) -> tuple[dict, str | None]:
     """Load latest predictions from S3. Returns ({ticker: pred_dict}, warning_msg) on failure."""
     s3 = boto3.client("s3")
     try:
@@ -89,7 +83,6 @@ def _load_predictions_from_s3(bucket: str, fd=None) -> tuple[dict, str | None]:
         return {p["ticker"]: p for p in data.get("predictions", []) if "ticker" in p}, None
     except Exception as e:
         logger.error("Failed to load predictions from S3: %s", e)
-        if fd: fd.report(e, severity="warning", context={"site": "load_predictions_s3"})
         return {}, "Predictions unavailable from S3"
 
 
@@ -98,15 +91,14 @@ def _build_position_contexts(
     conn,
     signals_bucket: str,
     run_date: str,
-    fd=None,
 ) -> tuple[list[dict], list[str]]:
     """Assemble per-position context for rationale synthesis.
 
     Returns (contexts, data_warnings).
     """
     data_warnings: list[str] = []
-    signals_data, sig_warn = _load_signals_from_s3(signals_bucket, run_date, fd=fd)
-    predictions, pred_warn = _load_predictions_from_s3(signals_bucket, fd=fd)
+    signals_data, sig_warn = _load_signals_from_s3(signals_bucket, run_date)
+    predictions, pred_warn = _load_predictions_from_s3(signals_bucket)
     if sig_warn:
         data_warnings.append(sig_warn)
     if pred_warn:
@@ -165,7 +157,7 @@ def _build_position_contexts(
     return contexts, data_warnings
 
 
-def _synthesize_rationales(contexts: list[dict], fd=None) -> dict[str, str]:
+def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
     """Call Haiku to synthesize per-position narratives. Falls back to templates."""
     if not contexts:
         return {}
@@ -193,7 +185,6 @@ def _synthesize_rationales(contexts: list[dict], fd=None) -> dict[str, str]:
         return {n["ticker"]: n["narrative"] for n in result.get("narratives", [])}
     except Exception as e:
         logger.warning(f"LLM rationale synthesis failed: {e} — using template fallback")
-        if fd: fd.report(e, severity="warning", context={"site": "llm_rationale_synthesis"})
 
     # Template fallback
     narratives = {}
@@ -235,16 +226,6 @@ def run(run_date: str | None = None):
     _health_start = _time.time()
     logger.info(f"EOD reconciliation | date={run_date}")
 
-    fd = None
-    try:
-        import flow_doctor
-        fd = flow_doctor.init(config_path=os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "flow-doctor-eod.yaml"))
-    except ImportError:
-        pass  # flow-doctor not installed — optional dependency
-    except Exception as e:
-        logging.getLogger(__name__).warning("flow-doctor init failed: %s", e)
-
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
 
@@ -266,7 +247,7 @@ def run(run_date: str | None = None):
     # Enrich positions with sector from signals.json
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
     try:
-        sig_data, _ = _load_signals_from_s3(signals_bucket, run_date, fd=fd)
+        sig_data, _ = _load_signals_from_s3(signals_bucket, run_date)
         sector_lookup = {}
         for s in (sig_data.get("universe", []) + sig_data.get("buy_candidates", [])):
             t = s.get("ticker")
@@ -308,7 +289,6 @@ def run(run_date: str | None = None):
                     spy_return = float((hist["Close"].values.flat[-1] / hist["Close"].values.flat[-2] - 1) * 100)
             except Exception as e:
                 logger.warning(f"SPY return calc failed: {e}")
-                if fd: fd.report(e, severity="warning", context={"site": "spy_return_calc"})
 
     alpha = (daily_return - spy_return) if (daily_return is not None and spy_return is not None) else None
 
@@ -360,7 +340,6 @@ def run(run_date: str | None = None):
             logger.info(f"Exported {key} ({len(df)} rows) to s3://{trades_bucket}/{key}")
         except Exception as e:
             logger.warning(f"S3 CSV export failed for {key}: {e}")
-            if fd: fd.report(e, severity="warning", context={"site": "s3_csv_export", "key": key})
 
     backup_to_s3(db_path, run_date, trades_bucket)
 
@@ -370,12 +349,11 @@ def run(run_date: str | None = None):
     data_warnings: list[str] = []
     try:
         if positions:
-            contexts, data_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date, fd=fd)
-            position_narratives = _synthesize_rationales(contexts, fd=fd)
+            contexts, data_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date)
+            position_narratives = _synthesize_rationales(contexts)
             logger.info(f"Position narratives generated for {len(position_narratives)} tickers")
     except Exception as e:
         logger.warning(f"Position rationale generation failed: {e}")
-        if fd: fd.report(e, severity="warning", context={"site": "rationale_generation"})
 
     try:
         send_eod_email(
@@ -394,7 +372,6 @@ def run(run_date: str | None = None):
         )
     except Exception as e:
         logger.error(f"EOD email failed: {e}")
-        if fd: fd.report(e, severity="error", context={"site": "send_eod_email"})
 
     # Write health status
     try:

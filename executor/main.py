@@ -171,18 +171,6 @@ def run(
     _health_start = _time.time()
     logger.info(f"Executor starting | date={run_date} | dry_run={dry_run} | simulate={simulate}")
 
-    # Flow Doctor: structured error capture (skip in backtester simulate mode)
-    fd = None
-    if not simulate:
-        try:
-            import flow_doctor
-            fd = flow_doctor.init(config_path=os.path.join(
-                os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"))
-        except ImportError:
-            pass  # flow-doctor not installed — optional dependency
-        except Exception as e:
-            logger.warning("flow-doctor init failed: %s", e)
-
     config = load_config()
     if config_override:
         for key, val in config_override.items():
@@ -274,12 +262,6 @@ def run(
             logger.info("Signal source: population-based (technical + GBM)")
         except Exception as e:
             logger.error(f"Population-based signal generation failed: {e}")
-            if fd:
-                fd.report(e, severity="critical", context={
-                    "site": "population_signal_generation",
-                    "signal_source": signal_source,
-                    "run_date": run_date,
-                })
             if conn:
                 conn.close()
             return
@@ -289,13 +271,6 @@ def run(
             signals_raw = read_signals_with_fallback(signals_bucket, run_date)
         except RuntimeError as e:
             logger.error(f"Cannot proceed without signals: {e}")
-            if fd:
-                fd.report(e, severity="critical", context={
-                    "site": "research_signal_read",
-                    "signal_source": signal_source,
-                    "run_date": run_date,
-                    "signals_bucket": signals_bucket,
-                })
             if conn:
                 conn.close()
             return
@@ -324,11 +299,7 @@ def run(
             from executor.signal_generator import read_predictions
             predictions_by_ticker = read_predictions(signals_bucket)
         except Exception as e:
-            if fd:
-                fd.report(e, severity="warning", context={
-                    "site": "gbm_predictions_read",
-                    "signals_bucket": signals_bucket,
-                })
+            logger.warning("Failed to load GBM predictions: %s", e)
             predictions_by_ticker = {}
     else:
         predictions_by_ticker = {}
@@ -676,19 +647,9 @@ def run(
                     },
                 })
     
-        # Flow Doctor: report if all entry signals were blocked
-        if fd and len(enter_signals) > 0 and n_entered == 0:
-            fd.report(
-                severity="warning",
-                message=f"All {len(enter_signals)} ENTER signals blocked by risk guard",
-                context={
-                    "site": "all_entries_blocked",
-                    "run_date": run_date,
-                    "market_regime": market_regime,
-                    "n_candidates": len(enter_signals),
-                },
-            )
-    
+        if len(enter_signals) > 0 and n_entered == 0:
+            logger.warning("All %d ENTER signals blocked by risk guard", len(enter_signals))
+
         # ── 4. Process EXIT signals (Research + Strategy) ───────────────────────
         # Merge Research exits with strategy-generated exits (deduplicate by ticker)
         all_exit_tickers = set()
