@@ -67,53 +67,36 @@ def place_bracket_with_stop(
         result = ib_client.place_market_order(ticker, "BUY", quantity, timeout_seconds)
         return {**result, "stop_order_id": None, "trail_amount": None}
 
-    # Parent: market BUY — don't transmit until child is attached
-    parent = MarketOrder("BUY", quantity)
-    parent.orderId = ib.client.getReqId()
-    parent.transmit = False
+    # Step 1: Place market BUY and wait for fill
+    buy_order = MarketOrder("BUY", quantity)
+    buy_order.orderId = ib.client.getReqId()
+    buy_trade = ib.placeOrder(contract, buy_order)
 
-    # Child: trailing stop SELL — transmit both when this is placed
-    stop = Order()
-    stop.orderId = ib.client.getReqId()
-    stop.action = "SELL"
-    stop.orderType = "TRAIL"
-    stop.totalQuantity = quantity
-    stop.auxPrice = trail_amount  # trailing amount in dollars
-    stop.parentId = parent.orderId
-    stop.transmit = True
+    logger.info(f"BUY {quantity} {ticker} placed | orderId={buy_order.orderId}")
 
-    parent_trade = ib.placeOrder(contract, parent)
-    stop_trade = ib.placeOrder(contract, stop)
-
-    logger.info(
-        f"Bracket order placed: BUY {quantity} {ticker} "
-        f"+ trailing stop (trail=${trail_amount:.2f}) "
-        f"| parent={parent.orderId} stop={stop.orderId}"
-    )
-
-    # Poll for parent fill
+    # Poll for fill
     terminal_states = {"Filled", "Cancelled", "Inactive", "ApiCancelled"}
     elapsed = 0.0
     poll_interval = 0.5
     while elapsed < timeout_seconds:
         ib.sleep(poll_interval)
         elapsed += poll_interval
-        if parent_trade.orderStatus.status in terminal_states:
+        if buy_trade.orderStatus.status in terminal_states:
             break
 
-    status = parent_trade.orderStatus.status
+    status = buy_trade.orderStatus.status
     fill_price = None
     filled_shares = None
     fill_time = None
 
-    if parent_trade.fills:
-        total_qty = sum(f.execution.shares for f in parent_trade.fills)
-        total_cost = sum(f.execution.shares * f.execution.price for f in parent_trade.fills)
+    if buy_trade.fills:
+        total_qty = sum(f.execution.shares for f in buy_trade.fills)
+        total_cost = sum(f.execution.shares * f.execution.price for f in buy_trade.fills)
         fill_price = round(total_cost / total_qty, 4) if total_qty > 0 else None
         filled_shares = int(total_qty)
         fill_time = (
-            parent_trade.fills[-1].execution.time.isoformat()
-            if parent_trade.fills[-1].execution.time else None
+            buy_trade.fills[-1].execution.time.isoformat()
+            if buy_trade.fills[-1].execution.time else None
         )
 
     # Normalize status
@@ -128,15 +111,31 @@ def place_bracket_with_stop(
     else:
         result_status = status
 
+    # Step 2: Place independent trailing stop if BUY filled
+    stop_order_id = None
+    if result_status == "Filled" and filled_shares:
+        stop = Order()
+        stop.orderId = ib.client.getReqId()
+        stop.action = "SELL"
+        stop.orderType = "TRAIL"
+        stop.totalQuantity = filled_shares
+        stop.auxPrice = trail_amount
+
+        stop_trade = ib.placeOrder(contract, stop)
+        stop_order_id = stop.orderId
+        logger.info(
+            f"Trailing stop placed: SELL {filled_shares} {ticker} "
+            f"trail=${trail_amount:.2f} | orderId={stop_order_id}"
+        )
+
     logger.info(
-        f"Bracket parent {result_status}: BUY {quantity} {ticker} "
-        f"| fill_price={fill_price} trail=${trail_amount:.2f} "
-        f"| stop_status={stop_trade.orderStatus.status}"
+        f"BUY {result_status}: {quantity} {ticker} "
+        f"| fill_price={fill_price} trail=${trail_amount:.2f}"
     )
 
     return {
-        "ib_order_id": parent.orderId,
-        "stop_order_id": stop.orderId,
+        "ib_order_id": buy_order.orderId,
+        "stop_order_id": stop_order_id,
         "status": result_status,
         "fill_price": fill_price,
         "filled_shares": filled_shares,
