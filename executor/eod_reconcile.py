@@ -266,8 +266,8 @@ def run(run_date: str | None = None):
     prior_nav = prior_row[0] if prior_row else None
 
     if prior_nav is None:
-        logger.info("First trading day — no prior NAV, daily return will be 0%%")
-        daily_return = 0.0
+        logger.info("First trading day — no prior NAV, daily return unavailable")
+        daily_return = None
     else:
         daily_return = ((nav - prior_nav) / prior_nav * 100)
 
