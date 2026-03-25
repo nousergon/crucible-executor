@@ -369,6 +369,9 @@ def run_daemon(dry_run: bool = False) -> None:
             logger.info("Phase 0 complete: %d urgent exits processed", n_urgent)
 
         # ── Phase 1+2: Monitor entries and exits ──────────────────────────
+        _last_heartbeat = _time.time()
+        _HEARTBEAT_INTERVAL = strategy_config.get("heartbeat_interval_sec", 3600)
+
         while not _shutdown_requested:
             # Check market hours
             if not is_market_hours():
@@ -386,6 +389,19 @@ def run_daemon(dry_run: bool = False) -> None:
             # Reload order book in case morning batch updated it
             order_book = OrderBook.load()
             order_book.merge_executed(executed_tickers)
+
+            # ── Heartbeat ─────────────────────────────────────────────
+            if _time.time() - _last_heartbeat >= _HEARTBEAT_INTERVAL:
+                n_pending = len(order_book.pending_entries())
+                n_stops = len(order_book.active_stops())
+                n_positions = len(ibkr.get_positions())
+                send_daemon_status(
+                    f"\U0001f49a *Daemon heartbeat*\n"
+                    f"Positions: {n_positions} | Stops: {n_stops} | "
+                    f"Pending entries: {n_pending}\n"
+                    f"Trades today: {trades_executed}"
+                )
+                _last_heartbeat = _time.time()
 
             # ── Check exits ──────────────────────────────────────────
             for stop in order_book.active_stops():
