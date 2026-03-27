@@ -632,6 +632,50 @@ def _plan_exits_and_reduces(
     return orders
 
 
+def _write_order_book_summary(
+    ob: OrderBook,
+    blocked_entries: list[dict] | None,
+    signals_bucket: str,
+    run_date: str,
+) -> None:
+    """Write a public-safe order book summary to S3 for the dashboard."""
+    import boto3
+
+    summary = {
+        "date": run_date,
+        "entries_approved": [
+            {"ticker": e["ticker"]} for e in ob.pending_entries()
+        ],
+        "entries_blocked": [
+            {"ticker": b["ticker"], "reason": b["reason"]}
+            for b in (blocked_entries or [])
+        ],
+        "exits": [
+            {"ticker": e["ticker"], "reason": e.get("reason", "research_signal")}
+            for e in ob.pending_urgent_exits()
+            if e.get("signal") != "COVER"
+        ],
+        "covers": [
+            {"ticker": e["ticker"]}
+            for e in ob.pending_urgent_exits()
+            if e.get("signal") == "COVER"
+        ],
+    }
+
+    try:
+        s3 = boto3.client("s3")
+        key = f"signals/{run_date}/order_book_summary.json"
+        s3.put_object(
+            Bucket=signals_bucket,
+            Key=key,
+            Body=json.dumps(summary, indent=2),
+            ContentType="application/json",
+        )
+        logger.info("Order book summary written to s3://%s/%s", signals_bucket, key)
+    except Exception as e:
+        logger.warning("Failed to write order book summary (non-fatal): %s", e)
+
+
 def _write_stops_and_finalize(
     ibkr,
     ob: OrderBook,
@@ -640,6 +684,7 @@ def _write_stops_and_finalize(
     conn,
     run_date: str,
     blocked_entries: list[dict] | None = None,
+    signals_bucket: str | None = None,
 ) -> None:
     """Write stop records for held positions, detect shorts, save order book, notify."""
     from executor.strategies.exit_manager import _compute_atr
@@ -691,6 +736,11 @@ def _write_stops_and_finalize(
             })
 
     ob.save()
+
+    # Write public-safe summary for dashboard
+    if signals_bucket:
+        _write_order_book_summary(ob, blocked_entries, signals_bucket, run_date)
+
     n_entries = len(ob.pending_entries())
     n_urgent = len(ob.pending_urgent_exits())
     n_stops = len(ob.active_stops())
@@ -1020,7 +1070,7 @@ def run(
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
             try:
-                _write_stops_and_finalize(ibkr, ob, price_histories, strategy_config, conn, run_date, blocked_entries)
+                _write_stops_and_finalize(ibkr, ob, price_histories, strategy_config, conn, run_date, blocked_entries, signals_bucket)
             except Exception as e:
                 logger.warning("Failed to write order book: %s", e)
 
