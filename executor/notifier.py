@@ -32,7 +32,10 @@ def _send_telegram(token: str, chat_id: str, text: str) -> bool:
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
             timeout=5,
         )
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            return True
+        logger.warning("Telegram API returned %d: %s", resp.status_code, resp.text[:200])
+        return False
     except Exception:
         logger.debug("Telegram send failed", exc_info=True)
         return False
