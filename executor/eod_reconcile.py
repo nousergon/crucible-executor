@@ -128,7 +128,7 @@ def _build_position_contexts(
             try:
                 entry_rationale = json.loads(entry["rationale_json"])
             except (json.JSONDecodeError, TypeError):
-                pass
+                logger.debug("Could not parse entry rationale JSON for %s", ticker)
 
         ctx = {
             "ticker": ticker,
@@ -221,7 +221,7 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
     return narratives
 
 
-def run(run_date: str | None = None):
+def run(run_date: str | None = None) -> None:
     run_date = run_date or str(date.today())
     _health_start = _time.time()
     logger.info(f"EOD reconciliation | date={run_date}")

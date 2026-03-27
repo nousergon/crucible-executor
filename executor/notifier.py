@@ -24,6 +24,20 @@ logger = logging.getLogger(__name__)
 _TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
 
+def _send_telegram(token: str, chat_id: str, text: str) -> bool:
+    """Fire-and-forget Telegram message. Returns True on success."""
+    try:
+        resp = requests.post(
+            _TELEGRAM_API.format(token=token),
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=5,
+        )
+        return resp.status_code == 200
+    except Exception:
+        logger.debug("Telegram send failed", exc_info=True)
+        return False
+
+
 def send_trade_alert(
     action: str,
     ticker: str,
@@ -51,21 +65,12 @@ def send_trade_alert(
         f"Source: {source}"
     )
 
-    try:
-        resp = requests.post(
-            _TELEGRAM_API.format(token=token),
-            json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            logger.info("Telegram alert sent: %s %s", action, ticker)
-            return True
-        else:
-            logger.warning("Telegram API returned %d: %s", resp.status_code, resp.text[:200])
-            return False
-    except Exception as e:
-        logger.warning("Telegram notification failed: %s", e)
-        return False
+    ok = _send_telegram(token, chat_id, msg)
+    if ok:
+        logger.info("Telegram alert sent: %s %s", action, ticker)
+    else:
+        logger.warning("Telegram trade alert failed for %s %s", action, ticker)
+    return ok
 
 
 def send_daemon_status(message: str) -> bool:
@@ -75,12 +80,4 @@ def send_daemon_status(message: str) -> bool:
     if not token or not chat_id:
         return False
 
-    try:
-        requests.post(
-            _TELEGRAM_API.format(token=token),
-            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
-            timeout=5,
-        )
-        return True
-    except Exception:
-        return False
+    return _send_telegram(token, chat_id, message)

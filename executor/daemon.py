@@ -29,7 +29,7 @@ import logging
 import os
 import signal
 import sys
-import time as _time
+import time as _time  # aliased to avoid shadowing by local 'time' variables
 from datetime import date, datetime
 
 import pytz
@@ -53,7 +53,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Terminology:
+#   "status" — IB order execution status: "Filled", "Rejected", "Timeout", etc.
+#   "signal" — trading action type from Research/strategy: "ENTER", "EXIT", "REDUCE", "COVER"
+
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "risk.yaml")
+
+# Order retry policy — applied uniformly to all order types (urgent exits, intraday exits, entries)
+MAX_ORDER_RETRIES = 3
+ORDER_RETRY_DELAYS = [0, 2, 5]  # seconds between attempts
+
+# Market timing constants (US Eastern)
+MARKET_OPEN_HOUR = 9
+MARKET_OPEN_MINUTE = 30
+
+# Connection retry limits
+MAX_RECONNECT_BACKOFF_SECS = 300
+DEFAULT_CONNECT_BACKOFF_BASE = 30
 
 # Exception types that indicate a dropped IB Gateway connection
 try:
@@ -71,38 +87,47 @@ def _handle_signal(signum, frame):
     _shutdown_requested = True
 
 
+def _cleanup_connections(
+    monitor: "PriceMonitor | None",
+    ibkr: "IBKRClient | None",
+) -> None:
+    """Best-effort cleanup of IB connections."""
+    if monitor:
+        try:
+            monitor.unsubscribe_all()
+        except Exception:
+            logger.debug("monitor.unsubscribe_all failed during cleanup", exc_info=True)
+    if ibkr:
+        try:
+            ibkr.disconnect()
+        except Exception:
+            logger.debug("ibkr.disconnect failed during cleanup", exc_info=True)
+
+
 def _reconnect(
     ibkr: IBKRClient,
     monitor: "PriceMonitor",
     order_book: "OrderBook",
     config: dict,
     client_id: int,
-    max_attempts: int = 10,
+    max_reconnect_attempts: int = 10,
     backoff_base: int = 30,
-) -> tuple:
+) -> tuple[IBKRClient, PriceMonitor]:
     """Reconnect to IB Gateway after a connection drop.
 
-    Returns (new_ibkr, new_monitor) tuple. Raises after max_attempts.
+    Returns (new_ibkr, new_monitor) tuple. Raises after max_reconnect_attempts.
     """
-    # Clean up old connection
-    try:
-        monitor.unsubscribe_all()
-    except Exception:
-        pass
-    try:
-        ibkr.disconnect()
-    except Exception:
-        pass
+    _cleanup_connections(monitor, ibkr)
 
     send_daemon_status(
         "\u26a0\ufe0f *IB Gateway connection lost* — attempting reconnect..."
     )
 
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, max_reconnect_attempts + 1):
         if _shutdown_requested:
             raise KeyboardInterrupt("Shutdown during reconnect")
-        wait = min(backoff_base * attempt, 300)
-        logger.info("Reconnect attempt %d/%d — waiting %ds...", attempt, max_attempts, wait)
+        wait = min(backoff_base * attempt, MAX_RECONNECT_BACKOFF_SECS)
+        logger.info("Reconnect attempt %d/%d — waiting %ds...", attempt, max_reconnect_attempts, wait)
         _time.sleep(wait)
         try:
             new_ibkr = IBKRClient(
@@ -117,12 +142,68 @@ def _reconnect(
             send_daemon_status("\u2705 *IB Gateway reconnected*")
             return new_ibkr, new_monitor
         except Exception as e:
-            logger.warning("Reconnect attempt %d/%d failed: %s", attempt, max_attempts, e)
-            if attempt == max_attempts:
+            logger.warning("Reconnect attempt %d/%d failed: %s", attempt, max_reconnect_attempts, e)
+            if attempt == max_reconnect_attempts:
                 send_daemon_status(
-                    f"\u274c *IB Gateway reconnect failed after {max_attempts} attempts* — daemon exiting"
+                    f"\u274c *IB Gateway reconnect failed after {max_reconnect_attempts} attempts* — daemon exiting"
                 )
                 raise
+
+
+def _validate_sell_shares(
+    positions: dict,
+    ticker: str,
+    shares: int,
+    action: str,
+    context: str,
+) -> int | None:
+    """Validate and cap sell shares against held position.
+
+    Returns adjusted share count, or None if the sell should be skipped
+    (no position held — selling would go short).
+    """
+    held = int(positions.get(ticker, {}).get("shares", 0))
+    if held <= 0:
+        logger.warning(
+            "SKIP %s %s %s: hold %d shares — selling would go short",
+            context, action, ticker, held,
+        )
+        return None
+    if shares > held:
+        logger.warning(
+            "CAPPING %s %s %s: requested %d but hold %d — capping to avoid short",
+            context, action, ticker, shares, held,
+        )
+        return held
+    return shares
+
+
+def _place_order_with_retry(
+    ibkr: IBKRClient,
+    ticker: str,
+    side: str,
+    shares: int,
+    label: str,
+    use_bracket: bool = False,
+    bracket_kwargs: dict | None = None,
+) -> dict:
+    """Place a market order with retry on Rejected/Timeout.
+
+    Returns the order result dict. Logs retries and final failure.
+    """
+    order_result = None
+    for attempt in range(MAX_ORDER_RETRIES):
+        if attempt > 0:
+            _time.sleep(ORDER_RETRY_DELAYS[attempt])
+            logger.info("Retry %d/%d: %s %s", attempt + 1, MAX_ORDER_RETRIES, label, ticker)
+        if use_bracket and bracket_kwargs:
+            from executor.bracket_orders import place_bracket_with_stop
+            order_result = place_bracket_with_stop(ibkr, ticker, shares, **bracket_kwargs)
+        else:
+            order_result = ibkr.place_market_order(ticker, side, shares)
+        if order_result["status"] not in ("Rejected", "Timeout"):
+            break
+    return order_result
 
 
 def load_config() -> dict:
@@ -164,7 +245,7 @@ def run_daemon(dry_run: bool = False) -> None:
         now_et = datetime.now(_ET)
 
         # Notify once at market open that we have no order book
-        if not notified_no_order_book and (now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)):
+        if not notified_no_order_book and (now_et.hour > MARKET_OPEN_HOUR or (now_et.hour == MARKET_OPEN_HOUR and now_et.minute >= MARKET_OPEN_MINUTE)):
             send_daemon_status(
                 "\u26a0\ufe0f *No order book at market open*\n"
                 f"Date: {run_date}\n"
@@ -173,7 +254,7 @@ def run_daemon(dry_run: bool = False) -> None:
             notified_no_order_book = True
 
         # Give up once market session ends (4:15 PM ET, accounts for 15-min data delay)
-        if not is_market_hours(now_et) and (now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)):
+        if not is_market_hours(now_et) and (now_et.hour > MARKET_OPEN_HOUR or (now_et.hour == MARKET_OPEN_HOUR and now_et.minute >= MARKET_OPEN_MINUTE)):
             send_daemon_status(
                 "\u274c *No order book received today*\n"
                 f"Date: {run_date}\n"
@@ -208,7 +289,7 @@ def run_daemon(dry_run: bool = False) -> None:
     conn = init_db(db_path)
 
     max_connect_attempts = config.get("ibkr_daemon_max_connect_attempts", 10)
-    connect_backoff_base = 30  # seconds
+    connect_backoff_base = DEFAULT_CONNECT_BACKOFF_BASE
 
     def _connect_ibkr() -> IBKRClient:
         """Connect to IB Gateway with exponential backoff. Raises after max attempts."""
@@ -241,7 +322,7 @@ def run_daemon(dry_run: bool = False) -> None:
             except SystemExit:
                 raise
             except Exception as e:
-                wait = min(connect_backoff_base * attempt, 300)
+                wait = min(connect_backoff_base * attempt, MAX_RECONNECT_BACKOFF_SECS)
                 logger.warning(
                     "IB Gateway connection attempt %d/%d failed: %s — retrying in %ds",
                     attempt, max_connect_attempts, e, wait,
@@ -285,33 +366,41 @@ def run_daemon(dry_run: bool = False) -> None:
                 return
             logger.info("Market is open — proceeding")
 
-        # ── Phase 0: Execute urgent exits immediately (no trigger delay) ──
+        # ── Phase 0: Execute urgent exits/covers immediately (no trigger delay) ──
+        # Fetch current positions once for short-sell prevention checks
+        _phase0_positions = ibkr.get_positions() if not dry_run else {}
+
         for urgent in order_book.pending_urgent_exits():
             ticker = urgent["ticker"]
-            action = urgent["signal"]  # "EXIT" or "REDUCE"
+            action = urgent["signal"]  # "EXIT", "REDUCE", or "COVER"
             shares = urgent["shares"]
             reason = urgent.get("reason", "research_signal")
 
+            # COVER = buy to close a short position
+            if action == "COVER":
+                side = "BUY"
+            else:
+                side = "SELL"
+                # Short-sell prevention: cap sell shares at current held position
+                validated = _validate_sell_shares(_phase0_positions, ticker, shares, action, "URGENT")
+                if validated is None:
+                    order_book.mark_urgent_executed(ticker, action)
+                    continue
+                shares = validated
+
             logger.info(
-                "%sURGENT %s %s: %d shares | reason: %s",
+                "%sURGENT %s %s: %s %d shares | reason: %s",
                 "[DRY RUN] " if dry_run else "",
-                action, ticker, shares, reason,
+                action, ticker, side, shares, reason,
             )
 
             if not dry_run:
-                order_result = None
-                for _attempt in range(3):
-                    if _attempt > 0:
-                        _time.sleep([0, 2, 5][_attempt])
-                        logger.info("Retry %d/3: URGENT %s %s", _attempt + 1, action, ticker)
-                    order_result = ibkr.place_market_order(ticker, "SELL", shares)
-                    if order_result["status"] not in ("Rejected", "Timeout"):
-                        break
+                order_result = _place_order_with_retry(ibkr, ticker, side, shares, f"URGENT {action}")
                 if order_result["status"] in ("Rejected", "Timeout"):
-                    logger.error("URGENT %s %s FAILED after 3 attempts: %s", action, ticker, order_result["status"])
+                    logger.error("URGENT %s %s FAILED after %d attempts: %s", action, ticker, MAX_ORDER_RETRIES, order_result["status"])
                     send_daemon_status(
                         f"\u26a0\ufe0f *URGENT {action} {ticker} FAILED*\n"
-                        f"Status: {order_result['status']} after 3 retries\n"
+                        f"Status: {order_result['status']} after {MAX_ORDER_RETRIES} retries\n"
                         f"Shares: {shares} | Reason: {reason}"
                     )
                     continue
@@ -352,8 +441,15 @@ def run_daemon(dry_run: bool = False) -> None:
                 if action == "EXIT":
                     order_book.remove_stop(ticker)
 
+                # Update cached positions after execution
+                if action == "COVER":
+                    _phase0_positions.pop(ticker, None)
+                elif ticker in _phase0_positions:
+                    held_after = int(_phase0_positions[ticker].get("shares", 0)) - shares
+                    _phase0_positions[ticker]["shares"] = held_after
+
                 send_trade_alert(
-                    action="SELL",
+                    action=side,
                     ticker=ticker,
                     shares=shares,
                     price=fill_price,
@@ -465,14 +561,7 @@ def run_daemon(dry_run: bool = False) -> None:
         send_daemon_status("\u274c *Daemon crashed* — check logs")
         raise
     finally:
-        try:
-            monitor.unsubscribe_all()
-        except Exception:
-            pass
-        try:
-            ibkr.disconnect()
-        except Exception:
-            pass
+        _cleanup_connections(monitor, ibkr)
         if conn:
             conn.close()
         send_daemon_status(
@@ -484,7 +573,7 @@ def run_daemon(dry_run: bool = False) -> None:
 
 def _execute_exit(
     ibkr: IBKRClient,
-    conn,
+    conn: "sqlite3.Connection",
     order_book: OrderBook,
     exit_signal: dict,
     price_state: dict,
@@ -498,6 +587,16 @@ def _execute_exit(
     sell_action = "SELL"
     current_price = price_state.get("last", 0)
 
+    # Short-sell prevention: verify we hold enough shares before selling
+    if not dry_run:
+        positions = ibkr.get_positions()
+        validated = _validate_sell_shares(positions, ticker, shares, action, "intraday")
+        if validated is None:
+            order_book.remove_stop(ticker)
+            order_book.save()
+            return
+        shares = validated
+
     logger.info(
         "%s%s %s: %d shares @ ~$%.2f | %s",
         "[DRY RUN] " if dry_run else "",
@@ -507,16 +606,9 @@ def _execute_exit(
     if dry_run:
         return
 
-    order_result = None
-    for _attempt in range(2):
-        if _attempt > 0:
-            _time.sleep(2)
-            logger.info("Retry %d/2: %s %s", _attempt + 1, action, ticker)
-        order_result = ibkr.place_market_order(ticker, sell_action, shares)
-        if order_result["status"] not in ("Rejected", "Timeout"):
-            break
+    order_result = _place_order_with_retry(ibkr, ticker, sell_action, shares, action)
     if order_result["status"] in ("Rejected", "Timeout"):
-        logger.error("%s %s FAILED after 2 attempts: %s", action, ticker, order_result["status"])
+        logger.error("%s %s FAILED after %d attempts: %s", action, ticker, MAX_ORDER_RETRIES, order_result["status"])
         send_daemon_status(f"\u26a0\ufe0f *{action} {ticker} FAILED*: {order_result['status']}")
         return
 
@@ -562,7 +654,7 @@ def _execute_exit(
 
 def _execute_entry(
     ibkr: IBKRClient,
-    conn,
+    conn: "sqlite3.Connection",
     order_book: OrderBook,
     entry: dict,
     price_state: dict,
@@ -593,25 +685,14 @@ def _execute_entry(
     use_bracket = atr_value and atr_value > 0 and strategy_config.get("bracket_stop_enabled", True)
     bracket_mult = strategy_config.get("bracket_trail_atr_multiple", 2.0) if use_bracket else None
 
-    order_result = None
-    for _attempt in range(2):
-        if _attempt > 0:
-            _time.sleep(2)
-            logger.info("Retry %d/2: ENTER %s", _attempt + 1, ticker)
-        if use_bracket:
-            from executor.bracket_orders import place_bracket_with_stop
-            order_result = place_bracket_with_stop(
-                ibkr, ticker, shares,
-                atr_value=atr_value,
-                atr_multiple=bracket_mult,
-            )
-        else:
-            order_result = ibkr.place_market_order(ticker, "BUY", shares)
-        if order_result["status"] not in ("Rejected", "Timeout"):
-            break
+    order_result = _place_order_with_retry(
+        ibkr, ticker, "BUY", shares, "ENTER",
+        use_bracket=bool(use_bracket),
+        bracket_kwargs={"atr_value": atr_value, "atr_multiple": bracket_mult} if use_bracket else None,
+    )
 
     if order_result["status"] in ("Rejected", "Timeout"):
-        logger.error("ENTER %s FAILED after 2 attempts: %s", ticker, order_result["status"])
+        logger.error("ENTER %s FAILED after %d attempts: %s", ticker, MAX_ORDER_RETRIES, order_result["status"])
         send_daemon_status(f"\u26a0\ufe0f *ENTER {ticker} FAILED*: {order_result['status']}")
         return
 

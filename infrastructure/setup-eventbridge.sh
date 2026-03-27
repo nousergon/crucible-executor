@@ -2,7 +2,7 @@
 # Create EventBridge scheduled rules for:
 #   1. Start trading instance weekdays 6:15 AM PT
 #   2. Stop trading instance weekdays 1:30 PM PT
-#   3. Launch backtester spot instance Mondays 08:00 UTC (via SSM on micro)
+#   3. Launch backtester spot instance Saturdays 08:00 UTC (via SSM on micro)
 #
 # Prerequisites:
 #   - TRADING_INSTANCE_ID set (the t3.small trading instance)
@@ -16,9 +16,18 @@ set -euo pipefail
 
 REGION="us-east-1"
 
+# Auto-source instance IDs from ec2.env if not already set
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "${TRADING_INSTANCE_ID:-}" ] || [ -z "${MICRO_INSTANCE_ID:-}" ]; then
+    if [ -f "$SCRIPT_DIR/ec2.env" ]; then
+        source "$SCRIPT_DIR/ec2.env"
+    fi
+fi
+
 if [ -z "${TRADING_INSTANCE_ID:-}" ] || [ -z "${MICRO_INSTANCE_ID:-}" ]; then
     echo "ERROR: Both TRADING_INSTANCE_ID and MICRO_INSTANCE_ID must be set"
-    echo "Usage: TRADING_INSTANCE_ID=i-xxx MICRO_INSTANCE_ID=i-yyy bash $0"
+    echo "Either create infrastructure/ec2.env or pass them as env vars:"
+    echo "  TRADING_INSTANCE_ID=i-xxx MICRO_INSTANCE_ID=i-yyy bash $0"
     exit 1
 fi
 
@@ -147,13 +156,13 @@ aws scheduler update-schedule \
 
 echo "  Stop: weekdays 1:30 PM PT"
 
-# ── 4. Backtester spot launch — Mondays 08:00 UTC (via SSM on micro) ────────
+# ── 4. Backtester spot launch — Saturdays 08:00 UTC (via SSM on micro) ───────
 echo "Creating schedule: backtester-spot-launch..."
 BACKTEST_CMD="cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && . /home/ec2-user/.alpha-engine.env && bash infrastructure/spot_backtest.sh >> /var/log/backtester.log 2>&1"
 
 aws scheduler create-schedule \
     --name "alpha-engine-backtester-weekly" \
-    --schedule-expression "cron(0 8 ? * MON *)" \
+    --schedule-expression "cron(0 8 ? * SAT *)" \
     --schedule-expression-timezone "UTC" \
     --flexible-time-window '{"Mode":"OFF"}' \
     --target "{
@@ -166,7 +175,7 @@ aws scheduler create-schedule \
     2>/dev/null || \
 aws scheduler update-schedule \
     --name "alpha-engine-backtester-weekly" \
-    --schedule-expression "cron(0 8 ? * MON *)" \
+    --schedule-expression "cron(0 8 ? * SAT *)" \
     --schedule-expression-timezone "UTC" \
     --flexible-time-window '{"Mode":"OFF"}' \
     --target "{
@@ -177,7 +186,7 @@ aws scheduler update-schedule \
     --state ENABLED \
     --region "$REGION"
 
-echo "  Backtester: Mondays 08:00 UTC (SSM on micro)"
+echo "  Backtester: Saturdays 08:00 UTC (SSM on micro)"
 
 echo ""
 echo "=== EventBridge Setup Complete ==="
@@ -185,6 +194,6 @@ echo ""
 echo "Schedules created:"
 echo "  alpha-engine-start-trading      weekdays 6:15 AM PT"
 echo "  alpha-engine-stop-trading       weekdays 1:30 PM PT"
-echo "  alpha-engine-backtester-weekly  Mondays 08:00 UTC"
+echo "  alpha-engine-backtester-weekly  Saturdays 08:00 UTC"
 echo ""
 echo "Verify: aws scheduler list-schedules --region ${REGION}"

@@ -1,7 +1,6 @@
 """
-Liquidate all open positions in the paper account.
-
-Run this before a funding reset to start a new strategy test from a clean slate.
+Liquidate all open positions in the paper account — operational tool for
+paper account resets. Not part of the automated trading pipeline.
 
 Usage:
     python liquidate_all.py                    # dry-run (shows what would be sold)

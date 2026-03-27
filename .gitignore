@@ -2,6 +2,7 @@
 .env
 config/risk.yaml
 config/.executor_params_cache.json
+infrastructure/ec2.env
 
 # Python
 __pycache__/

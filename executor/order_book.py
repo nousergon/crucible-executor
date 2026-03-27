@@ -109,7 +109,23 @@ class OrderBook:
         self._data.setdefault("approved_entries", []).append(entry)
 
     def add_urgent_exit(self, record: dict) -> None:
-        """Add an urgent exit/reduce to the book (executed immediately by daemon)."""
+        """Add an urgent exit/reduce/cover to the book (executed immediately by daemon).
+
+        Deduplicates by ticker+signal: if a pending urgent with the same ticker
+        and signal type already exists, the new record is skipped.
+        """
+        ticker = record.get("ticker")
+        signal = record.get("signal")
+        existing = self._data.get("urgent_exits", [])
+        for ex in existing:
+            if (ex.get("ticker") == ticker
+                    and ex.get("signal") == signal
+                    and ex.get("status") == "pending"):
+                logger.warning(
+                    "Skipping duplicate urgent %s for %s — already pending",
+                    signal, ticker,
+                )
+                return
         record.setdefault("status", "pending")
         self._data.setdefault("urgent_exits", []).append(record)
 
@@ -164,8 +180,26 @@ class OrderBook:
         """Set the book date (used by morning batch)."""
         self._data["date"] = run_date
 
+    def reset_pending(self) -> None:
+        """Clear all pending items, preserving executed_today and date.
+
+        Called by main.py before rebuilding the order book. Makes main.py
+        idempotent — running it twice on the same day produces the same
+        order book rather than appending duplicates.
+        """
+        cleared = (
+            len(self._data.get("approved_entries", []))
+            + len(self._data.get("urgent_exits", []))
+            + len(self._data.get("active_stops", []))
+        )
+        self._data["approved_entries"] = []
+        self._data["urgent_exits"] = []
+        self._data["active_stops"] = []
+        if cleared:
+            logger.info("Order book reset: cleared %d pending items (executed_today preserved)", cleared)
+
     def merge_executed(self, executed_tickers: set[str]) -> None:
-        """Remove entries for tickers already executed today.
+        """Remove entries and urgent exits for tickers already executed today.
 
         Called by the daemon after reloading the order book from disk,
         in case main.py re-ran and wrote fresh 'pending' entries for
@@ -173,11 +207,20 @@ class OrderBook:
         """
         if not executed_tickers:
             return
-        before = len(self._data.get("approved_entries", []))
+        before_entries = len(self._data.get("approved_entries", []))
+        before_urgents = len(self._data.get("urgent_exits", []))
         self._data["approved_entries"] = [
             e for e in self._data.get("approved_entries", [])
             if e["ticker"] not in executed_tickers
         ]
-        removed = before - len(self._data["approved_entries"])
-        if removed:
-            logger.info("Merged executed state: removed %d already-traded entries", removed)
+        self._data["urgent_exits"] = [
+            e for e in self._data.get("urgent_exits", [])
+            if e["ticker"] not in executed_tickers
+        ]
+        removed_entries = before_entries - len(self._data["approved_entries"])
+        removed_urgents = before_urgents - len(self._data["urgent_exits"])
+        if removed_entries or removed_urgents:
+            logger.info(
+                "Merged executed state: removed %d entries, %d urgent exits for already-traded tickers",
+                removed_entries, removed_urgents,
+            )
