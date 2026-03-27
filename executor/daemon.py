@@ -458,7 +458,9 @@ def run_daemon(dry_run: bool = False) -> None:
                 )
 
                 trades_executed += 1
-                executed_tickers.add(ticker)
+                # COVER trades shouldn't prevent new ENTER for the same ticker
+                if action != "COVER":
+                    executed_tickers.add(ticker)
 
         if n_urgent > 0:
             order_book.save()

@@ -24,12 +24,28 @@ logger = logging.getLogger(__name__)
 _TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
 
+def _escape_markdown(text: str) -> str:
+    """Escape Telegram Markdown v1 special characters.
+
+    Replaces characters that Telegram interprets as formatting markers
+    (_, `, [, ]) to prevent 400 Bad Request parse errors. Preserves
+    * for bold markers which we control in our message templates.
+    """
+    return (
+        text
+        .replace("_", "-")
+        .replace("`", "'")
+        .replace("[", "(")
+        .replace("]", ")")
+    )
+
+
 def _send_telegram(token: str, chat_id: str, text: str) -> bool:
     """Fire-and-forget Telegram message. Returns True on success."""
     try:
         resp = requests.post(
             _TELEGRAM_API.format(token=token),
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            json={"chat_id": chat_id, "text": _escape_markdown(text), "parse_mode": "Markdown"},
             timeout=5,
         )
         if resp.status_code == 200:
