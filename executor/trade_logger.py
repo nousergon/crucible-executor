@@ -52,6 +52,18 @@ _TRADES_MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN filled_shares INTEGER",
     "ALTER TABLE trades ADD COLUMN execution_latency_ms INTEGER",
     "ALTER TABLE trades ADD COLUMN source TEXT",
+    # ── Roundtrip linkage + execution quality (2026-03-27) ──
+    "ALTER TABLE trades ADD COLUMN entry_trade_id TEXT",
+    "ALTER TABLE trades ADD COLUMN signal_price REAL",
+    "ALTER TABLE trades ADD COLUMN trigger_price REAL",
+    "ALTER TABLE trades ADD COLUMN trigger_type TEXT",
+    "ALTER TABLE trades ADD COLUMN spy_price_at_order REAL",
+    "ALTER TABLE trades ADD COLUMN realized_pnl REAL",
+    "ALTER TABLE trades ADD COLUMN realized_return_pct REAL",
+    "ALTER TABLE trades ADD COLUMN spy_return_during_hold REAL",
+    "ALTER TABLE trades ADD COLUMN realized_alpha_pct REAL",
+    "ALTER TABLE trades ADD COLUMN days_held INTEGER",
+    "ALTER TABLE trades ADD COLUMN slippage_vs_signal REAL",
 ]
 
 _EOD_MIGRATIONS = [
@@ -117,8 +129,12 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             sector_rating, market_regime, price_target_upside,
             thesis_summary, fill_price, fill_time, ib_order_id,
             predicted_direction, prediction_confidence, rationale_json,
-            status, exit_reason, filled_shares, execution_latency_ms, source, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            status, exit_reason, filled_shares, execution_latency_ms, source,
+            entry_trade_id, signal_price, trigger_price, trigger_type,
+            spy_price_at_order, realized_pnl, realized_return_pct,
+            spy_return_during_hold, realized_alpha_pct, days_held,
+            slippage_vs_signal, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -147,6 +163,17 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("filled_shares"),
             trade.get("execution_latency_ms"),
             trade.get("source"),
+            trade.get("entry_trade_id"),
+            trade.get("signal_price"),
+            trade.get("trigger_price"),
+            trade.get("trigger_type"),
+            trade.get("spy_price_at_order"),
+            trade.get("realized_pnl"),
+            trade.get("realized_return_pct"),
+            trade.get("spy_return_during_hold"),
+            trade.get("realized_alpha_pct"),
+            trade.get("days_held"),
+            trade.get("slippage_vs_signal"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )
@@ -213,6 +240,29 @@ def get_entry_trade(conn: sqlite3.Connection, ticker: str) -> dict | None:
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT * FROM trades WHERE ticker=? AND action='ENTER' ORDER BY date DESC LIMIT 1",
+        (ticker,),
+    ).fetchone()
+    conn.row_factory = None
+    return dict(row) if row else None
+
+
+def get_unmatched_entry(conn: sqlite3.Connection, ticker: str) -> dict | None:
+    """Return the most recent ENTER trade for *ticker* that has no paired exit.
+
+    An entry is "unmatched" if no other trade row references its trade_id
+    via the entry_trade_id column.  Returns None if every entry has been
+    paired (or if there are no entries at all).
+    """
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """SELECT * FROM trades
+           WHERE ticker = ? AND action = 'ENTER'
+             AND trade_id NOT IN (
+                 SELECT entry_trade_id FROM trades
+                 WHERE entry_trade_id IS NOT NULL
+             )
+           ORDER BY date DESC, created_at DESC
+           LIMIT 1""",
         (ticker,),
     ).fetchone()
     conn.row_factory = None

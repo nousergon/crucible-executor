@@ -1100,6 +1100,29 @@ def run(
             except Exception as _he:
                 logger.warning("Health status write failed: %s", _he)
 
+            # ── Data manifest ──────────────────────────────────────────────────
+            try:
+                from executor.health_status import write_data_manifest
+                write_data_manifest(
+                    bucket=signals_bucket,
+                    module_name="executor_morning",
+                    run_date=run_date,
+                    manifest={
+                        "signals_date": signals_raw.get("date", run_date),
+                        "signals_count": len(signals.get("enter", [])) + len(signals.get("exit", [])),
+                        "predictions_available": bool(predictions),
+                        "entries_planned": n_entered,
+                        "entries_blocked": n_blocked,
+                        "blocked_reasons": [
+                            {"ticker": b.get("ticker"), "reason": b.get("reason")}
+                            for b in blocked_entries[:20]
+                        ] if 'blocked_entries' in dir() else [],
+                        "exits_planned": n_exit,
+                    },
+                )
+            except Exception as _me:
+                logger.warning("Data manifest write failed: %s", _me)
+
         logger.info(f"Executor complete | dry_run={dry_run} | simulate={simulate}")
 
         if simulate:

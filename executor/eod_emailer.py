@@ -83,6 +83,7 @@ def build_eod_email(
     position_narratives: dict[str, str] | None = None,
     sector_attribution: dict | None = None,
     data_warnings: list[str] | None = None,
+    roundtrip_stats: dict | None = None,
 ) -> tuple[str, str, str]:
     """
     Build the EOD email subject + (html_body, plain_body).
@@ -207,6 +208,29 @@ def build_eod_email(
         plain_parts.append("  No trades today.")
     plain_parts.append("")
 
+    # ── Roundtrip performance ────────────────────────────────────────────────
+    if roundtrip_stats and roundtrip_stats.get("n_roundtrips", 0) > 0:
+        rs = roundtrip_stats
+        html_parts.append("<h2>Roundtrip Performance (All Time)</h2>")
+        html_parts += [
+            "<table>",
+            "<tr><th>Metric</th><th>Value</th></tr>",
+            f"<tr><td>Closed Roundtrips</td><td>{rs['n_roundtrips']}</td></tr>",
+            f"<tr><td>Avg Return</td><td>{_pct(rs.get('avg_return_pct'))}</td></tr>",
+            f"<tr><td>Avg Alpha vs SPY</td><td>{_pct(rs.get('avg_alpha_pct'))}</td></tr>",
+            f"<tr><td>Win Rate vs SPY</td><td>{rs.get('win_rate_vs_spy', 0):.0f}%</td></tr>",
+            f"<tr><td>Avg Hold (days)</td><td>{rs.get('avg_hold_days', '—')}</td></tr>",
+            "</table>",
+        ]
+        plain_parts.append("ROUNDTRIP PERFORMANCE (ALL TIME)")
+        plain_parts.append("-" * 40)
+        plain_parts.append(f"  Closed roundtrips: {rs['n_roundtrips']}")
+        plain_parts.append(f"  Avg return:        {_plain_pct(rs.get('avg_return_pct'))}")
+        plain_parts.append(f"  Avg alpha vs SPY:  {_plain_pct(rs.get('avg_alpha_pct'))}")
+        plain_parts.append(f"  Win rate vs SPY:   {rs.get('win_rate_vs_spy', 0):.0f}%")
+        plain_parts.append(f"  Avg hold (days):   {rs.get('avg_hold_days', '—')}")
+        plain_parts.append("")
+
     # ── Trailing 10-day history ──────────────────────────────────────────────
     history = conn.execute(
         """SELECT date, portfolio_nav, daily_return_pct, spy_return_pct, daily_alpha_pct
@@ -254,13 +278,30 @@ def send_eod_email(
     position_narratives: dict[str, str] | None = None,
     sector_attribution: dict | None = None,
     data_warnings: list[str] | None = None,
+    roundtrip_stats: dict | None = None,
+    trades_bucket: str = "",
 ) -> None:
     subject, html_body, plain_body = build_eod_email(
         run_date, nav, daily_return, spy_return, alpha, positions, conn,
         position_narratives=position_narratives,
         sector_attribution=sector_attribution,
         data_warnings=data_warnings,
+        roundtrip_stats=roundtrip_stats,
     )
+
+    # Archive email HTML to S3
+    if trades_bucket:
+        try:
+            _s3 = boto3.client("s3")
+            _s3.put_object(
+                Bucket=trades_bucket,
+                Key=f"consolidated/{run_date}/eod.html",
+                Body=html_body.encode("utf-8"),
+                ContentType="text/html",
+            )
+            logger.info("EOD email archived to S3: consolidated/%s/eod.html", run_date)
+        except Exception as e:
+            logger.warning("EOD email archival failed (non-fatal): %s", e)
 
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
 

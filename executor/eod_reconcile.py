@@ -355,6 +355,32 @@ def run(run_date: str | None = None) -> None:
     except Exception as e:
         logger.warning(f"Position rationale generation failed: {e}")
 
+    # ── Roundtrip stats (for trades with entry-exit linkage) ──────────────
+    roundtrip_stats = None
+    try:
+        rt_row = conn.execute("""
+            SELECT COUNT(*) as n,
+                   AVG(realized_return_pct) as avg_ret,
+                   AVG(realized_alpha_pct) as avg_alpha,
+                   AVG(days_held) as avg_hold,
+                   SUM(CASE WHEN realized_alpha_pct > 0 THEN 1 ELSE 0 END) as n_beat_spy
+            FROM trades
+            WHERE entry_trade_id IS NOT NULL
+              AND realized_return_pct IS NOT NULL
+        """).fetchone()
+        if rt_row and rt_row[0] > 0:
+            roundtrip_stats = {
+                "n_roundtrips": rt_row[0],
+                "avg_return_pct": round(rt_row[1], 2) if rt_row[1] else None,
+                "avg_alpha_pct": round(rt_row[2], 2) if rt_row[2] else None,
+                "avg_hold_days": round(rt_row[3], 1) if rt_row[3] else None,
+                "n_beat_spy": rt_row[4] or 0,
+                "win_rate_vs_spy": round(rt_row[4] / rt_row[0] * 100, 1) if rt_row[4] else 0,
+            }
+            logger.info("Roundtrip stats: %s", roundtrip_stats)
+    except Exception as e:
+        logger.warning("Roundtrip stats query failed: %s", e)
+
     try:
         send_eod_email(
             run_date=run_date,
@@ -369,6 +395,8 @@ def run(run_date: str | None = None) -> None:
             position_narratives=position_narratives,
             sector_attribution=sector_attribution,
             data_warnings=data_warnings,
+            roundtrip_stats=roundtrip_stats,
+            trades_bucket=trades_bucket,
         )
     except Exception as e:
         logger.error(f"EOD email failed: {e}")
@@ -391,6 +419,29 @@ def run(run_date: str | None = None) -> None:
         )
     except Exception as _he:
         logger.warning("Health status write failed: %s", _he)
+
+    # ── Data manifest ──────────────────────────────────────────────────────
+    try:
+        from executor.health_status import write_data_manifest
+        trades_today_count = conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE date=?", (run_date,)
+        ).fetchone()[0]
+        write_data_manifest(
+            bucket=trades_bucket,
+            module_name="eod_reconcile",
+            run_date=run_date,
+            manifest={
+                "nav": round(nav, 2),
+                "n_positions": len(positions),
+                "daily_return_pct": round(daily_return, 4) if daily_return is not None else None,
+                "spy_return_pct": round(spy_return, 4) if spy_return is not None else None,
+                "alpha_pct": round(alpha, 4) if alpha is not None else None,
+                "trades_today": trades_today_count,
+                "roundtrip_stats": roundtrip_stats,
+            },
+        )
+    except Exception as _me:
+        logger.warning("Data manifest write failed: %s", _me)
 
     conn.close()
     logger.info("EOD reconciliation complete")

@@ -45,7 +45,7 @@ from executor.notifier import send_daemon_status, send_trade_alert
 from executor.order_book import OrderBook
 from executor.price_monitor import PriceMonitor
 from executor.strategies.config import load_strategy_config
-from executor.trade_logger import init_db, log_trade
+from executor.trade_logger import init_db, log_trade, get_unmatched_entry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -339,8 +339,10 @@ def run_daemon(dry_run: bool = False) -> None:
     exit_mgr = IntradayExitManager(strategy_config)
     entry_engine = EntryTriggerEngine(strategy_config)
 
-    # Subscribe to all tickers in the order book
+    # Subscribe to all tickers in the order book (+ SPY for roundtrip benchmarking)
     tickers = order_book.all_tickers()
+    if "SPY" not in tickers:
+        tickers.append("SPY")
     monitor.subscribe(tickers)
 
     n_urgent = len(order_book.pending_urgent_exits())
@@ -406,6 +408,23 @@ def run_daemon(dry_run: bool = False) -> None:
                     continue
 
                 fill_price = order_result.get("fill_price") or ibkr.get_current_price(ticker) or 0
+
+                # ── Roundtrip linkage for urgent exits ──
+                _entry = get_unmatched_entry(conn, ticker)
+                _entry_id = _entry["trade_id"] if _entry else None
+                _entry_fill = _entry["fill_price"] if _entry else None
+                _entry_spy = _entry.get("spy_price_at_order") if _entry else None
+                _entry_date = _entry["date"] if _entry else None
+                _spy_now = None
+                _spy_state = monitor.get_price("SPY")
+                if _spy_state:
+                    _spy_now = _spy_state.get("last")
+                _rpnl = ((fill_price - _entry_fill) * shares) if _entry_fill else None
+                _rpct = ((fill_price / _entry_fill) - 1) * 100 if _entry_fill else None
+                _spy_ret = ((_spy_now / _entry_spy) - 1) * 100 if (_spy_now and _entry_spy) else None
+                _ralpha = (_rpct - _spy_ret) if (_rpct is not None and _spy_ret is not None) else None
+                _dheld = (date.fromisoformat(run_date) - date.fromisoformat(_entry_date)).days if _entry_date else None
+
                 log_trade(conn, {
                     "date": run_date,
                     "ticker": ticker,
@@ -434,7 +453,15 @@ def run_daemon(dry_run: bool = False) -> None:
                         "source": "intraday_daemon",
                         "phase": "urgent",
                     }),
-                    "execution_latency_ms": None,
+                    "entry_trade_id": _entry_id,
+                    "trigger_price": fill_price,
+                    "trigger_type": reason,
+                    "spy_price_at_order": _spy_now,
+                    "realized_pnl": _rpnl,
+                    "realized_return_pct": _rpct,
+                    "spy_return_during_hold": _spy_ret,
+                    "realized_alpha_pct": _ralpha,
+                    "days_held": _dheld,
                 })
 
                 order_book.mark_urgent_executed(ticker, action)
@@ -525,7 +552,7 @@ def run_daemon(dry_run: bool = False) -> None:
                     try:
                         _execute_exit(
                             ibkr, conn, order_book, exit_signal, price_state,
-                            run_date, dry_run,
+                            run_date, dry_run, monitor=monitor,
                         )
                         if not dry_run:
                             trades_executed += 1
@@ -548,7 +575,7 @@ def run_daemon(dry_run: bool = False) -> None:
                         try:
                             _execute_entry(
                                 ibkr, conn, order_book, entry, price_state, reason,
-                                run_date, strategy_config, dry_run,
+                                run_date, strategy_config, dry_run, monitor=monitor,
                             )
                             if not dry_run:
                                 trades_executed += 1
@@ -563,6 +590,21 @@ def run_daemon(dry_run: bool = False) -> None:
         send_daemon_status("\u274c *Daemon crashed* — check logs")
         raise
     finally:
+        # ── Data manifest ──────────────────────────────────────────────────
+        try:
+            from executor.health_status import write_data_manifest
+            write_data_manifest(
+                bucket=config.get("signals_bucket", "alpha-engine-research"),
+                module_name="daemon",
+                run_date=run_date,
+                manifest={
+                    "trades_executed": trades_executed,
+                    "tickers_monitored": len(order_book.all_tickers()) if order_book else 0,
+                },
+            )
+        except Exception:
+            logger.debug("Data manifest write failed", exc_info=True)
+
         _cleanup_connections(monitor, ibkr)
         if conn:
             conn.close()
@@ -581,6 +623,7 @@ def _execute_exit(
     price_state: dict,
     run_date: str,
     dry_run: bool,
+    monitor: "PriceMonitor | None" = None,
 ) -> None:
     """Execute an intraday exit (SELL or REDUCE)."""
     ticker = exit_signal["ticker"]
@@ -616,6 +659,23 @@ def _execute_exit(
 
     fill_price = order_result.get("fill_price") or current_price
 
+    # ── Roundtrip linkage ──
+    _entry = get_unmatched_entry(conn, ticker)
+    _entry_id = _entry["trade_id"] if _entry else None
+    _entry_fill = _entry["fill_price"] if _entry else None
+    _entry_spy = _entry.get("spy_price_at_order") if _entry else None
+    _entry_date = _entry["date"] if _entry else None
+    _spy_now = None
+    if monitor:
+        _spy_state = monitor.get_price("SPY")
+        if _spy_state:
+            _spy_now = _spy_state.get("last")
+    _rpnl = ((fill_price - _entry_fill) * shares) if _entry_fill else None
+    _rpct = ((fill_price / _entry_fill) - 1) * 100 if _entry_fill else None
+    _spy_ret = ((_spy_now / _entry_spy) - 1) * 100 if (_spy_now and _entry_spy) else None
+    _ralpha = (_rpct - _spy_ret) if (_rpct is not None and _spy_ret is not None) else None
+    _dheld = (date.fromisoformat(run_date) - date.fromisoformat(_entry_date)).days if _entry_date else None
+
     log_trade(conn, {
         "date": run_date,
         "ticker": ticker,
@@ -636,7 +696,15 @@ def _execute_exit(
             "exit_detail": exit_signal.get("detail"),
             "source": "intraday_daemon",
         }),
-        "execution_latency_ms": None,
+        "entry_trade_id": _entry_id,
+        "trigger_price": current_price,
+        "trigger_type": exit_signal.get("reason"),
+        "spy_price_at_order": _spy_now,
+        "realized_pnl": _rpnl,
+        "realized_return_pct": _rpct,
+        "spy_return_during_hold": _spy_ret,
+        "realized_alpha_pct": _ralpha,
+        "days_held": _dheld,
     })
 
     # Update order book
@@ -664,6 +732,7 @@ def _execute_entry(
     run_date: str,
     strategy_config: dict,
     dry_run: bool,
+    monitor: "PriceMonitor | None" = None,
 ) -> None:
     """Execute an intraday entry (BUY) with bracket stop."""
     ticker = entry["ticker"]
@@ -687,6 +756,7 @@ def _execute_entry(
     use_bracket = atr_value and atr_value > 0 and strategy_config.get("bracket_stop_enabled", True)
     bracket_mult = strategy_config.get("bracket_trail_atr_multiple", 2.0) if use_bracket else None
 
+    _t0_order = _time.time()
     order_result = _place_order_with_retry(
         ibkr, ticker, "BUY", shares, "ENTER",
         use_bracket=bool(use_bracket),
@@ -700,7 +770,18 @@ def _execute_entry(
 
     fill_price = order_result.get("fill_price") or current_price
 
-    log_trade(conn, {
+    # ── Roundtrip fields for entry ──
+    _signal_price = entry.get("current_price")  # morning plan price
+    _trigger_price = current_price               # price at trigger time
+    _spy_now = None
+    if monitor:
+        _spy_state = monitor.get_price("SPY")
+        if _spy_state:
+            _spy_now = _spy_state.get("last")
+    _slippage = ((fill_price - _signal_price) / _signal_price) if _signal_price else None
+    _latency_ms = int((_time.time() - _t0_order) * 1000)
+
+    trade_id = log_trade(conn, {
         "date": run_date,
         "ticker": ticker,
         "action": "ENTER",
@@ -725,11 +806,16 @@ def _execute_entry(
             "action": "ENTER",
             "trigger_reason": trigger_reason,
             "source": "intraday_daemon",
-            "planned_price": entry.get("current_price"),
+            "planned_price": _signal_price,
             "sizing_factors": entry.get("sizing_factors"),
             "predicted_alpha": entry.get("predicted_alpha"),
         }),
-        "execution_latency_ms": None,
+        "execution_latency_ms": _latency_ms,
+        "signal_price": _signal_price,
+        "trigger_price": _trigger_price,
+        "trigger_type": trigger_reason,
+        "spy_price_at_order": _spy_now,
+        "slippage_vs_signal": _slippage,
     })
 
     # Mark entry as executed in order book
@@ -749,6 +835,7 @@ def _execute_entry(
             "high_water": fill_price,
             "entry_date": run_date,
             "shares": shares,
+            "entry_trade_id": trade_id,
         })
     else:
         logger.warning("No ATR for %s — position entered without trailing stop", ticker)
