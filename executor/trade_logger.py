@@ -247,26 +247,36 @@ def get_entry_trade(conn: sqlite3.Connection, ticker: str) -> dict | None:
 
 
 def get_unmatched_entry(conn: sqlite3.Connection, ticker: str) -> dict | None:
-    """Return the most recent ENTER trade for *ticker* that has no paired exit.
+    """Return the most recent ENTER trade for *ticker* that has remaining shares.
 
-    An entry is "unmatched" if no other trade row references its trade_id
-    via the entry_trade_id column.  Returns None if every entry has been
-    paired (or if there are no entries at all).
+    An entry has remaining shares if the total shares of all exits
+    referencing its trade_id (via entry_trade_id) is less than the
+    entry's shares.  This correctly handles partial fills — a REDUCE
+    of 50 shares against a 100-share entry leaves 50 shares for a
+    subsequent EXIT to match against.
+
+    The returned dict includes a ``shares_remaining`` key.
+    Returns None if every entry is fully matched.
     """
     conn.row_factory = sqlite3.Row
     row = conn.execute(
-        """SELECT * FROM trades
-           WHERE ticker = ? AND action = 'ENTER'
-             AND trade_id NOT IN (
-                 SELECT entry_trade_id FROM trades
-                 WHERE entry_trade_id IS NOT NULL
-             )
-           ORDER BY date DESC, created_at DESC
-           LIMIT 1""",
+        """SELECT t.*,
+                  t.shares - COALESCE(
+                      (SELECT SUM(t2.shares) FROM trades t2
+                       WHERE t2.entry_trade_id = t.trade_id), 0
+                  ) AS shares_remaining
+           FROM trades t
+           WHERE t.ticker = ? AND t.action = 'ENTER'
+           ORDER BY t.date DESC, t.created_at DESC""",
         (ticker,),
-    ).fetchone()
+    ).fetchall()
     conn.row_factory = None
-    return dict(row) if row else None
+    # Return first entry with remaining shares
+    for r in row:
+        d = dict(r)
+        if d.get("shares_remaining", 0) > 0:
+            return d
+    return None
 
 
 def backup_to_s3(db_path: str, run_date: str, s3_bucket: str) -> None:

@@ -232,17 +232,42 @@ def run(run_date: str | None = None) -> None:
     db_path = config["db_path"]
     trades_bucket = config["trades_bucket"]
 
-    conn = init_db(db_path)
-    ibkr = IBKRClient(
-        host=config["ibkr_host"],
-        port=config["ibkr_port"],
-        client_id=config["ibkr_client_id"],
-    )
+    if not config.get("email_sender") or not config.get("email_recipients"):
+        logger.warning(
+            "Email not configured (email_sender/email_recipients missing from risk.yaml) "
+            "— EOD email will be skipped"
+        )
 
-    # Current NAV and positions
-    nav = ibkr.get_portfolio_nav()
-    positions = ibkr.get_positions()
-    ibkr.disconnect()
+    conn = init_db(db_path)
+
+    # Connect to IB Gateway with retry (transient failures at EOD are common)
+    max_eod_attempts = 3
+    nav = None
+    positions = None
+    for attempt in range(1, max_eod_attempts + 1):
+        try:
+            ibkr = IBKRClient(
+                host=config["ibkr_host"],
+                port=config["ibkr_port"],
+                client_id=config["ibkr_client_id"],
+            )
+            nav = ibkr.get_portfolio_nav()
+            positions = ibkr.get_positions()
+            ibkr.disconnect()
+            break
+        except Exception as e:
+            if attempt == max_eod_attempts:
+                logger.error(
+                    "EOD: IB Gateway connection failed after %d attempts: %s",
+                    max_eod_attempts, e,
+                )
+                raise
+            wait = 30 * attempt
+            logger.warning(
+                "EOD: IB Gateway attempt %d/%d failed: %s — retrying in %ds",
+                attempt, max_eod_attempts, e, wait,
+            )
+            _time.sleep(wait)
 
     # Enrich positions with sector from signals.json
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")

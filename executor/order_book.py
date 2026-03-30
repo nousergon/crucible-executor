@@ -38,10 +38,18 @@ class OrderBook:
 
     @classmethod
     def load(cls, path: Path = _ORDER_BOOK_PATH) -> "OrderBook":
-        """Load order book from disk. Returns empty book if missing or stale."""
+        """Load order book from disk (with file lock). Returns empty book if missing or stale."""
+        import fcntl
+
         if path.exists():
             try:
-                data = json.loads(path.read_text())
+                lock_path = path.with_suffix(".lock")
+                with open(lock_path, "w") as lock_f:
+                    fcntl.flock(lock_f, fcntl.LOCK_SH)
+                    try:
+                        data = json.loads(path.read_text())
+                    finally:
+                        fcntl.flock(lock_f, fcntl.LOCK_UN)
                 # Discard stale book from a previous day
                 if data.get("date") != date.today().isoformat():
                     logger.info("Order book is from %s — starting fresh", data.get("date"))
@@ -52,11 +60,19 @@ class OrderBook:
         return cls(_default_book(), path)
 
     def save(self) -> None:
-        """Write order book to disk (atomic via tmp + rename)."""
+        """Write order book to disk (atomic via tmp + rename, with file lock)."""
+        import fcntl
+
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self._path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(self._data, indent=2, default=str))
-        tmp_path.rename(self._path)
+        lock_path = self._path.with_suffix(".lock")
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            try:
+                tmp_path = self._path.with_suffix(".tmp")
+                tmp_path.write_text(json.dumps(self._data, indent=2, default=str))
+                tmp_path.rename(self._path)
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
 
     # ── Queries ──────────────────────────────────────────────────────────────
 
@@ -104,7 +120,19 @@ class OrderBook:
     # ── Mutations ────────────────────────────────────────────────────────────
 
     def add_entry(self, entry: dict) -> None:
-        """Add an approved entry to the book."""
+        """Add an approved entry to the book.
+
+        Deduplicates by ticker: if a pending entry for the same ticker
+        already exists, the new record is skipped.
+        """
+        ticker = entry.get("ticker")
+        existing = self._data.get("approved_entries", [])
+        for ex in existing:
+            if ex.get("ticker") == ticker and ex.get("status") == "pending":
+                logger.warning(
+                    "Skipping duplicate entry for %s — already pending", ticker,
+                )
+                return
         entry.setdefault("status", "pending")
         self._data.setdefault("approved_entries", []).append(entry)
 

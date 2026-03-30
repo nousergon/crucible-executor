@@ -77,13 +77,18 @@ class EntryTriggerEngine:
         # 3. Support bounce
         support_level = triggers.get("support_level")
         if support_level and support_level > 0:
-            support_threshold = triggers.get(
-                "support_pct",
-                self._config.get("intraday_support_pct", 0.01),
-            )
-            dist = (current_price - support_level) / support_level
-            if 0 <= dist <= support_threshold:
-                return True, f"near support ${support_level:.2f} (dist {dist:.1%})"
+            # Invalidate support if intraday low already broke below it
+            day_low = price_state.get("low", float("inf"))
+            if day_low < support_level:
+                pass  # support broken — skip this trigger
+            else:
+                support_threshold = triggers.get(
+                    "support_pct",
+                    self._config.get("intraday_support_pct", 0.01),
+                )
+                dist = (current_price - support_level) / support_level
+                if 0 <= dist <= support_threshold:
+                    return True, f"near support ${support_level:.2f} (dist {dist:.1%})"
 
         # 4. Time expiry — execute at market if no trigger fired
         now_et = datetime.now(_ET).time()

@@ -68,8 +68,8 @@ class PriceMonitor:
 
             self.prices[symbol] = {
                 "last": price,
-                "high": max(high or price, prev.get("high", 0)),  # track intraday high
-                "low": min(low or price, prev.get("low", float("inf"))) if prev.get("low") else (low or price),
+                "high": max(high or price, prev.get("high", price)),  # track intraday high
+                "low": min(low or price, prev.get("low", price)),     # track intraday low
                 "close": close,
                 "volume": volume,
                 "updated_at": datetime.now().isoformat(),

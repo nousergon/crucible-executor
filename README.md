@@ -371,6 +371,8 @@ The backtester writes three S3 config files that upstream modules read on cold-s
 | `config/predictor_params.json` | Backtester | Predictor | Veto confidence threshold |
 | `config/research_params.json` | Backtester | Research | Signal boost parameters (deferred until 200+ samples) |
 
+**Propagation timing:** Backtester runs Saturday 08:00 UTC and writes configs to S3. Lambda-based modules (Research, Predictor) pick up new configs on next cold-start (typically their next scheduled invocation). EC2-based modules (Executor) pick up configs when `main.py` runs on next trading day. There is no mid-day hot-reload — config changes take effect on the next run cycle.
+
 ---
 
 ## Key Metrics
@@ -427,6 +429,28 @@ s3://alpha-engine-research/
 | Dashboard | Streamlit + Plotly |
 | Databases | SQLite per-module (backed up to S3) |
 | Notifications | Telegram Bot API |
+
+---
+
+## Cross-Module Opportunities
+
+### Stale Predictions Propagation
+
+If `daily_closes/{date}.parquet` is not written before inference runs, predictions use the slim cache only (potentially 1-2 days stale). The predictor tracks this via `price_freshness.max_age_days` in `predictor/metrics/latest.json`. The Dashboard Predictor page surfaces this metric. If `max_age_days > 2`, investigate whether `save_daily_closes()` is failing or the inference Lambda is running before market close.
+
+### S3 Retry Standardization
+
+S3 retry logic varies across modules. Current state (2026-03-30):
+
+| Module | Retry | Pattern |
+|--------|-------|---------|
+| Research | Yes | Custom `retry.py` decorator (3 attempts, exponential backoff) |
+| Predictor | No | One-shot S3 calls |
+| Executor | No | One-shot S3 calls (signals read, trades backup) |
+| Backtester | No | One-shot S3 calls (config writes, report upload) |
+| Dashboard | Yes | `_s3_get_object()` retry loop (3 attempts, backoff, transient-only) |
+
+Future: extract research's `retry.py` into a shared package or copy the pattern into predictor/backtester. Dashboard's retry is inline (appropriate for its single-file S3 loader). Priority is low — S3 throttling is rare at current request volumes.
 
 ---
 

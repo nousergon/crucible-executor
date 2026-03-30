@@ -317,7 +317,12 @@ def run_daemon(dry_run: bool = False) -> None:
                 except SystemExit:
                     raise
                 except Exception as e:
-                    logger.warning("Could not verify paper account (non-blocking): %s", e)
+                    logger.error(
+                        "Paper account verification failed on attempt %d: %s — will retry",
+                        attempt, e,
+                    )
+                    client.disconnect()
+                    raise  # let outer retry loop reconnect and re-verify
                 return client
             except SystemExit:
                 raise
@@ -407,6 +412,14 @@ def run_daemon(dry_run: bool = False) -> None:
                     )
                     continue
 
+                # Use actual filled quantity (handles PartialFill)
+                actual_shares = order_result.get("filled_shares") or shares
+                if actual_shares != shares:
+                    logger.warning(
+                        "URGENT %s %s partial fill: requested %d, filled %d",
+                        action, ticker, shares, actual_shares,
+                    )
+
                 fill_price = order_result.get("fill_price") or ibkr.get_current_price(ticker) or 0
 
                 # ── Roundtrip linkage for urgent exits ──
@@ -419,7 +432,7 @@ def run_daemon(dry_run: bool = False) -> None:
                 _spy_state = monitor.get_price("SPY")
                 if _spy_state:
                     _spy_now = _spy_state.get("last")
-                _rpnl = ((fill_price - _entry_fill) * shares) if _entry_fill else None
+                _rpnl = ((fill_price - _entry_fill) * actual_shares) if _entry_fill else None
                 _rpct = ((fill_price / _entry_fill) - 1) * 100 if _entry_fill else None
                 _spy_ret = ((_spy_now / _entry_spy) - 1) * 100 if (_spy_now and _entry_spy) else None
                 _ralpha = (_rpct - _spy_ret) if (_rpct is not None and _spy_ret is not None) else None
@@ -429,7 +442,7 @@ def run_daemon(dry_run: bool = False) -> None:
                     "date": run_date,
                     "ticker": ticker,
                     "action": action,
-                    "shares": shares,
+                    "shares": actual_shares,
                     "price_at_order": fill_price,
                     "portfolio_nav_at_order": None,
                     "position_pct": None,
@@ -657,6 +670,14 @@ def _execute_exit(
         send_daemon_status(f"\u26a0\ufe0f *{action} {ticker} FAILED*: {order_result['status']}")
         return
 
+    # Use actual filled quantity (handles PartialFill)
+    actual_shares = order_result.get("filled_shares") or shares
+    if actual_shares != shares:
+        logger.warning(
+            "%s %s partial fill: requested %d, filled %d",
+            action, ticker, shares, actual_shares,
+        )
+
     fill_price = order_result.get("fill_price") or current_price
 
     # ── Roundtrip linkage ──
@@ -670,7 +691,7 @@ def _execute_exit(
         _spy_state = monitor.get_price("SPY")
         if _spy_state:
             _spy_now = _spy_state.get("last")
-    _rpnl = ((fill_price - _entry_fill) * shares) if _entry_fill else None
+    _rpnl = ((fill_price - _entry_fill) * actual_shares) if _entry_fill else None
     _rpct = ((fill_price / _entry_fill) - 1) * 100 if _entry_fill else None
     _spy_ret = ((_spy_now / _entry_spy) - 1) * 100 if (_spy_now and _entry_spy) else None
     _ralpha = (_rpct - _spy_ret) if (_rpct is not None and _spy_ret is not None) else None
@@ -680,7 +701,7 @@ def _execute_exit(
         "date": run_date,
         "ticker": ticker,
         "action": action,
-        "shares": shares,
+        "shares": actual_shares,
         "price_at_order": current_price,
         "portfolio_nav_at_order": None,
         "position_pct": None,
@@ -768,6 +789,14 @@ def _execute_entry(
         send_daemon_status(f"\u26a0\ufe0f *ENTER {ticker} FAILED*: {order_result['status']}")
         return
 
+    # Use actual filled quantity (handles PartialFill)
+    actual_shares = order_result.get("filled_shares") or shares
+    if actual_shares != shares:
+        logger.warning(
+            "ENTER %s partial fill: requested %d, filled %d",
+            ticker, shares, actual_shares,
+        )
+
     fill_price = order_result.get("fill_price") or current_price
 
     # ── Roundtrip fields for entry ──
@@ -785,7 +814,7 @@ def _execute_entry(
         "date": run_date,
         "ticker": ticker,
         "action": "ENTER",
-        "shares": shares,
+        "shares": actual_shares,
         "price_at_order": current_price,
         "portfolio_nav_at_order": None,
         "position_pct": entry.get("position_pct"),
@@ -834,11 +863,31 @@ def _execute_entry(
             "atr_multiple": atr_mult,
             "high_water": fill_price,
             "entry_date": run_date,
-            "shares": shares,
+            "shares": actual_shares,
             "entry_trade_id": trade_id,
         })
     else:
-        logger.warning("No ATR for %s — position entered without trailing stop", ticker)
+        fallback_enabled = strategy_config.get("fallback_stop_enabled", True)
+        fallback_pct = strategy_config.get("fallback_stop_pct", 0.10)
+        if fallback_enabled:
+            stop_price = round(fill_price * (1 - fallback_pct), 2)
+            logger.warning(
+                "No ATR for %s — using %.0f%% fallback stop at $%.2f",
+                ticker, fallback_pct * 100, stop_price,
+            )
+            order_book.add_stop({
+                "ticker": ticker,
+                "entry_price": fill_price,
+                "current_stop": stop_price,
+                "trail_atr": 0,
+                "atr_multiple": 0,
+                "high_water": fill_price,
+                "entry_date": run_date,
+                "shares": actual_shares,
+                "entry_trade_id": trade_id,
+            })
+        else:
+            logger.warning("No ATR for %s — fallback stop disabled, position has no stop", ticker)
     order_book.save()
 
     send_trade_alert(

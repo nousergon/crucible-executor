@@ -8,6 +8,7 @@ Pre-market and after-hours orders get poor fills; this gate blocks them.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, time
 
 import pytz
@@ -18,7 +19,11 @@ _ET = pytz.timezone("US/Eastern")
 _MARKET_OPEN = time(9, 30)
 # NYSE closes at 4:00 PM ET, but IB Gateway free data is 15-min delayed,
 # so the last real-time trades don't arrive until ~4:15 PM ET.
-_MARKET_CLOSE = time(16, 15)
+# Override via MARKET_CLOSE_HOUR and MARKET_CLOSE_MINUTE env vars if needed.
+_MARKET_CLOSE = time(
+    int(os.environ.get("MARKET_CLOSE_HOUR", "16")),
+    int(os.environ.get("MARKET_CLOSE_MINUTE", "15")),
+)
 
 
 def is_market_hours(now: datetime | None = None) -> bool:

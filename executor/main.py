@@ -373,8 +373,12 @@ def _plan_entries(
         )
 
         if sizing["shares"] == 0:
-            logger.info(f"SKIP ENTER {ticker} — position too small (${sizing['dollar_size']:.0f})")
-            blocked.append({"ticker": ticker, "reason": f"position too small (${sizing['dollar_size']:.0f})"})
+            logger.info(
+                f"SKIP ENTER {ticker} — shares round to 0 "
+                f"(weight={sizing['position_pct']:.3f}, dollar=${sizing['dollar_size']:.0f}, "
+                f"price=${current_price:.2f})"
+            )
+            blocked.append({"ticker": ticker, "reason": f"shares round to 0 (${sizing['dollar_size']:.0f} / ${current_price:.2f})"})
             continue
 
         # GBM veto check
@@ -967,6 +971,8 @@ def run(
         ob.reset_pending()
 
         # ── 2e. Compute signal age for staleness discount ─────────────────────
+        # Signal age is fixed for the trading day (main.py runs once on boot).
+        # Signals are never refreshed mid-day, so this doesn't need recomputation.
         signals_date_str = signals_raw.get("date", run_date)
         try:
             signals_date = date.fromisoformat(signals_date_str)

@@ -109,6 +109,13 @@ def compute_position_size(
                   * staleness_adj * earnings_adj)
     position_weight = min(raw_weight, max_pct)
 
+    # ATR volatility cap: ensure ATR constraint is not overridden by other
+    # multipliers. If ATR sizing reduced the weight, the final weight should
+    # not exceed what ATR alone would have allowed.
+    if config.get("atr_sizing_enabled", True) and atr_adj < 1.0:
+        atr_only_weight = base_weight * atr_adj * drawdown_multiplier
+        position_weight = min(position_weight, atr_only_weight, max_pct)
+
     dollar_size = portfolio_nav * position_weight
     shares = math.floor(dollar_size / current_price) if current_price and current_price > 0 else 0
 
