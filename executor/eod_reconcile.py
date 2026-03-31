@@ -18,8 +18,6 @@ from datetime import date, timedelta
 import boto3
 import pandas as pd
 import yaml
-import yfinance as yf
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from executor.eod_emailer import send_eod_email
@@ -38,14 +36,23 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config",
 
 
 def _spy_close(run_date: str) -> float | None:
-    """Fetch SPY closing price for run_date via yfinance."""
+    """Fetch SPY closing price for run_date via polygon (yfinance fallback)."""
     try:
+        from polygon_client import polygon_client
+        close = polygon_client().get_single_close("SPY", run_date)
+        if close is not None:
+            return close
+    except Exception as e:
+        logger.warning("Polygon SPY fetch failed, trying yfinance: %s", e)
+    # Fallback to yfinance
+    try:
+        import yfinance as yf
         end_date = (date.fromisoformat(run_date) + timedelta(days=1)).isoformat()
         hist = yf.download("SPY", start=run_date, end=end_date, progress=False, auto_adjust=True)
         if not hist.empty:
             return float(hist["Close"].values.flat[0])
     except Exception as e:
-        logger.warning(f"Could not fetch SPY price: {e}")
+        logger.warning("Could not fetch SPY price: %s", e)
     return None
 
 

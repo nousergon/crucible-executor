@@ -35,9 +35,10 @@ def read_signals(s3_bucket: str, run_date: str | None = None) -> dict:
 
 def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_lookback: int = 5) -> dict:
     """
-    Try to read signals for run_date, falling back to previous trading days if not found.
+    Try to read signals for run_date, falling back to previous days if not found.
 
-    Skips weekends (research pipeline only runs on NYSE trading days).
+    Research runs on Saturday and writes signals with the Saturday date,
+    so the lookback must include weekends.
     Tries up to max_lookback calendar days back before giving up.
 
     Returns the signals dict. Raises RuntimeError if nothing found within the lookback window.
@@ -47,8 +48,6 @@ def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_
 
     for days_back in range(max_lookback + 1):
         candidate = start - timedelta(days=days_back)
-        if candidate.weekday() >= 5:  # skip Saturday (5) and Sunday (6)
-            continue
         try:
             signals = read_signals(s3_bucket, str(candidate))
             if days_back > 0:
