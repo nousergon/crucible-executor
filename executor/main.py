@@ -1125,7 +1125,7 @@ def run(
                     manifest={
                         "signals_date": signals_raw.get("date", run_date),
                         "signals_count": len(signals.get("enter", [])) + len(signals.get("exit", [])),
-                        "predictions_available": bool(predictions),
+                        "predictions_available": bool(predictions_by_ticker),
                         "entries_planned": n_entered,
                         "entries_blocked": n_blocked,
                         "blocked_reasons": [
