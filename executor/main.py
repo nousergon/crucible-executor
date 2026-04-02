@@ -41,7 +41,7 @@ from executor.signal_reader import get_actionable_signals, read_signals_with_fal
 from executor.strategies.config import load_strategy_config
 from executor.strategies.exit_manager import evaluate_exits, SECTOR_ETF_MAP
 from executor.price_cache import load_price_histories
-from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade
+from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade, log_shadow_book_block
 
 logging.basicConfig(
     level=logging.INFO,
@@ -311,9 +311,21 @@ def _plan_entries(
         sector_info = sector_ratings.get(sector, {})
         sector_rating_str = sector_info.get("rating", "market_weight")
 
+        # Common context for shadow book logging
+        _shadow_base = {
+            "ticker": ticker,
+            "date": run_date,
+            "sector": sector,
+            "sector_rating": sector_rating_str,
+            "research_score": sig.get("score"),
+            "conviction": sig.get("conviction"),
+            "market_regime": market_regime,
+            "portfolio_nav": portfolio_nav,
+        }
+
         if ticker in current_positions:
             logger.info(f"SKIP ENTER {ticker} — already in portfolio")
-            blocked.append({"ticker": ticker, "reason": "already in portfolio"})
+            blocked.append({**_shadow_base, "block_reason": "already in portfolio"})
             continue
 
         # Momentum confirmation gate
@@ -325,7 +337,7 @@ def _plan_entries(
                 if momentum_20d < mom_threshold:
                     reason = f"momentum gate: 20d={momentum_20d:.1f}% < {mom_threshold}%"
                     logger.info(f"SKIP ENTER {ticker} — {reason}")
-                    blocked.append({"ticker": ticker, "reason": reason})
+                    blocked.append({**_shadow_base, "block_reason": reason})
                     continue
 
         # Earnings proximity warning
@@ -341,7 +353,7 @@ def _plan_entries(
         current_price = ibkr.get_current_price(ticker)
         if not current_price:
             logger.warning(f"SKIP ENTER {ticker} — no price available")
-            blocked.append({"ticker": ticker, "reason": "no price available"})
+            blocked.append({**_shadow_base, "block_reason": "no price available"})
             continue
 
         # Compute ATR % for ATR-based sizing
@@ -378,7 +390,13 @@ def _plan_entries(
                 f"(weight={sizing['position_pct']:.3f}, dollar=${sizing['dollar_size']:.0f}, "
                 f"price=${current_price:.2f})"
             )
-            blocked.append({"ticker": ticker, "reason": f"shares round to 0 (${sizing['dollar_size']:.0f} / ${current_price:.2f})"})
+            blocked.append({
+                **_shadow_base, "block_reason": f"shares round to 0 (${sizing['dollar_size']:.0f} / ${current_price:.2f})",
+                "current_price": current_price, "intended_position_pct": sizing["position_pct"],
+                "intended_dollars": sizing["dollar_size"],
+                "predicted_direction": pred_data.get("predicted_direction"),
+                "prediction_confidence": pred_data.get("prediction_confidence"),
+            })
             continue
 
         # GBM veto check
@@ -386,7 +404,15 @@ def _plan_entries(
         if pred_data.get("gbm_veto"):
             reason = f"GBM veto: α={pred_data.get('predicted_alpha', 0):.2%}, rank={pred_data.get('combined_rank')}"
             logger.info(f"VETO {ticker} — {reason}")
-            blocked.append({"ticker": ticker, "reason": reason})
+            blocked.append({
+                **_shadow_base, "block_reason": reason,
+                "current_price": current_price,
+                "intended_position_pct": sizing["position_pct"],
+                "intended_shares": sizing["shares"],
+                "intended_dollars": sizing["dollar_size"],
+                "predicted_direction": pred_data.get("predicted_direction"),
+                "prediction_confidence": pred_data.get("prediction_confidence"),
+            })
             continue
 
         # Inject sector_rating into signal for risk guard
@@ -408,7 +434,15 @@ def _plan_entries(
 
         if not approved:
             logger.info(f"BLOCKED {ticker} — {reason}")
-            blocked.append({"ticker": ticker, "reason": reason})
+            blocked.append({
+                **_shadow_base, "block_reason": reason,
+                "current_price": current_price,
+                "intended_position_pct": sizing["position_pct"],
+                "intended_shares": sizing["shares"],
+                "intended_dollars": sizing["dollar_size"],
+                "predicted_direction": pred_data.get("predicted_direction"),
+                "prediction_confidence": pred_data.get("prediction_confidence"),
+            })
             continue
 
         logger.info(
@@ -1064,6 +1098,14 @@ def run(
             simulate=simulate,
         )
         orders.extend(entry_orders)
+
+        # Log blocked entries to shadow book for evaluation
+        if conn and blocked_entries:
+            for be in blocked_entries:
+                try:
+                    log_shadow_book_block(conn, be)
+                except Exception as e:
+                    logger.debug("Shadow book log failed for %s: %s", be.get("ticker"), e)
 
         # ── 4–5. Process EXIT and REDUCE signals ────────────────────────────────
         exit_orders = _plan_exits_and_reduces(

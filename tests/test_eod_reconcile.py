@@ -40,34 +40,65 @@ def _make_prediction(ticker, direction="UP", confidence=0.75, alpha=0.02):
 # ── _spy_close ───────────────────────────────────────────────────────────────
 
 
-@patch("executor.eod_reconcile.yf")
-def test_spy_close_returns_float(mock_yf):
-    """_spy_close returns the SPY closing price as a float."""
-    import pandas as pd
-    import numpy as np
+def test_spy_close_returns_float_via_polygon():
+    """_spy_close returns the SPY closing price via polygon."""
+    import types
 
-    mock_hist = pd.DataFrame({"Close": [450.25]})
-    mock_yf.download.return_value = mock_hist
-    result = _spy_close("2026-03-27")
+    mock_client = MagicMock()
+    mock_client.get_single_close.return_value = 450.25
+    mock_polygon_mod = types.ModuleType("polygon_client")
+    mock_polygon_mod.polygon_client = MagicMock(return_value=mock_client)
+
+    with patch.dict("sys.modules", {"polygon_client": mock_polygon_mod}):
+        result = _spy_close("2026-03-27")
     assert result == pytest.approx(450.25)
-    mock_yf.download.assert_called_once()
 
 
-@patch("executor.eod_reconcile.yf")
-def test_spy_close_returns_none_on_empty(mock_yf):
-    """_spy_close returns None when yfinance returns no data."""
+def test_spy_close_falls_back_to_yfinance():
+    """_spy_close falls back to yfinance when polygon fails."""
     import pandas as pd
+    import types
 
-    mock_yf.download.return_value = pd.DataFrame()
-    result = _spy_close("2026-03-27")
+    mock_yf = types.ModuleType("yfinance")
+    mock_yf.download = MagicMock(return_value=pd.DataFrame({"Close": [448.50]}))
+
+    # Polygon raises, yfinance succeeds
+    mock_polygon_mod = types.ModuleType("polygon_client")
+    mock_polygon_mod.polygon_client = MagicMock(side_effect=Exception("no key"))
+
+    with patch.dict("sys.modules", {"polygon_client": mock_polygon_mod, "yfinance": mock_yf}):
+        result = _spy_close("2026-03-27")
+    assert result == pytest.approx(448.50)
+
+
+def test_spy_close_returns_none_on_empty_yfinance():
+    """_spy_close returns None when yfinance returns empty data."""
+    import pandas as pd
+    import types
+
+    mock_yf = types.ModuleType("yfinance")
+    mock_yf.download = MagicMock(return_value=pd.DataFrame())
+
+    mock_polygon_mod = types.ModuleType("polygon_client")
+    mock_polygon_mod.polygon_client = MagicMock(side_effect=Exception("no key"))
+
+    with patch.dict("sys.modules", {"polygon_client": mock_polygon_mod, "yfinance": mock_yf}):
+        result = _spy_close("2026-03-27")
     assert result is None
 
 
-@patch("executor.eod_reconcile.yf")
-def test_spy_close_returns_none_on_exception(mock_yf):
-    """_spy_close returns None when yfinance raises."""
-    mock_yf.download.side_effect = Exception("network error")
-    result = _spy_close("2026-03-27")
+def test_spy_close_returns_none_on_all_failures():
+    """_spy_close returns None when both sources fail."""
+    import types
+
+    mock_polygon_mod = types.ModuleType("polygon_client")
+    mock_polygon_mod.polygon_client = MagicMock(side_effect=Exception("no key"))
+
+    mock_yf = types.ModuleType("yfinance")
+    mock_yf.download = MagicMock(side_effect=Exception("network error"))
+
+    with patch.dict("sys.modules", {"polygon_client": mock_polygon_mod, "yfinance": mock_yf}):
+        result = _spy_close("2026-03-27")
     assert result is None
 
 

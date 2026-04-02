@@ -70,6 +70,28 @@ _EOD_MIGRATIONS = [
     "ALTER TABLE eod_pnl ADD COLUMN spy_close REAL",
 ]
 
+CREATE_SHADOW_BOOK_TABLE = """
+CREATE TABLE IF NOT EXISTS executor_shadow_book (
+    shadow_id               TEXT PRIMARY KEY,
+    date                    TEXT NOT NULL,
+    ticker                  TEXT NOT NULL,
+    block_reason            TEXT NOT NULL,
+    research_score          REAL,
+    conviction              TEXT,
+    sector                  TEXT,
+    sector_rating           TEXT,
+    predicted_direction     TEXT,
+    prediction_confidence   REAL,
+    intended_position_pct   REAL,
+    intended_shares         INTEGER,
+    intended_dollars        REAL,
+    current_price           REAL,
+    portfolio_nav           REAL,
+    market_regime           TEXT,
+    created_at              TEXT NOT NULL
+);
+"""
+
 CREATE_EOD_TABLE = """
 CREATE TABLE IF NOT EXISTS eod_pnl (
     date                TEXT PRIMARY KEY,
@@ -86,7 +108,7 @@ CREATE TABLE IF NOT EXISTS eod_pnl (
 def init_db(db_path: str) -> sqlite3.Connection:
     """Create tables if they don't exist and run any pending migrations. Returns open connection."""
     conn = sqlite3.connect(db_path)
-    conn.executescript(CREATE_TRADES_TABLE + CREATE_EOD_TABLE)
+    conn.executescript(CREATE_TRADES_TABLE + CREATE_EOD_TABLE + CREATE_SHADOW_BOOK_TABLE)
     for migration in _TRADES_MIGRATIONS:
         try:
             conn.execute(migration)
@@ -180,6 +202,47 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
     conn.commit()
     logger.info(f"Trade logged: {trade['action']} {trade['shares']} {trade['ticker']} | id={trade_id}")
     return trade_id
+
+
+def log_shadow_book_block(conn: sqlite3.Connection, entry: dict) -> str:
+    """
+    Log a risk guard block to the shadow book for evaluation.
+    Returns the shadow_id.
+    """
+    shadow_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO executor_shadow_book (
+            shadow_id, date, ticker, block_reason,
+            research_score, conviction, sector, sector_rating,
+            predicted_direction, prediction_confidence,
+            intended_position_pct, intended_shares, intended_dollars,
+            current_price, portfolio_nav, market_regime, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            shadow_id,
+            entry["date"],
+            entry["ticker"],
+            entry["block_reason"],
+            entry.get("research_score"),
+            entry.get("conviction"),
+            entry.get("sector"),
+            entry.get("sector_rating"),
+            entry.get("predicted_direction"),
+            entry.get("prediction_confidence"),
+            entry.get("intended_position_pct"),
+            entry.get("intended_shares"),
+            entry.get("intended_dollars"),
+            entry.get("current_price"),
+            entry.get("portfolio_nav"),
+            entry.get("market_regime"),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    logger.info("Shadow book: BLOCKED %s — %s | id=%s", entry["ticker"], entry["block_reason"], shadow_id)
+    return shadow_id
 
 
 def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
