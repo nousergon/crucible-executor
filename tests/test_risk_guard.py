@@ -167,12 +167,12 @@ class TestCheckOrder:
         approved, _ = self._call(signal=_base_signal(score=70))
         assert approved
 
-    # ── Conviction gate ──
+    # ── Conviction (no hard gate — sizing adjustment only) ──
 
-    def test_declining_conviction_rejected(self):
-        approved, reason = self._call(signal=_base_signal(conviction="declining"))
-        assert not approved
-        assert "Conviction" in reason
+    def test_declining_conviction_approved(self):
+        """Declining conviction should pass risk guard (sized down by position_sizer)."""
+        approved, _ = self._call(signal=_base_signal(conviction="declining"))
+        assert approved
 
     def test_rising_conviction_approved(self):
         approved, _ = self._call(signal=_base_signal(conviction="rising"))

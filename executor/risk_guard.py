@@ -218,11 +218,9 @@ def check_order(
     if score < min_score:
         return False, f"Score {score:.1f} < minimum {min_score}"
 
-    # 2. Conviction gate
-    conviction = signal.get("conviction", "stable")
-    allowed_convictions = config.get("min_conviction_to_enter", ["rising", "stable"])
-    if conviction not in allowed_convictions:
-        return False, f"Conviction '{conviction}' not in allowed set {allowed_convictions}"
+    # 2. Conviction: no hard gate — declining conviction is handled by position
+    #    sizer (0.7x multiplier).  Research conviction is weekly, too stale to
+    #    block daily entries that the predictor scores positively.
 
     # 3. Graduated drawdown response (replaces binary circuit breaker)
     dd_multiplier, dd_reason = compute_drawdown_multiplier(portfolio_nav, peak_nav, config)
@@ -272,6 +270,7 @@ def check_order(
         if not corr_approved:
             return False, corr_reason
 
+    conviction = signal.get("conviction", "stable")
     return True, (
         f"ENTER approved | score={score:.1f} conviction={conviction} "
         f"size={position_pct:.1%} NAV | dd_multiplier={dd_multiplier}"
