@@ -117,6 +117,14 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
         data = json.loads(obj["Body"].read())
+        # Advisory schema validation (log warnings, never block)
+        _unknown_keys = [k for k in data if k not in _PARAM_MAP and k not in (
+            "disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend",
+            "updated_at", "best_sharpe", "best_alpha", "improvement_pct",
+            "n_combos_tested", "manual_override",
+        )]
+        if _unknown_keys:
+            logger.warning("executor_params.json contains unknown keys: %s", _unknown_keys)
         # Only keep safe-to-override params (numeric) + special non-numeric params
         safe = {k: v for k, v in data.items() if k in _PARAM_MAP}
         # Phase 4 non-numeric params: disabled_triggers (list), p_up sizing (bool)
