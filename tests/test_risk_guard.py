@@ -2,7 +2,12 @@
 import pytest
 from unittest.mock import patch
 
-from executor.risk_guard import compute_drawdown_multiplier, check_order
+from executor.risk_guard import (
+    compute_drawdown_multiplier,
+    check_order,
+    check_correlation,
+    _pearson_correlation,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -296,3 +301,126 @@ class TestCheckOrder:
         )
         assert not approved
         assert "underweight" in reason.lower()
+
+    # ── Correlation gate ──
+
+    def test_high_correlation_blocks_entry(self):
+        """Highly correlated same-sector ticker should be blocked."""
+        # Build price histories with perfectly correlated returns
+        history = [{"close": 100 + i} for i in range(70)]
+        positions = {"MSFT": {"market_value": 5000, "sector": "Technology"}}
+        approved, reason = self._call(
+            ticker="AAPL",
+            dollar_size=4000,
+            current_positions=positions,
+            price_histories={
+                "AAPL": history,
+                "MSFT": history,  # identical → correlation = 1.0
+            },
+            config=_base_config(
+                correlation_block_enabled=True,
+                correlation_block_threshold=0.80,
+            ),
+        )
+        assert not approved
+        assert "correlation" in reason.lower()
+
+    def test_low_correlation_allows_entry(self):
+        """Uncorrelated tickers should pass."""
+        import random
+        random.seed(42)
+        history_a = [{"close": 100 + i} for i in range(70)]
+        history_b = [{"close": 100 + random.uniform(-5, 5)} for _ in range(70)]
+        positions = {"MSFT": {"market_value": 5000, "sector": "Technology"}}
+        approved, _ = self._call(
+            ticker="AAPL",
+            dollar_size=4000,
+            current_positions=positions,
+            price_histories={
+                "AAPL": history_a,
+                "MSFT": history_b,
+            },
+            config=_base_config(
+                correlation_block_enabled=True,
+                correlation_block_threshold=0.80,
+            ),
+        )
+        assert approved
+
+    def test_correlation_check_disabled_always_passes(self):
+        history = [{"close": 100 + i} for i in range(70)]
+        positions = {"MSFT": {"market_value": 5000, "sector": "Technology"}}
+        approved, _ = self._call(
+            ticker="AAPL",
+            dollar_size=4000,
+            current_positions=positions,
+            price_histories={"AAPL": history, "MSFT": history},
+            config=_base_config(correlation_block_enabled=False),
+        )
+        assert approved
+
+    def test_correlation_no_price_histories_passes(self):
+        """When price_histories is None, correlation check is skipped."""
+        approved, _ = self._call(price_histories=None)
+        assert approved
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _pearson_correlation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestPearsonCorrelation:
+    def test_perfect_positive_correlation(self):
+        x = [1, 2, 3, 4, 5]
+        y = [2, 4, 6, 8, 10]
+        assert abs(_pearson_correlation(x, y) - 1.0) < 0.001
+
+    def test_perfect_negative_correlation(self):
+        x = [1, 2, 3, 4, 5]
+        y = [10, 8, 6, 4, 2]
+        assert abs(_pearson_correlation(x, y) - (-1.0)) < 0.001
+
+    def test_uncorrelated(self):
+        x = [1, 2, 3, 4, 5]
+        y = [5, 1, 4, 2, 3]
+        corr = _pearson_correlation(x, y)
+        assert corr is not None
+        assert abs(corr) < 0.5
+
+    def test_single_element_returns_none(self):
+        assert _pearson_correlation([1], [1]) is None
+
+    def test_constant_series_returns_none(self):
+        assert _pearson_correlation([5, 5, 5], [1, 2, 3]) is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# check_correlation (standalone)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCheckCorrelation:
+    def test_insufficient_history_passes(self):
+        """Short history → skip correlation check."""
+        approved, reason = check_correlation(
+            "AAPL",
+            {"AAPL": {"sector": "Tech"}, "MSFT": {"sector": "Tech"}},
+            {"AAPL": [{"close": 100}] * 10, "MSFT": [{"close": 100}] * 10},
+            {"correlation_block_enabled": True, "correlation_lookback_days": 60},
+        )
+        assert approved
+        assert "insufficient" in reason
+
+    def test_no_same_sector_positions_passes(self):
+        """Different sectors → no correlation computed."""
+        history = [{"close": 100 + i} for i in range(70)]
+        approved, reason = check_correlation(
+            "AAPL",
+            {"AAPL": {"sector": "Tech"}, "JPM": {"sector": "Financial"}},
+            {"AAPL": history, "JPM": history},
+            {"correlation_block_enabled": True, "correlation_lookback_days": 60,
+             "correlation_block_threshold": 0.80},
+        )
+        assert approved
+        assert "no same-sector" in reason

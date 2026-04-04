@@ -252,6 +252,166 @@ class TestComputePositionSize:
         # 0.04 * 0.70 = 0.028
         assert result["position_pct"] == 0.028
 
+    # ── ATR sizing ──
+
+    def test_atr_sizing_reduces_volatile_stocks(self):
+        """High ATR% → smaller position (target_risk / atr_pct)."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(atr_sizing_enabled=True, atr_sizing_target_risk=0.02),
+            atr_pct=0.04,  # 4% daily ATR → adj = 0.02/0.04 = 0.5
+        )
+        assert result["atr_adj"] == 0.5
+        # 0.04 * 0.5 = 0.02
+        assert result["position_pct"] == 0.02
+
+    def test_atr_sizing_capped_at_1_5(self):
+        """Very low ATR should be capped at 1.5x, not unlimited."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(atr_sizing_enabled=True, atr_sizing_target_risk=0.02),
+            atr_pct=0.005,  # 0.5% ATR → 0.02/0.005 = 4.0 → capped at 1.5
+        )
+        assert result["atr_adj"] == 1.5
+
+    def test_atr_none_defaults_to_1(self):
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=[{"ticker": f"T{i}"} for i in range(25)],
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(atr_sizing_enabled=True),
+            atr_pct=None,
+        )
+        assert result["atr_adj"] == 1.0
+
+    # ── Confidence sizing ──
+
+    def test_confidence_sizing_high_confidence(self):
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(confidence_sizing_enabled=True,
+                                confidence_sizing_min=0.7, confidence_sizing_range=0.6),
+            prediction_confidence=1.0,  # max confidence → adj = 0.7 + 0.6*1.0 = 1.3
+        )
+        assert abs(result["confidence_adj"] - 1.3) < 0.01
+
+    def test_confidence_sizing_low_confidence(self):
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(confidence_sizing_enabled=True,
+                                confidence_sizing_min=0.7, confidence_sizing_range=0.6),
+            prediction_confidence=0.0,  # min confidence → adj = 0.7
+        )
+        assert abs(result["confidence_adj"] - 0.7) < 0.01
+
+    def test_confidence_clamped_to_0_1(self):
+        """Confidence > 1 should be clamped."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(confidence_sizing_enabled=True,
+                                confidence_sizing_min=0.7, confidence_sizing_range=0.6),
+            prediction_confidence=5.0,  # way above 1 → clamped to 1.0
+        )
+        assert abs(result["confidence_adj"] - 1.3) < 0.01
+
+    # ── Staleness discount ──
+
+    def test_staleness_decays_over_days(self):
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(staleness_discount_enabled=True,
+                                staleness_decay_per_day=0.03, staleness_floor=0.70),
+            signal_age_days=5,  # 1 - 0.03*5 = 0.85
+        )
+        assert abs(result["staleness_adj"] - 0.85) < 0.01
+
+    def test_staleness_floor(self):
+        """Staleness discount should not go below floor."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(staleness_discount_enabled=True,
+                                staleness_decay_per_day=0.03, staleness_floor=0.70),
+            signal_age_days=20,  # 1 - 0.03*20 = 0.40 → floored at 0.70
+        )
+        assert abs(result["staleness_adj"] - 0.70) < 0.01
+
+    # ── Earnings proximity ──
+
+    def test_earnings_proximity_reduces_sizing(self):
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(earnings_sizing_enabled=True,
+                                earnings_proximity_days=5, earnings_sizing_reduction=0.50),
+            days_to_earnings=3,  # within 5-day window → adj = 0.50
+        )
+        assert abs(result["earnings_adj"] - 0.50) < 0.01
+
+    def test_earnings_far_away_no_reduction(self):
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(earnings_sizing_enabled=True,
+                                earnings_proximity_days=5, earnings_sizing_reduction=0.50),
+            days_to_earnings=30,  # outside window → adj = 1.0
+        )
+        assert result["earnings_adj"] == 1.0
+
     def test_min_position_dollar_filters_tiny_orders(self):
         """If dollar_size < min_position_dollar, shares should be 0."""
         result = compute_position_size(
