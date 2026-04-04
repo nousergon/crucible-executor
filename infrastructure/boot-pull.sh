@@ -29,8 +29,24 @@ for repo in "${REPOS[@]}"; do
 
     log "Pulling $repo ..."
     cd "$repo"
+    PREV_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
     if git fetch origin >> "$LOG" 2>&1 && git reset --hard origin/main >> "$LOG" 2>&1; then
+        NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
         log "OK   $repo — $(git log --oneline -1)"
+
+        # Deploy gate: dry-run validation for executor after code update
+        if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
+            if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
+                log "GATE $repo — running dry-run validation..."
+                if .venv/bin/python executor/main.py --dry-run >> "$LOG" 2>&1; then
+                    log "OK   $repo — dry-run passed"
+                else
+                    log "FAIL $repo — dry-run failed, rolling back to $PREV_SHA"
+                    git reset --hard "$PREV_SHA" >> "$LOG" 2>&1
+                    log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
+                fi
+            fi
+        fi
     else
         log "WARN $repo — fetch/reset failed (network issue?)"
     fi
