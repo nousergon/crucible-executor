@@ -62,6 +62,29 @@ class IBKRClient:
         logger.info(f"Portfolio NAV: ${nav:,.2f}")
         return nav
 
+    def get_account_snapshot(self) -> dict:
+        """Return key account summary fields from IB Gateway.
+
+        All values are IB's ground truth — mark-to-market, settled cash,
+        accrued interest, etc. Use these as the basis for EOD metrics.
+        """
+        self.ensure_connected()
+        summary = {s.tag: s for s in self.ib.accountSummary()}
+
+        def _float(tag: str) -> float | None:
+            return float(summary[tag].value) if tag in summary else None
+
+        return {
+            "net_liquidation": _float("NetLiquidation"),
+            "total_cash": _float("TotalCashValue"),
+            "settled_cash": _float("SettledCash"),
+            "accrued_interest": _float("AccruedCash"),
+            "gross_position_value": _float("GrossPositionValue"),
+            "buying_power": _float("BuyingPower"),
+            "unrealized_pnl": _float("UnrealizedPnL"),
+            "realized_pnl": _float("RealizedPnL"),
+        }
+
     def get_positions(self) -> dict[str, dict]:
         """
         Return current portfolio positions.
@@ -77,6 +100,7 @@ class IBKRClient:
                 "shares": int(p.position),
                 "market_value": float(p.marketValue),
                 "avg_cost": float(p.averageCost),
+                "unrealized_pnl": float(p.unrealizedPNL),
                 "sector": "",  # sector populated from signals.json by caller
             }
         logger.info(f"Open positions: {len(positions)}")
