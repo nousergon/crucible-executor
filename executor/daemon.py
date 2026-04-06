@@ -37,6 +37,9 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from ssm_secrets import load_secrets
+load_secrets()
+
 from executor.entry_triggers import EntryTriggerEngine
 from executor.ibkr import IBKRClient
 from executor.intraday_exit_manager import IntradayExitManager

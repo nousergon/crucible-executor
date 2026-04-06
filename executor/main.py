@@ -33,6 +33,9 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from ssm_secrets import load_secrets
+load_secrets()
+
 from executor.ibkr import IBKRClient, SimulatedIBKRClient
 from executor.order_book import OrderBook
 from executor.position_sizer import compute_position_size
@@ -40,7 +43,7 @@ from executor.risk_guard import check_order, compute_drawdown_multiplier
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
 from executor.strategies.config import load_strategy_config
 from executor.strategies.exit_manager import evaluate_exits, SECTOR_ETF_MAP
-from executor.price_cache import load_price_histories
+from executor.price_cache import load_daily_vwap, load_price_histories
 from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade, log_shadow_book_block
 
 from executor.log_config import setup_logging
@@ -511,6 +514,7 @@ def _plan_entries(
                 "triggers": {
                     "pullback_pct": strategy_config.get("intraday_pullback_pct", 0.02),
                     "vwap_discount": strategy_config.get("intraday_vwap_discount_pct", 0.005),
+                    "vwap": vwap_map.get(ticker),
                     "support_level": _compute_support_level(ticker_hist, strategy_config),
                 },
                 "research_score": sig.get("score"),
@@ -997,7 +1001,10 @@ def run(
                 )
             else:
                 price_histories = {}
-    
+
+        # Load previous day's VWAP from daily_closes for intraday entry triggers
+        vwap_map = load_daily_vwap(signals_bucket, run_date)
+
         # Separate sector ETF histories for exit manager
         sector_etf_histories = {
             t: price_histories[t] for t in SECTOR_ETF_MAP.values()

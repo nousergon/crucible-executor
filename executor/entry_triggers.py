@@ -1,11 +1,12 @@
 """
 Intraday entry trigger engine — determines when to execute approved entries.
 
-Four trigger types (OR logic — any one fires execution):
+Five trigger types (OR logic — any one fires execution):
   1. Pullback: price drops >= X% from intraday high
-  2. VWAP discount: price < VWAP by >= Y%
+  2. VWAP discount: price < previous day's VWAP by >= Y%
   3. Support bounce: price within Z% of N-day support level
-  4. Time expiry: execute at market if no trigger fires by cutoff time
+  4. Graduated entry: after 2 PM ET, accept if price <= morning price + 1%
+  5. Time expiry: unconditional market order at 3:55 PM ET
 
 The morning batch writes approved entries to the order book.
 The daemon calls this engine on each price update.
@@ -28,9 +29,16 @@ class EntryTriggerEngine:
 
     def __init__(self, strategy_config: dict):
         self._config = strategy_config
-        expiry_str = strategy_config.get("intraday_expiry_time", "15:30")
+
+        expiry_str = strategy_config.get("intraday_expiry_time", "15:55")
         h, m = expiry_str.split(":")
         self._expiry_time = time(int(h), int(m))
+
+        grad_str = strategy_config.get("intraday_graduated_start_time", "14:00")
+        h, m = grad_str.split(":")
+        self._graduated_start_time = time(int(h), int(m))
+
+        self._graduated_max_premium = strategy_config.get("intraday_graduated_max_premium_pct", 0.01)
         self._disabled_triggers = set(strategy_config.get("disabled_triggers", []))
 
     def should_enter(self, entry: dict, price_state: dict) -> tuple[bool, str]:
@@ -93,9 +101,23 @@ class EntryTriggerEngine:
                     if 0 <= dist <= support_threshold:
                         return True, f"near support ${support_level:.2f} (dist {dist:.1%})"
 
-        # 4. Time expiry — execute at market if no trigger fired
+        # 4. Time-based entries (graduated → expiry)
         now_et = datetime.now(_ET).time()
+
+        # 4a. True expiry — unconditional market order near close
         if now_et >= self._expiry_time:
             return True, "time_expiry"
+
+        # 4b. Graduated window — accept entry if price is near or below morning price
+        if "graduated_entry" not in self._disabled_triggers:
+            if now_et >= self._graduated_start_time:
+                morning_price = entry.get("current_price")
+                if morning_price and morning_price > 0:
+                    premium = (current_price - morning_price) / morning_price
+                    if premium <= self._graduated_max_premium:
+                        return True, (
+                            f"graduated_entry ({premium:+.1%} vs morning "
+                            f"${morning_price:.2f}, limit {self._graduated_max_premium:.1%})"
+                        )
 
         return False, ""

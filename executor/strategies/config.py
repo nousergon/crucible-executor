@@ -51,7 +51,9 @@ INTRADAY_PULLBACK_PCT = 0.02       # 2% pullback from intraday high
 INTRADAY_VWAP_DISCOUNT_PCT = 0.005 # 0.5% below VWAP
 INTRADAY_SUPPORT_PCT = 0.01        # within 1% of support level
 INTRADAY_SUPPORT_LOOKBACK_DAYS = 20
-INTRADAY_EXPIRY_TIME = "15:30"     # execute at market if no trigger by 3:30 PM ET
+INTRADAY_EXPIRY_TIME = "15:55"     # execute at market if no trigger by 3:55 PM ET
+INTRADAY_GRADUATED_START_TIME = "14:00"  # start accepting "close enough" prices at 2 PM ET
+INTRADAY_GRADUATED_MAX_PREMIUM_PCT = 0.01  # max 1% above morning price for graduated entry
 
 # Exit rules
 INTRADAY_TRAILING_STOP_ATR_MULTIPLE = 2.0
@@ -146,6 +148,8 @@ def load_strategy_config(config: dict) -> dict:
         "intraday_support_pct": entry_trigger_cfg.get("support_pct", INTRADAY_SUPPORT_PCT),
         "intraday_support_lookback_days": entry_trigger_cfg.get("support_lookback_days", INTRADAY_SUPPORT_LOOKBACK_DAYS),
         "intraday_expiry_time": entry_trigger_cfg.get("expiry_time", INTRADAY_EXPIRY_TIME),
+        "intraday_graduated_start_time": entry_trigger_cfg.get("graduated_start_time", INTRADAY_GRADUATED_START_TIME),
+        "intraday_graduated_max_premium_pct": entry_trigger_cfg.get("graduated_max_premium_pct", INTRADAY_GRADUATED_MAX_PREMIUM_PCT),
 
         # Intraday exit rules
         "intraday_trailing_stop_atr_multiple": intraday_exit_cfg.get("trailing_stop_atr_multiple", INTRADAY_TRAILING_STOP_ATR_MULTIPLE),

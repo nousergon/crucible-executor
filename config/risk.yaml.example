@@ -147,10 +147,12 @@ intraday:
   entry_triggers:
     enabled: true
     pullback_pct: 0.02                  # 2% pullback from intraday high
-    vwap_discount_pct: 0.005            # 0.5% below VWAP
+    vwap_discount_pct: 0.005            # 0.5% below previous day's VWAP
     support_pct: 0.01                   # within 1% of support level
     support_lookback_days: 20           # days to look back for support
-    expiry_time: "15:30"                # execute at market if no trigger by 3:30 PM ET
+    graduated_start_time: "14:00"       # start accepting "close enough" entries at 2 PM ET
+    graduated_max_premium_pct: 0.01     # max 1% above morning price for graduated entry
+    expiry_time: "15:55"                # unconditional market order at 3:55 PM ET
 
   exit_rules:
     trailing_stop_atr_multiple: 2.0     # intraday trailing stop (software-side)

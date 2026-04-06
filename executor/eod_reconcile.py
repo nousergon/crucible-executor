@@ -20,6 +20,9 @@ import pandas as pd
 import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from ssm_secrets import load_secrets
+load_secrets()
+
 from executor.eod_emailer import send_eod_email
 from executor.ibkr import IBKRClient
 from executor.trade_logger import (
