@@ -232,6 +232,17 @@ def run_daemon(dry_run: bool = False) -> None:
     config = load_config()
     strategy_config = load_strategy_config(config)
 
+    # Flow Doctor: structured error capture (optional, never blocks)
+    fd = None
+    try:
+        import flow_doctor
+        fd = flow_doctor.init(config_path=os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"))
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning("flow-doctor init failed: %s", e)
+
     global _allow_shorts
     _allow_shorts = config.get("allow_shorts", False)
     if _allow_shorts:
@@ -637,8 +648,11 @@ def run_daemon(dry_run: bool = False) -> None:
                             ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)
                             break
 
-    except Exception:
+    except Exception as _exc:
         logger.exception("Daemon error")
+        if fd:
+            fd.report(_exc, severity="critical", context={
+                "site": "daemon_main", "dry_run": dry_run, "run_date": run_date})
         send_daemon_status("\u274c *Daemon crashed* — check logs")
         raise
     finally:
@@ -660,6 +674,8 @@ def run_daemon(dry_run: bool = False) -> None:
         _cleanup_connections(monitor, ibkr)
         if conn:
             conn.close()
+        if fd:
+            fd.log_summary(logger)
         send_daemon_status(
             f"\u23f9 *Daemon stopped*\n"
             f"Trades executed: {trades_executed}"

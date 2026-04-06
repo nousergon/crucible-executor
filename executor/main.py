@@ -885,6 +885,18 @@ def run(
     signals_bucket = config["signals_bucket"]
     trades_bucket = config["trades_bucket"]
 
+    # ── Flow Doctor: structured error capture (optional, never blocks) ───
+    fd = None
+    if not simulate:
+        try:
+            import flow_doctor
+            fd = flow_doctor.init(config_path=os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"))
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning("flow-doctor init failed: %s", e)
+
     # ── 0. Check upstream health (warn + Telegram alert, never blocks) ───
     if not simulate:
         _health_warnings = []
@@ -930,7 +942,10 @@ def run(
         signals_raw, signals, run_date, predictions_by_ticker = _read_signals(
             config, signals_bucket, run_date, simulate, signals_override, conn,
         )
-    except (RuntimeError, Exception):
+    except (RuntimeError, Exception) as _sig_err:
+        if fd:
+            fd.report(_sig_err, severity="error", context={
+                "site": "signal_read", "run_date": run_date})
         if conn:
             conn.close()
         return
@@ -1215,12 +1230,17 @@ def run(
             except Exception as _me:
                 logger.warning("Data manifest write failed: %s", _me)
 
+        if fd:
+            fd.log_summary(logger)
         logger.info(f"Executor complete | dry_run={dry_run} | simulate={simulate}")
 
         if simulate:
             return orders
-    except Exception:
+    except Exception as _exc:
         logger.exception("Executor error — ensuring IBKR disconnect")
+        if fd:
+            fd.report(_exc, severity="critical", context={
+                "site": "executor_main", "dry_run": dry_run, "run_date": run_date})
         if not simulate:
             try:
                 from executor.health_status import write_health

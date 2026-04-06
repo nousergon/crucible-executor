@@ -237,6 +237,17 @@ def run(run_date: str | None = None) -> None:
     db_path = config["db_path"]
     trades_bucket = config["trades_bucket"]
 
+    # Flow Doctor: structured error capture (optional, never blocks)
+    fd = None
+    try:
+        import flow_doctor
+        fd = flow_doctor.init(config_path=os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"))
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning("flow-doctor init failed: %s", e)
+
     if not config.get("email_sender") or not config.get("email_recipients"):
         logger.warning(
             "Email not configured (email_sender/email_recipients missing from risk.yaml) "
@@ -256,7 +267,8 @@ def run(run_date: str | None = None) -> None:
                 port=config["ibkr_port"],
                 client_id=config["ibkr_client_id"],
             )
-            nav = ibkr.get_portfolio_nav()
+            account = ibkr.get_account_snapshot()
+            nav = account["net_liquidation"]
             positions = ibkr.get_positions()
             ibkr.disconnect()
             break
@@ -266,6 +278,10 @@ def run(run_date: str | None = None) -> None:
                     "EOD: IB Gateway connection failed after %d attempts: %s",
                     max_eod_attempts, e,
                 )
+                if fd:
+                    fd.report(e, severity="critical", context={
+                        "site": "eod_ibkr_connect", "run_date": run_date,
+                        "attempts": max_eod_attempts})
                 raise
             wait = 30 * attempt
             logger.warning(
@@ -343,7 +359,51 @@ def run(run_date: str | None = None) -> None:
         "daily_alpha_pct": alpha,
         "positions_snapshot": positions,
         "spy_close": spy_price,
+        "total_cash": account.get("total_cash"),
+        "accrued_interest": account.get("accrued_interest"),
+        "unrealized_pnl": account.get("unrealized_pnl"),
+        "realized_pnl": account.get("realized_pnl"),
     })
+
+    # ── Per-position daily return & alpha contribution ──────────────────────
+    # Look up prior day's positions_snapshot to get yesterday's price per ticker
+    prior_snapshot_row = conn.execute(
+        "SELECT positions_snapshot FROM eod_pnl WHERE positions_snapshot IS NOT NULL ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    prior_positions = {}
+    if prior_snapshot_row and prior_snapshot_row[0]:
+        try:
+            prior_positions = json.loads(prior_snapshot_row[0])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    for ticker, pos in positions.items():
+        shares = pos.get("shares", 0)
+        mv = pos.get("market_value", 0)
+        current_price = mv / shares if shares else 0
+
+        # Daily return: today's price vs yesterday's price (or entry price if new today)
+        prior_pos = prior_positions.get(ticker)
+        if prior_pos:
+            prior_mv = prior_pos.get("market_value", 0)
+            prior_shares = prior_pos.get("shares", 0)
+            prior_price = prior_mv / prior_shares if prior_shares else 0
+        else:
+            # New position — use avg_cost (entry price) as the baseline
+            prior_price = pos.get("avg_cost", current_price)
+
+        if prior_price and prior_price > 0:
+            pos["daily_return_pct"] = (current_price / prior_price - 1) * 100
+            pos["daily_return_usd"] = (current_price - prior_price) * shares
+        else:
+            pos["daily_return_pct"] = 0.0
+            pos["daily_return_usd"] = 0.0
+
+        # Alpha contribution: (weight * position_return) - (weight * SPY_return)
+        weight = mv / nav if nav else 0
+        pos_spy = spy_return if spy_return is not None else 0
+        pos["alpha_contribution_pct"] = weight * (pos["daily_return_pct"] - pos_spy)
+        pos["alpha_contribution_usd"] = pos["alpha_contribution_pct"] / 100 * nav if nav else 0
 
     # ── Sector attribution ──────────────────────────────────────────────────
     sector_attribution = {}
@@ -494,9 +554,13 @@ def run(run_date: str | None = None) -> None:
             data_warnings=data_warnings,
             roundtrip_stats=roundtrip_stats,
             trades_bucket=trades_bucket,
+            account_snapshot=account,
         )
     except Exception as e:
         logger.error(f"EOD email failed: {e}")
+        if fd:
+            fd.report(e, severity="error", context={
+                "site": "eod_email", "run_date": run_date})
 
     # Write health status
     try:
@@ -540,6 +604,8 @@ def run(run_date: str | None = None) -> None:
     except Exception as _me:
         logger.warning("Data manifest write failed: %s", _me)
 
+    if fd:
+        fd.log_summary(logger)
     conn.close()
     logger.info("EOD reconciliation complete")
 

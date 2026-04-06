@@ -19,6 +19,7 @@ REPOS=(
     /home/ec2-user/alpha-engine
     /home/ec2-user/alpha-engine-backtester
     /home/ec2-user/alpha-engine-dashboard
+    /home/ec2-user/flow-doctor
 )
 
 for repo in "${REPOS[@]}"; do
@@ -57,6 +58,15 @@ for repo in "${REPOS[@]}"; do
             log "OK   $repo — deps updated"
         else
             log "WARN $repo — pip install failed"
+        fi
+    fi
+
+    # Install flow-doctor from source if this repo has a venv and flow-doctor is cloned
+    if [ -f ".venv/bin/pip" ] && [ -d "/home/ec2-user/flow-doctor" ] && [ "$repo" != "/home/ec2-user/flow-doctor" ]; then
+        if .venv/bin/pip install --quiet -e /home/ec2-user/flow-doctor >> "$LOG" 2>&1; then
+            log "OK   $repo — flow-doctor installed"
+        else
+            log "WARN $repo — flow-doctor install failed (non-fatal)"
         fi
     fi
 done

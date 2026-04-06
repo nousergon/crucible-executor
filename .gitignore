@@ -3,6 +3,7 @@
 config/risk.yaml
 config/.executor_params_cache.json
 infrastructure/ec2.env
+flow-doctor.yaml
 
 # Python
 __pycache__/
