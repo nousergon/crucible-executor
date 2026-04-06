@@ -68,6 +68,10 @@ _TRADES_MIGRATIONS = [
 
 _EOD_MIGRATIONS = [
     "ALTER TABLE eod_pnl ADD COLUMN spy_close REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN total_cash REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN accrued_interest REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN unrealized_pnl REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN realized_pnl REAL",
 ]
 
 CREATE_SHADOW_BOOK_TABLE = """
@@ -255,8 +259,10 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
         """
         INSERT OR REPLACE INTO eod_pnl
             (date, portfolio_nav, daily_return_pct, spy_return_pct,
-             daily_alpha_pct, positions_snapshot, spy_close, created_at)
-        VALUES (?,?,?,?,?,?,?,?)
+             daily_alpha_pct, positions_snapshot, spy_close,
+             total_cash, accrued_interest, unrealized_pnl, realized_pnl,
+             created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             eod["date"],
@@ -266,6 +272,10 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             eod.get("daily_alpha_pct"),
             json.dumps(eod.get("positions_snapshot", {})),
             eod.get("spy_close"),
+            eod.get("total_cash"),
+            eod.get("accrued_interest"),
+            eod.get("unrealized_pnl"),
+            eod.get("realized_pnl"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )

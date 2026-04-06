@@ -65,6 +65,14 @@ def _pct(v: float | None, decimals: int = 2) -> str:
     return f'<span class="{css}">{sign}{v:.{decimals}f}%</span>'
 
 
+def _dollar(v: float | None) -> str:
+    if v is None:
+        return "—"
+    sign = "+" if v >= 0 else ""
+    css = "pos" if v > 0 else ("neg" if v < 0 else "neu")
+    return f'<span class="{css}">{sign}${v:,.0f}</span>'
+
+
 def _plain_pct(v: float | None) -> str:
     if v is None:
         return "—"
@@ -84,6 +92,7 @@ def build_eod_email(
     sector_attribution: dict | None = None,
     data_warnings: list[str] | None = None,
     roundtrip_stats: dict | None = None,
+    account_snapshot: dict | None = None,
 ) -> tuple[str, str, str]:
     """
     Build the EOD email subject + (html_body, plain_body).
@@ -95,13 +104,33 @@ def build_eod_email(
     subject = f"Alpha Engine | {run_date} | NAV {nav_fmt} | α {alpha_str}"
 
     # ── Daily summary ────────────────────────────────────────────────────────
+    # Extract IB ground truth values
+    acct = account_snapshot or {}
+    ib_cash = acct.get("total_cash")
+    ib_accrued = acct.get("accrued_interest")
+    ib_gross_pos = acct.get("gross_position_value")
+    ib_unrealized = acct.get("unrealized_pnl")
+    ib_realized = acct.get("realized_pnl")
+
     html_parts = ["<h2>Daily Summary</h2>", "<table>",
                   "<tr><th>Metric</th><th>Value</th></tr>",
                   f"<tr><td>NAV</td><td>{nav_fmt}</td></tr>",
                   f"<tr><td>Daily Return</td><td>{_pct(daily_return)}</td></tr>",
                   f"<tr><td>SPY Return</td><td>{_pct(spy_return)}</td></tr>",
-                  f"<tr><td>Daily Alpha</td><td>{_pct(alpha)}</td></tr>",
-                  "</table>"]
+                  f"<tr><td>Daily Alpha</td><td>{_pct(alpha)}</td></tr>"]
+
+    if ib_cash is not None:
+        html_parts.append(f"<tr><td>Cash</td><td>${ib_cash:,.0f}</td></tr>")
+    if ib_gross_pos is not None:
+        html_parts.append(f"<tr><td>Positions (MV)</td><td>${ib_gross_pos:,.0f}</td></tr>")
+    if ib_unrealized is not None:
+        html_parts.append(f"<tr><td>Unrealized P&L</td><td>{_dollar(ib_unrealized)}</td></tr>")
+    if ib_realized is not None and ib_realized != 0:
+        html_parts.append(f"<tr><td>Realized P&L</td><td>{_dollar(ib_realized)}</td></tr>")
+    if ib_accrued is not None and ib_accrued != 0:
+        html_parts.append(f"<tr><td>Accrued Interest</td><td>{_dollar(ib_accrued)}</td></tr>")
+
+    html_parts.append("</table>")
 
     plain_parts = [
         f"Alpha Engine EOD — {run_date}",
@@ -110,8 +139,14 @@ def build_eod_email(
         f"Daily Return: {_plain_pct(daily_return)}",
         f"SPY Return:   {_plain_pct(spy_return)}",
         f"Daily Alpha:  {_plain_pct(alpha)}",
-        "",
     ]
+    if ib_cash is not None:
+        plain_parts.append(f"Cash:         ${ib_cash:,.0f}")
+    if ib_gross_pos is not None:
+        plain_parts.append(f"Positions:    ${ib_gross_pos:,.0f}")
+    if ib_unrealized is not None:
+        plain_parts.append(f"Unrealized:   ${ib_unrealized:+,.0f}")
+    plain_parts.append("")
 
     # ── Data warnings banner ──────────────────────────────────────────────
     if data_warnings:
@@ -131,17 +166,78 @@ def build_eod_email(
     plain_parts.append("-" * 40)
 
     if positions:
+        total_mv = sum(pos.get("market_value", 0) for pos in positions.values())
+        total_day_usd = sum(pos.get("daily_return_usd", 0) for pos in positions.values())
+        total_alpha_usd = sum(pos.get("alpha_contribution_usd", 0) for pos in positions.values())
+
+        # Cash row: use IB's ground truth cash, fall back to NAV - positions.
+        # Cash daily return = total daily P&L minus sum of position P&L (the residual).
+        # This captures actual interest, dividends, and any other non-position changes.
+        cash = ib_cash if ib_cash is not None else (nav - total_mv if nav else 0)
+        # Total portfolio daily P&L from NAV change
+        total_nav_change = nav * (daily_return / 100) if daily_return is not None else 0
+        cash_daily_usd = total_nav_change - total_day_usd
+        cash_daily_return_pct = (cash_daily_usd / cash * 100) if cash and cash > 0 else 0
+        cash_alpha_usd = cash_daily_usd - (cash * (spy_return or 0) / 100) if cash else 0
+
+        # Grand totals including cash
+        grand_day_usd = total_day_usd + cash_daily_usd
+        grand_alpha_usd = total_alpha_usd + cash_alpha_usd
+        grand_alpha_pct = grand_alpha_usd / nav * 100 if nav else 0
+
         html_parts += ["<table>",
-                       "<tr><th>Ticker</th><th>Shares</th><th>Market Value</th><th>% NAV</th></tr>"]
+                       "<tr><th>Ticker</th><th>Shares</th><th>Mkt Value</th>"
+                       "<th>% NAV</th><th>Day Ret %</th><th>Day Ret $</th>"
+                       "<th>α $</th><th>α % of Total</th></tr>"]
         for ticker, pos in sorted(positions.items()):
             mv = pos.get("market_value", 0)
             pct_nav = mv / nav * 100 if nav else 0
+            daily_ret = pos.get("daily_return_pct")
+            daily_usd = pos.get("daily_return_usd", 0)
+            alpha_usd = pos.get("alpha_contribution_usd", 0)
+            alpha_pct_of_total = (alpha_usd / grand_alpha_usd * 100) if grand_alpha_usd else 0
             html_parts.append(
                 f"<tr><td>{ticker}</td><td>{pos['shares']:,}</td>"
-                f"<td>${mv:,.0f}</td><td>{pct_nav:.1f}%</td></tr>"
+                f"<td>${mv:,.0f}</td><td>{pct_nav:.1f}%</td>"
+                f"<td>{_pct(daily_ret)}</td><td>{_dollar(daily_usd)}</td>"
+                f"<td>{_dollar(alpha_usd)}</td><td>{_pct(alpha_pct_of_total)}</td></tr>"
             )
-            plain_parts.append(f"  {ticker:<6} {pos['shares']:>6} shares  ${mv:>10,.0f}  {pct_nav:.1f}% NAV")
+            dr_str = _plain_pct(daily_ret) if daily_ret is not None else "—"
+            plain_parts.append(
+                f"  {ticker:<6} {pos['shares']:>5}  ${mv:>9,.0f}  {pct_nav:>5.1f}%"
+                f"  {dr_str:>7}  ${daily_usd:>+8,.0f}  ${alpha_usd:>+8,.0f}  {alpha_pct_of_total:>+6.1f}%"
+            )
+
+        # Cash row
+        if abs(cash) > 1:
+            cash_pct = cash / nav * 100 if nav else 0
+            cash_alpha_pct_of_total = (cash_alpha_usd / grand_alpha_usd * 100) if grand_alpha_usd else 0
+            html_parts.append(
+                f'<tr style="color:#888"><td><i>Cash</i></td><td></td>'
+                f'<td>${cash:,.0f}</td><td>{cash_pct:.1f}%</td>'
+                f'<td>{_pct(cash_daily_return_pct)}</td><td>{_dollar(cash_daily_usd)}</td>'
+                f'<td>{_dollar(cash_alpha_usd)}</td><td>{_pct(cash_alpha_pct_of_total)}</td></tr>'
+            )
+            plain_parts.append(
+                f"  {'Cash':<6} {'':>5}  ${cash:>9,.0f}  {cash_pct:>5.1f}%"
+                f"  {_plain_pct(cash_daily_return_pct):>7}  ${cash_daily_usd:>+8,.0f}  ${cash_alpha_usd:>+8,.0f}  {cash_alpha_pct_of_total:>+6.1f}%"
+            )
+
+        # Totals row — should tie to Daily Summary
+        html_parts.append(
+            f'<tr style="font-weight:bold;border-top:2px solid #333">'
+            f'<td>Total</td><td></td>'
+            f'<td>${nav:,.0f}</td><td>100%</td>'
+            f'<td></td><td>{_dollar(grand_day_usd)}</td>'
+            f'<td>{_dollar(grand_alpha_usd)}</td>'
+            f'<td><b>{_pct(grand_alpha_pct)}</b></td></tr>'
+        )
         html_parts.append("</table>")
+        plain_parts.append(f"  {'':->80}")
+        plain_parts.append(
+            f"  {'Total':<6} {'':>5}  ${nav:>9,.0f}  100.0%"
+            f"  {'':>7}  ${grand_day_usd:>+8,.0f}  ${grand_alpha_usd:>+8,.0f}  {grand_alpha_pct:>+6.2f}%"
+        )
     else:
         html_parts.append("<p>No open positions.</p>")
         plain_parts.append("  No open positions.")
@@ -280,6 +376,7 @@ def send_eod_email(
     data_warnings: list[str] | None = None,
     roundtrip_stats: dict | None = None,
     trades_bucket: str = "",
+    account_snapshot: dict | None = None,
 ) -> None:
     subject, html_body, plain_body = build_eod_email(
         run_date, nav, daily_return, spy_return, alpha, positions, conn,
@@ -287,6 +384,7 @@ def send_eod_email(
         sector_attribution=sector_attribution,
         data_warnings=data_warnings,
         roundtrip_stats=roundtrip_stats,
+        account_snapshot=account_snapshot,
     )
 
     # Archive email HTML to S3
