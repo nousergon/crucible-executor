@@ -97,6 +97,7 @@ def send_daemon_status(message: str) -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
+        logger.warning("Telegram not configured — TELEGRAM_BOT_TOKEN=%s TELEGRAM_CHAT_ID=%s", "set" if token else "MISSING", "set" if chat_id else "MISSING")
         return False
 
     return _send_telegram(token, chat_id, message)
