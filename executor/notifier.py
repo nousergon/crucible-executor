@@ -53,7 +53,7 @@ def _send_telegram(token: str, chat_id: str, text: str) -> bool:
         logger.warning("Telegram API returned %d: %s", resp.status_code, resp.text[:200])
         return False
     except Exception:
-        logger.debug("Telegram send failed", exc_info=True)
+        logger.warning("Telegram send failed", exc_info=True)
         return False
 
 
