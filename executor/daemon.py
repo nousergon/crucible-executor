@@ -542,16 +542,19 @@ def run_daemon(dry_run: bool = False) -> None:
             order_book.merge_executed(executed_tickers)
 
             # ── Heartbeat ─────────────────────────────────────────────
-            if _time.time() - _last_heartbeat >= _HEARTBEAT_INTERVAL:
+            _elapsed = _time.time() - _last_heartbeat
+            if _elapsed >= _HEARTBEAT_INTERVAL:
                 n_pending = len(order_book.pending_entries())
                 n_stops = len(order_book.active_stops())
                 n_positions = len(ibkr.get_positions())
-                send_daemon_status(
+                msg = (
                     f"\U0001f49a *Daemon heartbeat*\n"
                     f"Positions: {n_positions} | Stops: {n_stops} | "
                     f"Pending entries: {n_pending}\n"
                     f"Trades today: {trades_executed}"
                 )
+                ok = send_daemon_status(msg)
+                logger.info("Heartbeat sent (ok=%s) after %.0fs | pos=%d stops=%d pending=%d trades=%d", ok, _elapsed, n_positions, n_stops, n_pending, trades_executed)
                 _last_heartbeat = _time.time()
 
             # ── Mid-day backup (noon ET) ─────────────────────────────
