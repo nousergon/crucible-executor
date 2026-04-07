@@ -384,6 +384,21 @@ def run(run_date: str | None = None) -> None:
         "realized_pnl": account.get("realized_pnl"),
     })
 
+    # ── Load closing prices from daily_closes for accurate per-position returns ──
+    closing_prices: dict[str, float] = {}
+    try:
+        import io as _io_dc
+        dc_key = f"predictor/daily_closes/{run_date}.parquet"
+        dc_obj = boto3.client("s3").get_object(Bucket=trades_bucket, Key=dc_key)
+        dc_df = pd.read_parquet(_io_dc.BytesIO(dc_obj["Body"].read()))
+        for ticker_idx, row in dc_df.iterrows():
+            if "Close" in row and pd.notna(row["Close"]):
+                closing_prices[str(ticker_idx)] = float(row["Close"])
+        if closing_prices:
+            logger.info("Loaded %d closing prices from daily_closes/%s", len(closing_prices), run_date)
+    except Exception as _dc_exc:
+        logger.debug("daily_closes not available for %s — using IB Gateway prices: %s", run_date, _dc_exc)
+
     # ── Per-position daily return & alpha contribution ──────────────────────
     # Look up prior day's positions_snapshot to get yesterday's price per ticker
     prior_snapshot_row = conn.execute(
@@ -400,6 +415,12 @@ def run(run_date: str | None = None) -> None:
         shares = pos.get("shares", 0)
         mv = pos.get("market_value", 0)
         current_price = mv / shares if shares else 0
+
+        # Prefer closing price from daily_closes over IB Gateway's delayed data
+        if ticker in closing_prices:
+            current_price = closing_prices[ticker]
+            pos["market_value"] = current_price * shares
+            mv = pos["market_value"]
 
         # Daily return: today's price vs yesterday's price (or entry price if new today)
         prior_pos = prior_positions.get(ticker)
