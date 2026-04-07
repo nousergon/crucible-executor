@@ -127,4 +127,28 @@ if [ -d "$SYSTEMD_SRC" ]; then
     fi
 fi
 
+# ── Pull config files from S3 ───────────────────────────────────────────────
+# Configs are pushed to S3 by push-configs.sh (local machine) and pulled
+# here on every boot. This replaces SCP-based config sync.
+BUCKET="alpha-engine-research"
+CONFIG_MAP=(
+    "config/risk.yaml:/home/ec2-user/alpha-engine/config/risk.yaml"
+    "config/flow-doctor-executor.yaml:/home/ec2-user/alpha-engine/flow-doctor.yaml"
+    "config/data.yaml:/home/ec2-user/alpha-engine-data/config.yaml"
+    "config/backtester.yaml:/home/ec2-user/alpha-engine-backtester/config.yaml"
+    "config/flow-doctor-backtester.yaml:/home/ec2-user/alpha-engine-backtester/flow-doctor.yaml"
+)
+
+for entry in "${CONFIG_MAP[@]}"; do
+    s3_key="${entry%%:*}"
+    local_path="${entry#*:}"
+    local_dir=$(dirname "$local_path")
+    [ -d "$local_dir" ] || continue  # skip if repo not cloned
+    if aws s3 cp "s3://${BUCKET}/${s3_key}" "$local_path" >> "$LOG" 2>&1; then
+        log "OK   config: $s3_key → $local_path"
+    else
+        log "WARN config: $s3_key not found in S3 (using existing local)"
+    fi
+done
+
 log "=== boot-pull complete ==="
