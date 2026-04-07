@@ -786,6 +786,16 @@ def _execute_exit(
     # Update order book
     if action == "EXIT":
         order_book.remove_stop(ticker)
+    elif action == "REDUCE":
+        # Update stop record shares to reflect remaining position
+        remaining = int(positions.get(ticker, {}).get("shares", 0))
+        if remaining > 0:
+            order_book.update_stop_shares(ticker, remaining)
+            # Mark profit-take as executed so it doesn't fire again
+            if exit_signal.get("reason") == "intraday_profit_take":
+                order_book.mark_profit_take_executed(ticker)
+        else:
+            order_book.remove_stop(ticker)
     order_book.save()
 
     send_trade_alert(

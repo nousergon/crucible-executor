@@ -220,6 +220,20 @@ class OrderBook:
                 stop["current_stop"] = new_stop
                 break
 
+    def update_stop_shares(self, ticker: str, new_shares: int) -> None:
+        """Update the share count on a stop record after a partial REDUCE."""
+        for stop in self._data.get("active_stops", []):
+            if stop["ticker"] == ticker:
+                stop["shares"] = new_shares
+                break
+
+    def mark_profit_take_executed(self, ticker: str) -> None:
+        """Mark a stop record so profit-take doesn't fire again."""
+        for stop in self._data.get("active_stops", []):
+            if stop["ticker"] == ticker:
+                stop["profit_take_executed"] = True
+                break
+
     def set_date(self, run_date: str) -> None:
         """Set the book date (used by morning batch)."""
         self._data["date"] = run_date

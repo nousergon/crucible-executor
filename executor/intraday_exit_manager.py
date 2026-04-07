@@ -123,7 +123,9 @@ class IntradayExitManager:
         return None
 
     def _check_profit_take(self, stop: dict, current_price: float) -> dict | None:
-        """Reduce 50% when profit exceeds threshold."""
+        """Reduce 50% when profit exceeds threshold. Fires at most once per position."""
+        if stop.get("profit_take_executed"):
+            return None
         threshold = self._config.get("intraday_profit_take_pct", 0.08)
         entry_price = stop.get("entry_price")
         if not entry_price or entry_price <= 0:
