@@ -35,14 +35,14 @@ for repo in "${REPOS[@]}"; do
         NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
         log "OK   $repo — $(git log --oneline -1)"
 
-        # Deploy gate: dry-run validation for executor after code update
+        # Deploy gate: syntax check only (no IB Gateway connection needed)
         if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
             if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
-                log "GATE $repo — running dry-run validation..."
-                if .venv/bin/python executor/main.py --dry-run >> "$LOG" 2>&1; then
-                    log "OK   $repo — dry-run passed"
+                log "GATE $repo — running syntax validation..."
+                if .venv/bin/python -c "import ast; ast.parse(open('executor/main.py').read()); ast.parse(open('executor/daemon.py').read()); ast.parse(open('executor/eod_reconcile.py').read())" >> "$LOG" 2>&1; then
+                    log "OK   $repo — syntax check passed"
                 else
-                    log "FAIL $repo — dry-run failed, rolling back to $PREV_SHA"
+                    log "FAIL $repo — syntax check failed, rolling back to $PREV_SHA"
                     git reset --hard "$PREV_SHA" >> "$LOG" 2>&1
                     log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
                 fi
