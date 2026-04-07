@@ -16,6 +16,7 @@ _SEARCH_PATHS = [
     os.path.expanduser("~/alpha-engine-config/executor/risk.yaml"),
     os.path.join(_REPO_ROOT, "..", "alpha-engine-config", "executor", "risk.yaml"),
     os.path.join(_REPO_ROOT, "config", "risk.yaml"),
+    os.path.join(_REPO_ROOT, "config", "risk.yaml.example"),
 ]
 
 
