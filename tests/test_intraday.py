@@ -45,7 +45,10 @@ class TestEntryTriggerEngine:
         assert ok is True
         assert "pullback" in reason
 
-    def test_pullback_no_fire(self):
+    @patch("executor.entry_triggers.datetime")
+    def test_pullback_no_fire(self, mock_dt):
+        mock_dt.now.return_value = _ET.localize(datetime(2026, 4, 8, 10, 0))
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         eng = self._engine()
         ok, reason = eng.should_enter(
             {"triggers": {"pullback_pct": 0.02}},
@@ -71,7 +74,10 @@ class TestEntryTriggerEngine:
         assert ok is True
         assert "support" in reason
 
-    def test_support_broken_no_fire(self):
+    @patch("executor.entry_triggers.datetime")
+    def test_support_broken_no_fire(self, mock_dt):
+        mock_dt.now.return_value = _ET.localize(datetime(2026, 4, 8, 10, 0))
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         eng = self._engine(disabled_triggers=["pullback"])
         ok, reason = eng.should_enter(
             {"triggers": {"support_level": 145.0}},
@@ -103,7 +109,10 @@ class TestEntryTriggerEngine:
         assert ok is True
         assert "graduated" in reason
 
-    def test_disabled_trigger(self):
+    @patch("executor.entry_triggers.datetime")
+    def test_disabled_trigger(self, mock_dt):
+        mock_dt.now.return_value = _ET.localize(datetime(2026, 4, 8, 10, 0))
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         eng = self._engine(disabled_triggers=["pullback"])
         ok, _ = eng.should_enter(
             {"triggers": {"pullback_pct": 0.02}},

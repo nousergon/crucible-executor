@@ -326,7 +326,8 @@ def run(run_date: str | None = None) -> None:
 
     # Prior day's NAV (to compute daily return)
     prior_row = conn.execute(
-        "SELECT portfolio_nav FROM eod_pnl ORDER BY date DESC LIMIT 1"
+        "SELECT portfolio_nav FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
+        (run_date,),
     ).fetchone()
     prior_nav = prior_row[0] if prior_row else None
 
@@ -342,7 +343,8 @@ def run(run_date: str | None = None) -> None:
     if spy_price:
         # Try cached prior SPY close from eod_pnl first
         spy_prior_row = conn.execute(
-            "SELECT spy_close FROM eod_pnl WHERE spy_close IS NOT NULL ORDER BY date DESC LIMIT 1"
+            "SELECT spy_close FROM eod_pnl WHERE spy_close IS NOT NULL AND date < ? ORDER BY date DESC LIMIT 1",
+            (run_date,),
         ).fetchone()
         if spy_prior_row and spy_prior_row[0]:
             spy_return = (spy_price / spy_prior_row[0] - 1) * 100
@@ -350,7 +352,8 @@ def run(run_date: str | None = None) -> None:
             # Fallback: fetch SPY close for the actual prior eod_pnl date
             # (avoids period="2d" which only gets 1 day regardless of gaps)
             prior_date_row = conn.execute(
-                "SELECT date FROM eod_pnl ORDER BY date DESC LIMIT 1"
+                "SELECT date FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
+                (run_date,),
             ).fetchone()
             if prior_date_row:
                 prior_spy = _spy_close(prior_date_row[0])
@@ -402,7 +405,8 @@ def run(run_date: str | None = None) -> None:
     # ── Per-position daily return & alpha contribution ──────────────────────
     # Look up prior day's positions_snapshot to get yesterday's price per ticker
     prior_snapshot_row = conn.execute(
-        "SELECT positions_snapshot FROM eod_pnl WHERE positions_snapshot IS NOT NULL ORDER BY date DESC LIMIT 1"
+        "SELECT positions_snapshot FROM eod_pnl WHERE positions_snapshot IS NOT NULL AND date < ? ORDER BY date DESC LIMIT 1",
+        (run_date,),
     ).fetchone()
     prior_positions = {}
     if prior_snapshot_row and prior_snapshot_row[0]:
