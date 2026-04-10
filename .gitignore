@@ -3,7 +3,9 @@
 config/risk.yaml
 config/.executor_params_cache.json
 infrastructure/ec2.env
-flow-doctor.yaml
+# flow-doctor.yaml was previously gitignored because it held inline credentials.
+# As of flow-doctor 0.2.0 + FLOW_DOCTOR_* env var contract, all secrets come from
+# the environment and the YAML contains only ${VAR} references — safe to commit.
 
 # Python
 __pycache__/

@@ -33,12 +33,22 @@ def read_signals(s3_bucket: str, run_date: str | None = None) -> dict:
     return data
 
 
-def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_lookback: int = 5) -> dict:
+def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_lookback: int = 14) -> dict:
     """
     Read the latest signals from S3.
 
     Tries signals/latest.json first (written by Research alongside the dated file).
     Falls back to date-scanning if the pointer doesn't exist.
+
+    The default max_lookback of 14 days covers the Research pipeline's weekly
+    cadence (Saturday 00:00 UTC) plus a one-week buffer for a missed Saturday
+    run. Shorter windows are fragile: by Friday of any given week, the most
+    recent Saturday signals file is already 6 days old, and a 5-day window
+    would fail even on a normal week.
+
+    A staleness WARNING is logged when the signals being returned are more
+    than 7 calendar days old, so a quietly-missed Saturday run becomes visible
+    in the executor's log stream even if the signals still load successfully.
 
     Returns the signals dict. Raises RuntimeError if nothing found.
     """
@@ -52,6 +62,7 @@ def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_
             f"Signals loaded from signals/latest.json | date={data.get('date')} "
             f"| universe={len(data.get('universe', []))}"
         )
+        _warn_if_stale(data.get("date"), run_date)
         return data
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchKey":
@@ -68,8 +79,13 @@ def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_
         try:
             signals = read_signals(s3_bucket, str(candidate))
             if days_back > 0:
-                logger.warning(
+                log_fn = logger.warning if days_back > 7 else logger.info
+                log_fn(
                     f"No signals for {start} — using {candidate} "
+                    f"({days_back} calendar day(s) old). Dates tried: {tried}. "
+                    f"Research pipeline may have missed a weekly run."
+                    if days_back > 7
+                    else f"No signals for {start} — using {candidate} "
                     f"({days_back} calendar day(s) old). Dates tried: {tried}"
                 )
             return signals
@@ -84,6 +100,27 @@ def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_
         f"No signals found within {max_lookback} calendar days of {start}. "
         f"Dates tried: {tried}. Check that the research pipeline ran recently."
     )
+
+
+def _warn_if_stale(signals_date: str | None, run_date: str | None) -> None:
+    """Log a WARNING if the loaded signals are more than 7 days old relative to run_date.
+
+    Staleness >7 days means the Research pipeline likely missed its Saturday
+    run — the signals will still work, but something upstream needs investigation.
+    """
+    if not signals_date:
+        return
+    try:
+        sig = date.fromisoformat(signals_date)
+    except (ValueError, TypeError):
+        return
+    ref = date.fromisoformat(run_date) if run_date else date.today()
+    age = (ref - sig).days
+    if age > 7:
+        logger.warning(
+            f"Loaded signals are {age} calendar days old (signals_date={sig}, "
+            f"run_date={ref}). Research pipeline may have missed a weekly run."
+        )
 
 
 def get_actionable_signals(signals: dict) -> dict:
