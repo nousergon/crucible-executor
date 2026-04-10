@@ -232,16 +232,9 @@ def run_daemon(dry_run: bool = False) -> None:
     config = load_config()
     strategy_config = load_strategy_config(config)
 
-    # Flow Doctor: structured error capture (optional, never blocks)
-    fd = None
-    try:
-        import flow_doctor
-        fd = flow_doctor.init(config_path=os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"))
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.warning("flow-doctor init failed: %s", e)
+    # Flow Doctor: retrieve the shared instance owned by log_config
+    from executor.log_config import get_flow_doctor
+    fd = get_flow_doctor()
 
     global _allow_shorts
     _allow_shorts = config.get("allow_shorts", False)

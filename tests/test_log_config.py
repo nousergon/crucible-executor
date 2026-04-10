@@ -1,4 +1,4 @@
-"""Tests for log_config — structured logging + flow-doctor integration."""
+"""Tests for log_config — structured logging + flow-doctor singleton."""
 
 import logging
 import os
@@ -6,7 +6,20 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from executor.log_config import setup_logging, _attach_flow_doctor, JSONFormatter
+import executor.log_config as log_config
+from executor.log_config import (
+    JSONFormatter,
+    get_flow_doctor,
+    setup_logging,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_singleton():
+    """Ensure the singleton is reset between tests."""
+    log_config._fd_instance = None
+    yield
+    log_config._fd_instance = None
 
 
 class TestSetupLogging:
@@ -31,7 +44,7 @@ class TestSetupLogging:
             os.environ.pop("ALPHA_ENGINE_JSON_LOGS", None)
             os.environ.pop("FLOW_DOCTOR_ENABLED", None)
             setup_logging("daemon")
-            fmt = root = logging.getLogger().handlers[0].formatter._fmt
+            fmt = logging.getLogger().handlers[0].formatter._fmt
             assert "[daemon]" in fmt
 
     def test_clears_existing_handlers(self):
@@ -44,15 +57,34 @@ class TestSetupLogging:
         assert len(root.handlers) == 1
 
 
-class TestFlowDoctorIntegration:
-    def test_not_attached_when_disabled(self):
+class TestFlowDoctorSingleton:
+    def test_get_flow_doctor_returns_none_when_disabled(self):
+        """get_flow_doctor() should return None if setup was not called with FD enabled."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("FLOW_DOCTOR_ENABLED", None)
             setup_logging("test")
-            root = logging.getLogger()
-            assert len(root.handlers) == 1  # only StreamHandler
+            assert get_flow_doctor() is None
 
-    def test_attached_when_enabled(self):
+    def test_get_flow_doctor_returns_instance_when_enabled(self):
+        """get_flow_doctor() should return the shared instance after setup."""
+        mock_fd = MagicMock()
+        mock_handler = MagicMock(spec=logging.Handler)
+        mock_handler.level = logging.ERROR
+        with patch.dict(os.environ, {"FLOW_DOCTOR_ENABLED": "1"}):
+            with patch("executor.log_config.flow_doctor") as mock_module:
+                mock_module.init.return_value = mock_fd
+                mock_module.FlowDoctorHandler.return_value = mock_handler
+                setup_logging("main")
+                assert get_flow_doctor() is mock_fd
+
+    def test_setup_loads_from_yaml_not_inline_kwargs(self):
+        """Shared instance must load from flow-doctor.yaml, never inline kwargs.
+
+        The pre-consolidation log_config.py built a second FlowDoctor instance
+        from hardcoded inline kwargs that silently diverged from the YAML used
+        by main.py / daemon.py / eod_reconcile.py. This test pins the new
+        behavior so the regression doesn't return.
+        """
         mock_fd = MagicMock()
         mock_handler = MagicMock(spec=logging.Handler)
         mock_handler.level = logging.ERROR
@@ -62,17 +94,35 @@ class TestFlowDoctorIntegration:
                 mock_module.FlowDoctorHandler.return_value = mock_handler
                 setup_logging("main")
                 mock_module.init.assert_called_once()
-                call_kwargs = mock_module.init.call_args[1]
-                assert call_kwargs["flow_name"] == "alpha-engine-executor-main"
-                assert call_kwargs["repo"] == "cipher813/alpha-engine"
+                call_args = mock_module.init.call_args
+                # Must be called with config_path, not inline kwargs like repo/notify
+                assert "config_path" in call_args.kwargs
+                assert call_args.kwargs["config_path"].endswith("flow-doctor.yaml")
+                # Must NOT be called with the old inline kwargs
+                assert "repo" not in call_args.kwargs
+                assert "notify" not in call_args.kwargs
 
-    def test_init_failure_raises(self):
-        """flow-doctor is a hard dep — init failures should propagate."""
+    def test_init_failure_propagates(self):
+        """flow-doctor is a hard dep — init failures should propagate, not be swallowed."""
         with patch.dict(os.environ, {"FLOW_DOCTOR_ENABLED": "1"}):
             with patch("executor.log_config.flow_doctor") as mock_module:
                 mock_module.init.side_effect = RuntimeError("config error")
                 with pytest.raises(RuntimeError, match="config error"):
                     setup_logging("test")
+
+    def test_singleton_is_shared_across_call_sites(self):
+        """Multiple get_flow_doctor() calls should return the same instance."""
+        mock_fd = MagicMock()
+        mock_handler = MagicMock(spec=logging.Handler)
+        mock_handler.level = logging.ERROR
+        with patch.dict(os.environ, {"FLOW_DOCTOR_ENABLED": "1"}):
+            with patch("executor.log_config.flow_doctor") as mock_module:
+                mock_module.init.return_value = mock_fd
+                mock_module.FlowDoctorHandler.return_value = mock_handler
+                setup_logging("main")
+                assert get_flow_doctor() is get_flow_doctor()
+                # And flow_doctor.init was called exactly once
+                mock_module.init.assert_called_once()
 
 
 class TestJSONFormatter:

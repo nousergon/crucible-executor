@@ -4,8 +4,12 @@ Structured logging configuration for the executor.
 JSON mode activates when ALPHA_ENGINE_JSON_LOGS=1 (set on EC2 via systemd env).
 Text mode (default) preserves the current human-readable format for local dev.
 
-Flow Doctor integration: attaches an error-monitoring handler that captures
-ERROR+ log records, deduplicates, diagnoses via LLM, and creates GitHub issues.
+Flow Doctor integration: owns the single shared FlowDoctor instance for the
+entire executor process. All call sites (main.py, daemon.py, eod_reconcile.py)
+should call ``get_flow_doctor()`` instead of calling ``flow_doctor.init()``
+themselves — running four independent FlowDoctor instances with separate
+SQLite stores, rate limiters, and dedup states is a footgun.
+
 Enabled when FLOW_DOCTOR_ENABLED=1 (default on EC2).
 """
 
@@ -15,8 +19,17 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 import flow_doctor
+
+_FLOW_DOCTOR_YAML_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"
+)
+
+# Singleton — populated once by setup_logging() and retrieved by call sites
+# via get_flow_doctor(). None until setup_logging() runs with FLOW_DOCTOR_ENABLED=1.
+_fd_instance: Optional[flow_doctor.FlowDoctor] = None
 
 
 class JSONFormatter(logging.Formatter):
@@ -38,22 +51,21 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(log_entry, default=str)
 
 
+def get_flow_doctor() -> Optional[flow_doctor.FlowDoctor]:
+    """Return the shared flow-doctor instance, or None if not initialized.
+
+    Call sites use this to access flow-doctor without creating duplicate
+    instances. Returns None if setup_logging() was never called with
+    FLOW_DOCTOR_ENABLED=1, or if flow-doctor init failed.
+    """
+    return _fd_instance
+
+
 def _attach_flow_doctor(name: str) -> None:
-    """Attach flow-doctor handler to root logger (ERROR+ only)."""
-    fd = flow_doctor.init(
-        flow_name=f"alpha-engine-executor-{name}",
-        repo="cipher813/alpha-engine",
-        owner="@cipher813",
-        store={"type": "sqlite", "path": "flow_doctor.db"},
-        diagnosis={"enabled": True, "model": "claude-haiku-4-5-20251001"},
-        notify=[{"type": "github", "repo": "cipher813/alpha-engine"}],
-        rate_limits={
-            "max_diagnosed_per_day": 5,
-            "max_issues_per_day": 3,
-            "dedup_cooldown_minutes": 120,
-        },
-    )
-    handler = flow_doctor.FlowDoctorHandler(fd, level=logging.ERROR)
+    """Initialize the shared flow-doctor instance and attach a log handler."""
+    global _fd_instance
+    _fd_instance = flow_doctor.init(config_path=_FLOW_DOCTOR_YAML_PATH)
+    handler = flow_doctor.FlowDoctorHandler(_fd_instance, level=logging.ERROR)
     logging.getLogger().addHandler(handler)
 
 
