@@ -256,16 +256,9 @@ def run(run_date: str | None = None) -> None:
     db_path = config["db_path"]
     trades_bucket = config["trades_bucket"]
 
-    # Flow Doctor: structured error capture (optional, never blocks)
-    fd = None
-    try:
-        import flow_doctor
-        fd = flow_doctor.init(config_path=os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"))
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.warning("flow-doctor init failed: %s", e)
+    # Flow Doctor: retrieve the shared instance owned by log_config
+    from executor.log_config import get_flow_doctor
+    fd = get_flow_doctor()
 
     if not config.get("email_sender") or not config.get("email_recipients"):
         logger.warning(
