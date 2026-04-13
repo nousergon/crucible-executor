@@ -387,8 +387,16 @@ def run_daemon(dry_run: bool = False) -> None:
     # can decide whether it's safe to fire the EOD pipeline. Pre-market exits
     # (shutdown signal, early crash, etc.) must NOT trigger EOD — market-close
     # side-effects like stopping the trading EC2 instance would then run
-    # before the market ever opened. This flag is the single gate.
+    # before the market ever opened.
     market_opened = False
+    # Separate gate: EOD should fire only when the daemon exits because the
+    # market closed naturally, NOT when it exits because of a SIGTERM
+    # (e.g. `systemctl restart` mid-session, maintenance work). Without this,
+    # every operator-initiated restart during market hours triggers EOD →
+    # EOD pipeline stops the EC2 → instance disappears mid-session.
+    # 2026-04-13: observed exactly this when a mid-session daemon restart
+    # cascaded into two EOD fires and an instance shutdown at 10:05 AM PT.
+    natural_close = False
 
     try:
         # ── Wait for market open (daemon may start before 9:30 AM ET) ────
@@ -546,6 +554,7 @@ def run_daemon(dry_run: bool = False) -> None:
             # Check market hours
             if not is_market_hours():
                 logger.info("Market closed — daemon shutting down")
+                natural_close = True
                 break
 
             try:
@@ -692,15 +701,22 @@ def run_daemon(dry_run: bool = False) -> None:
         logger.info("Daemon shutdown complete | trades=%d", trades_executed)
 
         # Trigger EOD pipeline Step Function — only if the daemon actually
-        # made it into the live trading window. Pre-market exits (shutdown
-        # signal, crash during setup, IB connection failure) must not fire
-        # EOD: it would stop the trading EC2 instance before the market
-        # opens and email a bogus EOD summary. 2026-04-13 regression.
-        if not dry_run and market_opened:
+        # made it into the live trading window AND exited because the market
+        # closed naturally. SIGTERM-driven exits (systemctl restart, deploy,
+        # maintenance) must NOT fire EOD: the EOD Step Function stops the
+        # trading EC2 instance, which turns any operator-initiated restart
+        # during market hours into an unintended shutdown.
+        # 2026-04-13 regression observations:
+        #   1. Pre-market daemon exit triggered EOD → instance down at 06:14 PT.
+        #      Fixed by the market_opened gate.
+        #   2. Mid-session daemon restart (10:04 PT) triggered EOD → instance
+        #      down at 10:05 PT. Fixed by the natural_close gate below.
+        if not dry_run and market_opened and natural_close:
             _trigger_eod_pipeline(config, run_date)
         elif not dry_run:
             logger.warning(
-                "Skipping EOD pipeline trigger: daemon exited before market opened"
+                "Skipping EOD pipeline trigger: market_opened=%s natural_close=%s",
+                market_opened, natural_close,
             )
 
 
