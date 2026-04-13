@@ -90,3 +90,95 @@ def test_quiet_daemon_still_counts_as_active():
     m = bf.compute_backfill_metrics(intervals, day)
     assert m["active_minutes"] == 390
     assert m["uptime_pct"] == 1.0
+
+
+# ── Interval-extraction state machine tests ───────────────────────────────
+#
+# journal_intervals() makes a subprocess call, so these tests feed events
+# through a tiny helper that replicates the state-machine walk. Keeping the
+# state machine's logic in a module-level helper would be cleaner — but for
+# now we exercise it by monkeypatching subprocess output.
+
+
+def _fake_journalctl_output(events: list[tuple[datetime, str]]) -> str:
+    """Render (ts, 'start'|'stop') tuples as JSON lines journalctl would emit."""
+    import json
+    lines = []
+    for ts, kind in events:
+        msg = (
+            "Started alpha-engine-daemon.service - …"
+            if kind == "start"
+            else "Stopped alpha-engine-daemon.service - …"
+        )
+        lines.append(json.dumps({
+            "MESSAGE": msg,
+            "__REALTIME_TIMESTAMP": str(int(ts.timestamp() * 1_000_000)),
+        }))
+    return "\n".join(lines)
+
+
+def test_journal_intervals_dedupes_consecutive_stops(monkeypatch):
+    """systemd emits Deactivated + Stopped + Main-exited per real stop.
+    State machine must collapse them into one transition."""
+    day = date(2026, 4, 13)
+    # Start, then 3 back-to-back stop messages (as systemd really emits),
+    # then a fresh start, then one stop.
+    events = [
+        (_et(2026, 4, 13, 10, 0), "start"),
+        (_et(2026, 4, 13, 12, 0), "stop"),
+        (_et(2026, 4, 13, 12, 0, ), "stop"),  # duplicate
+        (_et(2026, 4, 13, 12, 0), "stop"),  # duplicate
+        (_et(2026, 4, 13, 13, 0), "start"),
+        (_et(2026, 4, 13, 15, 0), "stop"),
+    ]
+    monkeypatch.setattr(
+        bf.subprocess,
+        "check_output",
+        lambda *a, **kw: _fake_journalctl_output(events),
+    )
+    intervals = bf.journal_intervals(day)
+    # Two real intervals, no triple-counted (day_start, 12:00) ones.
+    assert len(intervals) == 2
+    m = bf.compute_backfill_metrics(intervals, day)
+    # 10:00 → 12:00 = 120 min; 13:00 → 15:00 = 120 min
+    assert m["active_minutes"] == 240
+    assert m["uptime_pct"] == round(240 / 390, 4)
+    # No runaway percentages
+    assert m["uptime_pct"] <= 1.0
+
+
+def test_journal_intervals_daemon_already_running_at_day_start(monkeypatch):
+    """If the first event is a stop, the daemon was running before day_start."""
+    day = date(2026, 4, 13)
+    events = [
+        (_et(2026, 4, 13, 10, 0), "stop"),
+        (_et(2026, 4, 13, 11, 0), "start"),
+        (_et(2026, 4, 13, 15, 0), "stop"),
+    ]
+    monkeypatch.setattr(
+        bf.subprocess,
+        "check_output",
+        lambda *a, **kw: _fake_journalctl_output(events),
+    )
+    intervals = bf.journal_intervals(day)
+    assert len(intervals) == 2
+    m = bf.compute_backfill_metrics(intervals, day)
+    # Day-start-to-10:00 clipped to (9:30, 10:00) = 30 min
+    # 11:00 to 15:00 = 240 min
+    assert m["active_minutes"] == 30 + 240
+
+
+def test_journal_intervals_daemon_still_running_at_day_end(monkeypatch):
+    """If the daemon starts and never stops, close the interval at day end."""
+    day = date(2026, 4, 13)
+    events = [(_et(2026, 4, 13, 10, 0), "start")]
+    monkeypatch.setattr(
+        bf.subprocess,
+        "check_output",
+        lambda *a, **kw: _fake_journalctl_output(events),
+    )
+    intervals = bf.journal_intervals(day)
+    assert len(intervals) == 1
+    m = bf.compute_backfill_metrics(intervals, day)
+    # 10:00 → 16:00 market close = 360 min
+    assert m["active_minutes"] == 360

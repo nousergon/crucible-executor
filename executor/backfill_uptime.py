@@ -103,28 +103,42 @@ def journal_intervals(day: date) -> list[tuple[datetime, datetime]]:
 
     events.sort(key=lambda x: x[0])
 
+    # Walk events as a state machine. systemd emits multiple stop messages
+    # per real stop (Deactivated + Stopped + Main process exited), so we
+    # must dedupe rather than treat each as a separate transition. Same
+    # for consecutive starts from Start-only notifications.
     day_start_utc = start_et.astimezone(_UTC)
     day_end_utc = end_et.astimezone(_UTC)
     intervals: list[tuple[datetime, datetime]] = []
+    state = "unknown"  # "unknown" | "running" | "stopped"
     current_start: datetime | None = None
 
     for ts, kind in events:
-        if kind == "start":
-            if current_start is None:
+        if state == "unknown":
+            # First event tells us what the daemon was doing before day start.
+            if kind == "start":
+                state = "running"
                 current_start = ts
-            # else: double-start (no stop between) — keep the earlier start
-        else:  # stop
-            if current_start is None:
-                # Daemon was already running at day start
-                intervals.append((day_start_utc, ts))
             else:
-                # Only record if stop is after start (guards against clock skew)
-                if ts > current_start:
+                # Daemon was already running at day start — stop closes that
+                # implicit interval.
+                intervals.append((day_start_utc, ts))
+                state = "stopped"
+        elif state == "running":
+            if kind == "stop":
+                if current_start is not None and ts > current_start:
                     intervals.append((current_start, ts))
                 current_start = None
+                state = "stopped"
+            # else: start while running — duplicate, ignore
+        else:  # state == "stopped"
+            if kind == "start":
+                current_start = ts
+                state = "running"
+            # else: stop while stopped — duplicate, ignore
 
     # Unclosed interval: daemon still running at day end
-    if current_start is not None:
+    if state == "running" and current_start is not None:
         intervals.append((current_start, day_end_utc))
 
     return intervals
