@@ -167,6 +167,17 @@ class IBKRClient:
             }
 
         order = MarketOrder(action, shares)
+        # Set routing/lifecycle fields explicitly so the IB paper-account
+        # order preset (which forces TIF=DAY via Error 10349) has nothing
+        # to "override" — IB reads values as provided on the wire and
+        # stops auto-cancelling orders whose preset-adjusted values
+        # conflict with the market-order defaults. Observed 2026-04-13:
+        # HSY SELL cancelled with Error 10349 on bare MarketOrder; setting
+        # these fields matches ib_insync defaults and avoids the preset
+        # reinterpretation path.
+        order.tif = "DAY"
+        order.outsideRth = False
+        order.transmit = True
         trade = self.ib.placeOrder(contract, order)
 
         # Poll for fill confirmation

@@ -69,6 +69,11 @@ def place_bracket_with_stop(
 
     # Step 1: Place market BUY and wait for fill
     buy_order = MarketOrder("BUY", quantity)
+    # Explicit routing fields to preempt the paper-account order preset
+    # that forces TIF=DAY and can cancel bare market orders with Error
+    # 10349. See ibkr.py:place_market_order for the same pattern.
+    buy_order.tif = "DAY"
+    buy_order.outsideRth = False
     buy_order.orderId = ib.client.getReqId()
     buy_trade = ib.placeOrder(contract, buy_order)
 
