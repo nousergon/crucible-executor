@@ -568,6 +568,10 @@ def run_daemon(dry_run: bool = False) -> None:
             order_book = OrderBook.load()
             order_book.merge_executed(executed_tickers)
 
+            # Per-tick structured log line consumed by uptime_tracker.
+            # Format is stable — parsers match on the DAEMON_TICK prefix.
+            logger.info("DAEMON_TICK ib_connected=%s", str(ibkr.ib.isConnected()).lower())
+
             # ── Heartbeat ─────────────────────────────────────────────
             _elapsed = _time.time() - _last_heartbeat
             if _elapsed >= _HEARTBEAT_INTERVAL:
