@@ -7,9 +7,11 @@ Requires=ibgateway.service
 Type=oneshot
 User=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine
-EnvironmentFile=/home/ec2-user/.alpha-engine.env
 ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python executor/eod_reconcile.py
 ExecStartPost=/bin/bash /home/ec2-user/alpha-engine/infrastructure/emit-heartbeat.sh executor-eod
 StandardOutput=append:/var/log/eod.log
 StandardError=append:/var/log/eod.log
 Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+Environment=AWS_REGION=us-east-1
+Environment=ALPHA_ENGINE_JSON_LOGS=1
+Environment=FLOW_DOCTOR_ENABLED=1

@@ -7,7 +7,6 @@ Requires=ibgateway.service
 Type=simple
 User=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine
-EnvironmentFile=/home/ec2-user/.alpha-engine.env
 ExecStartPre=/home/ec2-user/alpha-engine/infrastructure/wait-for-ibgateway.sh
 ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.daemon
 ExecStartPost=/bin/bash /home/ec2-user/alpha-engine/infrastructure/emit-heartbeat.sh executor-daemon-start
@@ -18,6 +17,9 @@ RestartSec=30
 StandardOutput=append:/var/log/daemon.log
 StandardError=append:/var/log/daemon.log
 Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+Environment=AWS_REGION=us-east-1
+Environment=ALPHA_ENGINE_JSON_LOGS=1
+Environment=FLOW_DOCTOR_ENABLED=1
 
 [Install]
 WantedBy=multi-user.target
