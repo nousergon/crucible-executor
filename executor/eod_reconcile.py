@@ -302,7 +302,9 @@ def run(run_date: str | None = None) -> None:
             )
             _time.sleep(wait)
 
-    # Enrich positions with sector from signals.json
+    # Enrich positions with sector — signals.json first, entry-trade fallback.
+    # A missing sector is an observability failure (blank rows in sector
+    # attribution), not a hard error — log loudly and continue with "Unknown".
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
     try:
         sig_data, _ = _load_signals_from_s3(signals_bucket, run_date)
@@ -312,10 +314,22 @@ def run(run_date: str | None = None) -> None:
             if t and s.get("sector"):
                 sector_lookup[t] = s["sector"]
         for ticker in positions:
-            if not positions[ticker].get("sector") and ticker in sector_lookup:
+            if positions[ticker].get("sector"):
+                continue
+            if ticker in sector_lookup:
                 positions[ticker]["sector"] = sector_lookup[ticker]
+                continue
+            entry = get_entry_trade(conn, ticker)
+            if entry and entry.get("sector"):
+                positions[ticker]["sector"] = entry["sector"]
+                continue
+            logger.error(
+                "Sector unknown for %s — missing from signals.json and entry trade. "
+                "Sector attribution will be incomplete.", ticker,
+            )
+            positions[ticker]["sector"] = "Unknown"
     except Exception as e:
-        logger.warning(f"Sector enrichment failed: {e}")
+        logger.error(f"Sector enrichment failed: {e}")
 
     # Prior day's NAV (to compute daily return)
     prior_row = conn.execute(
@@ -443,15 +457,16 @@ def run(run_date: str | None = None) -> None:
         pos["alpha_contribution_usd"] = pos["alpha_contribution_pct"] / 100 * nav if nav else 0
 
     # ── Sector attribution ──────────────────────────────────────────────────
+    # Daily contribution = today's per-position P&L as % of NAV (not cumulative
+    # unrealized, which has no relationship to the day's return).
     sector_attribution = {}
     if positions and nav > 0:
         for ticker, pos in positions.items():
             sector = pos.get("sector", "Unknown")
             mv = pos.get("market_value", 0)
             weight = mv / nav
-            # Use unrealized PnL as proxy for daily contribution
-            unrealized = pos.get("unrealized_pnl", 0)
-            daily_contrib = (unrealized / nav * 100) if nav else 0
+            daily_usd = pos.get("daily_return_usd", 0)
+            daily_contrib = (daily_usd / nav * 100) if nav else 0
             if sector not in sector_attribution:
                 sector_attribution[sector] = {"weight": 0.0, "contribution": 0.0, "positions": 0}
             sector_attribution[sector]["weight"] += weight
