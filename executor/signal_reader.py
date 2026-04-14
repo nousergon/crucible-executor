@@ -14,6 +14,32 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 
+def read_predictions(s3_bucket: str) -> dict[str, dict]:
+    """
+    Read predictor/predictions/latest.json from S3.
+
+    Returns: {ticker: prediction_dict}. Empty dict if not available.
+    """
+    s3 = boto3.client("s3")
+    try:
+        obj = s3.get_object(Bucket=s3_bucket, Key="predictor/predictions/latest.json")
+        data = json.loads(obj["Body"].read())
+        if data.get("timed_out"):
+            logger.warning(
+                "Predictions timed out — using partial set (%d tickers)",
+                len(data.get("predictions", [])),
+            )
+        preds = data.get("predictions", [])
+        result = {p["ticker"]: p for p in preds if "ticker" in p}
+        logger.info("Predictions loaded | n=%d", len(result))
+        return result
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            logger.warning("predictions/latest.json not found — running without GBM input")
+            return {}
+        raise
+
+
 def read_signals(s3_bucket: str, run_date: str | None = None) -> dict:
     """
     Download signals/{date}/signals.json from S3.
