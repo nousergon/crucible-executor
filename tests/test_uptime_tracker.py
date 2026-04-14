@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, time, timedelta
 
 import pytz
@@ -34,6 +35,47 @@ def test_parse_tick_lines_roundtrip():
     ts_et, connected = ticks[0]
     assert ts_et.hour == 9 and ts_et.minute == 30
     assert connected is True
+
+
+def _make_json_tick_line(ts_utc: datetime, connected: bool) -> str:
+    """Render a DAEMON_TICK line in the JSON format emitted by alpha_engine_lib.logging."""
+    return json.dumps({
+        "ts": ts_utc.isoformat(),
+        "level": "INFO",
+        "module": "daemon",
+        "func": "run_daemon",
+        "msg": f"DAEMON_TICK ib_connected={'true' if connected else 'false'}",
+    }) + "\n"
+
+
+def test_parse_tick_lines_json_format():
+    """Parser handles the JSON format written by the new alpha_engine_lib.logging."""
+    day = date(2026, 4, 13)
+    t_et = _ET.localize(datetime(2026, 4, 13, 10, 15))
+    t_utc = t_et.astimezone(_UTC)
+
+    line = _make_json_tick_line(t_utc, connected=True)
+    ticks = ut.parse_tick_lines([line, "{\"msg\": \"other\"}\n"], day)
+
+    assert len(ticks) == 1
+    ts_et, connected = ticks[0]
+    assert ts_et.hour == 10 and ts_et.minute == 15
+    assert connected is True
+
+
+def test_parse_tick_lines_mixed_formats():
+    """Text and JSON lines coexist during rollout — both get parsed."""
+    day = date(2026, 4, 13)
+    t1 = _ET.localize(datetime(2026, 4, 13, 9, 30)).astimezone(_UTC)
+    t2 = _ET.localize(datetime(2026, 4, 13, 9, 31)).astimezone(_UTC)
+
+    ticks = ut.parse_tick_lines(
+        [_make_tick_line(t1, True), _make_json_tick_line(t2, False)],
+        day,
+    )
+    assert len(ticks) == 2
+    assert ticks[0][1] is True
+    assert ticks[1][1] is False
 
 
 def test_parse_tick_lines_filters_wrong_day():
