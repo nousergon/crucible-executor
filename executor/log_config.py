@@ -27,6 +27,16 @@ _FLOW_DOCTOR_YAML_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "flow-doctor.yaml"
 )
 
+# IB Gateway error codes that are benign for a delayed-data paper-trading
+# executor. IB emits these at ERROR level, but the daemon continues to
+# receive delayed ticks via the delayedLast/delayedClose fallbacks in
+# price_monitor.py. Suppress to prevent alert spam when Brian opens the
+# IB iOS app during market hours (competing live session preempts the
+# live feed; delayed keeps flowing).
+_FLOW_DOCTOR_EXCLUDE_PATTERNS = [
+    r"Error 10197",  # No market data during competing live session
+]
+
 # Singleton — populated once by setup_logging() and retrieved by call sites
 # via get_flow_doctor(). None until setup_logging() runs with FLOW_DOCTOR_ENABLED=1.
 _fd_instance: Optional[flow_doctor.FlowDoctor] = None
@@ -65,7 +75,11 @@ def _attach_flow_doctor(name: str) -> None:
     """Initialize the shared flow-doctor instance and attach a log handler."""
     global _fd_instance
     _fd_instance = flow_doctor.init(config_path=_FLOW_DOCTOR_YAML_PATH)
-    handler = flow_doctor.FlowDoctorHandler(_fd_instance, level=logging.ERROR)
+    handler = flow_doctor.FlowDoctorHandler(
+        _fd_instance,
+        level=logging.ERROR,
+        exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+    )
     logging.getLogger().addHandler(handler)
 
 
