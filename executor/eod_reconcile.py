@@ -29,8 +29,11 @@ from executor.trade_logger import (
     init_db, log_eod, backup_to_s3, get_entry_trade, get_todays_trades,
 )
 
-from executor.log_config import setup_logging
-setup_logging("eod")
+from alpha_engine_lib.logging import setup_logging
+# See executor/main.py for the rationale on IB Error 10197 suppression.
+_FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197"]
+_FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
+setup_logging("eod", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
 
 from executor.config_loader import CONFIG_PATH
@@ -257,7 +260,7 @@ def run(run_date: str | None = None) -> None:
     trades_bucket = config["trades_bucket"]
 
     # Flow Doctor: retrieve the shared instance owned by log_config
-    from executor.log_config import get_flow_doctor
+    from alpha_engine_lib.logging import get_flow_doctor
     fd = get_flow_doctor()
 
     if not config.get("email_sender") or not config.get("email_recipients"):

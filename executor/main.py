@@ -46,8 +46,15 @@ from executor.strategies.exit_manager import evaluate_exits, SECTOR_ETF_MAP
 from executor.price_cache import load_daily_vwap, load_price_histories
 from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade, log_shadow_book_block
 
-from executor.log_config import setup_logging
-setup_logging("main")
+from alpha_engine_lib.logging import setup_logging
+# Suppress benign IB Error 10197 ("No market data during competing live
+# session") — the daemon keeps receiving delayed ticks via the
+# delayedLast fallback in price_monitor.py, so flow-doctor's ERROR
+# alert is spam rather than signal. Every executor entrypoint passes
+# the same pattern list so all three fire through the shared handler.
+_FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197"]
+_FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
+setup_logging("main", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
 
 from executor.config_loader import CONFIG_PATH
@@ -859,7 +866,7 @@ def run(
     trades_bucket = config["trades_bucket"]
 
     # ── Flow Doctor: retrieve the shared instance owned by log_config ───
-    from executor.log_config import get_flow_doctor
+    from alpha_engine_lib.logging import get_flow_doctor
     fd = get_flow_doctor() if not simulate else None
 
     # ── 0. Check upstream health — hard-fail if anything upstream is broken ──
