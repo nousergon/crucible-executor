@@ -224,37 +224,9 @@ def _read_signals(
 
     Returns (signals_raw, signals, run_date, predictions_by_ticker).
     """
-    signal_source = config.get("signal_source", "research")
-
     if signals_override is not None:
         signals_raw = signals_override
         run_date = signals_raw.get("date", run_date)
-    elif signal_source == "population":
-        try:
-            from executor.population_reader import read_population
-            from executor.signal_generator import generate_trading_signals, read_predictions
-
-            pop_data = read_population(signals_bucket)
-            predictions = read_predictions(signals_bucket)
-            pop_tickers = [p["ticker"] for p in pop_data.get("population", [])]
-            price_histories_for_scoring = load_price_histories(
-                tickers=pop_tickers,
-                signals_bucket=signals_bucket,
-            )
-            signals_raw = generate_trading_signals(
-                population=pop_data["population"],
-                predictions=predictions,
-                price_histories=price_histories_for_scoring,
-                market_regime=pop_data.get("market_regime", "neutral"),
-                sector_ratings=pop_data.get("sector_ratings", {}),
-                config=config,
-            )
-            logger.info("Signal source: population-based (technical + GBM)")
-        except Exception as e:
-            logger.error(f"Population-based signal generation failed: {e}")
-            if conn:
-                conn.close()
-            raise RuntimeError(f"Population signal generation failed: {e}")
     else:
         try:
             signals_raw = read_signals_with_fallback(signals_bucket, run_date)
@@ -284,7 +256,7 @@ def _read_signals(
     # Load GBM predictions for rationale capture
     if not simulate:
         try:
-            from executor.signal_generator import read_predictions
+            from executor.signal_reader import read_predictions
             predictions_by_ticker = read_predictions(signals_bucket)
         except Exception as e:
             logger.warning("Failed to load GBM predictions: %s", e)

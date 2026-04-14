@@ -80,18 +80,6 @@ email_sender: "you@example.com"
 email_recipients:
   - "you@example.com"
 
-# ── Signal Source ────────────────────────────────────────────────────────────
-# "research" (legacy): read signals.json directly from Research module
-# "population" (new):  read population/latest.json + compute technical scores + GBM
-signal_source: "research"
-
-# Trading signal generation (used when signal_source: "population")
-trading:
-  min_technical_score: 0          # disabled — predictor veto is primary gate
-  gbm_veto_confidence: 0.60     # GBM DOWN + this confidence → HOLD override
-  gbm_enrichment_max: 8.0       # max ±pts GBM can shift technical score
-  exit_score_threshold: 35       # below this technical score → EXIT
-
 # ── Strategy Layer ──────────────────────────────────────────────────────────
 strategy:
   exit_manager:
