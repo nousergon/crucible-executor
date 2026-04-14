@@ -43,13 +43,15 @@ _MARKET_MINUTES = 6 * 60 + 30  # 390
 _TICK_RE = re.compile(r"DAEMON_TICK\s+ib_connected=(true|false)")
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]?\d*")
 
-_DEFAULT_LOG = "/var/log/executor.log"
+# The daemon's systemd unit redirects stdout/stderr to /var/log/daemon.log;
+# DAEMON_TICK lines live there, not in executor.log (which holds main.py).
+_DEFAULT_LOG = "/var/log/daemon.log"
 _DEFAULT_TICK_SEC = 60
 _GAP_TOLERANCE_MULT = 2.5
 
 
 def _parse_ts(line: str) -> datetime | None:
-    """Parse the leading UTC timestamp from a log line."""
+    """Parse the leading UTC timestamp from a legacy-text log line."""
     m = _TS_RE.match(line)
     if not m:
         return None
@@ -60,22 +62,55 @@ def _parse_ts(line: str) -> datetime | None:
     return pytz.utc.localize(ts_naive)
 
 
+def _parse_tick_line(line: str) -> tuple[datetime, bool] | None:
+    """Extract (ts_utc, ib_connected) from a DAEMON_TICK line in either the
+    legacy text format or the current JSON format emitted by
+    alpha_engine_lib.logging. Returns None for anything else.
+    """
+    if "DAEMON_TICK" not in line:
+        return None
+
+    stripped = line.lstrip()
+    if stripped.startswith("{") and '"msg"' in stripped:
+        try:
+            rec = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        msg = rec.get("msg", "")
+        tick = _TICK_RE.search(msg)
+        if not tick:
+            return None
+        ts_raw = rec.get("ts")
+        if not isinstance(ts_raw, str):
+            return None
+        try:
+            ts = datetime.fromisoformat(ts_raw)
+        except ValueError:
+            return None
+        ts_utc = pytz.utc.localize(ts) if ts.tzinfo is None else ts.astimezone(pytz.utc)
+        return ts_utc, tick.group(1) == "true"
+
+    tick = _TICK_RE.search(line)
+    if not tick:
+        return None
+    ts_utc = _parse_ts(line)
+    if ts_utc is None:
+        return None
+    return ts_utc, tick.group(1) == "true"
+
+
 def parse_tick_lines(lines: Iterable[str], day: date) -> list[tuple[datetime, bool]]:
     """Return (ts_et, ib_connected) tuples for DAEMON_TICK lines falling on `day` (ET)."""
     ticks: list[tuple[datetime, bool]] = []
     for line in lines:
-        if "DAEMON_TICK" not in line:
+        parsed = _parse_tick_line(line)
+        if parsed is None:
             continue
-        m = _TICK_RE.search(line)
-        if not m:
-            continue
-        ts_utc = _parse_ts(line)
-        if ts_utc is None:
-            continue
+        ts_utc, connected = parsed
         ts_et = ts_utc.astimezone(_ET)
         if ts_et.date() != day:
             continue
-        ticks.append((ts_et, m.group(1) == "true"))
+        ticks.append((ts_et, connected))
     ticks.sort(key=lambda x: x[0])
     return ticks
 
