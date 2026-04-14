@@ -102,6 +102,20 @@ class TestFlowDoctorSingleton:
                 assert "repo" not in call_args.kwargs
                 assert "notify" not in call_args.kwargs
 
+    def test_handler_passes_exclude_patterns(self):
+        """FlowDoctorHandler must be wired with the IB 10197 suppression pattern."""
+        mock_fd = MagicMock()
+        mock_handler = MagicMock(spec=logging.Handler)
+        mock_handler.level = logging.ERROR
+        with patch.dict(os.environ, {"FLOW_DOCTOR_ENABLED": "1"}):
+            with patch("executor.log_config.flow_doctor") as mock_module:
+                mock_module.init.return_value = mock_fd
+                mock_module.FlowDoctorHandler.return_value = mock_handler
+                setup_logging("main")
+                call_kwargs = mock_module.FlowDoctorHandler.call_args.kwargs
+                assert "exclude_patterns" in call_kwargs
+                assert any("10197" in p for p in call_kwargs["exclude_patterns"])
+
     def test_init_failure_propagates(self):
         """flow-doctor is a hard dep — init failures should propagate, not be swallowed."""
         with patch.dict(os.environ, {"FLOW_DOCTOR_ENABLED": "1"}):
