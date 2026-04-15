@@ -47,12 +47,17 @@ from executor.price_cache import load_daily_vwap, load_price_histories
 from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade, log_shadow_book_block
 
 from alpha_engine_lib.logging import setup_logging
-# Suppress benign IB Error 10197 ("No market data during competing live
-# session") — the daemon keeps receiving delayed ticks via the
-# delayedLast fallback in price_monitor.py, so flow-doctor's ERROR
-# alert is spam rather than signal. Every executor entrypoint passes
-# the same pattern list so all three fire through the shared handler.
-_FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197"]
+# Suppress benign IB Error codes that don't represent real failures:
+#   10197 — "No market data during competing live session". The daemon
+#     keeps receiving delayed ticks via the delayedLast fallback in
+#     price_monitor.py, so flow-doctor's ERROR alert is spam.
+#   10349 — "Order TIF was set to DAY based on order preset". IB echoes
+#     this back every time the preset matches the submitted TIF=DAY
+#     (ibkr.py sets DAY defensively after the HSY cancel cycle on
+#     2026-04-13). The order is still placed and filled.
+# Every executor entrypoint passes the same pattern list so all three
+# fire through the shared handler.
+_FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
 setup_logging("main", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
