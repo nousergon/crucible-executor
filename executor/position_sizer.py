@@ -94,10 +94,19 @@ def compute_position_size(
         confidence_adj = confidence_adj * (1 - blend) + p_up_adj * blend
 
     # Signal staleness discount (Task 2.3)
-    if config.get("staleness_discount_enabled", True) and signal_age_days is not None and signal_age_days > 0:
-        decay_rate = config.get("staleness_decay_per_day", 0.03)
-        floor = config.get("staleness_floor", 0.70)
-        staleness_adj = max(1.0 - decay_rate * signal_age_days, floor)
+    # Decay applies only to age BEYOND the source's expected refresh cadence.
+    # Research signals are written weekly (Saturday); a Wednesday read at age=4
+    # is fresh relative to cadence, not stale. Daemon health gate already uses
+    # the same grace period (192h for research at main.py:894).
+    if config.get("staleness_discount_enabled", True) and signal_age_days is not None:
+        cadence_grace = config.get("signal_cadence_days", 7)
+        effective_age = max(0, signal_age_days - cadence_grace)
+        if effective_age > 0:
+            decay_rate = config.get("staleness_decay_per_day", 0.03)
+            floor = config.get("staleness_floor", 0.70)
+            staleness_adj = max(1.0 - decay_rate * effective_age, floor)
+        else:
+            staleness_adj = 1.0
     else:
         staleness_adj = 1.0
 

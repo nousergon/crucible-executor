@@ -56,7 +56,8 @@ confidence_sizing_range: 0.60    # range of confidence adjustment (backtester-tu
 
 # ── Signal staleness discount ──────────────────────────────────────────────
 staleness_discount_enabled: true
-staleness_decay_per_day: 0.03    # 3% decay per day (backtester-tunable: [0.02, 0.03, 0.05])
+signal_cadence_days: 7           # expected refresh interval (research runs weekly Sat) — decay only applies beyond this grace
+staleness_decay_per_day: 0.03    # 3% decay per day past cadence (backtester-tunable: [0.02, 0.03, 0.05])
 staleness_floor: 0.70            # minimum staleness multiplier
 
 # ── Earnings sizing adjustment ──────────────────────────────────────────────

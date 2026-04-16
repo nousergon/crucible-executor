@@ -349,7 +349,8 @@ class TestComputePositionSize:
 
     # ── Staleness discount ──
 
-    def test_staleness_decays_over_days(self):
+    def test_staleness_within_cadence_no_decay(self):
+        """Weekly research read mid-week (age < cadence) should NOT be decayed."""
         enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
         result = compute_position_size(
             ticker="AAPL",
@@ -359,13 +360,65 @@ class TestComputePositionSize:
             sector_rating="market_weight",
             current_price=150.0,
             config=_base_config(staleness_discount_enabled=True,
+                                signal_cadence_days=7,
                                 staleness_decay_per_day=0.03, staleness_floor=0.70),
-            signal_age_days=5,  # 1 - 0.03*5 = 0.85
+            signal_age_days=4,  # mid-week read of Saturday signals — within 7-day cadence
+        )
+        assert result["staleness_adj"] == 1.0
+
+    def test_staleness_at_cadence_boundary_no_decay(self):
+        """Age exactly equal to cadence should still be fresh (boundary inclusive)."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(staleness_discount_enabled=True,
+                                signal_cadence_days=7,
+                                staleness_decay_per_day=0.03, staleness_floor=0.70),
+            signal_age_days=7,
+        )
+        assert result["staleness_adj"] == 1.0
+
+    def test_staleness_decays_past_cadence(self):
+        """Once age exceeds cadence, decay applies to the EXCESS only."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(staleness_discount_enabled=True,
+                                signal_cadence_days=7,
+                                staleness_decay_per_day=0.03, staleness_floor=0.70),
+            signal_age_days=12,  # effective_age = 5 → 1 - 0.03*5 = 0.85
+        )
+        assert abs(result["staleness_adj"] - 0.85) < 0.01
+
+    def test_staleness_daily_cadence_decays_from_day_one(self):
+        """Setting cadence=0 restores the legacy daily-signal decay behavior."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(staleness_discount_enabled=True,
+                                signal_cadence_days=0,
+                                staleness_decay_per_day=0.03, staleness_floor=0.70),
+            signal_age_days=5,
         )
         assert abs(result["staleness_adj"] - 0.85) < 0.01
 
     def test_staleness_floor(self):
-        """Staleness discount should not go below floor."""
+        """Staleness discount should not go below floor even far past cadence."""
         enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
         result = compute_position_size(
             ticker="AAPL",
@@ -375,8 +428,9 @@ class TestComputePositionSize:
             sector_rating="market_weight",
             current_price=150.0,
             config=_base_config(staleness_discount_enabled=True,
+                                signal_cadence_days=7,
                                 staleness_decay_per_day=0.03, staleness_floor=0.70),
-            signal_age_days=20,  # 1 - 0.03*20 = 0.40 → floored at 0.70
+            signal_age_days=27,  # effective_age = 20 → 1 - 0.03*20 = 0.40 → floored at 0.70
         )
         assert abs(result["staleness_adj"] - 0.70) < 0.01
 
