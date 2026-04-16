@@ -39,6 +39,7 @@ REPOS=(
     /home/ec2-user/alpha-engine
     /home/ec2-user/alpha-engine-backtester
     /home/ec2-user/alpha-engine-dashboard
+    /home/ec2-user/alpha-engine-data
 )
 
 for repo in "${REPOS[@]}"; do

@@ -88,6 +88,42 @@ def read_health(bucket: str, module_name: str) -> dict | None:
         return None
 
 
+def verify_s3_object_fresh(
+    s3_client,
+    bucket: str,
+    key: str,
+    run_date: str,
+    max_age_hours: float = 12,
+) -> None:
+    """Assert an S3 object exists and, when run_date is today (UTC), was
+    written within the last max_age_hours.
+
+    Raises RuntimeError on missing or stale. Backfill runs (run_date in the
+    past) only get the existence check — historical writes are legitimately
+    old. This guards against silent upstream staleness where a partial write
+    or Step Function retry leaves yesterday's blob at today's key, which
+    check_upstream_health (stamp-based) would miss.
+    """
+    try:
+        resp = s3_client.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        raise RuntimeError(
+            f"s3://{bucket}/{key} not found — upstream did not run or failed."
+        ) from exc
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if run_date != today:
+        return  # backfill: skip freshness
+
+    age = datetime.now(timezone.utc) - resp["LastModified"]
+    age_hours = age.total_seconds() / 3600
+    if age_hours > max_age_hours:
+        raise RuntimeError(
+            f"s3://{bucket}/{key} is stale ({age_hours:.1f}h old, "
+            f"max {max_age_hours:.0f}h) — upstream did not refresh today's file."
+        )
+
+
 def check_upstream_health(
     bucket: str,
     modules: list[str],
