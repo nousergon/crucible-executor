@@ -891,7 +891,12 @@ def run(
     #   research           — 192h (runs weekly Sat; grace covers Sat→next Fri)
     #   predictor_inference — 26h (runs every weekday morning; catches a Mon
     #                               miss without false-alarming on the weekend)
-    _UPSTREAM_MAX_AGE_H = {"research": 192, "predictor_inference": 26}
+    #   daily_data         — 26h (same weekday 13:05 UTC cadence as predictor;
+    #                               stamp written by alpha-engine-data after
+    #                               daily_closes.collect — catches ran-and-failed
+    #                               states that the direct LastModified check
+    #                               below would miss)
+    _UPSTREAM_MAX_AGE_H = {"research": 192, "predictor_inference": 26, "daily_data": 26}
 
     if not simulate:
         _health_failures: list[str] = []
