@@ -946,6 +946,34 @@ def run(
                 logger.debug("Upstream failure Telegram notification failed", exc_info=True)
             raise RuntimeError(msg)
 
+        # Direct freshness check on today's daily_closes parquet. The stamp-based
+        # check_upstream_health above covers predictor/research "did it run"; this
+        # catches the "stamp says green but the actual data blob is yesterday's"
+        # failure mode (partial writes, Step Function retries skipping DataPhase1).
+        try:
+            import boto3
+            from executor.health_status import verify_s3_object_fresh
+            verify_s3_object_fresh(
+                boto3.client("s3"),
+                signals_bucket,
+                f"predictor/daily_closes/{run_date}.parquet",
+                run_date,
+                max_age_hours=12,
+            )
+        except RuntimeError as _freshness_err:
+            msg = f"daily_closes freshness check FAILED — executor aborting: {_freshness_err}"
+            logger.error(msg)
+            try:
+                from executor.notifier import send_daemon_status
+                send_daemon_status(
+                    "\u274c *daily_closes stale/missing*\n"
+                    f"Date: {run_date}\n"
+                    f"{_freshness_err}\n\nExecutor aborted — no order book written."
+                )
+            except Exception:
+                logger.debug("daily_closes freshness Telegram notification failed", exc_info=True)
+            raise RuntimeError(msg) from _freshness_err
+
     conn = None if simulate else init_db(db_path)
 
     # ── 1. Read signals from S3 (or use injected override) ──────────────────
