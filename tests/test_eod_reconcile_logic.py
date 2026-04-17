@@ -4,7 +4,36 @@ from unittest.mock import patch
 
 import pytest
 
-from executor.eod_reconcile import _apply_dividend_delta, _synthesize_rationales
+from executor.eod_reconcile import (
+    _apply_dividend_delta,
+    _resolve_prior_price,
+    _synthesize_rationales,
+)
+
+
+class TestResolvePriorPrice:
+    """Phase 3: prior-day price source resolution."""
+
+    def test_prefers_explicit_closing_price(self):
+        prior = {"closing_price": 105.0, "market_value": 500.0, "shares": 10}
+        pos = {"avg_cost": 100.0}
+        # closing_price wins even though MV/shares would give 50
+        assert _resolve_prior_price(prior, pos, current_price=110.0) == 105.0
+
+    def test_falls_back_to_mv_over_shares_for_legacy_snapshot(self):
+        # Pre-Phase-3 snapshots have no closing_price
+        prior = {"market_value": 1050.0, "shares": 10}
+        pos = {"avg_cost": 100.0}
+        assert _resolve_prior_price(prior, pos, current_price=110.0) == 105.0
+
+    def test_uses_avg_cost_when_no_prior_snapshot(self):
+        # Position opened today — no prior snapshot
+        pos = {"avg_cost": 99.50}
+        assert _resolve_prior_price(None, pos, current_price=101.0) == 99.50
+
+    def test_falls_back_to_current_price_when_no_avg_cost(self):
+        # Degenerate case — position has no avg_cost either
+        assert _resolve_prior_price(None, {}, current_price=110.0) == 110.0
 
 
 class TestApplyDividendDelta:

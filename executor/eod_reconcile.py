@@ -248,6 +248,31 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
     return narratives
 
 
+def _resolve_prior_price(
+    prior_pos: dict | None,
+    pos: dict,
+    current_price: float,
+) -> float:
+    """Pick the right prior-day price for daily return computation.
+
+    Phase 3+ snapshots store an explicit `closing_price` from daily_closes,
+    which is the same source today's reconcile uses for current_price —
+    eliminating the IB-MV-vs-daily-closes mismatch that was dumping noise
+    into the cash residual. Falls back to MV/shares for legacy snapshots
+    and to avg_cost for positions opened today.
+    """
+    if prior_pos:
+        cp = prior_pos.get("closing_price")
+        if cp is not None:
+            return float(cp)
+        prior_mv = prior_pos.get("market_value", 0)
+        prior_shares = prior_pos.get("shares", 0)
+        if prior_shares:
+            return prior_mv / prior_shares
+    # No prior snapshot — position opened today, use avg_cost
+    return pos.get("avg_cost", current_price)
+
+
 def _apply_dividend_delta(
     pos: dict,
     prior_pos: dict | None,
@@ -427,20 +452,6 @@ def run(run_date: str | None = None) -> None:
         else f"NAV=${nav:,.2f} | prior_nav={prior_nav}"
     )
 
-    log_eod(conn, {
-        "date": run_date,
-        "portfolio_nav": nav,
-        "daily_return_pct": daily_return,
-        "spy_return_pct": spy_return,
-        "daily_alpha_pct": alpha,
-        "positions_snapshot": positions,
-        "spy_close": spy_price,
-        "total_cash": account.get("total_cash"),
-        "accrued_interest": account.get("accrued_interest"),
-        "unrealized_pnl": account.get("unrealized_pnl"),
-        "realized_pnl": account.get("realized_pnl"),
-    })
-
     # ── Load closing prices from daily_closes for accurate per-position returns ──
     closing_prices: dict[str, float] = {}
     try:
@@ -479,16 +490,13 @@ def run(run_date: str | None = None) -> None:
             current_price = closing_prices[ticker]
             pos["market_value"] = current_price * shares
             mv = pos["market_value"]
+        # Persist the canonical close so tomorrow's reconcile reads the same
+        # source for prior_price (not derived from possibly-stale IB MV).
+        pos["closing_price"] = current_price
 
         # Daily return: today's price vs yesterday's price (or entry price if new today)
         prior_pos = prior_positions.get(ticker)
-        if prior_pos:
-            prior_mv = prior_pos.get("market_value", 0)
-            prior_shares = prior_pos.get("shares", 0)
-            prior_price = prior_mv / prior_shares if prior_shares else 0
-        else:
-            # New position — use avg_cost (entry price) as the baseline
-            prior_price = pos.get("avg_cost", current_price)
+        prior_price = _resolve_prior_price(prior_pos, pos, current_price)
 
         if prior_price and prior_price > 0:
             pos["daily_return_pct"] = (current_price / prior_price - 1) * 100
@@ -508,6 +516,9 @@ def run(run_date: str | None = None) -> None:
         pos_spy = spy_return if spy_return is not None else 0
         pos["alpha_contribution_pct"] = weight * (pos["daily_return_pct"] - pos_spy)
         pos["alpha_contribution_usd"] = pos["alpha_contribution_pct"] / 100 * nav if nav else 0
+
+    # data_warnings is appended to here (NAV gap) and by _build_position_contexts
+    data_warnings: list[str] = []
 
     # ── NAV change reconciliation ───────────────────────────────────────────
     # Every dollar of NAV change must be attributable to a source: position
@@ -553,14 +564,36 @@ def run(run_date: str | None = None) -> None:
             total_nav_change, total_day_usd, interest_usd,
             dividend_usd, unattributed_usd,
         )
-        # Warn if unattributed is material (>0.05% of NAV). Phase 3 tightens this.
+        # Warn if unattributed is material (> max($100, 0.05% NAV)). Surface
+        # the gap in data_warnings so it appears in the EOD email, not only
+        # in server logs.
         if nav and abs(unattributed_usd) > max(100.0, 0.0005 * nav):
-            logger.warning(
-                "NAV reconciliation gap: $%.0f unattributed (%.3f%% of NAV). "
-                "Likely causes: stale prior-day prices, untracked corporate action, "
-                "fees, or FX.",
-                unattributed_usd, (unattributed_usd / nav) * 100,
+            msg = (
+                f"NAV reconciliation gap: ${unattributed_usd:+,.0f} unattributed "
+                f"({unattributed_usd / nav * 100:+.3f}% of NAV). Likely causes: "
+                "stale prior-day prices, untracked corporate action, fees, or FX."
             )
+            logger.warning(msg)
+            data_warnings.append(msg)
+
+    # Persist EOD snapshot AFTER positions are enriched with closing prices,
+    # accrued dividends, and per-position returns. Yesterday's reconcile now
+    # reads this snapshot via closing_price (same source as today's
+    # daily_closes), closing the source-mismatch gap that was causing NAV
+    # residuals to land in cash.
+    log_eod(conn, {
+        "date": run_date,
+        "portfolio_nav": nav,
+        "daily_return_pct": daily_return,
+        "spy_return_pct": spy_return,
+        "daily_alpha_pct": alpha,
+        "positions_snapshot": positions,
+        "spy_close": spy_price,
+        "total_cash": account.get("total_cash"),
+        "accrued_interest": account.get("accrued_interest"),
+        "unrealized_pnl": account.get("unrealized_pnl"),
+        "realized_pnl": account.get("realized_pnl"),
+    })
 
     # ── Sector attribution ──────────────────────────────────────────────────
     # Daily contribution = today's per-position P&L as % of NAV (not cumulative
@@ -614,12 +647,12 @@ def run(run_date: str | None = None) -> None:
     # Build position rationale narratives
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
     position_narratives = {}
-    data_warnings: list[str] = []
     try:
         if positions:
-            contexts, data_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date)
+            contexts, ctx_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date)
             position_narratives = _synthesize_rationales(contexts)
             logger.info(f"Position narratives generated for {len(position_narratives)} tickers")
+            data_warnings.extend(ctx_warnings)
     except Exception as e:
         logger.warning(f"Position rationale generation failed: {e}")
 
