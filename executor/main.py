@@ -985,32 +985,39 @@ def run(
                 logger.debug("Upstream failure Telegram notification failed", exc_info=True)
             raise RuntimeError(msg)
 
-        # Direct freshness check on today's daily_closes parquet. The stamp-based
-        # check_upstream_health above covers predictor/research "did it run"; this
-        # catches the "stamp says green but the actual data blob is yesterday's"
-        # failure mode (partial writes, Step Function retries skipping DataPhase1).
+        # Direct freshness check on the ArcticDB universe library. The
+        # stamp-based check_upstream_health above covers predictor/research
+        # "did it run"; this catches the "stamp green but data blob is
+        # yesterday's" failure mode (partial writes, retries skipping
+        # DataPhase1). SPY is the canary — always present, written by the
+        # daily_closes collector. If SPY has no row dated run_date, the
+        # data pipeline did not complete for today and the executor must
+        # abort before any signals are read.
         try:
-            import boto3
-            from executor.health_status import verify_s3_object_fresh
-            verify_s3_object_fresh(
-                boto3.client("s3"),
-                signals_bucket,
-                f"predictor/daily_closes/{run_date}.parquet",
-                run_date,
-                max_age_hours=12,
-            )
-        except RuntimeError as _freshness_err:
-            msg = f"daily_closes freshness check FAILED — executor aborting: {_freshness_err}"
+            import pandas as _pd
+            from executor.price_cache import _open_universe_library
+            _universe = _open_universe_library(signals_bucket)
+            _spy_df = _universe.read("SPY").data
+            _target = _pd.Timestamp(run_date).normalize()
+            _idx = _spy_df.index.normalize() if hasattr(_spy_df.index, "normalize") else _spy_df.index
+            if _spy_df.empty or (_idx == _target).sum() == 0:
+                _latest = _pd.Timestamp(_spy_df.index[-1]).date() if not _spy_df.empty else "EMPTY"
+                raise RuntimeError(
+                    f"ArcticDB universe has no SPY row for {run_date} "
+                    f"(latest: {_latest}). DataPhase1 did not complete."
+                )
+        except Exception as _freshness_err:
+            msg = f"ArcticDB freshness check FAILED — executor aborting: {_freshness_err}"
             logger.error(msg)
             try:
                 from executor.notifier import send_daemon_status
                 send_daemon_status(
-                    "\u274c *daily_closes stale/missing*\n"
+                    "\u274c *ArcticDB universe stale/missing*\n"
                     f"Date: {run_date}\n"
                     f"{_freshness_err}\n\nExecutor aborted — no order book written."
                 )
             except Exception:
-                logger.debug("daily_closes freshness Telegram notification failed", exc_info=True)
+                logger.debug("ArcticDB freshness Telegram notification failed", exc_info=True)
             raise RuntimeError(msg) from _freshness_err
 
     conn = None if simulate else init_db(db_path)
