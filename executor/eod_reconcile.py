@@ -40,32 +40,37 @@ from executor.config_loader import CONFIG_PATH
 
 
 def _spy_close(run_date: str, config: dict | None = None) -> float:
-    """Fetch SPY close for run_date from ArcticDB universe library.
+    """Fetch SPY's actual session close for run_date via yfinance.
 
-    ArcticDB is the single source of truth — no parquet, polygon, or
-    yfinance fallback. Hard-fails if SPY is missing, stale, or has no
-    close for run_date, because EOD alpha is meaningless without a
-    reliable SPY reference.
+    EOD reconcile runs ~20 min after the 4:00 PM ET close, so yfinance
+    has the authoritative close for run_date. This path intentionally
+    bypasses ArcticDB: the universe/macro libraries are populated by
+    DataPhase1 at 6:05 AM PT using polygon's grouped-daily endpoint,
+    which silently returns T-1's aggregate when queried pre-market.
+    That write stamps T-1 data under index=T, so ArcticDB's "SPY close
+    for T" row is actually T-1's close — poisoning EOD alpha by exactly
+    one session. See incident 2026-04-17.
+
+    Hard-fails if yfinance returns no row for run_date (per
+    feedback_no_silent_fails / feedback_hard_fail_until_stable).
     """
-    from executor.price_cache import _open_universe_library
-    bucket = (config or {}).get("trades_bucket", "alpha-engine-research")
-    universe = _open_universe_library(bucket)
-    try:
-        df = universe.read("SPY").data
-    except Exception as e:
-        raise RuntimeError(f"ArcticDB read failed for SPY: {e}") from e
-    if df.empty or "Close" not in df.columns:
-        raise RuntimeError("ArcticDB SPY frame empty or missing Close column")
+    os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+    import yfinance as yf  # imported late so XDG_CACHE_HOME takes effect
     target = pd.Timestamp(run_date).normalize()
-    idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
-    matches = df[idx == target]
+    start = (target - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    end = (target + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    hist = yf.Ticker("SPY").history(start=start, end=end, auto_adjust=False)
+    if hist.empty:
+        raise RuntimeError(f"yfinance returned no SPY data for {start}..{end}")
+    idx = hist.index.tz_localize(None).normalize() if hist.index.tz is not None else hist.index.normalize()
+    matches = hist[idx == target]
     if matches.empty:
         raise RuntimeError(
-            f"ArcticDB has no SPY close for {run_date} (latest: "
-            f"{pd.Timestamp(df.index[-1]).date()})"
+            f"yfinance has no SPY close for {run_date} "
+            f"(latest available: {idx[-1].date()})"
         )
     close = float(matches["Close"].iloc[-1])
-    logger.info("[data_source=arcticdb] SPY close for %s: $%.2f", run_date, close)
+    logger.info("[data_source=yfinance] SPY close for %s: $%.2f", run_date, close)
     return close
 
 
@@ -406,32 +411,25 @@ def run(run_date: str | None = None) -> None:
     else:
         daily_return = ((nav - prior_nav) / prior_nav * 100)
 
-    # SPY return for the day
+    # SPY return for the day — always re-fetch both endpoints via yfinance.
+    # The cached eod_pnl.spy_close values are poisoned on rows written before
+    # the 2026-04-17 fix (see _spy_close docstring): they were sourced from
+    # ArcticDB and are T-1's close under date=T. Don't trust them.
     spy_price = _spy_close(run_date, config)
     spy_return = None
     if spy_price:
-        # Try cached prior SPY close from eod_pnl first
-        spy_prior_row = conn.execute(
-            "SELECT spy_close FROM eod_pnl WHERE spy_close IS NOT NULL AND date < ? ORDER BY date DESC LIMIT 1",
+        prior_date_row = conn.execute(
+            "SELECT date FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
             (run_date,),
         ).fetchone()
-        if spy_prior_row and spy_prior_row[0]:
-            spy_return = (spy_price / spy_prior_row[0] - 1) * 100
-        else:
-            # Fallback: fetch SPY close for the actual prior eod_pnl date
-            # (avoids period="2d" which only gets 1 day regardless of gaps)
-            prior_date_row = conn.execute(
-                "SELECT date FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
-                (run_date,),
-            ).fetchone()
-            if prior_date_row:
-                prior_spy = _spy_close(prior_date_row[0])
-                if prior_spy:
-                    spy_return = (spy_price / prior_spy - 1) * 100
-                else:
-                    logger.warning("Could not fetch SPY close for prior date %s", prior_date_row[0])
+        if prior_date_row:
+            prior_spy = _spy_close(prior_date_row[0])
+            if prior_spy:
+                spy_return = (spy_price / prior_spy - 1) * 100
             else:
-                logger.warning("No prior eod_pnl row — cannot compute SPY return")
+                logger.warning("Could not fetch SPY close for prior date %s", prior_date_row[0])
+        else:
+            logger.warning("No prior eod_pnl row — cannot compute SPY return")
 
     alpha = (daily_return - spy_return) if (daily_return is not None and spy_return is not None) else None
 

@@ -40,81 +40,60 @@ def _make_prediction(ticker, direction="UP", confidence=0.75, alpha=0.02):
 # ── _spy_close ───────────────────────────────────────────────────────────────
 
 
-def _mock_universe_with(symbols: dict[str, "pd.DataFrame"]):
-    """Build a mock ArcticDB universe library.
-
-    symbols maps ticker → DataFrame. universe.read(ticker) returns a
-    SimpleNamespace with .data = the frame. Missing tickers raise.
-    """
-    import pandas as pd  # noqa: F401 — used by caller's frames
-    from types import SimpleNamespace
-
-    lib = MagicMock()
-
-    def _read(sym):
-        if sym not in symbols:
-            raise KeyError(f"no such symbol: {sym}")
-        return SimpleNamespace(data=symbols[sym])
-
-    lib.read.side_effect = _read
-    return lib
+def _mock_yf_ticker(hist_df):
+    """Build a mock yfinance.Ticker whose .history() returns hist_df."""
+    ticker = MagicMock()
+    ticker.history.return_value = hist_df
+    mod = MagicMock()
+    mod.Ticker.return_value = ticker
+    return mod
 
 
-def test_spy_close_reads_from_arcticdb():
-    """_spy_close returns the SPY close for run_date via ArcticDB universe."""
+def test_spy_close_reads_from_yfinance():
+    """_spy_close returns the SPY close for run_date via yfinance."""
     import pandas as pd
 
     df = pd.DataFrame(
         {"Close": [447.00, 450.25]},
         index=pd.to_datetime(["2026-03-26", "2026-03-27"]),
     )
-    with patch(
-        "executor.price_cache._open_universe_library",
-        return_value=_mock_universe_with({"SPY": df}),
-    ):
+    with patch.dict("sys.modules", {"yfinance": _mock_yf_ticker(df)}):
         result = _spy_close("2026-03-27")
     assert result == pytest.approx(450.25)
 
 
-def test_spy_close_hard_fails_when_symbol_missing():
-    """_spy_close raises when ArcticDB has no SPY symbol — no fallback."""
-    with patch(
-        "executor.price_cache._open_universe_library",
-        return_value=_mock_universe_with({}),
-    ):
-        with pytest.raises(RuntimeError, match="ArcticDB read failed for SPY"):
+def test_spy_close_handles_tz_aware_index():
+    """yfinance frequently returns a tz-aware DatetimeIndex — must still match."""
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {"Close": [447.00, 450.25]},
+        index=pd.to_datetime(["2026-03-26", "2026-03-27"]).tz_localize("America/New_York"),
+    )
+    with patch.dict("sys.modules", {"yfinance": _mock_yf_ticker(df)}):
+        result = _spy_close("2026-03-27")
+    assert result == pytest.approx(450.25)
+
+
+def test_spy_close_hard_fails_when_empty():
+    """_spy_close raises when yfinance returns an empty history."""
+    import pandas as pd
+
+    with patch.dict("sys.modules", {"yfinance": _mock_yf_ticker(pd.DataFrame())}):
+        with pytest.raises(RuntimeError, match="returned no SPY data"):
             _spy_close("2026-03-27")
 
 
 def test_spy_close_hard_fails_when_date_missing():
-    """_spy_close raises when run_date has no row in ArcticDB — no fallback."""
+    """_spy_close raises when run_date has no row in yfinance response."""
     import pandas as pd
 
     df = pd.DataFrame(
         {"Close": [447.00]},
         index=pd.to_datetime(["2026-03-26"]),
     )
-    with patch(
-        "executor.price_cache._open_universe_library",
-        return_value=_mock_universe_with({"SPY": df}),
-    ):
+    with patch.dict("sys.modules", {"yfinance": _mock_yf_ticker(df)}):
         with pytest.raises(RuntimeError, match="no SPY close for 2026-03-27"):
-            _spy_close("2026-03-27")
-
-
-def test_spy_close_hard_fails_when_close_column_missing():
-    """_spy_close raises when the SPY frame has no Close column."""
-    import pandas as pd
-
-    df = pd.DataFrame(
-        {"Open": [447.00]},
-        index=pd.to_datetime(["2026-03-27"]),
-    )
-    with patch(
-        "executor.price_cache._open_universe_library",
-        return_value=_mock_universe_with({"SPY": df}),
-    ):
-        with pytest.raises(RuntimeError, match="empty or missing Close"):
             _spy_close("2026-03-27")
 
 
