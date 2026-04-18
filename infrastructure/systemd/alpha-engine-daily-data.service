@@ -1,0 +1,22 @@
+[Unit]
+Description=Alpha Engine Daily Data — post-close OHLCV capture for all tracked tickers
+# Runs before EOD reconcile so ArcticDB has today's real close populated
+# by the time alpha-engine-eod.service reads it.
+# No IB Gateway dependency — reads Polygon/FRED/yfinance, writes S3 + ArcticDB.
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine-data
+# Pull latest code + env + run collector. Mirrors the command that used to run
+# in the weekday Step Function's DailyData SSM step (see alpha-engine-data
+# infrastructure/step_function_daily.json prior to 2026-04-17 label-bug fix).
+ExecStartPre=/usr/bin/git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main
+ExecStart=/bin/bash -c 'set -a && source /home/ec2-user/.alpha-engine.env && set +a && source /home/ec2-user/alpha-engine-data/.venv/bin/activate && python weekly_collector.py --daily'
+StandardOutput=append:/var/log/daily-data.log
+StandardError=append:/var/log/daily-data.log
+Environment=AWS_REGION=us-east-1
+Environment=ALPHA_ENGINE_JSON_LOGS=1
+
+[Install]
+WantedBy=timers.target

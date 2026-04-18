@@ -1,0 +1,17 @@
+[Unit]
+Description=Trigger Alpha Engine Daily Data collection at 1:05 PM PT (post-close)
+
+[Timer]
+# 1:05 PM PT = 5 minutes after the 4:00 PM ET market close. Polygon's
+# grouped-daily endpoint has the completed session aggregate available
+# by then, so the collector writes today's actual close into ArcticDB
+# under index=T (not a T-1-mislabeled-as-T row, which was the pre-fix
+# pre-market failure mode — see 2026-04-17 incident).
+#
+# Ordered BEFORE alpha-engine-eod.timer (1:20 PM PT) so EOD reconcile
+# reads fresh same-day SPY + ticker closes from ArcticDB.
+OnCalendar=Mon..Fri 13:05 America/Los_Angeles
+Persistent=false
+
+[Install]
+WantedBy=timers.target

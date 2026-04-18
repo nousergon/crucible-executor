@@ -1,7 +1,13 @@
 [Unit]
 Description=Alpha Engine EOD Reconciliation
-After=ibgateway.service
+After=ibgateway.service alpha-engine-daily-data.service
 Requires=ibgateway.service
+# Soft dependency on daily-data: EOD reads today's SPY + ticker closes from
+# ArcticDB, which the daily-data service populates at 1:05 PM PT (15 min
+# before EOD at 1:20 PM PT). If daily-data fails, EOD will hard-fail when
+# _spy_close/universe-lib reads find no row for run_date — by design, since
+# alpha against stale SPY is meaningless.
+Wants=alpha-engine-daily-data.service
 
 [Service]
 Type=oneshot
