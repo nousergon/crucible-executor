@@ -39,6 +39,16 @@ logger = logging.getLogger(__name__)
 # predictor's own DailyData dependency expectation.
 _ATR_MAX_STALENESS_TRADING_DAYS = 1
 
+# Symbols that live in the ArcticDB `macro` library rather than `universe`.
+# Mirrors the canonical writer list in alpha-engine-data's
+# ``builders/daily_append.py`` (macro_keys + sector_etfs). Kept in sync
+# manually; any additions there need matching updates here.
+_MACRO_SYMBOLS = frozenset({
+    "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
+    "XLP", "XLRE", "XLU", "XLV", "XLY",
+})
+
 
 def _open_universe_library(signals_bucket: str):
     """Open the ArcticDB `universe` library for reads.
@@ -83,7 +93,13 @@ def load_price_histories(
     tickers: list[str],
     signals_bucket: str,
 ) -> dict[str, list[dict]]:
-    """Load OHLCV histories for a list of tickers from ArcticDB universe.
+    """Load OHLCV histories for a list of tickers from ArcticDB.
+
+    Routes per ticker: single-stock watchlist symbols are read from the
+    ``universe`` library (full OHLCV); index ETFs / macro series
+    (``SPY``/``VIX``/sector ETFs/etc., see ``_MACRO_SYMBOLS``) are read
+    from the ``macro`` library (Close only; Open/High/Low default to 0.0
+    for those symbols — sector-relative exit veto consumes Close only).
 
     ArcticDB is the sole source of truth — the S3 slim-cache parquet
     fallback was removed 2026-04-17. Library/read errors hard-fail
@@ -99,13 +115,20 @@ def load_price_histories(
         return {}
 
     universe = _open_universe_library(signals_bucket)
+    macro = None  # lazy-open only if a macro-routed ticker appears
     histories: dict[str, list[dict]] = {}
     read_errors: list[str] = []
     empty: list[str] = []
 
     for ticker in tickers:
+        if ticker in _MACRO_SYMBOLS:
+            if macro is None:
+                macro = _open_macro_library(signals_bucket)
+            lib = macro
+        else:
+            lib = universe
         try:
-            df = universe.read(ticker).data
+            df = lib.read(ticker).data
         except Exception as e:
             read_errors.append(f"{ticker} ({e.__class__.__name__})")
             continue
@@ -126,7 +149,8 @@ def load_price_histories(
     if read_errors:
         raise RuntimeError(
             f"load_price_histories ArcticDB read failed for {len(read_errors)} "
-            f"ticker(s): {read_errors}. Universe library must be reachable."
+            f"ticker(s): {read_errors}. ArcticDB universe+macro libraries "
+            f"must be reachable."
         )
 
     logger.info(
