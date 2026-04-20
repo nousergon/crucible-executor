@@ -13,6 +13,15 @@ Search order (example template NOT a fallback — copyable only):
   1. ~/alpha-engine-config/executor/risk.yaml  (EC2 — config repo cloned at home)
   2. {repo_root}/../alpha-engine-config/executor/risk.yaml  (local dev — sibling directory)
   3. {repo_root}/config/risk.yaml  (legacy fallback)
+
+Path resolution is deliberately LAZY — consumers call ``get_config_path()``
+or ``load_config()`` at runtime, not at import time. An import-time
+``CONFIG_PATH = get_config_path()`` would hard-fail any test, CI runner,
+or tooling that merely imports executor without needing to read config.
+The old module-level constant was only safe because the removed .example
+fallback guaranteed resolution — that's exactly the silent-fallthrough
+trap this PR closes. Callers that used to import ``CONFIG_PATH`` now
+import ``get_config_path`` and resolve inline.
 """
 
 import os
@@ -50,10 +59,7 @@ def get_config_path() -> str:
     )
 
 
-CONFIG_PATH = get_config_path()
-
-
 def load_config() -> dict:
-    """Load and return the risk.yaml config dict."""
-    with open(CONFIG_PATH) as f:
+    """Load and return the risk.yaml config dict. Resolves the path lazily."""
+    with open(get_config_path()) as f:
         return yaml.safe_load(f)

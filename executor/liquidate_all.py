@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from executor.config_loader import CONFIG_PATH, load_config
+from executor.config_loader import load_config
 
 
 def liquidate(execute: bool, skip_confirm: bool) -> None:

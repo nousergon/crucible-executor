@@ -62,7 +62,7 @@ _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath
 setup_logging("main", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
 
-from executor.config_loader import CONFIG_PATH
+from executor.config_loader import get_config_path
 
 # S3-delivered executor params (loaded once per cold-start)
 _executor_params_cache: dict | None = None
@@ -210,7 +210,7 @@ def _merge_s3_params(config: dict, s3_params: dict) -> dict[str, Any]:
 
 
 def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
+    with open(get_config_path()) as f:
         return yaml.safe_load(f)
 
 

@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from executor.config_loader import CONFIG_PATH, load_config as _load_config
+from executor.config_loader import load_config as _load_config
 
 
 def emergency_shutdown(execute: bool, stop_instance: bool) -> None:

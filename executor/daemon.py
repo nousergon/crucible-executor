@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 #   "status" — IB order execution status: "Filled", "Rejected", "Timeout", etc.
 #   "signal" — trading action type from Research/strategy: "ENTER", "EXIT", "REDUCE", "COVER"
 
-from executor.config_loader import CONFIG_PATH
+from executor.config_loader import get_config_path
 
 # Order retry policy — applied uniformly to all order types (urgent exits, intraday exits, entries)
 MAX_ORDER_RETRIES = 3
@@ -221,7 +221,7 @@ def _place_order_with_retry(
 
 
 def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
+    with open(get_config_path()) as f:
         return yaml.safe_load(f)
 
 

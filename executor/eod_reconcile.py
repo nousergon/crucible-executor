@@ -36,7 +36,7 @@ _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath
 setup_logging("eod", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
 
-from executor.config_loader import CONFIG_PATH
+from executor.config_loader import load_config
 
 
 def _spy_close(run_date: str, config: dict | None = None) -> float:
@@ -305,8 +305,7 @@ def run(run_date: str | None = None) -> None:
     _health_start = _time.time()
     logger.info(f"EOD reconciliation | date={run_date}")
 
-    with open(CONFIG_PATH) as f:
-        config = yaml.safe_load(f)
+    config = load_config()
 
     db_path = config["db_path"]
     trades_bucket = config["trades_bucket"]
