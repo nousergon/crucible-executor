@@ -24,4 +24,4 @@ requests~=2.32
 #   CI: .github/workflows/ci.yml wires a git URL insteadOf rewrite.
 #   EC2: ~/.netrc covers github.com with a PAT that has Contents:read
 #        on alpha-engine-lib (confirm via git ls-remote before deploy).
-alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.1.2
+alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.1.3

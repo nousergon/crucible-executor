@@ -43,7 +43,10 @@ _ATR_MAX_STALENESS_TRADING_DAYS = 1
 def _open_universe_library(signals_bucket: str):
     """Open the ArcticDB `universe` library for reads.
 
-    Single connection helper used by every read path in the executor.
+    Per-ticker OHLCV + features. Does NOT include SPY/VIX/sector ETFs —
+    those live in the `macro` library; use ``_open_macro_library`` for
+    those.
+
     Hard-fails on connection/library errors per feedback_no_silent_fails.
     """
     adb = _arcticdb  # already imported at module top for macOS allocator prime
@@ -54,6 +57,26 @@ def _open_universe_library(signals_bucket: str):
     )
     arctic = adb.Arctic(uri)
     return arctic.get_library("universe")
+
+
+def _open_macro_library(signals_bucket: str):
+    """Open the ArcticDB `macro` library for reads.
+
+    Market-wide time series: SPY, VIX, VIX3M, TNX, IRX, GLD, USO, and
+    the XL* sector ETFs. Written by alpha-engine-data's daily_append
+    and builders.backfill. SPY in particular is what the morning
+    freshness gate and EOD reconcile check.
+
+    Hard-fails on connection/library errors per feedback_no_silent_fails.
+    """
+    adb = _arcticdb
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    uri = (
+        f"s3s://s3.{region}.amazonaws.com:{signals_bucket}"
+        f"?path_prefix=arcticdb&aws_auth=true"
+    )
+    arctic = adb.Arctic(uri)
+    return arctic.get_library("macro")
 
 
 def load_price_histories(

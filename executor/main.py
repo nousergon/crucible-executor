@@ -985,26 +985,29 @@ def run(
                 logger.debug("Upstream failure Telegram notification failed", exc_info=True)
             raise RuntimeError(msg)
 
-        # Direct freshness check on the ArcticDB universe library. The
+        # Direct freshness check on the ArcticDB macro library. The
         # stamp-based check_upstream_health above covers predictor/research
         # "did it run"; this catches the "stamp green but data blob is
         # yesterday's" failure mode (partial writes, retries skipping
-        # DataPhase1). SPY is the canary — always present, written by the
-        # daily_closes collector. If SPY has no row dated run_date, the
-        # data pipeline did not complete for today and the executor must
-        # abort before any signals are read.
+        # DataPhase1). SPY is the canary — written by the daily_append
+        # post-close job to the macro library (NOT universe). If SPY has
+        # no row for the last closed trading day, the post-close pipeline
+        # did not complete and the executor must abort before any signals
+        # are read.
         try:
             import pandas as _pd
-            from executor.price_cache import _open_universe_library
-            _universe = _open_universe_library(signals_bucket)
-            _spy_df = _universe.read("SPY").data
-            _target = _pd.Timestamp(run_date).normalize()
+            from executor.price_cache import _open_macro_library
+            from alpha_engine_lib.trading_calendar import last_closed_trading_day
+            _macro = _open_macro_library(signals_bucket)
+            _spy_df = _macro.read("SPY").data
+            _expected_min = _pd.Timestamp(last_closed_trading_day()).normalize()
             _idx = _spy_df.index.normalize() if hasattr(_spy_df.index, "normalize") else _spy_df.index
-            if _spy_df.empty or (_idx == _target).sum() == 0:
+            if _spy_df.empty or (_idx >= _expected_min).sum() == 0:
                 _latest = _pd.Timestamp(_spy_df.index[-1]).date() if not _spy_df.empty else "EMPTY"
                 raise RuntimeError(
-                    f"ArcticDB universe has no SPY row for {run_date} "
-                    f"(latest: {_latest}). DataPhase1 did not complete."
+                    f"ArcticDB macro has no SPY row >= {_expected_min.date()} "
+                    f"(latest: {_latest}). Post-close daily-data job did not "
+                    f"complete for the last closed trading day."
                 )
         except Exception as _freshness_err:
             msg = f"ArcticDB freshness check FAILED — executor aborting: {_freshness_err}"

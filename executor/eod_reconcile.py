@@ -40,18 +40,23 @@ from executor.config_loader import CONFIG_PATH
 
 
 def _spy_close(run_date: str, config: dict | None = None) -> float:
-    """Fetch SPY close for run_date from ArcticDB universe library.
+    """Fetch SPY close for run_date from ArcticDB macro library.
+
+    SPY lives in the `macro` library (per alpha-engine-data's
+    daily_append writer), NOT the `universe` library. Reading from
+    universe was a bug: universe has only the per-ticker watchlist
+    symbols, no index ETFs.
 
     ArcticDB is the single source of truth — no parquet, polygon, or
     yfinance fallback. Hard-fails if SPY is missing, stale, or has no
     close for run_date, because EOD alpha is meaningless without a
     reliable SPY reference.
     """
-    from executor.price_cache import _open_universe_library
+    from executor.price_cache import _open_macro_library
     bucket = (config or {}).get("trades_bucket", "alpha-engine-research")
-    universe = _open_universe_library(bucket)
+    macro = _open_macro_library(bucket)
     try:
-        df = universe.read("SPY").data
+        df = macro.read("SPY").data
     except Exception as e:
         raise RuntimeError(f"ArcticDB read failed for SPY: {e}") from e
     if df.empty or "Close" not in df.columns:

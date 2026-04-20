@@ -69,7 +69,7 @@ def test_spy_close_reads_from_arcticdb():
         index=pd.to_datetime(["2026-03-26", "2026-03-27"]),
     )
     with patch(
-        "executor.price_cache._open_universe_library",
+        "executor.price_cache._open_macro_library",
         return_value=_mock_universe_with({"SPY": df}),
     ):
         result = _spy_close("2026-03-27")
@@ -79,7 +79,7 @@ def test_spy_close_reads_from_arcticdb():
 def test_spy_close_hard_fails_when_symbol_missing():
     """_spy_close raises when ArcticDB has no SPY symbol — no fallback."""
     with patch(
-        "executor.price_cache._open_universe_library",
+        "executor.price_cache._open_macro_library",
         return_value=_mock_universe_with({}),
     ):
         with pytest.raises(RuntimeError, match="ArcticDB read failed for SPY"):
@@ -95,7 +95,7 @@ def test_spy_close_hard_fails_when_date_missing():
         index=pd.to_datetime(["2026-03-26"]),
     )
     with patch(
-        "executor.price_cache._open_universe_library",
+        "executor.price_cache._open_macro_library",
         return_value=_mock_universe_with({"SPY": df}),
     ):
         with pytest.raises(RuntimeError, match="no SPY close for 2026-03-27"):
@@ -111,7 +111,7 @@ def test_spy_close_hard_fails_when_close_column_missing():
         index=pd.to_datetime(["2026-03-27"]),
     )
     with patch(
-        "executor.price_cache._open_universe_library",
+        "executor.price_cache._open_macro_library",
         return_value=_mock_universe_with({"SPY": df}),
     ):
         with pytest.raises(RuntimeError, match="empty or missing Close"):
