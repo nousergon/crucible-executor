@@ -737,7 +737,7 @@ def _write_order_book_summary(
 
     try:
         s3 = boto3.client("s3")
-        key = f"signals/{run_date}/order_book_summary.json"
+        key = f"order_books/{run_date}/summary.json"
         s3.put_object(
             Bucket=signals_bucket,
             Key=key,
