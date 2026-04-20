@@ -51,7 +51,13 @@ for repo in "${REPOS[@]}"; do
     log "Pulling $repo ..."
     cd "$repo"
     PREV_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
-    if git fetch origin >> "$LOG" 2>&1 && git reset --hard origin/main >> "$LOG" 2>&1; then
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [ "$CURRENT_BRANCH" != "main" ]; then
+        log "NOTE $repo — on branch '$CURRENT_BRANCH', will reset to origin/main (policy: boot always tracks main)"
+    fi
+    if git fetch origin >> "$LOG" 2>&1 \
+       && git checkout -f main >> "$LOG" 2>&1 \
+       && git reset --hard origin/main >> "$LOG" 2>&1; then
         NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
         log "OK   $repo — $(git log --oneline -1)"
 
@@ -122,24 +128,43 @@ else
     log "SKIP trades.db restore (no risk.yaml)"
 fi
 
-# Sync systemd service files from repo (if alpha-engine has them)
+# Sync systemd service files from repo (if alpha-engine has them).
+#
+# Installs NEW units as well as updating existing ones. Prior versions of
+# this block only touched units already in /etc/systemd/system/, which
+# silently skipped newly-added repo units (e.g. alpha-engine-daily-data.timer
+# added in PR #62 sat on disk for days before this was noticed). After a
+# new .timer is copied and daemon-reload'd, it's enabled + started so the
+# next boot picks it up and the current boot activates it immediately.
 SYSTEMD_SRC="/home/ec2-user/alpha-engine/infrastructure/systemd"
 if [ -d "$SYSTEMD_SRC" ]; then
     CHANGED=false
+    NEW_TIMERS=()
     for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         [ -f "$unit" ] || continue
         name=$(basename "$unit")
-        if [ -f "/etc/systemd/system/$name" ]; then
-            if ! diff -q "$unit" "/etc/systemd/system/$name" >/dev/null 2>&1; then
-                sudo cp "$unit" /etc/systemd/system/
-                log "OK   systemd: updated $name"
-                CHANGED=true
-            fi
+        target="/etc/systemd/system/$name"
+        if [ ! -f "$target" ]; then
+            sudo cp "$unit" /etc/systemd/system/
+            log "OK   systemd: installed $name (new)"
+            CHANGED=true
+            [[ "$name" == *.timer ]] && NEW_TIMERS+=("$name")
+        elif ! diff -q "$unit" "$target" >/dev/null 2>&1; then
+            sudo cp "$unit" /etc/systemd/system/
+            log "OK   systemd: updated $name"
+            CHANGED=true
         fi
     done
     if $CHANGED; then
         sudo systemctl daemon-reload
         log "OK   systemd: daemon-reload"
+        for timer in "${NEW_TIMERS[@]}"; do
+            if sudo systemctl enable --now "$timer" >> "$LOG" 2>&1; then
+                log "OK   systemd: enabled + started $timer"
+            else
+                log "WARN systemd: failed to enable $timer"
+            fi
+        done
     fi
 fi
 
