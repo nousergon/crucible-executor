@@ -248,6 +248,14 @@ def _read_signals(
                 conn.close()
             raise
 
+    # Defense-in-depth universe filter — drop buy_candidates whose tickers
+    # aren't in the ArcticDB universe library. Research's population_selector
+    # (alpha-engine-research#41) is the primary guardrail; this catches
+    # anything that slipped past (manual edits, Research bug, universe-drift
+    # window). See filter_buy_candidates_to_universe for scope + rationale.
+    from executor.signal_reader import filter_buy_candidates_to_universe
+    signals_raw = filter_buy_candidates_to_universe(signals_raw, signals_bucket)
+
     signals = get_actionable_signals(signals_raw)
 
     # Alert if signals are stale (research didn't run recently)
