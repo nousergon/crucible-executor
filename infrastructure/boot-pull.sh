@@ -139,7 +139,6 @@ fi
 SYSTEMD_SRC="/home/ec2-user/alpha-engine/infrastructure/systemd"
 if [ -d "$SYSTEMD_SRC" ]; then
     CHANGED=false
-    NEW_TIMERS=()
     for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         [ -f "$unit" ] || continue
         name=$(basename "$unit")
@@ -148,7 +147,6 @@ if [ -d "$SYSTEMD_SRC" ]; then
             sudo cp "$unit" /etc/systemd/system/
             log "OK   systemd: installed $name (new)"
             CHANGED=true
-            [[ "$name" == *.timer ]] && NEW_TIMERS+=("$name")
         elif ! diff -q "$unit" "$target" >/dev/null 2>&1; then
             sudo cp "$unit" /etc/systemd/system/
             log "OK   systemd: updated $name"
@@ -158,14 +156,40 @@ if [ -d "$SYSTEMD_SRC" ]; then
     if $CHANGED; then
         sudo systemctl daemon-reload
         log "OK   systemd: daemon-reload"
-        for timer in "${NEW_TIMERS[@]}"; do
-            if sudo systemctl enable --now "$timer" >> "$LOG" 2>&1; then
-                log "OK   systemd: enabled + started $timer"
-            else
-                log "WARN systemd: failed to enable $timer"
-            fi
-        done
     fi
+
+    # Reconcile timer enable state. Every timer shipped in the repo
+    # MUST be enabled. `systemctl enable` is idempotent on already-
+    # enabled timers, and recreates the `timers.target.wants/` symlink
+    # on any timer that was disabled or whose symlink was lost. Fixes
+    # three failure modes the prior new-install-only enable path could
+    # not recover from:
+    #
+    # 1. Manual `systemctl disable` (intentional debugging, accidental).
+    # 2. EBS volume state where unit files exist on disk but
+    #    `timers.target.wants/` is empty.
+    # 3. New timers added to `infrastructure/systemd/` after the
+    #    one-shot `setup-trading-ec2.sh` run already completed — they
+    #    get `cp`'d by boot-pull but the previous "enable only on first
+    #    install" branch missed them because the target file already
+    #    existed.
+    #
+    # 2026-04-21 SNDK EOD incident: `alpha-engine-eod.timer` was
+    # disabled for an unknown reason. boot-pull's previous logic only
+    # enabled timers inside the `[ ! -f "$target" ]` branch, so the
+    # disabled state persisted for two boots. EOD emails silently
+    # stopped firing until manual SSM intervention re-enabled the
+    # timer. This reconciliation pass makes every boot self-healing
+    # for timer-enable drift.
+    for unit in "$SYSTEMD_SRC"/*.timer; do
+        [ -f "$unit" ] || continue
+        name=$(basename "$unit")
+        if sudo systemctl enable --now "$name" >> "$LOG" 2>&1; then
+            log "OK   systemd: enable reconciled $name"
+        else
+            log "WARN systemd: enable reconcile failed: $name"
+        fi
+    done
 fi
 
 # Config files are now in the alpha-engine-config private repo (pulled above).
