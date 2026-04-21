@@ -149,6 +149,82 @@ def _warn_if_stale(signals_date: str | None, run_date: str | None) -> None:
         )
 
 
+def filter_buy_candidates_to_universe(
+    signals: dict,
+    signals_bucket: str,
+) -> dict:
+    """Drop buy_candidates whose tickers aren't in the ArcticDB universe library.
+
+    Defense-in-depth layer. Research's ``population_selector.
+    compute_exits_and_open_slots`` (alpha-engine-research#41) is the
+    primary universe guardrail — it drops non-S&P incumbents at the
+    exit-evaluator stage. This function is the caller-side net: if a
+    ticker somehow sneaks past (manual signals.json edit, a Research
+    bug, a universe-drift window where DataPhase1 hasn't repopulated
+    the ArcticDB library yet), dropping here prevents sizing positions
+    against data that doesn't exist.
+
+    Scope: ``buy_candidates`` only. The ``universe`` list (EXIT/REDUCE/
+    HOLD for existing holdings) is left unfiltered — if we somehow
+    hold a position outside the universe we still need to exit it,
+    and per-ticker ArcticDB reads for ATR/VWAP on those will surface
+    as clear named errors downstream if they fail.
+
+    If the ArcticDB read itself fails (library unreachable, IAM miss),
+    the filter is skipped with a WARNING — better to let the
+    executor's own ArcticDB reads surface that as their own, clearer
+    error than to block on a defense-in-depth layer.
+
+    Origin: 2026-04-20 — TSM + ASML persisted as population incumbents
+    despite being absent from constituents.json; manifested as
+    ``NoSuchVersionException`` deep in executor-sim replay.
+    """
+    buy = signals.get("buy_candidates") or []
+    if not buy:
+        return signals
+
+    try:
+        # Local import — avoids top-level circular (price_cache imports
+        # executor.market_hours which touches signal_reader indirectly).
+        from executor.price_cache import _open_universe_library
+        universe_lib = _open_universe_library(signals_bucket)
+        universe_symbols = set(universe_lib.list_symbols())
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        logger.warning(
+            "Skipping buy-candidate universe filter — could not open ArcticDB "
+            "universe library: %s. Executor's direct ArcticDB reads will surface "
+            "any data issues as their own named errors downstream.",
+            exc,
+        )
+        return signals
+
+    allowed: list[dict] = []
+    dropped: list[str] = []
+    for entry in buy:
+        ticker = entry.get("ticker") if isinstance(entry, dict) else None
+        if ticker and ticker in universe_symbols:
+            allowed.append(entry)
+        elif ticker:
+            dropped.append(ticker)
+
+    if dropped:
+        logger.warning(
+            "[signal_reader] dropped %d buy_candidate(s) not in ArcticDB "
+            "universe: %s. Research's population_selector (alpha-engine-"
+            "research#41) should have caught these — the fact that they "
+            "reached here means one of: (a) Research bug, (b) manual edit "
+            "to signals.json, (c) universe-library drift window. Not hard-"
+            "failing because the remaining %d buy_candidate(s) are valid.",
+            len(dropped),
+            dropped,
+            len(allowed),
+        )
+        signals = dict(signals)  # shallow copy to avoid mutating caller's dict
+        signals["buy_candidates"] = allowed
+
+    return signals
+
+
 class UnscoredBuyCandidatesError(RuntimeError):
     """Raised when signals.json has buy_candidates that are missing from
     predictions.json — the GBM veto gate is structurally unreachable for
