@@ -460,13 +460,6 @@ def run_daemon(dry_run: bool = False) -> None:
     trades_executed = 0
     executed_tickers: set = set()  # tracks tickers already traded today
 
-    # Track whether we reached the live trading window so the finally block
-    # can decide whether it's safe to fire the EOD pipeline. Pre-market exits
-    # (shutdown signal, early crash, etc.) must NOT trigger EOD — market-close
-    # side-effects like stopping the trading EC2 instance would then run
-    # before the market ever opened.
-    market_opened = False
-
     try:
         # ── Wait for market open (daemon may start before 9:30 AM ET) ────
         if not is_market_hours():
@@ -476,11 +469,6 @@ def run_daemon(dry_run: bool = False) -> None:
             if _shutdown_requested:
                 return
             logger.info("Market is open — proceeding")
-
-        # Guard: Phase 0 urgent exits + live IB order placement must only run
-        # once the market is actually open. Reaching this line means the
-        # wait-for-open loop above exited on is_market_hours() == True.
-        market_opened = True
 
         # ── Phase 0: Execute urgent exits/covers immediately (no trigger delay) ──
         # Fetch current positions once for short-sell prevention checks
@@ -795,51 +783,6 @@ def run_daemon(dry_run: bool = False) -> None:
             f"Trades executed: {trades_executed}"
         )
         logger.info("Daemon shutdown complete | trades=%d", trades_executed)
-
-        # Trigger EOD pipeline Step Function only when two conditions hold
-        # at exit time:
-        #   1. market_opened: the daemon actually entered the live trading
-        #      window. Pre-market exits (crash, signal) must not fire EOD.
-        #   2. not is_market_hours(): the market is closed RIGHT NOW. This
-        #      makes SIGTERM-driven mid-session restarts (systemctl restart,
-        #      maintenance) safe — the daemon exits, market is still open,
-        #      no EOD fires, instance stays up.
-        # Checking state at exit (instead of tracking an exit-reason flag)
-        # handles the race where the market closes between the last loop
-        # iteration and the finally block.
-        if not dry_run and market_opened and not is_market_hours():
-            _trigger_eod_pipeline(config, run_date)
-        elif not dry_run:
-            logger.warning(
-                "Skipping EOD pipeline trigger: market_opened=%s market_open_now=%s",
-                market_opened, is_market_hours(),
-            )
-
-
-def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
-    """Start the EOD Step Function pipeline after daemon shutdown."""
-    try:
-        import boto3 as _b3_sf
-        sfn = _b3_sf.client("stepfunctions", region_name="us-east-1")
-        state_machine_arn = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
-        micro_instance_id = "i-09b539c844515d549"
-        trading_instance_id = "i-018eb3307a21329bf"
-        sns_topic_arn = config.get("sns_topic_arn", "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts")
-        import json as _json_sf
-        sfn.start_execution(
-            stateMachineArn=state_machine_arn,
-            name=f"eod-{run_date}-{int(__import__('time').time())}",
-            input=_json_sf.dumps({
-                "ec2_instance_id": [micro_instance_id],
-                "trading_instance_id": [trading_instance_id],
-                "sns_topic_arn": sns_topic_arn,
-                "run_date": run_date,
-                "triggered_by": "daemon_shutdown",
-            }),
-        )
-        logger.info("EOD pipeline triggered: %s", state_machine_arn)
-    except Exception as exc:
-        logger.warning("Failed to trigger EOD pipeline (non-fatal): %s", exc)
 
 
 def _execute_exit(
