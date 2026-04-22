@@ -164,11 +164,18 @@ def _validate_sell_shares(
     shares: int,
     action: str,
     context: str,
+    pending_sell_shares: int = 0,
 ) -> int | None:
-    """Validate and cap sell shares against held position.
+    """Validate and cap sell shares against held position minus in-flight sells.
 
     Returns adjusted share count, or None if the sell should be skipped
-    (no position held — selling would go short).
+    (no capacity to sell — selling would go short).
+
+    ``pending_sell_shares`` is the total un-filled SELL quantity already working
+    at the broker for this ticker. Passing it in lets us cap against
+    held - in-flight so a retry/duplicate can't cumulatively blow past the
+    position. (PFE incident 2026-04-22: three duplicate SELL 77s each passed
+    this check individually against held=155, summing to 231 → short 76.)
 
     When ``_allow_shorts`` is True (set via ``allow_shorts: true`` in
     risk.yaml), the guard is bypassed and sells are allowed to create
@@ -177,18 +184,19 @@ def _validate_sell_shares(
     if _allow_shorts:
         return shares
     held = int(positions.get(ticker, {}).get("shares", 0))
-    if held <= 0:
+    available = held - int(pending_sell_shares)
+    if available <= 0:
         logger.warning(
-            "SKIP %s %s %s: hold %d shares — selling would go short",
-            context, action, ticker, held,
+            "SKIP %s %s %s: hold %d shares, in-flight SELL %d — no capacity",
+            context, action, ticker, held, pending_sell_shares,
         )
         return None
-    if shares > held:
+    if shares > available:
         logger.warning(
-            "CAPPING %s %s %s: requested %d but hold %d — capping to avoid short",
-            context, action, ticker, shares, held,
+            "CAPPING %s %s %s: requested %d but available %d (held %d minus in-flight SELL %d)",
+            context, action, ticker, shares, available, held, pending_sell_shares,
         )
-        return held
+        return available
     return shares
 
 
@@ -204,10 +212,27 @@ def _place_order_with_retry(
     """Place a market order with retry on Rejected/Timeout.
 
     Returns the order result dict. Logs retries and final failure.
+
+    Retry rules:
+      * Rejected → real failure (Cancelled/Inactive/ApiCancelled). Retry.
+      * Timeout  → no answer from IB Gateway at all. Cancel prior orderId
+                   (best-effort) to prevent a stale duplicate, then retry.
+      * Working  → IB accepted the order and is holding it (PreSubmitted at
+                   pre-open, Submitted routing, etc.). Do NOT retry — it will
+                   fill when the hold releases. Retrying duplicates the order
+                   (PFE incident 2026-04-22).
+      * Filled / PartialFill → done.
     """
     order_result = None
     for attempt in range(MAX_ORDER_RETRIES):
         if attempt > 0:
+            prior_id = order_result.get("ib_order_id") if order_result else None
+            prior_status = order_result.get("status") if order_result else None
+            if prior_status == "Timeout" and prior_id is not None:
+                try:
+                    ibkr.cancel_order(prior_id)
+                except Exception as exc:
+                    logger.warning("cancel_order(%s) raised: %s", prior_id, exc)
             _time.sleep(ORDER_RETRY_DELAYS[attempt])
             logger.info("Retry %d/%d: %s %s", attempt + 1, MAX_ORDER_RETRIES, label, ticker)
         if use_bracket and bracket_kwargs:
@@ -218,6 +243,48 @@ def _place_order_with_retry(
         if order_result["status"] not in ("Rejected", "Timeout"):
             break
     return order_result
+
+
+def _enqueue_cover_for_unintended_shorts(
+    positions: dict,
+    order_book: "OrderBook",
+    run_date: str,
+) -> list[str]:
+    """Scan IB positions; enqueue an URGENT COVER for any short.
+
+    Runs at the top of Phase 0 when ``allow_shorts=False`` (the default).
+    Any negative position is treated as unintended — we did not knowingly
+    open it — and must be flattened immediately at market open.
+
+    Mirror of urgent_exit: emits a COVER urgent into the order book so the
+    existing Phase 0 BUY path executes it. Dedupe is handled by
+    ``OrderBook.add_urgent_exit`` (ticker+signal), so calling this twice in
+    a session is safe.
+
+    Returns the list of tickers that had an auto-cover enqueued.
+    """
+    if _allow_shorts:
+        return []
+    covered = []
+    for ticker, pos in positions.items():
+        shares = int(pos.get("shares", 0))
+        if shares >= 0:
+            continue
+        qty = abs(shares)
+        logger.error(
+            "AUTO-COVER %s: detected short position %d — enqueuing URGENT COVER %d",
+            ticker, shares, qty,
+        )
+        order_book.add_urgent_exit({
+            "ticker": ticker,
+            "signal": "COVER",
+            "shares": qty,
+            "reason": "auto_cover_unintended_short",
+            "detail": f"position={shares} at Phase 0 open; allow_shorts=False",
+            "date": run_date,
+        })
+        covered.append(ticker)
+    return covered
 
 
 def load_config() -> dict:
@@ -419,6 +486,22 @@ def run_daemon(dry_run: bool = False) -> None:
         # Fetch current positions once for short-sell prevention checks
         _phase0_positions = ibkr.get_positions() if not dry_run else {}
 
+        # Auto-cover: any short position at Phase 0 open is unintended
+        # (allow_shorts=False is the configured invariant). Enqueue URGENT
+        # COVERs into the order book before the normal loop so the existing
+        # BUY path flattens them. Covers the residue from bugs like the PFE
+        # retry-duplicate incident 2026-04-22.
+        if not dry_run:
+            auto_covered = _enqueue_cover_for_unintended_shorts(
+                _phase0_positions, order_book, run_date,
+            )
+            if auto_covered:
+                send_daemon_status(
+                    f"⚠️ *AUTO-COVER enqueued for unintended shorts*\n"
+                    f"Tickers: {', '.join(auto_covered)}"
+                )
+                order_book.save()
+
         for urgent in order_book.pending_urgent_exits():
             ticker = urgent["ticker"]
             action = urgent["signal"]  # "EXIT", "REDUCE", or "COVER"
@@ -430,8 +513,20 @@ def run_daemon(dry_run: bool = False) -> None:
                 side = "BUY"
             else:
                 side = "SELL"
-                # Short-sell prevention: cap sell shares at current held position
-                validated = _validate_sell_shares(_phase0_positions, ticker, shares, action, "URGENT")
+                # Short-sell prevention: cap sell shares at held minus in-flight.
+                # In-flight check defends against the PFE incident 2026-04-22
+                # where a retry loop issued three duplicate SELL 77s that each
+                # individually passed held=155, summing to 231 → short 76.
+                pending = 0
+                if not dry_run:
+                    try:
+                        pending = ibkr.get_open_sell_shares(ticker)
+                    except Exception as exc:
+                        logger.warning("get_open_sell_shares(%s) failed: %s — treating as 0", ticker, exc)
+                validated = _validate_sell_shares(
+                    _phase0_positions, ticker, shares, action, "URGENT",
+                    pending_sell_shares=pending,
+                )
                 if validated is None:
                     order_book.mark_urgent_executed(ticker, action)
                     continue
@@ -764,10 +859,18 @@ def _execute_exit(
     sell_action = "SELL"
     current_price = price_state.get("last", 0)
 
-    # Short-sell prevention: verify we hold enough shares before selling
+    # Short-sell prevention: verify we hold enough shares net of in-flight sells.
     if not dry_run:
         positions = ibkr.get_positions()
-        validated = _validate_sell_shares(positions, ticker, shares, action, "intraday")
+        pending = 0
+        try:
+            pending = ibkr.get_open_sell_shares(ticker)
+        except Exception as exc:
+            logger.warning("get_open_sell_shares(%s) failed: %s — treating as 0", ticker, exc)
+        validated = _validate_sell_shares(
+            positions, ticker, shares, action, "intraday",
+            pending_sell_shares=pending,
+        )
         if validated is None:
             order_book.remove_stop(ticker)
             order_book.save()

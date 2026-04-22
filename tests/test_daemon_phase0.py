@@ -5,10 +5,12 @@ from unittest.mock import MagicMock, patch
 from executor.daemon import (
     _validate_sell_shares,
     _cleanup_connections,
+    _enqueue_cover_for_unintended_shorts,
     _place_order_with_retry,
     MAX_ORDER_RETRIES,
     ORDER_RETRY_DELAYS,
 )
+from executor.order_book import OrderBook, _default_book
 
 
 # ── _validate_sell_shares ────────────────────────────────────────────────────
@@ -34,6 +36,71 @@ class TestValidateSellShares:
         positions = {"AAPL": {"shares": -5}}
         result = _validate_sell_shares(positions, "AAPL", 10, "SELL", "exit")
         assert result is None
+
+    def test_caps_against_in_flight_pending_sells(self):
+        # PFE incident 2026-04-22: retry loop issued three duplicate SELL 77s
+        # that each individually passed held=155, summing to 231 → short 76.
+        # With in-flight tracking, the second + third retries see the first
+        # order's 77 remaining and refuse.
+        positions = {"PFE": {"shares": 155}}
+        result = _validate_sell_shares(
+            positions, "PFE", 77, "REDUCE", "URGENT",
+            pending_sell_shares=77,
+        )
+        assert result == 77  # 155 - 77 = 78 available; requested 77 fits
+        result = _validate_sell_shares(
+            positions, "PFE", 77, "REDUCE", "URGENT",
+            pending_sell_shares=154,
+        )
+        assert result == 1  # 155 - 154 = 1 available; cap to 1
+        result = _validate_sell_shares(
+            positions, "PFE", 77, "REDUCE", "URGENT",
+            pending_sell_shares=155,
+        )
+        assert result is None  # no capacity — refuse
+
+
+# ── _enqueue_cover_for_unintended_shorts ─────────────────────────────────────
+
+
+class TestEnqueueCoverForUnintendedShorts:
+    def _fresh_book(self, tmp_path):
+        return OrderBook(_default_book("2026-04-22"), path=tmp_path / "ob.json")
+
+    def test_enqueues_cover_for_negative_position(self, tmp_path):
+        book = self._fresh_book(tmp_path)
+        positions = {"PFE": {"shares": -76}, "AAPL": {"shares": 100}}
+        covered = _enqueue_cover_for_unintended_shorts(positions, book, "2026-04-22")
+        assert covered == ["PFE"]
+        pending = book.pending_urgent_exits()
+        assert len(pending) == 1
+        assert pending[0]["ticker"] == "PFE"
+        assert pending[0]["signal"] == "COVER"
+        assert pending[0]["shares"] == 76
+        assert pending[0]["reason"] == "auto_cover_unintended_short"
+
+    def test_skips_long_and_flat_positions(self, tmp_path):
+        book = self._fresh_book(tmp_path)
+        positions = {"AAPL": {"shares": 100}, "MSFT": {"shares": 0}}
+        covered = _enqueue_cover_for_unintended_shorts(positions, book, "2026-04-22")
+        assert covered == []
+        assert book.pending_urgent_exits() == []
+
+    def test_bypasses_when_allow_shorts_true(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("executor.daemon._allow_shorts", True)
+        book = self._fresh_book(tmp_path)
+        positions = {"PFE": {"shares": -76}}
+        covered = _enqueue_cover_for_unintended_shorts(positions, book, "2026-04-22")
+        assert covered == []
+        assert book.pending_urgent_exits() == []
+
+    def test_dedup_safe_on_repeat_call(self, tmp_path):
+        book = self._fresh_book(tmp_path)
+        positions = {"PFE": {"shares": -76}}
+        _enqueue_cover_for_unintended_shorts(positions, book, "2026-04-22")
+        _enqueue_cover_for_unintended_shorts(positions, book, "2026-04-22")
+        # OrderBook.add_urgent_exit dedupes by ticker+signal
+        assert len(book.pending_urgent_exits()) == 1
 
 
 # ── _place_order_with_retry ──────────────────────────────────────────────────
@@ -96,6 +163,58 @@ class TestPlaceOrderWithRetry:
         assert mock_sleep.call_count == MAX_ORDER_RETRIES - 1
         for i in range(1, MAX_ORDER_RETRIES):
             mock_sleep.assert_any_call(ORDER_RETRY_DELAYS[i])
+
+    @patch("executor.daemon._time.sleep")
+    def test_working_status_does_not_retry(self, mock_sleep):
+        # PreSubmitted/Submitted → "Working" from place_market_order. The
+        # order is live at the broker; retrying would duplicate it (PFE
+        # incident 2026-04-22).
+        ibkr = MagicMock()
+        ibkr.place_market_order.return_value = {"status": "Working", "ib_order_id": 287}
+        result = _place_order_with_retry(ibkr, "PFE", "SELL", 77, "urgent")
+        assert result["status"] == "Working"
+        assert ibkr.place_market_order.call_count == 1
+        ibkr.cancel_order.assert_not_called()
+        mock_sleep.assert_not_called()
+
+    @patch("executor.daemon._time.sleep")
+    def test_timeout_cancels_prior_order_before_retry(self, mock_sleep):
+        ibkr = MagicMock()
+        ibkr.place_market_order.side_effect = [
+            {"status": "Timeout", "ib_order_id": 287},
+            {"status": "Filled", "ib_order_id": 289},
+        ]
+        result = _place_order_with_retry(ibkr, "PFE", "SELL", 77, "urgent")
+        assert result["status"] == "Filled"
+        assert ibkr.place_market_order.call_count == 2
+        ibkr.cancel_order.assert_called_once_with(287)
+
+    @patch("executor.daemon._time.sleep")
+    def test_rejected_does_not_cancel(self, mock_sleep):
+        # Rejected means IB already terminated the order (Cancelled / Inactive
+        # / ApiCancelled); cancelling again is a no-op. Skip the call to keep
+        # retry fast and avoid log noise.
+        ibkr = MagicMock()
+        ibkr.place_market_order.side_effect = [
+            {"status": "Rejected", "ib_order_id": 287},
+            {"status": "Filled", "ib_order_id": 289},
+        ]
+        _place_order_with_retry(ibkr, "AAPL", "SELL", 10, "urgent")
+        ibkr.cancel_order.assert_not_called()
+
+    @patch("executor.daemon._time.sleep")
+    def test_cancel_order_failure_does_not_abort_retry(self, mock_sleep):
+        # If cancel_order raises, we still want to proceed with the retry —
+        # the prior order may have already terminated at IB side.
+        ibkr = MagicMock()
+        ibkr.cancel_order.side_effect = RuntimeError("ib unreachable")
+        ibkr.place_market_order.side_effect = [
+            {"status": "Timeout", "ib_order_id": 287},
+            {"status": "Filled", "ib_order_id": 289},
+        ]
+        result = _place_order_with_retry(ibkr, "PFE", "SELL", 77, "urgent")
+        assert result["status"] == "Filled"
+        assert ibkr.place_market_order.call_count == 2
 
 
 # ── _cleanup_connections ─────────────────────────────────────────────────────

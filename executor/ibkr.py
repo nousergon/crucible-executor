@@ -209,6 +209,11 @@ class IBKRClient:
 
         # Poll for fill confirmation
         terminal_states = {"Filled", "Cancelled", "Inactive", "ApiCancelled"}
+        # PreSubmitted = IBKR accepted the order but is holding it (pre-open,
+        # outside-RTH with outsideRth=False, regulatory hold). Orders in this
+        # state WILL fill when the hold releases (e.g. market open), so the
+        # retry layer must not re-place; treat as "Working".
+        working_states = {"PendingSubmit", "PreSubmitted", "Submitted"}
         elapsed = 0.0
         poll_interval = 0.5
         while elapsed < timeout_seconds:
@@ -237,6 +242,8 @@ class IBKRClient:
             result_status = "Rejected"
         elif filled_shares and filled_shares < shares:
             result_status = "PartialFill"
+        elif status in working_states:
+            result_status = "Working"
         elif status not in terminal_states:
             result_status = "Timeout"
         else:
@@ -244,8 +251,8 @@ class IBKRClient:
 
         logger.info(
             f"Order {result_status}: {action} {shares} {ticker} "
-            f"| orderId={trade.order.orderId} fill_price={fill_price} "
-            f"filled_shares={filled_shares}"
+            f"| orderId={trade.order.orderId} ibStatus={status} "
+            f"fill_price={fill_price} filled_shares={filled_shares}"
         )
         return {
             "ib_order_id": trade.order.orderId,
@@ -329,10 +336,48 @@ class IBKRClient:
         self.ib.sleep(2)  # Allow cancellations to propagate
         logger.info("Global cancel sent — all open orders cancelled")
 
+    def cancel_order(self, ib_order_id: int) -> bool:
+        """Cancel a single open order by its IB orderId. Best-effort.
+
+        Returns True if we found the trade and issued cancelOrder, False if
+        the orderId was not among openTrades. Safe to call on already-terminal
+        orders (IBKR simply ignores unknown/done IDs).
+        """
+        if ib_order_id is None:
+            return False
+        self.ensure_connected()
+        for trade in self.ib.openTrades():
+            if trade.order.orderId == ib_order_id:
+                self.ib.cancelOrder(trade.order)
+                logger.info("Cancel requested for orderId=%s", ib_order_id)
+                return True
+        logger.debug("cancel_order: orderId=%s not in openTrades", ib_order_id)
+        return False
+
     def get_open_orders(self) -> list:
         """Return list of open orders."""
         self.ensure_connected()
         return self.ib.openOrders()
+
+    def get_open_sell_shares(self, ticker: str) -> int:
+        """Return total un-filled SELL shares currently working at IB for ticker.
+
+        Used by the short-sell guardrail so a new SELL can be capped against
+        already-in-flight sells in addition to current position. Scans
+        ``openTrades()`` for SELL orders matching ticker and sums
+        ``totalQuantity - filled``.
+        """
+        self.ensure_connected()
+        pending = 0
+        for trade in self.ib.openTrades():
+            if trade.contract.symbol != ticker:
+                continue
+            if trade.order.action != "SELL":
+                continue
+            remaining = int(trade.order.totalQuantity) - int(trade.orderStatus.filled or 0)
+            if remaining > 0:
+                pending += remaining
+        return pending
 
     def disconnect(self):
         self.ib.disconnect()
