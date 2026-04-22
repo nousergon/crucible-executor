@@ -43,7 +43,12 @@ from executor.risk_guard import check_order, compute_drawdown_multiplier
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
 from executor.strategies.config import load_strategy_config
 from executor.strategies.exit_manager import evaluate_exits, SECTOR_ETF_MAP
-from executor.price_cache import load_atr_14_pct, load_daily_vwap, load_price_histories
+from executor.price_cache import (
+    load_atr_14_pct,
+    load_daily_vwap,
+    load_feature_coverage,
+    load_price_histories,
+)
 from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade, log_shadow_book_block
 
 from alpha_engine_lib.logging import setup_logging
@@ -256,6 +261,35 @@ def _read_signals(
     from executor.signal_reader import filter_buy_candidates_to_universe
     signals_raw = filter_buy_candidates_to_universe(signals_raw, signals_bucket)
 
+    # Admission gate — refuse buy_candidates below hard coverage floor
+    # (default 0.30). Companion to the position sizer's coverage derate:
+    # the derate handles partial-coverage tickers gracefully, this gate
+    # refuses tickers whose coverage is so low that no amount of derating
+    # produces a trustworthy signal (pure pre-history IPOs, OHLCV-only
+    # symbols, etc.). Held positions exempt — admission applies to ENTRY
+    # only, not to unwinding existing exposure. Skipped in simulate mode
+    # to preserve backtester replay parity against historical signals.
+    if not simulate and config.get("coverage_admission_enabled", True):
+        from executor.signal_reader import filter_buy_candidates_by_coverage
+        from executor.price_cache import load_feature_coverage
+
+        buy_tickers = [
+            e.get("ticker") for e in (signals_raw.get("buy_candidates") or [])
+            if isinstance(e, dict) and e.get("ticker")
+        ]
+        if buy_tickers:
+            min_cov = float(config.get("min_coverage_for_admission", 0.30))
+            try:
+                cov_map = load_feature_coverage(buy_tickers, signals_bucket)
+                signals_raw = filter_buy_candidates_by_coverage(
+                    signals_raw, cov_map, min_coverage=min_cov,
+                )
+            except RuntimeError as exc:
+                # ArcticDB unreachable — same posture as other preflight
+                # reads: hard-fail, don't silently admit everything.
+                logger.error("Admission gate failed on ArcticDB read: %s", exc)
+                raise
+
     signals = get_actionable_signals(signals_raw)
 
     # Alert if signals are stale (research didn't run recently)
@@ -322,6 +356,7 @@ def _plan_entries(
     signal_age_days: int,
     earnings_by_ticker: dict,
     vwap_map: dict,
+    coverage_map: dict,
     ob: OrderBook,
     run_date: str,
     dry_run: bool,
@@ -411,6 +446,7 @@ def _plan_entries(
             p_up=pred_data.get("p_up"),
             signal_age_days=signal_age_days,
             days_to_earnings=earnings_by_ticker.get(ticker),
+            feature_coverage=coverage_map.get(ticker),
         )
 
         if sizing["shares"] == 0:
@@ -1133,6 +1169,23 @@ def run(
         vwap_tickers = sorted({s["ticker"] for s in signals.get("enter", [])})
         vwap_map = load_daily_vwap(vwap_tickers, signals_bucket, run_date) if vwap_tickers else {}
 
+        # Feature-coverage map per ENTER ticker. Drives the sizer's
+        # coverage derate (coverage_sizing_enabled in risk.yaml):
+        # short-history tickers whose long-window features are NaN get
+        # sized proportional to the fraction of populated features.
+        # Admission gate in _read_signals already rejected tickers below
+        # the hard floor; everything reaching here should have coverage
+        # ≥ min_coverage_for_admission. Scoped to enter_tickers only —
+        # held positions aren't sized via this path.
+        enter_tickers = [s["ticker"] for s in signals.get("enter", [])]
+        if enter_tickers and config.get("coverage_sizing_enabled", True):
+            coverage_map = load_feature_coverage(
+                tickers=enter_tickers,
+                signals_bucket=signals_bucket,
+            )
+        else:
+            coverage_map = {}
+
         # Single source of truth for ATR across the executor. Replaces per-call-site
         # _compute_atr(ticker_hist) invocations (position sizing, pullback-trigger
         # scaling, trailing stops) with the predictor's feature-store atr_14_pct,
@@ -1277,6 +1330,7 @@ def run(
             signal_age_days=signal_age_days,
             earnings_by_ticker=earnings_by_ticker,
             vwap_map=vwap_map,
+            coverage_map=coverage_map,
             ob=ob,
             run_date=run_date,
             dry_run=dry_run,

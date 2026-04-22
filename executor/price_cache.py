@@ -275,6 +275,126 @@ def load_atr_14_pct(
     return atr_map
 
 
+# Columns that are NOT considered "features" when computing coverage.
+# OHLCV + VWAP are raw market data (always populated post-ingest); feature
+# columns are the engineered signals (atr_14_pct, rsi_14, momentum_60d,
+# dist_from_52w_high, etc.) that may be NaN for short-history tickers.
+_COVERAGE_OHLCV_COLS = frozenset({
+    "Open", "High", "Low", "Close", "Adj_Close", "Volume", "VWAP",
+})
+
+
+def load_feature_coverage(
+    tickers: list[str],
+    signals_bucket: str,
+) -> dict[str, float]:
+    """Fraction of non-NaN feature columns in the most-recent ArcticDB
+    universe row for each ticker.
+
+    Coverage is defined as::
+
+        coverage = non_nan_feature_cols / total_feature_cols
+
+    where "feature cols" means every column EXCEPT the OHLCV+VWAP raw
+    market data. A full-history ticker (AAPL with 10y of data) returns
+    ~1.0. A short-history ticker (SNDK post-2025 spinoff with ~290 bars)
+    returns < 1.0 because 252-day features (``dist_from_52w_high``,
+    ``return_252d``, ``momentum_252d``) stay NaN on every row until the
+    252-row warmup is filled.
+
+    Used by:
+      - Position sizer — derate ``shares`` by coverage so a 70%-covered
+        ticker is sized 70% of a full-coverage ticker. Aligns position
+        size with information completeness (post-PR #78).
+      - Admission gate — refuse buy_candidates below a hard floor
+        (``min_coverage_for_admission``, e.g. 0.30). Pure pre-history
+        IPOs get rejected; partially-scoreable tickers get admitted
+        with a derate.
+
+    Failure semantics (intentionally tolerant — coverage is advisory):
+      - Missing ticker from universe library → 0.0 coverage logged,
+        downstream admission gate will reject.
+      - ArcticDB library unreachable → RuntimeError (same as
+        ``load_atr_14_pct`` — infrastructure problem, not data gap).
+      - Ticker frame with zero feature columns (shouldn't happen post
+        PR #78 migration) → 0.0 coverage, logged as WARNING.
+
+    Args:
+        tickers: Tickers to resolve coverage for.
+        signals_bucket: S3 bucket hosting the ArcticDB store.
+
+    Returns:
+        ``{ticker: coverage}`` for every requested ticker. Tickers that
+        failed the per-ticker read are present with value 0.0 so callers
+        never silently lose a ticker.
+    """
+    if not tickers:
+        return {}
+
+    universe = _open_universe_library(signals_bucket)
+
+    coverage_map: dict[str, float] = {}
+    read_errors: list[str] = []
+    empty_frames: list[str] = []
+    no_features: list[str] = []
+
+    for ticker in tickers:
+        try:
+            df = universe.read(ticker).data
+        except Exception as e:
+            read_errors.append(f"{ticker} ({e.__class__.__name__})")
+            coverage_map[ticker] = 0.0
+            continue
+
+        if df.empty:
+            empty_frames.append(ticker)
+            coverage_map[ticker] = 0.0
+            continue
+
+        feature_cols = [c for c in df.columns if c not in _COVERAGE_OHLCV_COLS]
+        if not feature_cols:
+            no_features.append(ticker)
+            coverage_map[ticker] = 0.0
+            continue
+
+        last_row = df[feature_cols].iloc[-1]
+        non_nan = int(last_row.notna().sum())
+        coverage_map[ticker] = non_nan / len(feature_cols)
+
+    # read_errors are infrastructure-level — hard-fail consistent with
+    # load_atr_14_pct. Tickers absent from the universe library return 0.0
+    # coverage (they fail the admission gate naturally).
+    if read_errors:
+        raise RuntimeError(
+            "load_feature_coverage ArcticDB read failed for "
+            f"{len(read_errors)} ticker(s): {read_errors}. Not a "
+            "data-gap — executor cannot trust coverage values when the "
+            "universe library is unreachable."
+        )
+
+    if empty_frames:
+        logger.warning(
+            "load_feature_coverage: %d ticker(s) have empty ArcticDB frames "
+            "— coverage set to 0.0, admission gate will reject: %s",
+            len(empty_frames), empty_frames,
+        )
+    if no_features:
+        logger.warning(
+            "load_feature_coverage: %d ticker(s) have no feature columns "
+            "in their ArcticDB frame (OHLCV-only) — coverage set to 0.0: %s",
+            len(no_features), no_features,
+        )
+
+    min_cov = min(coverage_map.values()) if coverage_map else 0.0
+    max_cov = max(coverage_map.values()) if coverage_map else 0.0
+    logger.info(
+        "[data_source=arcticdb] Loaded feature_coverage for %d tickers "
+        "(min=%.2f, max=%.2f)",
+        len(coverage_map), min_cov, max_cov,
+    )
+    return coverage_map
+
+
 def _n_trading_days_back(ref: date, n: int) -> date:
     """Walk back `n` trading days from `ref` (inclusive of today if it's
     a trading day). Weekend/holiday skipping uses the same calendar the

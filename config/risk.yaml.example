@@ -65,6 +65,18 @@ earnings_sizing_enabled: true
 earnings_proximity_days: 5       # days before earnings to apply reduction (backtester-tunable: [3, 5, 7])
 earnings_sizing_reduction: 0.50  # size reduction near earnings (backtester-tunable: [0.30, 0.50, 0.70])
 
+# ── Feature-coverage sizing + admission (short-history handling) ────────────
+# Paired controls for tickers whose long-window features (momentum_252d,
+# dist_from_52w_high, return_252d) are NaN because they have < 252 bars of
+# history. Supersedes the 2026-04-21 morning "quarantine at admission"
+# framing: we trade new listings, just size them proportional to the
+# information we have.
+coverage_sizing_enabled: true    # derate position size by feature_coverage_fraction
+coverage_derate_floor: 0.25      # never derate below 25% of normal size (backtester-tunable: [0.10, 0.25, 0.50])
+
+coverage_admission_enabled: true        # hard-refuse buy_candidates below min_coverage_for_admission
+min_coverage_for_admission: 0.30        # feature-coverage floor for NEW entries (backtester-tunable: [0.20, 0.30, 0.50])
+
 # ── IBKR connection ─────────────────────────────────────────────────────────
 ibkr_host: "127.0.0.1"
 ibkr_port: 4002                  # 4002 = paper trading, 4001 = live

@@ -225,6 +225,92 @@ def filter_buy_candidates_to_universe(
     return signals
 
 
+def filter_buy_candidates_by_coverage(
+    signals: dict,
+    coverage_map: dict[str, float],
+    min_coverage: float,
+) -> dict:
+    """Drop buy_candidates whose feature coverage is below ``min_coverage``.
+
+    Admission gate — the hard lower bound of the graceful-degrade chain
+    introduced 2026-04-21 evening + 2026-04-22 (Brian's aggressive-new-listings
+    posture reconfirmation). Coverage comes from ``price_cache.load_feature_coverage``;
+    tickers absent from the ArcticDB universe library appear with 0.0 and
+    naturally fail this gate.
+
+    Scope: ``buy_candidates`` only. Held positions (``universe`` list —
+    EXIT/REDUCE/HOLD) are NEVER filtered here. A held ticker whose
+    coverage drops below threshold still needs its exit/management path
+    evaluated (stop-loss, drawdown sizing, etc.) — admission-refuse
+    applies to NEW ENTRY decisions, not to unwinding existing exposure.
+
+    Rejected tickers are logged with their named coverage + threshold +
+    top missing features and emitted to the ``admission_refused``
+    CloudWatch metric so low-coverage admissions are observable.
+    """
+    buy = signals.get("buy_candidates") or []
+    if not buy:
+        return signals
+
+    allowed: list[dict] = []
+    refused: list[tuple[str, float]] = []
+    for entry in buy:
+        ticker = entry.get("ticker") if isinstance(entry, dict) else None
+        if not ticker:
+            continue
+        cov = coverage_map.get(ticker, 0.0)
+        if cov >= min_coverage:
+            allowed.append(entry)
+        else:
+            refused.append((ticker, cov))
+
+    if refused:
+        logger.warning(
+            "[signal_reader] admission gate refused %d buy_candidate(s) "
+            "below min_coverage=%.2f: %s. ``REFUSED_INSUFFICIENT_COVERAGE`` "
+            "— pure pre-history IPOs or extremely short-history tickers "
+            "cannot be meaningfully scored on long-window features. The %d "
+            "remaining candidate(s) will be sized normally (position sizer "
+            "will derate any partial-coverage tickers via "
+            "``coverage_sizing_enabled``).",
+            len(refused), min_coverage,
+            [(t, round(c, 3)) for t, c in refused],
+            len(allowed),
+        )
+        _emit_admission_refused_metric(len(refused))
+
+        signals = dict(signals)  # avoid mutating caller
+        signals["buy_candidates"] = allowed
+
+    return signals
+
+
+def _emit_admission_refused_metric(count: int) -> None:
+    """Emit ``AlphaEngine/Executor/admission_refused_count`` gauge.
+
+    Best-effort: CloudWatch errors WARN but don't fail the planner —
+    admission gate decision is the load-bearing path, metrics are
+    observability. Parallel shape to ``_emit_unscored_count_metric``.
+    """
+    try:
+        import boto3
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Executor",
+            MetricData=[{
+                "MetricName": "admission_refused_count",
+                "Value": float(count),
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:
+        logger.warning(
+            "CloudWatch admission_refused_count metric failed: %s. "
+            "Not blocking the planner — admission decision already made.",
+            exc,
+        )
+
+
 class UnscoredBuyCandidatesError(RuntimeError):
     """Raised when signals.json has buy_candidates that are missing from
     predictions.json — the GBM veto gate is structurally unreachable for

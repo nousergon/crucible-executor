@@ -38,6 +38,7 @@ def compute_position_size(
     p_up: float | None = None,
     signal_age_days: int | None = None,
     days_to_earnings: int | None = None,
+    feature_coverage: float | None = None,
 ) -> dict:
     """
     Compute position size for a new ENTER order.
@@ -121,10 +122,29 @@ def compute_position_size(
     else:
         earnings_adj = 1.0
 
+    # Feature-coverage derate (2026-04-22). Post-PR-#78 (alpha-engine-data),
+    # short-history tickers (new listings, spinoffs) land in ArcticDB with
+    # partial-NaN features — e.g. SNDK with ~290 bars has NaN on every
+    # 252-day rolling feature. Predictor can still score such tickers
+    # (LightGBM splits on NaN natively), but sizing them at full weight
+    # overstates the information we have. Derate position size by the
+    # fraction of non-NaN features, floored at ``coverage_derate_floor``
+    # so we never size below a meaningful threshold. Continuous (no cliff)
+    # so an 87%-covered ticker gets 87% of a 100%-covered ticker's size.
+    if (
+        config.get("coverage_sizing_enabled", True)
+        and feature_coverage is not None
+    ):
+        coverage_floor = config.get("coverage_derate_floor", 0.25)
+        clamped_cov = max(0.0, min(1.0, feature_coverage))
+        coverage_adj = max(coverage_floor, clamped_cov)
+    else:
+        coverage_adj = 1.0
+
     max_pct = config.get("max_position_pct", 0.05)
     raw_weight = (base_weight * sector_adj * conviction_adj * upside_adj
                   * drawdown_multiplier * atr_adj * confidence_adj
-                  * staleness_adj * earnings_adj)
+                  * staleness_adj * earnings_adj * coverage_adj)
     position_weight = min(raw_weight, max_pct)
 
     # ATR volatility cap: ensure ATR constraint is not overridden by other
@@ -146,7 +166,7 @@ def compute_position_size(
         f"conviction_adj={conviction_adj} upside_adj={upside_adj} "
         f"dd_mult={drawdown_multiplier} atr_adj={atr_adj} "
         f"confidence_adj={confidence_adj} staleness_adj={staleness_adj} "
-        f"earnings_adj={earnings_adj} "
+        f"earnings_adj={earnings_adj} coverage_adj={coverage_adj} "
         f"→ {position_weight:.3f} NAV = ${dollar_size:.0f} = {shares} shares"
     )
 
@@ -162,4 +182,5 @@ def compute_position_size(
         "confidence_adj": confidence_adj,
         "staleness_adj": staleness_adj,
         "earnings_adj": earnings_adj,
+        "coverage_adj": coverage_adj,
     }
