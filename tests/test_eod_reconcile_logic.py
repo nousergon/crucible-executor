@@ -1,11 +1,14 @@
 """Tests for executor/eod_reconcile.py — testable logic without IB Gateway."""
 
-from unittest.mock import patch
+import io
+import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from executor.eod_reconcile import (
     _apply_dividend_delta,
+    _load_constituents_sector_map,
     _resolve_prior_price,
     _synthesize_rationales,
 )
@@ -152,3 +155,64 @@ class TestSynthesizeRationales:
         assert len(result) == 2
         assert "AAPL" in result
         assert "MSFT" in result
+
+
+class TestLoadConstituentsSectorMap:
+    """Sector enrichment fallback reads latest weekly constituents.json."""
+
+    def _mock_s3(self, keys: list[str], sector_map: dict | None):
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {
+            "Contents": [{"Key": k} for k in keys],
+        }
+        body = {"sector_map": sector_map} if sector_map is not None else {}
+        s3.get_object.return_value = {
+            "Body": io.BytesIO(json.dumps(body).encode()),
+        }
+        return s3
+
+    @patch("executor.eod_reconcile.boto3")
+    def test_picks_latest_weekly_snapshot(self, mock_boto3):
+        # Lexicographic max of ISO dates == chronological latest
+        s3 = self._mock_s3(
+            keys=[
+                "market_data/weekly/2026-04-04/constituents.json",
+                "market_data/weekly/2026-04-18/constituents.json",
+                "market_data/weekly/2026-04-11/constituents.json",
+            ],
+            sector_map={"VRTX": "Health Care", "MSFT": "Information Technology"},
+        )
+        mock_boto3.client.return_value = s3
+
+        result = _load_constituents_sector_map("alpha-engine-research")
+
+        assert result == {"VRTX": "Health Care", "MSFT": "Information Technology"}
+        # Confirms the most recent key was the one fetched
+        s3.get_object.assert_called_once_with(
+            Bucket="alpha-engine-research",
+            Key="market_data/weekly/2026-04-18/constituents.json",
+        )
+
+    @patch("executor.eod_reconcile.boto3")
+    def test_empty_when_no_snapshots_listed(self, mock_boto3):
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {"Contents": []}
+        mock_boto3.client.return_value = s3
+        assert _load_constituents_sector_map("bucket") == {}
+        s3.get_object.assert_not_called()
+
+    @patch("executor.eod_reconcile.boto3")
+    def test_empty_on_s3_exception(self, mock_boto3):
+        s3 = MagicMock()
+        s3.list_objects_v2.side_effect = RuntimeError("boom")
+        mock_boto3.client.return_value = s3
+        assert _load_constituents_sector_map("bucket") == {}
+
+    @patch("executor.eod_reconcile.boto3")
+    def test_empty_when_sector_map_missing_from_payload(self, mock_boto3):
+        s3 = self._mock_s3(
+            keys=["market_data/weekly/2026-04-18/constituents.json"],
+            sector_map=None,  # body has no sector_map key
+        )
+        mock_boto3.client.return_value = s3
+        assert _load_constituents_sector_map("bucket") == {}
