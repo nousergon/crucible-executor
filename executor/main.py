@@ -919,6 +919,8 @@ def run(
     signals_override: dict = None,  # injected signals dict (skips S3 read)
     price_histories: dict = None,   # injected by backtester for exit manager
     config_override: dict = None,   # injected by backtester param sweep
+    atr_map: dict | None = None,    # injected by backtester to skip per-call ArcticDB read
+    vwap_map: dict | None = None,   # injected by backtester to skip per-call ArcticDB read
 ) -> list[dict] | None:
     """
     Returns list of order dicts when simulate=True, else None.
@@ -1166,8 +1168,18 @@ def run(
         # Previous-day VWAP per ENTER-signal ticker for intraday entry triggers.
         # Sourced from the ArcticDB universe library; hard-fails on any miss
         # so daemon triggers always see a trusted VWAP.
+        #
+        # The ``vwap_map`` kwarg lets a caller (today: the backtester) inject
+        # a precomputed resolved-per-ticker VWAP map and skip the per-call
+        # ArcticDB read. Live trading passes vwap_map=None and takes the
+        # existing path unchanged. Contract is identical either way:
+        # {ticker: vwap_value_for_run_date}. Same design as the existing
+        # ``price_histories`` kwarg — injection point, not replacement.
         vwap_tickers = sorted({s["ticker"] for s in signals.get("enter", [])})
-        vwap_map = load_daily_vwap(vwap_tickers, signals_bucket, run_date) if vwap_tickers else {}
+        if vwap_map is None:
+            vwap_map = load_daily_vwap(vwap_tickers, signals_bucket, run_date) if vwap_tickers else {}
+        # When vwap_map was injected, trust the caller's resolution —
+        # the backtester precomputes per simulate date before the call.
 
         # Feature-coverage map per ENTER ticker. Drives the sizer's
         # coverage derate (coverage_sizing_enabled in risk.yaml):
@@ -1195,16 +1207,22 @@ def run(
         #
         # ETF tickers are intentionally excluded — they're used for sector-relative
         # exit veto via price_histories, not for ATR-based execution.
+        #
+        # ``atr_map`` kwarg mirrors the vwap_map injection pattern — backtester
+        # precomputes once per simulate pipeline, skipping millions of
+        # per-call universe.read(ticker) round-trips. Live trading passes
+        # atr_map=None and takes the load_atr_14_pct path unchanged.
         atr_tickers = [s["ticker"] for s in signals.get("enter", [])]
         atr_tickers += list(current_positions.keys())
         atr_tickers = sorted(set(atr_tickers))
-        if atr_tickers:
-            atr_map = load_atr_14_pct(
-                tickers=atr_tickers,
-                signals_bucket=signals_bucket,
-            )
-        else:
-            atr_map = {}
+        if atr_map is None:
+            if atr_tickers:
+                atr_map = load_atr_14_pct(
+                    tickers=atr_tickers,
+                    signals_bucket=signals_bucket,
+                )
+            else:
+                atr_map = {}
 
         # Separate sector ETF histories for exit manager
         sector_etf_histories = {
