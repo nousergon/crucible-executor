@@ -96,6 +96,41 @@ def _load_signals_from_s3(bucket: str, run_date: str, max_lookback: int = 5) -> 
     return {}, f"Signals unavailable from S3 for {run_date} (checked {max_lookback} days back)"
 
 
+def _load_constituents_sector_map(bucket: str) -> dict[str, str]:
+    """Return the latest S&P 500+400 ticker→GICS sector map from S3.
+
+    Reads ``market_data/weekly/{YYYY-MM-DD}/constituents.json`` written by
+    the alpha-engine-data weekly collector. Used as the final sector
+    lookup fallback in EOD reconcile — catches legacy/fractional-share
+    positions whose ticker isn't in today's research universe or whose
+    entry_trade row predates reliable sector population.
+
+    Returns an empty dict on miss so the caller can fall through to the
+    "Unknown" sentinel without raising.
+    """
+    s3 = boto3.client("s3")
+    try:
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix="market_data/weekly/")
+        keys = [
+            obj["Key"] for obj in resp.get("Contents", [])
+            if obj["Key"].endswith("/constituents.json")
+        ]
+        if not keys:
+            logger.warning("No constituents.json under market_data/weekly/ in %s", bucket)
+            return {}
+        latest = max(keys)
+        obj = s3.get_object(Bucket=bucket, Key=latest)
+        data = json.loads(obj["Body"].read())
+        sector_map = data.get("sector_map", {}) or {}
+        logger.info(
+            "Loaded sector_map from %s (%d tickers)", latest, len(sector_map),
+        )
+        return sector_map
+    except Exception as e:
+        logger.error("Failed to load constituents sector_map: %s", e)
+        return {}
+
+
 def _load_predictions_from_s3(bucket: str) -> tuple[dict, str | None]:
     """Load latest predictions from S3. Returns ({ticker: pred_dict}, warning_msg) on failure."""
     s3 = boto3.client("s3")
@@ -368,9 +403,15 @@ def run(run_date: str | None = None) -> None:
             )
             _time.sleep(wait)
 
-    # Enrich positions with sector — signals.json first, entry-trade fallback.
+    # Enrich positions with sector. Lookup chain:
+    #   1. signals.json today (universe + buy_candidates)
+    #   2. trades.db entry_trade.sector
+    #   3. S&P 500+400 constituents.json (latest weekly snapshot) — catches
+    #      legacy/fractional-share positions whose ticker has fallen out of
+    #      today's research universe (e.g. dividend-reinvestment remnants).
     # A missing sector is an observability failure (blank rows in sector
-    # attribution), not a hard error — log loudly and continue with "Unknown".
+    # attribution), not a hard error — log loudly and continue with "Unknown"
+    # only when all three sources miss.
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
     try:
         sig_data, _ = _load_signals_from_s3(signals_bucket, run_date)
@@ -379,6 +420,7 @@ def run(run_date: str | None = None) -> None:
             t = s.get("ticker")
             if t and s.get("sector"):
                 sector_lookup[t] = s["sector"]
+        constituents_lookup: dict[str, str] | None = None
         for ticker in positions:
             if positions[ticker].get("sector"):
                 continue
@@ -389,9 +431,15 @@ def run(run_date: str | None = None) -> None:
             if entry and entry.get("sector"):
                 positions[ticker]["sector"] = entry["sector"]
                 continue
+            if constituents_lookup is None:
+                constituents_lookup = _load_constituents_sector_map(signals_bucket)
+            if ticker in constituents_lookup:
+                positions[ticker]["sector"] = constituents_lookup[ticker]
+                continue
             logger.error(
-                "Sector unknown for %s — missing from signals.json and entry trade. "
-                "Sector attribution will be incomplete.", ticker,
+                "Sector unknown for %s — missing from signals.json, entry trade, "
+                "and S&P 500+400 constituents. Sector attribution will be incomplete.",
+                ticker,
             )
             positions[ticker]["sector"] = "Unknown"
     except Exception as e:
