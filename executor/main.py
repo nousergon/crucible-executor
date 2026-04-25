@@ -518,6 +518,14 @@ def _plan_entries(
 
         n_entered += 1
         if simulate:
+            # Accumulate position state on the simulated client so the
+            # held-position guard above (line ~392 "SKIP ENTER ... already
+            # in portfolio") fires correctly on subsequent simulate dates.
+            # Without this, sim_client._positions stays empty across every
+            # signal date and the backtester re-ENTERs already-held tickers
+            # — the parity over-shoot pattern observed 2026-04-25 (bt=86 vs
+            # live=55, the extra bt orders were all currently-held names).
+            ibkr.place_market_order(ticker, "BUY", sizing["shares"])
             orders.append({
                 "date": run_date,
                 "ticker": ticker,
@@ -661,6 +669,9 @@ def _plan_exits_and_reduces(
             current_price = ibkr.get_current_price(ticker)
             if current_price is None:
                 current_price = current_positions[ticker].get("avg_cost", 0)
+            # Match ENTER simulate path — propagate state to sim_client so
+            # downstream sim dates see the EXITed position as gone.
+            ibkr.place_market_order(ticker, "SELL", shares_held)
             orders.append({
                 "date": run_date,
                 "ticker": ticker,
@@ -731,6 +742,9 @@ def _plan_exits_and_reduces(
             if current_price is None:
                 current_price = current_positions[ticker].get("avg_cost", 0)
             remaining_value = (shares_held - shares_to_sell) * (current_price or 0)
+            # Match ENTER/EXIT simulate paths — partial sell on sim_client
+            # so the position's reduced shares carry to the next sim date.
+            ibkr.place_market_order(ticker, "SELL", shares_to_sell)
             orders.append({
                 "date": run_date,
                 "ticker": ticker,
