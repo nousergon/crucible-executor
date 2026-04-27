@@ -1,4 +1,5 @@
 """Unit tests for executor.strategies.exit_manager — pure exit logic, no IBKR/S3."""
+import pandas as pd
 import pytest
 from datetime import date, timedelta
 
@@ -21,8 +22,8 @@ def _make_price_history(
     trend: float = 0.0,
     high_offset: float = 2.0,
     low_offset: float = 2.0,
-) -> list[dict]:
-    """Generate synthetic OHLCV price history bars.
+) -> pd.DataFrame:
+    """Generate synthetic OHLCV price history as a DataFrame.
 
     Args:
         n_bars: number of daily bars
@@ -31,23 +32,28 @@ def _make_price_history(
         trend: daily trend increment (positive = uptrend)
         high_offset: how much higher than close
         low_offset: how much lower than close
+
+    Returns:
+        DataFrame indexed by DatetimeIndex with [open, high, low, close]
+        columns. Skips weekends to mirror trading-day cadence.
     """
-    bars = []
+    dates = []
+    opens, highs, lows, closes = [], [], [], []
     dt = date.fromisoformat(start_date)
     for i in range(n_bars):
         close = base_price + trend * i
-        bars.append({
-            "date": dt.isoformat(),
-            "open": close - 0.5,
-            "high": close + high_offset,
-            "low": close - low_offset,
-            "close": close,
-        })
+        dates.append(pd.Timestamp(dt.isoformat()))
+        opens.append(close - 0.5)
+        highs.append(close + high_offset)
+        lows.append(close - low_offset)
+        closes.append(close)
         dt += timedelta(days=1)
-        # Skip weekends
         while dt.weekday() >= 5:
             dt += timedelta(days=1)
-    return bars
+    return pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes},
+        index=pd.DatetimeIndex(dates),
+    )
 
 
 def _strategy_config(**overrides):
@@ -146,7 +152,10 @@ class TestAtrTrailingStop:
             ticker="AAPL",
             current_price=50.0,
             entry_date="2026-01-02",
-            price_history=[],
+            price_history=pd.DataFrame(
+                columns=["open", "high", "low", "close"],
+                index=pd.DatetimeIndex([]),
+            ),
             strategy_config=_strategy_config(),
         )
         assert result is None
