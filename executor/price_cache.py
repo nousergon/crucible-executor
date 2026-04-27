@@ -92,7 +92,7 @@ def _open_macro_library(signals_bucket: str):
 def load_price_histories(
     tickers: list[str],
     signals_bucket: str,
-) -> dict[str, list[dict]]:
+) -> dict[str, "pd.DataFrame"]:
     """Load OHLCV histories for a list of tickers from ArcticDB.
 
     Routes per ticker: single-stock watchlist symbols are read from the
@@ -109,14 +109,25 @@ def load_price_histories(
     missing tickers.
 
     Returns:
-        {ticker: [{date, open, high, low, close}, ...]} sorted ascending.
+        {ticker: pd.DataFrame[open, high, low, close]} indexed by
+        DatetimeIndex (UTC-naive normalized dates), sorted ascending.
+
+    Shape note (2026-04-27): switched from ``list[dict]`` to
+    ``pd.DataFrame`` so downstream consumers (``_compute_atr``,
+    ``_compute_rsi``, ``check_correlation``, ``check_atr_trailing_stop``
+    post_entry filter) can vectorize their per-bar arithmetic instead
+    of running Python loops over dict lookups. Backtester's simulate
+    loop hot path drops by ~10-50× per call; live executor loads once
+    per boot, so the conversion cost (formerly inside iterrows here)
+    becomes a free win — pandas keeps the columnar layout it already
+    holds in ArcticDB.
     """
     if not tickers:
         return {}
 
     universe = _open_universe_library(signals_bucket)
     macro = None  # lazy-open only if a macro-routed ticker appears
-    histories: dict[str, list[dict]] = {}
+    histories: dict[str, "pd.DataFrame"] = {}
     read_errors: list[str] = []
     empty: list[str] = []
 
@@ -135,16 +146,22 @@ def load_price_histories(
         if df.empty:
             empty.append(ticker)
             continue
-        records: list[dict] = []
-        for dt, row in df.iterrows():
-            records.append({
-                "date": dt.strftime("%Y-%m-%d"),
-                "open": float(row["Open"]) if "Open" in row.index else 0.0,
-                "high": float(row["High"]) if "High" in row.index else 0.0,
-                "low": float(row["Low"]) if "Low" in row.index else 0.0,
-                "close": float(row["Close"]) if "Close" in row.index else 0.0,
-            })
-        histories[ticker] = records
+        # Normalize to a 4-column lower-case OHLCV frame indexed by
+        # DatetimeIndex. Macro routes (Close-only) get zero-filled OHL
+        # to preserve column shape — downstream consumers filter on
+        # Close-only paths via ``_MACRO_SYMBOLS`` upstream.
+        out = pd.DataFrame({
+            "open":  df["Open"].astype(float)  if "Open"  in df.columns else 0.0,
+            "high":  df["High"].astype(float)  if "High"  in df.columns else 0.0,
+            "low":   df["Low"].astype(float)   if "Low"   in df.columns else 0.0,
+            "close": df["Close"].astype(float) if "Close" in df.columns else 0.0,
+        }, index=df.index)
+        # Strip intraday timestamps (ArcticDB writes UTC-midnight) so
+        # ``df.loc[pd.Timestamp("2024-01-15"):]`` works against bare
+        # date strings the executor compares against.
+        if hasattr(out.index, "normalize"):
+            out.index = out.index.normalize()
+        histories[ticker] = out
 
     if read_errors:
         raise RuntimeError(

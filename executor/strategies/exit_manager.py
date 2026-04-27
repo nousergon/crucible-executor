@@ -20,6 +20,9 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
+import numpy as np
+import pandas as pd
+
 logger = logging.getLogger(__name__)
 
 SECTOR_ETF_MAP = {
@@ -41,7 +44,7 @@ def check_atr_trailing_stop(
     ticker: str,
     current_price: float,
     entry_date: str,
-    price_history: list[dict],
+    price_history: pd.DataFrame,
     strategy_config: dict,
 ) -> dict | None:
     """
@@ -54,9 +57,9 @@ def check_atr_trailing_stop(
         ticker: stock symbol
         current_price: current market price
         entry_date: ISO date string (YYYY-MM-DD) when position was entered
-        price_history: list of dicts with keys {date, open, high, low, close},
-                       sorted ascending by date. Must cover at least ATR period
-                       days before entry_date through today.
+        price_history: pd.DataFrame with columns [open, high, low, close],
+                       indexed by DatetimeIndex sorted ascending. Must cover
+                       at least ATR period days before entry_date through today.
         strategy_config: from load_strategy_config()
 
     Returns:
@@ -65,16 +68,19 @@ def check_atr_trailing_stop(
     if not strategy_config.get("atr_trailing_enabled", True):
         return None
 
-    if not price_history or current_price is None:
+    if price_history is None or len(price_history) == 0 or current_price is None:
         logger.info("ATR skip %s: no price history or current_price", ticker)
         return None
 
     period = strategy_config.get("atr_period", 14)
     multiplier = strategy_config.get("atr_multiplier", 3.0)
 
-    # Filter to bars on or after entry_date
-    entry_dt = date.fromisoformat(entry_date)
-    post_entry = [b for b in price_history if date.fromisoformat(b["date"]) >= entry_dt]
+    # Filter to bars on or after entry_date.
+    # ``price_history.index`` is a normalized DatetimeIndex; the bars
+    # covered are inclusive of entry_date itself (executor enters at
+    # close, so the entry-day bar belongs to the held position).
+    entry_ts = pd.Timestamp(entry_date)
+    post_entry = price_history.loc[entry_ts:]
 
     if len(post_entry) < 2:
         logger.info("ATR skip %s: %d bars since entry %s (need 2+)", ticker, len(post_entry), entry_date)
@@ -88,7 +94,7 @@ def check_atr_trailing_stop(
         return None
 
     # Highest high since entry
-    highest_high = max(b["high"] for b in post_entry)
+    highest_high = float(post_entry["high"].max())
 
     stop_level = highest_high - (atr * multiplier)
 
@@ -270,8 +276,8 @@ def check_profit_take(
 def check_sector_relative_veto(
     ticker: str,
     sector: str,
-    price_history: list[dict],
-    sector_etf_history: list[dict],
+    price_history: pd.DataFrame,
+    sector_etf_history: pd.DataFrame,
     strategy_config: dict,
 ) -> bool:
     """
@@ -284,8 +290,8 @@ def check_sector_relative_veto(
     Args:
         ticker: stock symbol
         sector: sector name (used for logging only)
-        price_history: stock OHLCV bars sorted ascending
-        sector_etf_history: sector ETF OHLCV bars sorted ascending
+        price_history: stock OHLCV DataFrame sorted ascending by date
+        sector_etf_history: sector ETF OHLCV DataFrame sorted ascending
         strategy_config: from load_strategy_config()
 
     Returns:
@@ -294,20 +300,18 @@ def check_sector_relative_veto(
     if not strategy_config.get("sector_relative_veto_enabled", True):
         return False
 
-    if not price_history or len(price_history) < 5:
+    if price_history is None or len(price_history) < 5:
         return False
 
-    if not sector_etf_history or len(sector_etf_history) < 5:
+    if sector_etf_history is None or len(sector_etf_history) < 5:
         return False
 
     lookback = min(20, len(price_history), len(sector_etf_history))
 
-    stock_return = (
-        price_history[-1]["close"] / price_history[-lookback]["close"]
-    ) - 1
-    sector_return = (
-        sector_etf_history[-1]["close"] / sector_etf_history[-lookback]["close"]
-    ) - 1
+    stock_close = price_history["close"]
+    sector_close = sector_etf_history["close"]
+    stock_return = float(stock_close.iloc[-1] / stock_close.iloc[-lookback]) - 1.0
+    sector_return = float(sector_close.iloc[-1] / sector_close.iloc[-lookback]) - 1.0
 
     outperformance = stock_return - sector_return
     threshold = strategy_config.get("sector_relative_outperform_threshold", 0.05)
@@ -324,7 +328,7 @@ def check_sector_relative_veto(
 
 def check_momentum_exit(
     ticker: str,
-    price_history: list[dict],
+    price_history: pd.DataFrame,
     strategy_config: dict,
 ) -> dict | None:
     """
@@ -335,7 +339,7 @@ def check_momentum_exit(
 
     Args:
         ticker: stock symbol
-        price_history: OHLCV bars sorted ascending (needs >= 21 bars)
+        price_history: OHLCV DataFrame sorted ascending (needs >= 21 bars)
         strategy_config: from load_strategy_config()
 
     Returns:
@@ -348,7 +352,8 @@ def check_momentum_exit(
         return None
 
     # 20-day momentum (percentage)
-    momentum = (price_history[-1]["close"] / price_history[-21]["close"] - 1) * 100
+    close = price_history["close"]
+    momentum = (float(close.iloc[-1]) / float(close.iloc[-21]) - 1) * 100
 
     # RSI(14)
     rsi = _compute_rsi(price_history, period=14)
@@ -379,10 +384,10 @@ def evaluate_exits(
     current_positions: dict[str, dict],
     signals_by_ticker: dict[str, dict],
     run_date: str,
-    price_histories: dict[str, list[dict]],
+    price_histories: dict[str, pd.DataFrame],
     ibkr_client,
     strategy_config: dict,
-    sector_etf_histories: dict[str, list[dict]] | None = None,
+    sector_etf_histories: dict[str, pd.DataFrame] | None = None,
 ) -> list[dict]:
     """
     Evaluate all held positions against exit rules.
@@ -401,11 +406,12 @@ def evaluate_exits(
         current_positions: {ticker: {shares, market_value, avg_cost, sector, entry_date}}
         signals_by_ticker: {ticker: signal_dict} from Research
         run_date: today's date
-        price_histories: {ticker: [{date, open, high, low, close}, ...]}
+        price_histories: {ticker: pd.DataFrame[open, high, low, close]}
+                         indexed by DatetimeIndex sorted ascending
         ibkr_client: for fetching current prices
         strategy_config: from load_strategy_config()
-        sector_etf_histories: {etf_ticker: [{date, open, high, low, close}, ...]}
-                              for sector-relative veto. None disables veto.
+        sector_etf_histories: {etf_ticker: pd.DataFrame} for sector-relative
+                              veto. None disables veto.
 
     Returns:
         List of signal dicts with action="EXIT" or "REDUCE" and reason field.
@@ -428,7 +434,7 @@ def evaluate_exits(
         if current_price is None:
             continue
 
-        history = price_histories.get(ticker, [])
+        history = price_histories.get(ticker)
 
         # 1. ATR trailing stop (with sector-relative veto)
         atr_signal = check_atr_trailing_stop(
@@ -443,9 +449,9 @@ def evaluate_exits(
             sector = pos.get("sector", "")
             etf_ticker = SECTOR_ETF_MAP.get(sector, "SPY")
             etf_history = (
-                sector_etf_histories.get(etf_ticker, [])
+                sector_etf_histories.get(etf_ticker)
                 if sector_etf_histories
-                else []
+                else None
             )
             if check_sector_relative_veto(
                 ticker, sector, history, etf_history, strategy_config
@@ -507,73 +513,100 @@ def evaluate_exits(
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _compute_atr(price_history: list[dict], period: int = 14) -> float | None:
+def _compute_atr(price_history: pd.DataFrame, period: int = 14) -> float | None:
     """
     Compute Average True Range over the last `period` bars.
 
-    Uses Wilder's smoothing (EWM with alpha=1/period).
+    Uses Wilder's smoothing (EWM with alpha=1/period). Vectorized via
+    numpy + pandas — output matches the prior scalar Python loop to
+    within float precision (Wilder smoothing is well-conditioned;
+    seed-bar contribution decays as (1-1/period)^N → ~0 within 5×period
+    bars).
+
     Returns None if insufficient data.
     """
-    if len(price_history) < period + 1:
+    if price_history is None or len(price_history) < period + 1:
         return None
 
-    true_ranges = []
-    for i in range(1, len(price_history)):
-        bar = price_history[i]
-        prev_close = price_history[i - 1]["close"]
-        high = bar["high"]
-        low = bar["low"]
+    high = price_history["high"].to_numpy(dtype=float)
+    low = price_history["low"].to_numpy(dtype=float)
+    close = price_history["close"].to_numpy(dtype=float)
+    prev_close = close[:-1]
 
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close),
-        )
-        true_ranges.append(tr)
+    tr = np.maximum.reduce([
+        high[1:] - low[1:],
+        np.abs(high[1:] - prev_close),
+        np.abs(low[1:] - prev_close),
+    ])
 
-    if len(true_ranges) < period:
+    if len(tr) < period:
         return None
 
-    # Wilder's smoothed ATR: start with SMA, then EWM
-    atr = sum(true_ranges[:period]) / period
+    # Wilder's smoothed ATR: SMA seed over first `period` bars, then EWM.
+    # ``ewm(alpha=1/period, adjust=False)`` matches the recurrence
+    # ``atr_i = atr_{i-1} * (1 - alpha) + tr_i * alpha`` exactly. Seeding
+    # the first ATR value with the SMA of the first `period` true ranges
+    # mirrors the pre-vectorized implementation.
+    sma_seed = float(np.mean(tr[:period]))
+    if len(tr) == period:
+        return sma_seed
+
+    smoothed = pd.Series(tr[period:]).ewm(alpha=1.0 / period, adjust=False).mean()
+    # Re-seed the EWM with sma_seed by treating the first smoothed value
+    # as ``sma_seed * (1 - alpha) + tr[period] * alpha``. pandas.ewm seeds
+    # with the first sample, so we manually walk the first step here.
     alpha = 1.0 / period
-    for tr in true_ranges[period:]:
-        atr = atr * (1 - alpha) + tr * alpha
+    first_step = sma_seed * (1.0 - alpha) + float(tr[period]) * alpha
+    if len(tr) == period + 1:
+        return first_step
+    # Subsequent steps: pandas.ewm on tr[period+1:] seeded with first_step.
+    # Equivalent to a manual loop, just C-vectorized.
+    rest = pd.Series(np.concatenate(([first_step], tr[period + 1:].astype(float))))
+    return float(rest.ewm(alpha=alpha, adjust=False).mean().iloc[-1])
 
-    return atr
 
-
-def _compute_rsi(price_history: list[dict], period: int = 14) -> float | None:
+def _compute_rsi(price_history: pd.DataFrame, period: int = 14) -> float | None:
     """
     Compute Relative Strength Index over the last `period` bars.
 
     Uses Wilder's smoothing (same as ATR) for average gain/loss.
     Returns None if insufficient data.
+
+    Vectorized via numpy + pandas — output matches the prior scalar
+    Python loop to within float precision.
     """
-    if len(price_history) < period + 1:
+    if price_history is None or len(price_history) < period + 1:
         return None
 
-    # Close-to-close changes
-    changes = [
-        price_history[i]["close"] - price_history[i - 1]["close"]
-        for i in range(1, len(price_history))
-    ]
-
-    gains = [max(c, 0) for c in changes]
-    losses = [max(-c, 0) for c in changes]
+    close = price_history["close"].to_numpy(dtype=float)
+    changes = np.diff(close)
+    gains = np.where(changes > 0, changes, 0.0)
+    losses = np.where(changes < 0, -changes, 0.0)
 
     if len(gains) < period:
         return None
 
-    # Initial SMA for first `period` bars
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    # Wilder's smoothing for remaining bars
+    # Wilder's smoothing: SMA seed over first `period`, then recurrence
+    # ``avg_i = avg_{i-1} * (1 - alpha) + x_i * alpha`` with alpha=1/period.
     alpha = 1.0 / period
-    for i in range(period, len(gains)):
-        avg_gain = avg_gain * (1 - alpha) + gains[i] * alpha
-        avg_loss = avg_loss * (1 - alpha) + losses[i] * alpha
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
+
+    if len(gains) > period:
+        # Walk the recurrence over remaining bars via pandas.ewm seeded
+        # at the SMA. The seed's contribution decays as (1-alpha)^N — for
+        # period=14 and ≥70 bars in price_history, the seed is < 1% of
+        # the final value, so this matches the prior loop to ~14 sig figs.
+        gain_step = avg_gain * (1.0 - alpha) + float(gains[period]) * alpha
+        loss_step = avg_loss * (1.0 - alpha) + float(losses[period]) * alpha
+        if len(gains) > period + 1:
+            gain_rest = pd.Series(np.concatenate(([gain_step], gains[period + 1:])))
+            loss_rest = pd.Series(np.concatenate(([loss_step], losses[period + 1:])))
+            avg_gain = float(gain_rest.ewm(alpha=alpha, adjust=False).mean().iloc[-1])
+            avg_loss = float(loss_rest.ewm(alpha=alpha, adjust=False).mean().iloc[-1])
+        else:
+            avg_gain = gain_step
+            avg_loss = loss_step
 
     if avg_loss == 0:
         return 100.0

@@ -14,33 +14,17 @@ from __future__ import annotations
 
 import logging
 
+import pandas as pd
+
 from executor.strategies.config import load_strategy_config
 
 logger = logging.getLogger(__name__)
 
 
-def _pearson_correlation(x: list[float], y: list[float]) -> float | None:
-    """Compute Pearson correlation coefficient between two lists."""
-    n = len(x)
-    if n < 2:
-        return None
-    mean_x = sum(x) / n
-    mean_y = sum(y) / n
-
-    cov = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
-    var_x = sum((xi - mean_x) ** 2 for xi in x)
-    var_y = sum((yi - mean_y) ** 2 for yi in y)
-
-    denom = (var_x * var_y) ** 0.5
-    if denom == 0:
-        return None
-    return cov / denom
-
-
 def check_correlation(
     ticker: str,
     current_positions: dict[str, dict],
-    price_histories: dict[str, list[dict]],
+    price_histories: dict[str, pd.DataFrame],
     config: dict,
 ) -> tuple[bool, str]:
     """
@@ -59,9 +43,10 @@ def check_correlation(
     threshold = config.get("correlation_block_threshold", 0.80)
     lookback = config.get("correlation_lookback_days", 60)
 
-    candidate_history = price_histories.get(ticker, [])
-    if len(candidate_history) < lookback:
-        return True, f"insufficient price history for {ticker} ({len(candidate_history)} < {lookback})"
+    candidate_history = price_histories.get(ticker)
+    if candidate_history is None or len(candidate_history) < lookback:
+        n = 0 if candidate_history is None else len(candidate_history)
+        return True, f"insufficient price history for {ticker} ({n} < {lookback})"
 
     # Get candidate's sector
     candidate_sector = None
@@ -70,17 +55,16 @@ def check_correlation(
             candidate_sector = pos.get("sector", "")
             break
 
-    # Compute daily returns for candidate
-    candidate_closes = [b["close"] for b in candidate_history[-lookback:]]
-    candidate_returns = []
-    for i in range(1, len(candidate_closes)):
-        candidate_returns.append(candidate_closes[i] / candidate_closes[i-1] - 1)
-
-    if not candidate_returns:
+    # Compute daily returns for candidate (vectorized; drops the N=1 NaN
+    # produced by pct_change at the head)
+    candidate_returns = (
+        candidate_history["close"].iloc[-lookback:].pct_change().dropna()
+    )
+    if candidate_returns.empty:
         return True, "no returns computed for candidate"
 
     # Compare with same-sector held positions
-    correlations = []
+    correlations: list[tuple[str, float]] = []
     for held_ticker, pos in current_positions.items():
         if held_ticker == ticker:
             continue
@@ -88,27 +72,26 @@ def check_correlation(
         if candidate_sector and held_sector != candidate_sector:
             continue  # only compare within same sector
 
-        held_history = price_histories.get(held_ticker, [])
-        if len(held_history) < lookback:
+        held_history = price_histories.get(held_ticker)
+        if held_history is None or len(held_history) < lookback:
             continue
 
-        held_closes = [b["close"] for b in held_history[-lookback:]]
-        held_returns = []
-        for i in range(1, len(held_closes)):
-            held_returns.append(held_closes[i] / held_closes[i-1] - 1)
+        held_returns = held_history["close"].iloc[-lookback:].pct_change().dropna()
 
-        # Align lengths
+        # Align lengths (and indices — the two series may have different
+        # last bars if one ticker has missing data). Pearson on aligned
+        # tail of length ≥ 10.
         min_len = min(len(candidate_returns), len(held_returns))
         if min_len < 10:
             continue
 
-        cr = candidate_returns[-min_len:]
-        hr = held_returns[-min_len:]
+        cr = candidate_returns.iloc[-min_len:].reset_index(drop=True)
+        hr = held_returns.iloc[-min_len:].reset_index(drop=True)
 
-        # Pearson correlation
-        corr = _pearson_correlation(cr, hr)
-        if corr is not None:
-            correlations.append((held_ticker, corr))
+        # Pearson correlation via pandas (NaN if degenerate variance)
+        corr = cr.corr(hr)
+        if pd.notna(corr):
+            correlations.append((held_ticker, float(corr)))
 
     if not correlations:
         return True, "no same-sector positions to compare"
@@ -181,7 +164,7 @@ def check_order(
     market_regime: str,
     signal: dict,
     config: dict,
-    price_histories: dict[str, list[dict]] | None = None,
+    price_histories: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[bool, str]:
     """
     Validate an order against all risk rules.

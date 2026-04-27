@@ -219,14 +219,20 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def _compute_support_level(price_history: list[dict], strategy_config: dict) -> float | None:
-    """Compute N-day low from price history for support-bounce entry trigger."""
+def _compute_support_level(price_history, strategy_config: dict) -> float | None:
+    """Compute N-day low from price history for support-bounce entry trigger.
+
+    Accepts a pandas DataFrame indexed by date with a ``low`` column.
+    """
     lookback = strategy_config.get("intraday_support_lookback_days", 20)
-    if not price_history or len(price_history) < lookback:
+    if price_history is None or len(price_history) < lookback:
         return None
-    recent = price_history[-lookback:]
-    lows = [bar["low"] for bar in recent if bar.get("low")]
-    return min(lows) if lows else None
+    lows = price_history["low"].iloc[-lookback:]
+    # Drop zeros/NaNs the way the prior list-based path did via ``if bar.get("low")``
+    valid = lows[(lows.notna()) & (lows > 0)]
+    if valid.empty:
+        return None
+    return float(valid.min())
 
 
 def _read_signals(
@@ -396,9 +402,10 @@ def _plan_entries(
 
         # Momentum confirmation gate
         if config.get("momentum_gate_enabled", True) and price_histories:
-            ticker_history = price_histories.get(ticker, [])
-            if len(ticker_history) >= 21:
-                momentum_20d = (ticker_history[-1]["close"] / ticker_history[-21]["close"] - 1) * 100
+            ticker_history = price_histories.get(ticker)
+            if ticker_history is not None and len(ticker_history) >= 21:
+                close = ticker_history["close"]
+                momentum_20d = (float(close.iloc[-1]) / float(close.iloc[-21]) - 1) * 100
                 mom_threshold = config.get("momentum_gate_threshold", -5.0)
                 if momentum_20d < mom_threshold:
                     reason = f"momentum gate: 20d={momentum_20d:.1f}% < {mom_threshold}%"
@@ -549,7 +556,7 @@ def _plan_entries(
             # trailing-stop calculation downstream (bracket_orders.py) keeps its dollar
             # semantics. Pullback threshold scales by atr_pct so high-vol and low-vol
             # names each get a trigger calibrated to their own realized volatility.
-            ticker_hist = (price_histories or {}).get(ticker, [])
+            ticker_hist = (price_histories or {}).get(ticker)
             ticker_atr_pct = atr_map.get(ticker)
             # atr_map is populated for every enter_signal ticker by load_atr_14_pct's
             # hard-fail contract — if ticker is missing here the morning planner
@@ -1534,8 +1541,8 @@ if __name__ == "__main__":
                 tickers = [s["ticker"] for s in sig_data.get("universe", [])]
                 histories = load_price_histories(tickers=tickers, signals_bucket=bucket)
                 for t, hist in histories.items():
-                    if hist and len(hist) > 0:
-                        sim_prices[t] = hist[-1]["close"]
+                    if hist is not None and len(hist) > 0:
+                        sim_prices[t] = float(hist["close"].iloc[-1])
                 logger.info("Seeded %d simulated prices from S3 slim cache", len(sim_prices))
         except Exception as e:
             logger.warning("Could not seed simulated prices: %s — entries will show no price", e)
