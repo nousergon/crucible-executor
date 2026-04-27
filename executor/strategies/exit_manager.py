@@ -46,6 +46,9 @@ def check_atr_trailing_stop(
     entry_date: str,
     price_history: pd.DataFrame,
     strategy_config: dict,
+    *,
+    feature_lookup=None,
+    run_date: str | None = None,
 ) -> dict | None:
     """
     Check if a position should be exited based on ATR trailing stop.
@@ -61,6 +64,14 @@ def check_atr_trailing_stop(
                        indexed by DatetimeIndex sorted ascending. Must cover
                        at least ATR period days before entry_date through today.
         strategy_config: from load_strategy_config()
+        feature_lookup: optional ``executor.feature_lookup.FeatureLookup`` —
+                       when provided AND ``period == DEFAULT_ATR_PERIOD``
+                       (14), the ATR is read from the precomputed lookup
+                       in O(log N) instead of recomputed per call. Tier 3
+                       Part C (2026-04-27).
+        run_date: ISO date string for the FeatureLookup query (only used
+                  when ``feature_lookup`` is provided). Defaults to the
+                  last bar in ``price_history`` if not supplied.
 
     Returns:
         EXIT signal dict if stop triggered, else None.
@@ -86,8 +97,18 @@ def check_atr_trailing_stop(
         logger.info("ATR skip %s: %d bars since entry %s (need 2+)", ticker, len(post_entry), entry_date)
         return None
 
-    # Compute ATR from the full price history (need period+1 bars minimum)
-    atr = _compute_atr(price_history, period)
+    # Tier 3 Part C: prefer precomputed ATR from FeatureLookup when
+    # available + period matches the lookup's hardcoded 14. Falls back
+    # to per-call _compute_atr otherwise (live executor without
+    # feature_lookup wired, or any non-default period).
+    atr: float | None = None
+    if feature_lookup is not None:
+        from executor.feature_lookup import DEFAULT_ATR_PERIOD
+        if period == DEFAULT_ATR_PERIOD:
+            query_date = run_date or price_history.index[-1]
+            atr = feature_lookup.atr_dollar_at(ticker, query_date)
+    if atr is None:
+        atr = _compute_atr(price_history, period)
     if atr is None or atr <= 0:
         logger.info("ATR skip %s: insufficient data for ATR(%d) (have %d bars)",
                      ticker, period, len(price_history))
@@ -330,6 +351,9 @@ def check_momentum_exit(
     ticker: str,
     price_history: pd.DataFrame,
     strategy_config: dict,
+    *,
+    feature_lookup=None,
+    run_date: str | None = None,
 ) -> dict | None:
     """
     Check if a position should be exited based on severe negative momentum.
@@ -341,6 +365,9 @@ def check_momentum_exit(
         ticker: stock symbol
         price_history: OHLCV DataFrame sorted ascending (needs >= 21 bars)
         strategy_config: from load_strategy_config()
+        feature_lookup: optional FeatureLookup for O(log N) momentum + RSI
+                       reads (Tier 3 Part C).
+        run_date: ISO date for FeatureLookup queries.
 
     Returns:
         EXIT signal dict if momentum criteria met, else None.
@@ -351,12 +378,20 @@ def check_momentum_exit(
     if price_history is None or len(price_history) < 21:
         return None
 
-    # 20-day momentum (percentage)
-    close = price_history["close"]
-    momentum = (float(close.iloc[-1]) / float(close.iloc[-21]) - 1) * 100
+    # 20-day momentum + RSI(14): prefer precomputed lookups when
+    # available, fall back to per-call computation.
+    momentum: float | None = None
+    rsi: float | None = None
+    if feature_lookup is not None:
+        query_date = run_date or price_history.index[-1]
+        momentum = feature_lookup.momentum_20d_pct_at(ticker, query_date)
+        rsi = feature_lookup.rsi_at(ticker, query_date)
 
-    # RSI(14)
-    rsi = _compute_rsi(price_history, period=14)
+    if momentum is None:
+        close = price_history["close"]
+        momentum = (float(close.iloc[-1]) / float(close.iloc[-21]) - 1) * 100
+    if rsi is None:
+        rsi = _compute_rsi(price_history, period=14)
 
     mom_threshold = strategy_config.get("momentum_exit_threshold", -15.0)
     rsi_threshold = strategy_config.get("momentum_exit_rsi", 30)
@@ -388,6 +423,8 @@ def evaluate_exits(
     ibkr_client,
     strategy_config: dict,
     sector_etf_histories: dict[str, pd.DataFrame] | None = None,
+    *,
+    feature_lookup=None,
 ) -> list[dict]:
     """
     Evaluate all held positions against exit rules.
@@ -412,6 +449,12 @@ def evaluate_exits(
         strategy_config: from load_strategy_config()
         sector_etf_histories: {etf_ticker: pd.DataFrame} for sector-relative
                               veto. None disables veto.
+        feature_lookup: optional ``executor.feature_lookup.FeatureLookup``
+                        with precomputed ATR / RSI / momentum series.
+                        Threaded into ``check_atr_trailing_stop`` and
+                        ``check_momentum_exit`` for O(log N) feature
+                        lookups instead of per-call recompute. Tier 3
+                        Part C (2026-04-27).
 
     Returns:
         List of signal dicts with action="EXIT" or "REDUCE" and reason field.
@@ -443,6 +486,8 @@ def evaluate_exits(
             entry_date=entry_date,
             price_history=history,
             strategy_config=strategy_config,
+            feature_lookup=feature_lookup,
+            run_date=run_date,
         )
         if atr_signal:
             # Check sector-relative veto before accepting ATR exit
@@ -491,6 +536,8 @@ def evaluate_exits(
             ticker=ticker,
             price_history=history,
             strategy_config=strategy_config,
+            feature_lookup=feature_lookup,
+            run_date=run_date,
         )
         if momentum_signal:
             strategy_signals.append(momentum_signal)
