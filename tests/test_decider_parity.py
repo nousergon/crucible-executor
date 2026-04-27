@@ -255,6 +255,78 @@ class TestDecideEntriesParity:
         assert held_ticker not in [o["ticker"] for o in plan.orders]
 
 
+class TestEnrichPositionsUniverseSectorsOverride:
+    """Tier 3 Part A (2026-04-27): backtester precomputes
+    ``universe_sectors`` once per signal date, shared across 60 combos
+    in a ``predictor_param_sweep``. Verify the optional override
+    produces byte-equal output to the per-call rebuild path.
+    """
+
+    def test_universe_sectors_override_matches_internal_rebuild(self):
+        from executor.deciders import enrich_positions
+
+        signals_raw = {
+            "universe": [
+                {"ticker": "AAPL", "sector": "Technology"},
+                {"ticker": "JPM", "sector": "Financial"},
+                {"ticker": "JNJ", "sector": "Healthcare"},
+            ],
+            "buy_candidates": [
+                {"ticker": "MSFT", "sector": "Technology"},
+            ],
+        }
+        positions = {
+            "AAPL": {"shares": 100, "avg_cost": 150.0},
+            "MSFT": {"shares": 50, "avg_cost": 300.0},
+        }
+        entry_dates = {"AAPL": "2026-04-20", "MSFT": "2026-04-22"}
+
+        # Path A — internal rebuild (live behavior, override=None)
+        result_a = enrich_positions(positions, signals_raw, entry_dates)
+
+        # Path B — explicit override (backtester behavior)
+        precomputed = {
+            "AAPL": "Technology",
+            "JPM": "Financial",
+            "JNJ": "Healthcare",
+            "MSFT": "Technology",
+        }
+        result_b = enrich_positions(
+            positions, signals_raw, entry_dates,
+            universe_sectors=precomputed,
+        )
+
+        assert result_a == result_b, (
+            "enrich_positions output drift between internal-rebuild "
+            "(override=None) and explicit override paths"
+        )
+
+    def test_override_takes_precedence_over_signals_raw(self):
+        """If caller passes override, signals_raw's sectors are ignored
+        — caller has authoritative pre-built mapping. (Backtester filters
+        signals against universe at simulation-loop bootstrap; the
+        precomputed map reflects that filter.)"""
+        from executor.deciders import enrich_positions
+
+        # signals_raw says AAPL is Technology
+        signals_raw = {
+            "universe": [{"ticker": "AAPL", "sector": "Technology"}],
+            "buy_candidates": [],
+        }
+        # Override says AAPL is Financial (intentionally divergent for the test)
+        override = {"AAPL": "Financial"}
+        positions = {"AAPL": {"shares": 100, "avg_cost": 150.0}}
+
+        result = enrich_positions(
+            positions, signals_raw, entry_dates_lookup=None,
+            universe_sectors=override,
+        )
+
+        assert result["AAPL"]["sector"] == "Financial", (
+            "Override map must take precedence over signals_raw's sectors"
+        )
+
+
 class TestDecideExitsAndReducesParity:
     """Direct decide_exits_and_reduces vs _plan_exits_and_reduces wrapper.
 

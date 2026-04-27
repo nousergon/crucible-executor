@@ -70,6 +70,7 @@ def enrich_positions(
     current_positions: dict[str, dict],
     signals_raw: dict,
     entry_dates_lookup: dict[str, str | None] | None = None,
+    universe_sectors: dict[str, str] | None = None,
 ) -> dict[str, dict]:
     """Return a NEW positions dict with each position's ``sector`` and
     ``entry_date`` populated from signals + entry_dates lookup.
@@ -80,15 +81,23 @@ def enrich_positions(
     ``trade_logger.get_entry_dates`` (live) or from the simulated
     client's per-position state (backtester). Pass ``None`` to leave
     ``entry_date`` unset on every position.
+
+    ``universe_sectors``: optional precomputed ``{ticker: sector}`` map.
+    When provided, the per-call dict comprehension over ``signals_raw``'s
+    universe + buy_candidates is skipped — caller has already built the
+    lookup. Live executor passes ``None`` (rebuilt per call); backtester
+    passes a precomputed map shared across all 60 combos in a
+    ``predictor_param_sweep`` (Tier 3 Part A amortization, 2026-04-27).
     """
-    universe_sectors: dict[str, str] = {
-        s["ticker"]: s.get("sector", "")
-        for s in (
-            signals_raw.get("universe", [])
-            + signals_raw.get("buy_candidates", [])
-        )
-        if s.get("ticker")
-    }
+    if universe_sectors is None:
+        universe_sectors = {
+            s["ticker"]: s.get("sector", "")
+            for s in (
+                signals_raw.get("universe", [])
+                + signals_raw.get("buy_candidates", [])
+            )
+            if s.get("ticker")
+        }
     out: dict[str, dict] = {}
     for ticker, pos in current_positions.items():
         new_pos = dict(pos)  # shallow copy
