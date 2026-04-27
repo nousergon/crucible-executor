@@ -214,9 +214,34 @@ def _merge_s3_params(config: dict, s3_params: dict) -> dict[str, Any]:
     return config
 
 
+_LOAD_CONFIG_CACHE: dict | None = None
+
+
 def load_config() -> dict:
-    with open(get_config_path()) as f:
-        return yaml.safe_load(f)
+    """Load and return the risk.yaml config dict.
+
+    Cached for the process lifetime: risk.yaml is read-only at runtime
+    and re-reading on every call wastes ~20 ms per executor.run()
+    invocation. Live executor calls this once per boot, so caching is a
+    no-op there. Backtester loops 100k+ times per predictor_param_sweep,
+    so per-call cache hit drops the load_config cost from ~1 sec total
+    (50-call profile) to ~1 ms.
+
+    A deep copy is returned so that the per-call config_override merge
+    in run() (which mutates nested ``config["strategy"][...]`` dicts)
+    can't pollute the cache. Deepcopy of a ~30-key nested dict is sub-
+    millisecond — much cheaper than re-parsing YAML.
+
+    Tests that need to override the config path can clear the cache by
+    setting ``executor.main._LOAD_CONFIG_CACHE = None`` before invoking
+    ``load_config()``.
+    """
+    global _LOAD_CONFIG_CACHE
+    import copy
+    if _LOAD_CONFIG_CACHE is None:
+        with open(get_config_path()) as f:
+            _LOAD_CONFIG_CACHE = yaml.safe_load(f)
+    return copy.deepcopy(_LOAD_CONFIG_CACHE)
 
 
 def _compute_support_level(price_history, strategy_config: dict) -> float | None:
@@ -264,8 +289,21 @@ def _read_signals(
     # (alpha-engine-research#41) is the primary guardrail; this catches
     # anything that slipped past (manual edits, Research bug, universe-drift
     # window). See filter_buy_candidates_to_universe for scope + rationale.
-    from executor.signal_reader import filter_buy_candidates_to_universe
-    signals_raw = filter_buy_candidates_to_universe(signals_raw, signals_bucket)
+    #
+    # Skipped in simulate mode (2026-04-27): the backtester already
+    # pre-filters signals against the ArcticDB universe ONCE at the
+    # simulation-loop bootstrap (``backtest.py:_run_simulation_loop``
+    # line 826 calls ``get_universe_symbols`` once, then per-date
+    # ``_simulate_single_date`` runs ``_filter_signals_to_universe`` against
+    # that set). Re-running the filter inside ``_read_signals`` would
+    # call ``universe_lib.list_symbols()`` per signal date — an
+    # ArcticDB round-trip the profile measured at ~424 ms/call, which
+    # blew the predictor_param_sweep budget. Live executor still pays
+    # the per-call cost (runs once per trading day, where the cost is
+    # negligible).
+    if not simulate:
+        from executor.signal_reader import filter_buy_candidates_to_universe
+        signals_raw = filter_buy_candidates_to_universe(signals_raw, signals_bucket)
 
     # Admission gate — refuse buy_candidates below hard coverage floor
     # (default 0.30). Companion to the position sizer's coverage derate:
