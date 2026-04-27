@@ -23,9 +23,11 @@ is the inline policy name on that role.
 ## Roles managed here
 
 - **`alpha-engine-executor-role`** — assumed by the trading EC2 instance
-  (`ae-trading`) and any executor processes assuming it. 9 inline policies
-  as of 2026-04-27. Trust policy + role creation are NOT managed here
-  (out of scope for the flat-file approach).
+  (`ae-trading`) and any executor processes assuming it. 8 inline policies
+  as of 2026-04-27 (was 9 — `alpha-engine-ssm-access` consolidated into
+  `alpha-engine-ssm-read`, which already had the superset of actions).
+  Trust policy + role creation are NOT managed here (out of scope for the
+  flat-file approach).
 - **`github-actions-iam-drift-check`** — assumed by GitHub Actions via
   OIDC for the daily IAM-drift-check workflow. Single inline policy
   granting `iam:ListRolePolicies` + `iam:GetRolePolicy` scoped to the
