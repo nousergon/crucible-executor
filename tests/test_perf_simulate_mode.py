@@ -36,56 +36,64 @@ def clear_load_config_cache():
     main_mod._LOAD_CONFIG_CACHE = None
 
 
+@pytest.fixture
+def fake_risk_yaml(tmp_path, monkeypatch):
+    """Write a minimal risk.yaml to a temp path and point
+    ``get_config_path`` at it. Lets the cache-behavior tests run on a
+    clean CI runner that has no real risk.yaml on disk.
+    """
+    p = tmp_path / "risk.yaml"
+    p.write_text(
+        "min_score_to_enter: 70\n"
+        "max_position_pct: 0.05\n"
+        "strategy:\n"
+        "  exit_manager:\n"
+        "    atr_period: 14\n"
+    )
+    monkeypatch.setattr(
+        "executor.main.get_config_path", lambda: str(p),
+    )
+    return p
+
+
 class TestLoadConfigCache:
-    def test_load_config_caches_result(self):
+    def test_load_config_caches_result(self, fake_risk_yaml):
         """First call reads the file; second call hits the cache."""
-        # Use the real load_config but observe via the cache module-level.
         cfg1 = main_mod.load_config()
-        # Cache should now be populated
         assert main_mod._LOAD_CONFIG_CACHE is not None
-        # Cache identity vs returned dict: returned must be a deep copy,
-        # not the cached object itself
+        # Returned dict is a deep copy, not the cached object
         assert cfg1 is not main_mod._LOAD_CONFIG_CACHE
 
         cfg2 = main_mod.load_config()
         assert cfg2 is not cfg1  # each call returns a fresh deepcopy
-        # But the contents are equal
         assert cfg2 == cfg1
 
-    def test_load_config_returns_independent_copies(self):
+    def test_load_config_returns_independent_copies(self, fake_risk_yaml):
         """Mutating one returned dict must not pollute the cache or
         a subsequent caller."""
         cfg1 = main_mod.load_config()
-        # Mutate top-level
         cfg1["min_score_to_enter"] = 999
-        # Mutate nested
-        if "strategy" in cfg1 and isinstance(cfg1["strategy"], dict):
-            if "exit_manager" not in cfg1["strategy"]:
-                cfg1["strategy"]["exit_manager"] = {}
-            cfg1["strategy"]["exit_manager"]["atr_period"] = 99
+        cfg1["strategy"]["exit_manager"]["atr_period"] = 99
 
         cfg2 = main_mod.load_config()
-        # Top-level not polluted
-        assert cfg2.get("min_score_to_enter") != 999, (
+        assert cfg2["min_score_to_enter"] != 999, (
             "Cache pollution: mutating cfg1 changed the cached config"
         )
-        # Nested not polluted
-        if "strategy" in cfg2 and "exit_manager" in cfg2.get("strategy", {}):
-            assert cfg2["strategy"]["exit_manager"].get("atr_period") != 99, (
-                "Cache pollution: nested-dict mutation leaked into cache"
-            )
+        assert cfg2["strategy"]["exit_manager"]["atr_period"] != 99, (
+            "Cache pollution: nested-dict mutation leaked into cache"
+        )
 
-    def test_file_only_read_once_under_repeated_calls(self):
+    def test_file_only_read_once_under_repeated_calls(self, fake_risk_yaml):
         """The YAML file should only be opened on first call."""
         # First call populates the cache
         main_mod.load_config()
-        # Patch the file-open path: subsequent calls must NOT hit it.
+        # Patch builtins.open: subsequent calls must NOT hit it.
         with patch("builtins.open") as mock_open:
             for _ in range(20):
                 main_mod.load_config()
             assert mock_open.call_count == 0, (
-                f"load_config() opened the file {mock_open.call_count}× under "
-                "repeated calls — cache is not effective"
+                f"load_config() opened the file {mock_open.call_count}x "
+                "under 20 repeated calls — cache is not effective"
             )
 
 
