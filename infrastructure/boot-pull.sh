@@ -153,6 +153,28 @@ if [ -d "$SYSTEMD_SRC" ]; then
             CHANGED=true
         fi
     done
+    # Orphan reconciliation: any /etc/systemd/system/alpha-engine-*.{service,timer}
+    # without a corresponding source in $SYSTEMD_SRC was removed from the
+    # repo and must be retired here. Disable + remove. Safety: only matches
+    # `alpha-engine-*` prefix, never touches unrelated system units.
+    #
+    # 2026-04-28: closes the asymmetry where adding a new timer was
+    # self-healing (install/update/enable handled) but retiring one was
+    # not — the systemd file lingered on disk and continued firing even
+    # after deletion from the repo. After this pass, removing a unit
+    # file from `infrastructure/systemd/` is the canonical retirement
+    # path: next boot disables + deletes it.
+    for installed in /etc/systemd/system/alpha-engine-*.service /etc/systemd/system/alpha-engine-*.timer; do
+        [ -f "$installed" ] || continue  # glob may match nothing
+        name=$(basename "$installed")
+        if [ ! -f "$SYSTEMD_SRC/$name" ]; then
+            sudo systemctl disable --now "$name" >> "$LOG" 2>&1 || true
+            sudo rm -f "$installed"
+            log "OK   systemd: orphan removed $name (no longer in repo)"
+            CHANGED=true
+        fi
+    done
+
     if $CHANGED; then
         sudo systemctl daemon-reload
         log "OK   systemd: daemon-reload"

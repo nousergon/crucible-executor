@@ -65,3 +65,64 @@ def test_no_new_timers_only_enable_path():
         "EOD outage. Use a reconciliation loop over every timer "
         "shipped in infrastructure/systemd/ instead."
     )
+
+
+# ── Orphan-removal pass (2026-04-28: EOD pipeline → SF cutover) ──────────────
+# Adding a new timer was self-healing (install + enable handled by the
+# reconciler) but retiring one was not — the unit file lingered on disk
+# and continued firing even after deletion from the repo. Removing the
+# alpha-engine-daily-data.* and alpha-engine-eod.* units to cut over to
+# the EOD Step Function exposed this gap.
+
+
+def test_orphan_removal_loop_exists():
+    """boot-pull.sh must scan /etc/systemd/system for alpha-engine-*
+    units that no longer have a source in the repo, and disable + remove
+    them. Without this pass, retiring a unit requires manual SSM."""
+    src = _source()
+    assert "/etc/systemd/system/alpha-engine-*" in src, (
+        "boot-pull.sh must iterate /etc/systemd/system/alpha-engine-* "
+        "to find orphaned units."
+    )
+    assert "systemctl disable --now" in src, (
+        "orphan-removal pass must call `systemctl disable --now` to "
+        "stop active timers before removing the unit file."
+    )
+    assert 'rm -f "$installed"' in src or "rm -f $installed" in src, (
+        "orphan-removal pass must `rm` the unit file from "
+        "/etc/systemd/system after disabling — leaving it on disk "
+        "lets `systemctl start` re-fire it manually."
+    )
+
+
+def test_orphan_removal_safety_prefix():
+    """The orphan loop must only match `alpha-engine-*` units. Removing
+    arbitrary units from /etc/systemd/system would brick the host."""
+    src = _source()
+    # The glob in the orphan loop must include the alpha-engine prefix —
+    # we never `rm` anything that doesn't start with that prefix.
+    assert "alpha-engine-*.service" in src and "alpha-engine-*.timer" in src, (
+        "orphan-removal globs must be scoped to alpha-engine-* prefix to "
+        "avoid disabling unrelated system units."
+    )
+
+
+def test_retired_units_not_shipped():
+    """The four units retired in the EOD-SF cutover must NOT exist in
+    infrastructure/systemd/ (the orphan-removal loop on next boot will
+    then disable + remove them on ae-trading)."""
+    systemd_src = Path(__file__).parent.parent / "infrastructure" / "systemd"
+    retired = [
+        "alpha-engine-daily-data.service",
+        "alpha-engine-daily-data.timer",
+        "alpha-engine-eod.service",
+        "alpha-engine-eod.timer",
+    ]
+    for name in retired:
+        assert not (systemd_src / name).exists(), (
+            f"{name} must not be in infrastructure/systemd/ — "
+            f"the EOD Step Function (alpha-engine-eod-pipeline) is the "
+            f"canonical path. If you re-add it, the SF triggers and the "
+            f"systemd timer will both fire (duplicate emails / racing "
+            f"writes against ArcticDB)."
+        )

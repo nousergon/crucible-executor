@@ -91,9 +91,7 @@ sudo bash "$REPO_DIR/infrastructure/install-boot-pull.sh"
 SYSTEMD_DIR="$REPO_DIR/infrastructure/systemd"
 
 for unit in xvfb.service ibgateway.service alpha-engine-morning.service \
-            alpha-engine-daemon.service alpha-engine-daemon.timer \
-            alpha-engine-daily-data.service alpha-engine-daily-data.timer \
-            alpha-engine-eod.service alpha-engine-eod.timer; do
+            alpha-engine-daemon.service alpha-engine-daemon.timer; do
     sudo cp "$SYSTEMD_DIR/$unit" /etc/systemd/system/
 done
 
@@ -103,8 +101,6 @@ sudo systemctl enable xvfb.service
 sudo systemctl enable ibgateway.service
 sudo systemctl enable alpha-engine-morning.service
 sudo systemctl enable alpha-engine-daemon.service
-sudo systemctl enable alpha-engine-daily-data.timer
-sudo systemctl enable alpha-engine-eod.timer
 
 echo ""
 echo "=== Trading Instance Setup Complete ==="
@@ -114,8 +110,11 @@ echo "  1. xvfb.service           — virtual display for IB Gateway"
 echo "  2. ibgateway.service      — IB Gateway via IBC (needs 2FA on first login)"
 echo "  3. alpha-engine-morning   — order book planner (main.py)"
 echo "  4. alpha-engine-daemon    — intraday order executor"
-echo "  5. alpha-engine-daily-data — post-close OHLCV capture (1:05 PM PT timer)"
-echo "  6. alpha-engine-eod       — EOD reconciliation (1:20 PM PT timer)"
+echo ""
+echo "Post-close data capture + EOD reconciliation are NOT systemd timers."
+echo "They run via the alpha-engine-eod-pipeline Step Function, triggered"
+echo "by EventBridge weekdays at 13:05 PT. SF chain: PostMarketData →"
+echo "EODReconcile → StopTradingInstance (single authoritative path)."
 echo ""
 echo "First login: IB Gateway will send a 2FA push to your phone."
 echo "Approve it within 2 minutes of instance start."
