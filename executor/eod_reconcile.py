@@ -24,7 +24,6 @@ from ssm_secrets import load_secrets
 load_secrets()
 
 from executor.eod_emailer import send_eod_email
-from executor.ibkr import IBKRClient
 from executor.trade_logger import (
     init_db, log_eod, backup_to_s3, get_entry_trade, get_todays_trades,
 )
@@ -337,28 +336,14 @@ def _apply_dividend_delta(
 
 
 def run(run_date: str | None = None) -> None:
-    today_trading_day = now_dual().trading_day
     if run_date is None:
-        run_date = today_trading_day
+        run_date = now_dual().trading_day
         logger.info(
             "EOD reconciliation | date=%s (resolved from now_dual().trading_day)",
             run_date,
         )
     else:
-        if run_date != today_trading_day:
-            raise RuntimeError(
-                f"EOD reconciliation refusing run_date={run_date!r} "
-                f"!= today's trading_day {today_trading_day!r}. "
-                f"Historical reruns are unsafe: get_account_snapshot() returns "
-                f"current live IB state which would be written against the "
-                f"historical row, corrupting the prior_nav chain. "
-                f"For SPY-only corrections use infrastructure/backfill_eod_pnl_spy.py; "
-                f"a --from-snapshot mode for full historical reconstruction is owed."
-            )
-        logger.info(
-            "EOD reconciliation | date=%s (explicit; matches today's trading_day)",
-            run_date,
-        )
+        logger.info("EOD reconciliation | date=%s (explicit)", run_date)
     _health_start = _time.time()
 
     config = load_config()
@@ -366,9 +351,8 @@ def run(run_date: str | None = None) -> None:
     db_path = config["db_path"]
     trades_bucket = config["trades_bucket"]
 
-    # Preflight: AWS_REGION + S3 bucket reachable. Fail fast before the
-    # retry loop so a misconfigured env surfaces immediately instead of
-    # after 3x IBKR reconnect timeouts.
+    # Preflight: AWS_REGION + S3 bucket reachable. Fail fast so a
+    # misconfigured env surfaces immediately instead of deeper down.
     from executor.preflight import ExecutorPreflight
     ExecutorPreflight(bucket=trades_bucket, mode="eod").run()
 
@@ -384,45 +368,58 @@ def run(run_date: str | None = None) -> None:
 
     conn = init_db(db_path)
 
-    # Connect to IB Gateway with retry (transient failures at EOD are common)
-    max_eod_attempts = 3
-    nav = None
-    positions = None
-    for attempt in range(1, max_eod_attempts + 1):
-        try:
-            ibkr = IBKRClient(
-                host=config["ibkr_host"],
-                port=config["ibkr_port"],
-                client_id=config["ibkr_client_id"],
+    # Load EOD state from S3 snapshot keyed by run_date.
+    #
+    # 2026-04-28 (Phase 2 of EOD-SF cutover): replaced the live IB-read
+    # block (`get_account_snapshot` + `get_positions` +
+    # `get_accrued_dividends_by_symbol`) with a snapshot read. The
+    # snapshot is written by `executor/snapshot_capturer.py` running as
+    # the SF's `CaptureSnapshot` step before this step. The snapshot
+    # decouples capture from reconciliation — the row keyed by
+    # `run_date=X` is now built from observations made at time X, not
+    # from now-as-of state at write-time. PR #116's `run_date != today`
+    # hard-block is no longer needed: the snapshot-existence check is
+    # the new contract, and snapshot existence is what makes the run
+    # safe (today, last Tuesday, or any other date with a snapshot).
+    from executor.snapshot_capturer import load_snapshot
+    snapshot = load_snapshot(
+        bucket=trades_bucket,
+        run_date=run_date,
+        region=config.get("aws_region", "us-east-1"),
+    )
+    if snapshot is None:
+        msg = (
+            f"No snapshot at s3://{trades_bucket}/trades/snapshots/{run_date}.json — "
+            f"`executor/snapshot_capturer.py` must run before "
+            f"`executor/eod_reconcile.py` so the row keyed by run_date={run_date!r} "
+            f"sources its inputs from observations made at time {run_date!r} "
+            f"(not from now-as-of IB state). The CaptureSnapshot SF step is the "
+            f"canonical writer; for manual recovery, run "
+            f"`python executor/snapshot_capturer.py --date {run_date}` while IB "
+            f"Gateway is up on ae-trading."
+        )
+        if fd:
+            fd.report(
+                RuntimeError(msg),
+                severity="critical",
+                context={"site": "eod_load_snapshot", "run_date": run_date},
             )
-            account = ibkr.get_account_snapshot()
-            nav = account["net_liquidation"]
-            positions = ibkr.get_positions()
-            # Per-symbol accrued dividends — often {} for paper accounts.
-            # Stored in positions_snapshot to compute day-over-day deltas.
-            dividends_by_symbol = ibkr.get_accrued_dividends_by_symbol()
-            for _tkr, _accrued in dividends_by_symbol.items():
-                if _tkr in positions:
-                    positions[_tkr]["accrued_dividend"] = _accrued
-            ibkr.disconnect()
-            break
-        except Exception as e:
-            if attempt == max_eod_attempts:
-                logger.error(
-                    "EOD: IB Gateway connection failed after %d attempts: %s",
-                    max_eod_attempts, e,
-                )
-                if fd:
-                    fd.report(e, severity="critical", context={
-                        "site": "eod_ibkr_connect", "run_date": run_date,
-                        "attempts": max_eod_attempts})
-                raise
-            wait = 30 * attempt
-            logger.warning(
-                "EOD: IB Gateway attempt %d/%d failed: %s — retrying in %ds",
-                attempt, max_eod_attempts, e, wait,
-            )
-            _time.sleep(wait)
+        raise RuntimeError(msg)
+
+    account = snapshot["account"]
+    nav = account["net_liquidation"]
+    positions = snapshot["positions"]
+    dividends_by_symbol = snapshot.get("accrued_dividends", {})
+    for _tkr, _accrued in dividends_by_symbol.items():
+        if _tkr in positions:
+            positions[_tkr]["accrued_dividend"] = _accrued
+    logger.info(
+        "EOD: snapshot loaded | NAV=$%.2f positions=%d dividends=%d captured_at=%s",
+        nav,
+        len(positions),
+        len(dividends_by_symbol),
+        snapshot.get("captured_at"),
+    )
 
     # Enrich positions with sector. Lookup chain:
     #   1. signals.json today (universe + buy_candidates)

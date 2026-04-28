@@ -376,74 +376,114 @@ class TestPnLMath:
         assert spy_return == pytest.approx(1.1235955, rel=1e-4)
 
 
-# ── run_date gating ──────────────────────────────────────────────────────────
-# Historical reruns are unsafe: get_account_snapshot() always returns current
-# live IB state, which would be written against the historical row and
-# corrupt the prior_nav chain. The gate hard-fails before any IBKR call.
+# ── snapshot-driven contract (Phase 2 of EOD-SF cutover) ─────────────────────
+# Phase 1 (PR #116) hard-blocked historical reruns to stop live-IB
+# corruption. Phase 2 replaces that gate entirely: eod_reconcile reads
+# from a per-run_date S3 snapshot (written by snapshot_capturer in the
+# CaptureSnapshot SF step) instead of querying live IB. The snapshot is
+# the date-locked source of truth — today, last Tuesday, or any date
+# with a snapshot all work uniformly. The contract becomes "snapshot
+# must exist for run_date" instead of "run_date must equal today."
 
 
-class TestRunDateGating:
-    def test_explicit_past_date_raises(self):
-        """run(run_date=<yesterday>) must raise before any IB connection."""
-        with patch("executor.eod_reconcile.now_dual") as mock_now_dual:
-            mock_now_dual.return_value = SimpleNamespace(
-                trading_day="2026-04-28", calendar_date="2026-04-28"
-            )
-            with pytest.raises(RuntimeError, match="Historical reruns are unsafe"):
-                run(run_date="2026-04-27")
-
-    def test_explicit_future_date_raises(self):
-        """A future-dated rerun is also a mismatch and must raise."""
-        with patch("executor.eod_reconcile.now_dual") as mock_now_dual:
-            mock_now_dual.return_value = SimpleNamespace(
-                trading_day="2026-04-28", calendar_date="2026-04-28"
-            )
-            with pytest.raises(RuntimeError, match="refusing run_date"):
-                run(run_date="2026-04-29")
-
-    def test_error_message_names_both_dates(self):
-        """Error message must include both the requested and resolved dates
-        so the operator can immediately see what was rejected."""
-        with patch("executor.eod_reconcile.now_dual") as mock_now_dual:
-            mock_now_dual.return_value = SimpleNamespace(
-                trading_day="2026-04-28", calendar_date="2026-04-28"
-            )
-            with pytest.raises(RuntimeError) as exc:
-                run(run_date="2026-04-25")
-            msg = str(exc.value)
-            assert "2026-04-25" in msg
-            assert "2026-04-28" in msg
-            assert "backfill_eod_pnl_spy.py" in msg  # points operator to safe path
-
-    def test_default_resolves_to_now_dual_trading_day(self, monkeypatch, tmp_path):
+class TestSnapshotContract:
+    def test_default_resolves_to_now_dual_trading_day(self):
         """run() with no run_date resolves via now_dual().trading_day, not
         date.today() (which would be UTC on ae-trading and could drift past
         midnight Pacific)."""
         # Patch now_dual + bail out at the first IO boundary (load_config) so
-        # we don't need to mock the full IB/S3/SQLite plumbing — the gate
-        # check fires before any of that.
+        # we don't need to mock the full snapshot/SQLite plumbing — confirming
+        # run_date resolved to today is the only assertion here.
         with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
              patch("executor.eod_reconcile.load_config") as mock_cfg:
             mock_now_dual.return_value = SimpleNamespace(
                 trading_day="2026-04-28", calendar_date="2026-04-28"
             )
             mock_cfg.side_effect = RuntimeError("expected_test_sentinel")
-            # The fact that it reaches load_config (and not the historical
-            # gate) confirms run_date resolved to today.
             with pytest.raises(RuntimeError, match="expected_test_sentinel"):
                 run(run_date=None)
 
-    def test_explicit_today_succeeds_past_gate(self):
-        """Explicit --date matching today's trading_day is permitted."""
+    def test_explicit_run_date_passes_through(self):
+        """Phase 2 removed the run_date != today hard-block — explicit
+        historical run_dates are now valid as long as a snapshot exists.
+        This test confirms run() doesn't raise on the date itself; the
+        snapshot-existence check happens later in the flow."""
         with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
              patch("executor.eod_reconcile.load_config") as mock_cfg:
             mock_now_dual.return_value = SimpleNamespace(
                 trading_day="2026-04-28", calendar_date="2026-04-28"
             )
             mock_cfg.side_effect = RuntimeError("expected_test_sentinel")
-            # Same as above: reaches load_config means gate accepted today.
+            # An explicit historical run_date used to raise (PR #116). With
+            # Phase 2's snapshot contract it must reach load_config — the
+            # snapshot-existence check is the new gate.
             with pytest.raises(RuntimeError, match="expected_test_sentinel"):
+                run(run_date="2026-04-25")
+
+    def test_run_raises_when_snapshot_missing(self):
+        """If no snapshot exists at s3://...trades/snapshots/{run_date}.json,
+        run() must hard-fail with a message naming the run_date and pointing
+        to the canonical writer. This is the new contract that supersedes
+        PR #116's run_date-equality gate."""
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
+             patch("executor.eod_reconcile.load_config") as mock_cfg, \
+             patch("executor.preflight.ExecutorPreflight") as mock_preflight, \
+             patch("executor.eod_reconcile.init_db") as mock_db, \
+             patch("executor.snapshot_capturer.load_snapshot") as mock_load:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            mock_cfg.return_value = {
+                "db_path": "/tmp/x.db",
+                "trades_bucket": "alpha-engine-research",
+                "aws_region": "us-east-1",
+                "email_sender": "x@x.com",
+                "email_recipients": "y@y.com",
+            }
+            mock_preflight.return_value.run.return_value = None
+            mock_db.return_value = MagicMock()
+            mock_load.return_value = None  # snapshot missing
+            with pytest.raises(RuntimeError, match="No snapshot at s3://"):
                 run(run_date="2026-04-28")
+
+    def test_run_raises_message_points_to_capturer(self):
+        """The error message must name the missing key + reference
+        snapshot_capturer.py so the operator knows where to recover."""
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
+             patch("executor.eod_reconcile.load_config") as mock_cfg, \
+             patch("executor.preflight.ExecutorPreflight") as mock_preflight, \
+             patch("executor.eod_reconcile.init_db") as mock_db, \
+             patch("executor.snapshot_capturer.load_snapshot") as mock_load:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            mock_cfg.return_value = {
+                "db_path": "/tmp/x.db",
+                "trades_bucket": "alpha-engine-research",
+                "aws_region": "us-east-1",
+                "email_sender": "x@x.com",
+                "email_recipients": "y@y.com",
+            }
+            mock_preflight.return_value.run.return_value = None
+            mock_db.return_value = MagicMock()
+            mock_load.return_value = None
+            with pytest.raises(RuntimeError) as exc:
+                run(run_date="2026-04-25")
+            msg = str(exc.value)
+            assert "2026-04-25" in msg
+            assert "snapshot_capturer.py" in msg
+            assert "trades/snapshots/" in msg
+
+    def test_eod_no_longer_imports_ibkrclient(self):
+        """eod_reconcile must NOT depend on IBKRClient — the live IB read
+        is now in snapshot_capturer.py. A future regression that re-adds
+        the import would re-couple reconciliation to live state."""
+        import executor.eod_reconcile as eod_mod
+        assert not hasattr(eod_mod, "IBKRClient"), (
+            "eod_reconcile.py must not import IBKRClient. The live IB "
+            "read belongs in snapshot_capturer.py (Phase 2 of EOD-SF "
+            "cutover); reconciliation reads from the S3 snapshot only."
+        )
 
     def test_cli_date_flag_forwards_to_run(self):
         """`python eod_reconcile.py --date YYYY-MM-DD` invokes run(run_date=...)."""
