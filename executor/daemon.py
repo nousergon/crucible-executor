@@ -1077,6 +1077,7 @@ def _execute_entry(
         "research_score": entry.get("research_score"),
         "research_conviction": entry.get("research_conviction"),
         "research_rating": entry.get("research_rating"),
+        "sector": entry.get("sector"),
         "sector_rating": entry.get("sector_rating"),
         "market_regime": entry.get("market_regime"),
         "price_target_upside": entry.get("price_target_upside"),

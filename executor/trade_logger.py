@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS trades (
     research_score           REAL,
     research_conviction      TEXT,
     research_rating          TEXT,
+    sector                   TEXT,
     sector_rating            TEXT,
     market_regime            TEXT,
     price_target_upside      REAL,
@@ -74,6 +75,11 @@ _TRADES_MIGRATIONS = [
     # without the new context keep working as NULLs.
     "ALTER TABLE trades ADD COLUMN trading_day TEXT",
     "ALTER TABLE trades ADD COLUMN signal_trading_day TEXT",
+    # GICS sector name (e.g. "Financials"). Populated from signals.json at
+    # ENTER time. Closes the dead-fallback in eod_reconcile's sector lookup
+    # chain — get_entry_trade(...).sector now resolves instead of always
+    # returning None and pushing the lookup through to constituents.json.
+    "ALTER TABLE trades ADD COLUMN sector TEXT",
 ]
 
 _EOD_MIGRATIONS = [
@@ -181,7 +187,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade_id, date, ticker, action, shares,
             price_at_order, portfolio_nav_at_order, position_pct,
             research_score, research_conviction, research_rating,
-            sector_rating, market_regime, price_target_upside,
+            sector, sector_rating, market_regime, price_target_upside,
             thesis_summary, fill_price, fill_time, ib_order_id,
             predicted_direction, prediction_confidence, rationale_json,
             status, exit_reason, filled_shares, execution_latency_ms, source,
@@ -189,7 +195,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             spy_price_at_order, realized_pnl, realized_return_pct,
             spy_return_during_hold, realized_alpha_pct, days_held,
             slippage_vs_signal, trading_day, signal_trading_day, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -203,6 +209,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("research_score"),
             trade.get("research_conviction"),
             trade.get("research_rating"),
+            trade.get("sector"),
             trade.get("sector_rating"),
             trade.get("market_regime"),
             trade.get("price_target_upside"),
