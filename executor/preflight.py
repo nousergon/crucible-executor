@@ -29,7 +29,6 @@ from alpha_engine_lib.preflight import BasePreflight
 # 4 days: covers Fri→Tue long weekends (US market holidays) + 1 day
 # buffer. Matches alpha-engine-data DataPreflight daily-mode thresholds.
 _MACRO_MAX_STALE_DAYS = 4
-_UNIVERSE_SYMBOL_MAX_STALE_DAYS = 4
 # 5 days: per-ticker scan threshold. Slightly more permissive than the
 # canonical-symbol check because individual tickers can legitimately
 # trail SPY by 1 day (DST/cross-listing edge cases). Backtester uses
@@ -53,23 +52,18 @@ class ExecutorPreflight(BasePreflight):
         self.check_s3_bucket()
 
         if self.mode in ("main", "daemon"):
-            # Canonical macro liveness (existing-class check) + matching
-            # universe-side liveness probe. The morning planner + daemon
-            # both read per-ticker OHLCV from `universe`; macro/SPY
-            # reports DataPhase1 health, universe/SPY reports daily_append
-            # health on the universe library.
+            # Canonical macro liveness — DataPhase1 health for SPY, which
+            # lives in the `macro` library only. SPY is the S&P 500 ETF
+            # tracker; the `universe` library holds the index constituents
+            # themselves and does not contain an SPY symbol.
             self.check_arcticdb_fresh(
                 "macro", "SPY", max_stale_days=_MACRO_MAX_STALE_DAYS,
             )
-            self.check_arcticdb_fresh(
-                "universe", "SPY",
-                max_stale_days=_UNIVERSE_SYMBOL_MAX_STALE_DAYS,
-            )
-            # Per-ticker freshness scan — catches the partial-write class
-            # (2026-04-21 ASGN/MOH) where macro.SPY + universe.SPY both
-            # stay fresh while individual tickers stop receiving writes.
-            # Without this, executor's load_atr_14_pct guard aborts deep
-            # in the morning run.
+            # Per-ticker freshness scan over the full universe library —
+            # catches the partial-write class (2026-04-21 ASGN/MOH) where
+            # macro.SPY stays fresh while individual constituents stop
+            # receiving writes. Validates daily_append health on the
+            # universe library by reading every symbol's tail(1).
             self.check_arcticdb_universe_fresh(
                 "universe",
                 max_stale_days=_UNIVERSE_PER_TICKER_MAX_STALE_DAYS,

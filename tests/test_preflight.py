@@ -25,8 +25,11 @@ class TestExecutorPreflight:
             ExecutorPreflight(bucket="b", mode="bogus")
 
     def test_main_mode_composes_full_check_sequence(self):
-        """main mode: env + S3 + macro/SPY freshness + universe/SPY
-        freshness + per-ticker universe scan."""
+        """main mode: env + S3 + macro/SPY freshness + per-ticker
+        universe scan. SPY is not in the universe library (it's the
+        S&P 500 ETF, not a constituent), so a single-symbol universe/SPY
+        check is structurally invalid — the full universe scan covers
+        daily_append health on every actual constituent."""
         pf = ExecutorPreflight(bucket="b", mode="main")
         with patch.object(pf, "check_env_vars") as env, \
              patch.object(pf, "check_s3_bucket") as s3, \
@@ -35,11 +38,8 @@ class TestExecutorPreflight:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
-        # macro/SPY + universe/SPY
-        assert fresh.call_count == 2
-        macro_call, universe_sym_call = fresh.call_args_list
-        assert macro_call.args[:2] == ("macro", "SPY")
-        assert universe_sym_call.args[:2] == ("universe", "SPY")
+        fresh.assert_called_once()
+        assert fresh.call_args.args[:2] == ("macro", "SPY")
         universe.assert_called_once()
         assert universe.call_args.args[0] == "universe"
 
@@ -53,7 +53,7 @@ class TestExecutorPreflight:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
-        assert fresh.call_count == 2
+        fresh.assert_called_once()
         universe.assert_called_once()
 
     def test_eod_mode_runs_macro_only(self):
