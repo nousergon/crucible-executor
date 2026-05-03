@@ -64,7 +64,7 @@ Orchestrated by three AWS Step Functions (Saturday, weekday, EOD). S3 as the com
 | # | Module | Repo | Role |
 |---|--------|------|------|
 | 1 | **Research** | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) | 6 LLM sector teams + CIO scan ~900 stocks weekly, produce composite scores (0-100) as `signals.json` |
-| 2 | **Predictor** | [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) | Meta-model (4 GBMs + ridge) predicts 5-day sector-relative alpha; veto gate blocks high-confidence DOWN |
+| 2 | **Predictor** | [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) | Stacked meta-ensemble (Layer-1 LightGBM momentum + LightGBM volatility + research-score calibrator → Layer-2 Ridge) predicts 5-day sector-relative alpha; veto gate blocks high-confidence DOWN |
 | 3 | **Executor** | [`alpha-engine`](https://github.com/cipher813/alpha-engine) *(this repo)* | Morning planner + intraday daemon: risk rules, position sizing, technical entry triggers, trailing stops |
 | 4 | **Backtester** | [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) | Weekly evaluation (component grades, P/R/F1) + 6 autonomous optimizers → S3 config feedback loop |
 | 5 | **Dashboard** | [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) | Streamlit monitoring: portfolio performance, signal quality, system report card, execution evaluation |
@@ -118,7 +118,7 @@ s3://alpha-engine-research/
 | Component | Technology |
 |-----------|------------|
 | LLM provider | Anthropic Claude (Haiku-4.5 per-ticker, Sonnet-4.6 synthesis) |
-| ML framework | LightGBM (meta-model: 4 specialized GBMs + ridge) |
+| ML framework | LightGBM (Layer-1 momentum + volatility components) + scikit-learn Ridge (Layer-2 meta-learner) |
 | Agent orchestration | LangGraph |
 | Price data | ArcticDB (S3-backed) + Polygon.io + yfinance fallback |
 | Broker | Interactive Brokers (paper account via IB Gateway) |
