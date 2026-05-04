@@ -28,6 +28,13 @@ is the inline policy name on that role.
   `alpha-engine-ssm-read`, which already had the superset of actions).
   Trust policy + role creation are NOT managed here (out of scope for the
   flat-file approach).
+- **`alpha-engine-step-functions-role`** — assumed by all three Step
+  Functions (`alpha-engine-saturday-pipeline`, `alpha-engine-weekday-pipeline`,
+  `alpha-engine-eod-pipeline`). One consolidated inline policy granting
+  Lambda invoke, SSM run, EC2 start/stop on the trading instance, SNS
+  publish, and CloudWatch Logs delivery. Codified 2026-05-04 after an
+  asymmetric `ec2:StartInstances` / `ec2:StopInstances` grant let the EOD
+  SF stall on `StopTradingInstance` for an entire afternoon.
 - **`github-actions-iam-drift-check`** — assumed by GitHub Actions via
   OIDC for the daily IAM-drift-check workflow. Single inline policy
   granting `iam:ListRolePolicies` + `iam:GetRolePolicy` scoped to the

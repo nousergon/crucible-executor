@@ -10,6 +10,7 @@
             ],
             "Resource": [
                 "arn:aws:iam::711398986525:role/alpha-engine-executor-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-step-functions-role",
                 "arn:aws:iam::711398986525:role/github-actions-iam-drift-check"
             ]
         }
