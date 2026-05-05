@@ -4,6 +4,11 @@ Tests for ExecutorPreflight mode composition.
 BasePreflight primitives are tested in alpha-engine-lib. These tests
 verify that each executor mode composes the expected primitive calls
 and rejects unknown modes.
+
+Data-freshness checks (universe + macro/SPY) moved upstream to
+alpha-engine-data's preflight 2026-05-05; the data step in every Step
+Function hard-fails on staleness before the executor runs, so re-checking
+here is redundant.
 """
 
 from __future__ import annotations
@@ -24,53 +29,46 @@ class TestExecutorPreflight:
         with pytest.raises(ValueError, match="unknown mode"):
             ExecutorPreflight(bucket="b", mode="bogus")
 
-    def test_main_mode_composes_full_check_sequence(self):
-        """main mode: env + S3 + macro/SPY freshness + per-ticker
-        universe scan. SPY is not in the universe library (it's the
-        S&P 500 ETF, not a constituent), so a single-symbol universe/SPY
-        check is structurally invalid — the full universe scan covers
-        daily_append health on every actual constituent."""
+    def test_main_mode_composes_check_sequence(self):
+        """main mode: env + S3. Data-freshness moved upstream."""
         pf = ExecutorPreflight(bucket="b", mode="main")
         with patch.object(pf, "check_env_vars") as env, \
-             patch.object(pf, "check_s3_bucket") as s3, \
-             patch.object(pf, "check_arcticdb_fresh") as fresh, \
-             patch.object(pf, "check_arcticdb_universe_fresh") as universe:
+             patch.object(pf, "check_s3_bucket") as s3:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
-        fresh.assert_called_once()
-        assert fresh.call_args.args[:2] == ("macro", "SPY")
-        universe.assert_called_once()
-        assert universe.call_args.args[0] == "universe"
 
-    def test_daemon_mode_composes_full_check_sequence(self):
-        """daemon mode mirrors main — same ArcticDB liveness gates."""
+    def test_daemon_mode_composes_check_sequence(self):
+        """daemon mode: same as main."""
         pf = ExecutorPreflight(bucket="b", mode="daemon")
         with patch.object(pf, "check_env_vars") as env, \
-             patch.object(pf, "check_s3_bucket") as s3, \
-             patch.object(pf, "check_arcticdb_fresh") as fresh, \
-             patch.object(pf, "check_arcticdb_universe_fresh") as universe:
+             patch.object(pf, "check_s3_bucket") as s3:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
-        fresh.assert_called_once()
-        universe.assert_called_once()
 
-    def test_eod_mode_runs_macro_only(self):
-        """eod reads macro/SPY for alpha + per-position closes; full
-        universe scan is overkill since only the ~20 held names matter."""
+    def test_eod_mode_composes_check_sequence(self):
+        """eod mode: env + S3 only."""
         pf = ExecutorPreflight(bucket="b", mode="eod")
         with patch.object(pf, "check_env_vars") as env, \
-             patch.object(pf, "check_s3_bucket") as s3, \
-             patch.object(pf, "check_arcticdb_fresh") as fresh, \
-             patch.object(pf, "check_arcticdb_universe_fresh") as universe:
+             patch.object(pf, "check_s3_bucket") as s3:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
-        # Only macro/SPY — no universe-side checks
-        fresh.assert_called_once()
-        assert fresh.call_args.args[:2] == ("macro", "SPY")
-        universe.assert_not_called()
+
+    def test_no_mode_calls_data_freshness_primitives(self):
+        """Regression: no executor mode may call macro or universe
+        freshness checks. Those moved to alpha-engine-data's preflight,
+        which is the SF data step's responsibility."""
+        for mode in ("main", "daemon", "eod"):
+            pf = ExecutorPreflight(bucket="b", mode=mode)
+            with patch.object(pf, "check_env_vars"), \
+                 patch.object(pf, "check_s3_bucket"), \
+                 patch.object(pf, "check_arcticdb_fresh") as fresh, \
+                 patch.object(pf, "check_arcticdb_universe_fresh") as universe:
+                pf.run()
+            fresh.assert_not_called()
+            universe.assert_not_called()
 
     def test_check_ib_paper_account_available_on_instance(self):
         """Daemon reuses the preflight instance to validate the IB
