@@ -68,6 +68,15 @@ fi
 sudo bash "$REPO_DIR/infrastructure/install-boot-pull.sh"
 
 # ── 6. Systemd services ────────────────────────────────────────────────────
+# Only xvfb + ibgateway are autostarted on boot. The morning planner
+# and daemon run exclusively from the weekday Step Function via SSM
+# (RunMorningPlanner + RunDaemon steps). Service unit files for the
+# planner + daemon + safety-net timer are still copied to
+# /etc/systemd/system/ so operators can manually `systemctl start`
+# them for break-glass scenarios, but they are NOT enabled — so a
+# fresh boot does not race the SF for the orderbook (incident:
+# 2026-05-05, daemon ran with stale predictions because boot-systemd
+# fired before MorningEnrich + PredictorInference completed).
 SYSTEMD_DIR="$REPO_DIR/infrastructure/systemd"
 
 for unit in xvfb.service ibgateway.service alpha-engine-morning.service \
@@ -77,10 +86,10 @@ done
 
 sudo systemctl daemon-reload
 
+# Boot autostart — only the always-needed background services. SF
+# orchestration is the sole authoritative path for the trading flow.
 sudo systemctl enable xvfb.service
 sudo systemctl enable ibgateway.service
-sudo systemctl enable alpha-engine-morning.service
-sudo systemctl enable alpha-engine-daemon.service
 
 echo ""
 echo "=== Trading Instance Setup Complete ==="
@@ -88,13 +97,15 @@ echo ""
 echo "Boot sequence (systemd):"
 echo "  1. xvfb.service           — virtual display for IB Gateway"
 echo "  2. ibgateway.service      — IB Gateway via IBC (needs 2FA on first login)"
-echo "  3. alpha-engine-morning   — order book planner (main.py)"
-echo "  4. alpha-engine-daemon    — intraday order executor"
 echo ""
-echo "Post-close data capture + EOD reconciliation are NOT systemd timers."
-echo "They run via the alpha-engine-eod-pipeline Step Function, triggered"
-echo "by EventBridge weekdays at 13:05 PT. SF chain: PostMarketData →"
-echo "EODReconcile → StopTradingInstance (single authoritative path)."
+echo "Trading flow runs from the weekday Step Function (NOT boot-systemd):"
+echo "  - RunMorningPlanner step → executor/main.py via SSM"
+echo "  - RunDaemon step          → systemctl start alpha-engine-daemon.service"
+echo ""
+echo "Post-close data capture + EOD reconciliation also run via SF"
+echo "(alpha-engine-eod-pipeline, triggered by EventBridge weekdays 13:05 PT)."
+echo "SF chain: PostMarketData → EODReconcile → StopTradingInstance."
+echo "Single authoritative path; if SF fails, no trades + SNS alerts fire."
 echo ""
 echo "First login: IB Gateway will send a 2FA push to your phone."
 echo "Approve it within 2 minutes of instance start."
