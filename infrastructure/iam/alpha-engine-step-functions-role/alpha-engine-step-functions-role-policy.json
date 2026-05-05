@@ -27,6 +27,11 @@
         },
         {
             "Effect": "Allow",
+            "Action": "ssm:DescribeInstanceInformation",
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
             "Action": [
                 "ec2:StartInstances",
                 "ec2:StopInstances"
