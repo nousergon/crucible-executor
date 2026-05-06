@@ -347,6 +347,19 @@ def _read_signals(
                 logger.error("Admission gate failed on ArcticDB read: %s", exc)
                 raise
 
+    if not simulate:
+        from executor.signal_reader import patch_unknown_sectors_with_constituents
+        try:
+            n_patched = patch_unknown_sectors_with_constituents(signals_raw, signals_bucket)
+            if n_patched:
+                logger.warning(
+                    "[sector_fallback] Backfilled %d sectors from constituents.json "
+                    "(research signals.json escape from alpha-engine-research#126)",
+                    n_patched,
+                )
+        except Exception as e:
+            logger.warning("Sector backfill skipped: %s", e)
+
     signals = get_actionable_signals(signals_raw)
 
     # Alert if signals are stale (research didn't run recently)
