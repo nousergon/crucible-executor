@@ -1,0 +1,267 @@
+"""Tests that decide_entries accumulates structured risk events on
+plan.risk_events for momentum-gate vetoes, GBM-veto overrides, and
+risk_guard rule vetoes. The live shell (main._plan_entries) returns
+this list to the caller for persistence via trade_logger.log_risk_event.
+
+Phase 2 transparency-inventory — closes the *risk decisions* row.
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+from executor.deciders import decide_entries
+
+
+def _df_history(n_bars: int = 100, base: float = 100.0,
+                trend: float = 0.1) -> pd.DataFrame:
+    """Construct a synthetic OHLCV history with configurable trend.
+
+    `trend` of 0.1 = +0.1/bar (uptrend, momentum gate passes).
+    `trend` of -0.5 = aggressive downtrend (momentum gate fails).
+    """
+    return pd.DataFrame(
+        {
+            "open":  [base + i * trend for i in range(n_bars)],
+            "high":  [base + i * trend + 0.5 for i in range(n_bars)],
+            "low":   [base + i * trend - 0.5 for i in range(n_bars)],
+            "close": [base + i * trend + 0.2 for i in range(n_bars)],
+        },
+        index=pd.bdate_range("2024-01-01", periods=n_bars),
+    )
+
+
+def _base_config(**overrides):
+    cfg = {
+        "min_score_to_enter": 70,
+        "max_position_pct": 0.05,
+        "bear_max_position_pct": 0.025,
+        "max_sector_pct": 0.25,
+        "max_equity_pct": 0.90,
+        "drawdown_circuit_breaker": 0.08,
+        "bear_block_underweight": True,
+        "earnings_proximity_warning_days": 2,
+        "momentum_gate_enabled": False,
+        "momentum_gate_threshold": -5.0,
+        "atr_sizing_enabled": True,
+        "correlation_block_enabled": False,
+        "coverage_sizing_enabled": False,
+        "reduce_fraction": 0.50,
+        "strategy": {
+            "graduated_drawdown": {
+                "enabled": True,
+                "tiers": [(-0.02, 1.00, "tier1"), (-0.04, 0.50, "tier2")],
+            },
+        },
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _strategy_config():
+    return {
+        "intraday_pullback_atr_multiple": 1.0,
+        "intraday_vwap_discount_pct": 0.005,
+        "intraday_support_lookback_days": 20,
+        "drawdown_forced_exit_enabled": False,
+    }
+
+
+def _make_inputs(*, signals_date: str, run_date: str, enter_signals: list[dict],
+                 predictions_by_ticker: dict | None = None,
+                 config_overrides: dict | None = None,
+                 price_histories: dict | None = None):
+    sig_payload = {
+        "date": signals_date,
+        "market_regime": "neutral",
+        "sector_ratings": {"Technology": {"rating": "overweight"},
+                           "Defensives": {"rating": "underweight"}},
+        "enter": enter_signals,
+        "exit": [], "reduce": [], "hold": [],
+        "universe": enter_signals,
+        "buy_candidates": enter_signals,
+    }
+    tickers = sorted({s["ticker"] for s in enter_signals} | {
+        "SPY", "XLK", "XLV", "XLF", "XLY", "XLP", "XLE",
+        "XLU", "XLRE", "XLB", "XLI", "XLC",
+    })
+    return {
+        "enter_signals": enter_signals,
+        "signals_raw": sig_payload,
+        "predictions_by_ticker": predictions_by_ticker or {},
+        "config": _base_config(**(config_overrides or {})),
+        "strategy_config": _strategy_config(),
+        "market_regime": "neutral",
+        "sector_ratings": sig_payload["sector_ratings"],
+        "portfolio_nav": 1_000_000.0,
+        "peak_nav": 1_000_000.0,
+        "current_positions": {},
+        "prices_now": {t: 100.0 for t in tickers},
+        "price_histories": price_histories or {
+            t: _df_history(base=100 + i) for i, t in enumerate(tickers)
+        },
+        "atr_map": {t: 0.02 for t in tickers},
+        "vwap_map": {t: 100.0 for t in tickers},
+        "coverage_map": {t: 1.0 for t in tickers},
+        "dd_multiplier": 1.0,
+        "signal_age_days": 0,
+        "earnings_by_ticker": {},
+        "run_date": run_date,
+    }
+
+
+# ── Approval path ────────────────────────────────────────────────────────────
+
+
+def test_approved_enter_emits_no_risk_events():
+    enter = [{"ticker": "NVDA", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    inputs = _make_inputs(
+        signals_date="2026-05-02", run_date="2026-05-02",
+        enter_signals=enter,
+    )
+    plan = decide_entries(predictions_date="2026-05-06", **inputs)
+    assert plan.n_entered == 1
+    assert plan.risk_events == []
+
+
+# ── Momentum-gate veto ───────────────────────────────────────────────────────
+
+
+def test_momentum_gate_emits_veto_event():
+    enter = [{"ticker": "NVDA", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    # Aggressive downtrend pushes 20d momentum well below the -5% gate.
+    bad_history = _df_history(trend=-0.5)
+    histories = {"NVDA": bad_history}
+    # Pad in flat histories for ETFs so price_histories isn't sparse.
+    for t in ("SPY", "XLK", "XLV", "XLF", "XLY"):
+        histories[t] = _df_history()
+    inputs = _make_inputs(
+        signals_date="2026-05-06", run_date="2026-05-06",
+        enter_signals=enter,
+        config_overrides={"momentum_gate_enabled": True,
+                          "momentum_gate_threshold": -5.0},
+        price_histories=histories,
+    )
+    plan = decide_entries(predictions_date="2026-05-06", **inputs)
+    assert plan.n_entered == 0
+    assert len(plan.risk_events) == 1
+    ev = plan.risk_events[0]
+    assert ev["event_type"] == "veto"
+    assert ev["rule"] == "momentum_gate"
+    assert ev["ticker"] == "NVDA"
+    assert ev["signal_date"] == "2026-05-06"
+    assert ev["prediction_date"] == "2026-05-06"
+
+
+# ── Predictor GBM veto override ─────────────────────────────────────────────
+
+
+def test_gbm_veto_emits_override_event():
+    enter = [{"ticker": "TSLA", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    predictions = {"TSLA": {
+        "gbm_veto": True,
+        "predicted_alpha": -0.018,
+        "predicted_direction": "DOWN",
+        "prediction_confidence": 0.72,
+        "combined_rank": 412,
+    }}
+    inputs = _make_inputs(
+        signals_date="2026-05-02", run_date="2026-05-02",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+    )
+    plan = decide_entries(predictions_date="2026-05-06", **inputs)
+    assert plan.n_entered == 0
+    assert len(plan.risk_events) == 1
+    ev = plan.risk_events[0]
+    assert ev["event_type"] == "override"
+    assert ev["rule"] == "predictor_gbm_veto"
+    assert ev["ticker"] == "TSLA"
+    assert ev["value"] == -0.018
+    assert ev["context"]["predicted_direction"] == "DOWN"
+    assert ev["context"]["combined_rank"] == 412
+    assert ev["signal_date"] == "2026-05-02"
+    assert ev["prediction_date"] == "2026-05-06"
+
+
+# ── Risk-guard rule veto threaded through ───────────────────────────────────
+
+
+def test_min_score_veto_threads_through_to_plan_events():
+    enter = [{"ticker": "KO", "signal": "ENTER", "score": 60,  # below 70
+              "conviction": "stable", "sector": "Defensives",
+              "rating": "BUY", "price_target_upside": 0.10}]
+    inputs = _make_inputs(
+        signals_date="2026-05-02", run_date="2026-05-02",
+        enter_signals=enter,
+    )
+    plan = decide_entries(predictions_date="2026-05-06", **inputs)
+    assert plan.n_entered == 0
+    assert len(plan.risk_events) == 1
+    ev = plan.risk_events[0]
+    assert ev["event_type"] == "veto"
+    assert ev["rule"] == "min_score"
+    assert ev["ticker"] == "KO"
+    assert ev["value"] == 60
+    assert ev["threshold"] == 70
+    # Lineage stamped by deciders even though risk_guard didn't know.
+    assert ev["signal_date"] == "2026-05-02"
+    assert ev["prediction_date"] == "2026-05-06"
+
+
+def test_max_sector_veto_threads_through():
+    enter = [{"ticker": "NVDA", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    inputs = _make_inputs(
+        signals_date="2026-05-02", run_date="2026-05-02",
+        enter_signals=enter,
+    )
+    # Push existing Technology exposure over the cap so the order breaches.
+    inputs["current_positions"] = {
+        "MSFT": {"market_value": 200_000, "sector": "Technology"},
+        "GOOG": {"market_value": 50_000, "sector": "Technology"},
+    }
+    plan = decide_entries(predictions_date="2026-05-06", **inputs)
+    assert plan.n_entered == 0
+    rules = [ev["rule"] for ev in plan.risk_events]
+    assert "max_sector" in rules
+    sector_ev = next(ev for ev in plan.risk_events if ev["rule"] == "max_sector")
+    assert sector_ev["sector"] == "Technology"
+    assert sector_ev["signal_date"] == "2026-05-02"
+
+
+# ── Multi-ticker accumulation ───────────────────────────────────────────────
+
+
+def test_multiple_blocked_tickers_all_emit_events():
+    enter = [
+        {"ticker": "KO",  "signal": "ENTER", "score": 50,  # min_score veto
+         "conviction": "stable", "sector": "Defensives",
+         "rating": "BUY", "price_target_upside": 0.10},
+        {"ticker": "TSLA", "signal": "ENTER", "score": 85,  # gbm_veto override
+         "conviction": "rising", "sector": "Technology",
+         "rating": "BUY", "price_target_upside": 0.20},
+    ]
+    predictions = {"TSLA": {"gbm_veto": True, "predicted_alpha": -0.02,
+                            "predicted_direction": "DOWN",
+                            "prediction_confidence": 0.7,
+                            "combined_rank": 500}}
+    inputs = _make_inputs(
+        signals_date="2026-05-02", run_date="2026-05-02",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+    )
+    plan = decide_entries(predictions_date="2026-05-06", **inputs)
+    assert plan.n_entered == 0
+    assert len(plan.risk_events) == 2
+    by_ticker = {ev["ticker"]: ev for ev in plan.risk_events}
+    assert by_ticker["KO"]["rule"] == "min_score"
+    assert by_ticker["KO"]["event_type"] == "veto"
+    assert by_ticker["TSLA"]["rule"] == "predictor_gbm_veto"
+    assert by_ticker["TSLA"]["event_type"] == "override"

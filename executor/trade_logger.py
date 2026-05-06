@@ -136,13 +136,52 @@ CREATE TABLE IF NOT EXISTS eod_pnl (
 """
 
 
+# Phase 2 transparency-inventory: structured veto/override/halt event log.
+# Closes the *risk decisions* row in the gate checklist (ROADMAP 2026-05-05).
+# `executor_shadow_book` is the ENTER-block sibling — same family, different
+# axis. Shadow book is keyed per-ticker per-day with free-text `block_reason`
+# for downstream evaluator backtesting. `risk_events` is the structured-rule
+# log that answers *"how often is rule X firing, and how close was the
+# measured value to the threshold?"* — the answer the inventory checklist
+# requires per gate.
+CREATE_RISK_EVENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS risk_events (
+    event_id          TEXT PRIMARY KEY,
+    date              TEXT NOT NULL,
+    trading_day       TEXT,
+    event_type        TEXT NOT NULL,
+    rule              TEXT NOT NULL,
+    ticker            TEXT,
+    sector            TEXT,
+    reason            TEXT,
+    value             REAL,
+    threshold         REAL,
+    market_regime     TEXT,
+    signal_date       TEXT,
+    prediction_date   TEXT,
+    context_json      TEXT,
+    created_at        TEXT NOT NULL
+);
+"""
+
+_RISK_EVENTS_MIGRATIONS: list[str] = [
+    # Placeholder — future column adds follow the same idempotent pattern as
+    # `_TRADES_MIGRATIONS` (catch "duplicate column" on re-run).
+]
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Create tables if they don't exist and run any pending migrations. Returns open connection."""
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.executescript(CREATE_TRADES_TABLE + CREATE_EOD_TABLE + CREATE_SHADOW_BOOK_TABLE)
+    conn.executescript(
+        CREATE_TRADES_TABLE
+        + CREATE_EOD_TABLE
+        + CREATE_SHADOW_BOOK_TABLE
+        + CREATE_RISK_EVENTS_TABLE
+    )
     for migration in _TRADES_MIGRATIONS:
         try:
             conn.execute(migration)
@@ -154,6 +193,16 @@ def init_db(db_path: str) -> sqlite3.Connection:
                 logging.getLogger(__name__).error("Migration failed: %s — %s", migration.strip()[:80], e)
                 raise
     for migration in _EOD_MIGRATIONS:
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+                pass  # Column already exists — expected on re-run
+            else:
+                logging.getLogger(__name__).error("Migration failed: %s — %s", migration.strip()[:80], e)
+                raise
+    for migration in _RISK_EVENTS_MIGRATIONS:
         try:
             conn.execute(migration)
             conn.commit()
@@ -299,6 +348,68 @@ def log_shadow_book_block(conn: sqlite3.Connection, entry: dict) -> str:
     conn.commit()
     logger.info("Shadow book: BLOCKED %s — %s | id=%s", entry["ticker"], entry["block_reason"], shadow_id)
     return shadow_id
+
+
+def log_risk_event(conn: sqlite3.Connection, event: dict) -> str:
+    """
+    Insert a structured veto/override/halt/throttle event. Returns event_id.
+
+    Required keys: date, event_type, rule.
+    Optional keys: trading_day, ticker, sector, reason, value, threshold,
+                   market_regime, signal_date, prediction_date, context.
+
+    `context` (dict) is serialized to context_json. Use it for rule-specific
+    extra context that doesn't justify a top-level column (e.g., per-ticker
+    correlation map for the correlation rule, breached tier description for
+    drawdown_tier_throttle). Keep it small — this is a structured log, not
+    a debug dump.
+    """
+    import json
+    event_id = str(uuid.uuid4())
+    trading_day = event.get("trading_day")
+    if trading_day is None:
+        try:
+            from alpha_engine_lib.dates import now_dual
+            trading_day = now_dual().trading_day
+        except Exception:
+            trading_day = None
+    context = event.get("context")
+    context_json = json.dumps(context) if context else None
+    conn.execute(
+        """
+        INSERT INTO risk_events (
+            event_id, date, trading_day, event_type, rule, ticker, sector,
+            reason, value, threshold, market_regime, signal_date,
+            prediction_date, context_json, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            event_id,
+            event["date"],
+            trading_day,
+            event["event_type"],
+            event["rule"],
+            event.get("ticker"),
+            event.get("sector"),
+            event.get("reason"),
+            event.get("value"),
+            event.get("threshold"),
+            event.get("market_regime"),
+            event.get("signal_date"),
+            event.get("prediction_date"),
+            context_json,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    logger.info(
+        "Risk event logged: %s/%s ticker=%s | id=%s",
+        event["event_type"],
+        event["rule"],
+        event.get("ticker") or "-",
+        event_id,
+    )
+    return event_id
 
 
 def log_eod(conn: sqlite3.Connection, eod: dict) -> None:

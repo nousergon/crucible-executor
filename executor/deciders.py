@@ -226,6 +226,13 @@ class EntryPlan:
     blocked: list[dict] = field(default_factory=list)
     n_entered: int = 0
     entries_with_meta: list[dict] = field(default_factory=list)
+    # Phase 2 transparency-inventory: structured veto/override events.
+    # Sibling of `blocked` — same family, different axis. `blocked` is the
+    # per-ENTER shadow-book row; `risk_events` is the structured-rule log
+    # consumed by `trade_logger.log_risk_event`. Free-text `block_reason`
+    # stays in `blocked` for evaluator backtesting; rule + value + threshold
+    # land here. The live shell (main.py) iterates and persists.
+    risk_events: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -308,6 +315,12 @@ def decide_entries(
     """
     plan = EntryPlan()
 
+    # signal_date is the signals.json filename date the orders sourced from.
+    # Distinct from signal_trading_day (NYSE attribution day inside the
+    # payload). Both stamped on every structured risk event for artifact
+    # lineage parity with PR #138's trades.signal_date column.
+    signals_date = signals_raw.get("date", run_date) if signals_raw else run_date
+
     for sig in enter_signals:
         ticker = sig["ticker"]
         sector = sig.get("sector", "Technology")
@@ -323,6 +336,19 @@ def decide_entries(
             "conviction": sig.get("conviction"),
             "market_regime": market_regime,
             "portfolio_nav": portfolio_nav,
+        }
+
+        # Structured-event base: every risk event stamps the same lineage
+        # fields (date, ticker, sector, market_regime, signal_date,
+        # prediction_date) — rule-specific fields (event_type, rule, value,
+        # threshold, reason) are merged in at each emit site.
+        _event_base = {
+            "date": run_date,
+            "ticker": ticker,
+            "sector": sector,
+            "market_regime": market_regime,
+            "signal_date": signals_date,
+            "prediction_date": predictions_date,
         }
 
         if ticker in current_positions:
@@ -341,6 +367,13 @@ def decide_entries(
                     reason = f"momentum gate: 20d={momentum_20d:.1f}% < {mom_threshold}%"
                     logger.info(f"SKIP ENTER {ticker} — {reason}")
                     plan.blocked.append({**_shadow_base, "block_reason": reason})
+                    plan.risk_events.append({**_event_base,
+                        "event_type": "veto",
+                        "rule": "momentum_gate",
+                        "reason": reason,
+                        "value": float(momentum_20d) / 100.0,
+                        "threshold": float(mom_threshold) / 100.0,
+                    })
                     continue
 
         # Earnings proximity warning (logs only)
@@ -400,10 +433,13 @@ def decide_entries(
             })
             continue
 
-        # GBM veto
+        # GBM veto — predictor overriding research's ENTER signal.
+        # event_type="override" (predictor overrides research, distinct
+        # from a risk-rule veto).
         if pred_data.get("gbm_veto"):
+            predicted_alpha = pred_data.get("predicted_alpha", 0)
             reason = (
-                f"GBM veto: α={pred_data.get('predicted_alpha', 0):.2%}, "
+                f"GBM veto: α={predicted_alpha:.2%}, "
                 f"rank={pred_data.get('combined_rank')}"
             )
             logger.info(f"VETO {ticker} — {reason}")
@@ -417,10 +453,28 @@ def decide_entries(
                 "predicted_direction": pred_data.get("predicted_direction"),
                 "prediction_confidence": pred_data.get("prediction_confidence"),
             })
+            plan.risk_events.append({**_event_base,
+                "event_type": "override",
+                "rule": "predictor_gbm_veto",
+                "reason": reason,
+                "value": float(predicted_alpha) if predicted_alpha is not None else None,
+                "context": {
+                    "predicted_direction": pred_data.get("predicted_direction"),
+                    "prediction_confidence": pred_data.get("prediction_confidence"),
+                    "combined_rank": pred_data.get("combined_rank"),
+                },
+            })
             continue
 
         sig_with_sector = {**sig, "sector_rating": sector_rating_str}
 
+        # Per-ticker events sink — risk_guard appends one event per veto
+        # rule (min_score, max_position, bear_underweight, max_sector,
+        # max_equity, correlation). Drawdown halt/throttle is emitted
+        # once at the portfolio level by the caller; risk_guard does not
+        # propagate `events` to its inner compute_drawdown_multiplier
+        # call.
+        check_events: list[dict] = []
         approved, reason = check_order(
             ticker=ticker,
             action="ENTER",
@@ -433,7 +487,16 @@ def decide_entries(
             signal=sig_with_sector,
             config=config,
             price_histories=price_histories,
+            events=check_events,
         )
+        # Merge per-ticker risk-guard events into the plan-level log,
+        # stamping the lineage fields that risk_guard doesn't know about
+        # (signal_date, prediction_date).
+        for ev in check_events:
+            ev.setdefault("date", run_date)
+            ev.setdefault("signal_date", signals_date)
+            ev.setdefault("prediction_date", predictions_date)
+            plan.risk_events.append(ev)
 
         if not approved:
             logger.info(f"BLOCKED {ticker} — {reason}")

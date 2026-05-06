@@ -178,7 +178,7 @@ class TestDecideEntriesParity:
         # seeded with prices so ibkr.get_current_price returns the same
         # values the direct call used.
         sim_client = SimulatedIBKRClient(prices=dict(prices_now), nav=inputs["portfolio_nav"])
-        n_b, orders_b, blocked_b = _plan_entries(
+        n_b, orders_b, blocked_b, _events_b = _plan_entries(
             enter_signals=inputs["enter_signals"],
             signals_raw=inputs["signals_raw"],
             predictions_by_ticker=inputs["predictions_by_ticker"],

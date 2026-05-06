@@ -49,7 +49,14 @@ from executor.price_cache import (
     load_feature_coverage,
     load_price_histories,
 )
-from executor.trade_logger import backup_to_s3, get_entry_dates, init_db, log_trade, log_shadow_book_block
+from executor.trade_logger import (
+    backup_to_s3,
+    get_entry_dates,
+    init_db,
+    log_risk_event,
+    log_shadow_book_block,
+    log_trade,
+)
 
 from alpha_engine_lib.logging import setup_logging
 # Suppress benign IB Error codes that don't represent real failures:
@@ -413,7 +420,7 @@ def _plan_entries(
     dry_run: bool,
     simulate: bool,
     predictions_date: str | None = None,
-) -> tuple[int, list[dict], list[dict]]:
+) -> tuple[int, list[dict], list[dict], list[dict]]:
     """Live-shell wrapper around ``executor.deciders.decide_entries``.
 
     Resolves ``prices_now`` from the IB / sim client, calls the pure
@@ -424,8 +431,10 @@ def _plan_entries(
         ``entries_with_meta`` to write the daemon's order book.
       * dry_run: log only, no side effects.
 
-    Returns the (n_entered, orders, blocked) tuple for back-compat with
-    callers that pre-date the deciders extraction.
+    Returns ``(n_entered, orders, blocked, risk_events)``. The fourth
+    element is the structured veto/override log emitted by
+    ``decide_entries`` (Phase 2 transparency-inventory). Caller persists
+    via ``trade_logger.log_risk_event``.
     """
     from executor.deciders import decide_entries
 
@@ -477,7 +486,7 @@ def _plan_entries(
         for entry in plan.entries_with_meta:
             ob.add_entry(entry)
 
-    return plan.n_entered, plan.orders, plan.blocked
+    return plan.n_entered, plan.orders, plan.blocked, plan.risk_events
 
 
 def _plan_exits_and_reduces(
@@ -931,9 +940,29 @@ def run(
             logger.info(f"Entry dates resolved for {len(entry_dates)}/{len(current_positions)} positions")
     
         # ── 2c. Compute graduated drawdown multiplier ──────────────────────────
-        dd_multiplier, dd_reason = compute_drawdown_multiplier(portfolio_nav, peak_nav, config)
+        # Pass an events sink so any halt/throttle event lands in
+        # `risk_events` ONCE per planning cycle (the per-ticker check_order
+        # call deliberately does NOT propagate events to its inner
+        # compute_drawdown_multiplier — see risk_guard.py:check_order).
+        dd_events: list[dict] = []
+        dd_multiplier, dd_reason = compute_drawdown_multiplier(
+            portfolio_nav, peak_nav, config, events=dd_events,
+        )
         if dd_multiplier < 1.0:
             logger.info(f"Drawdown tier active: {dd_reason}")
+        # Stamp lineage + persist immediately. Any subsequent per-ticker
+        # vetoes get persisted alongside after _plan_entries returns.
+        if conn and dd_events:
+            signals_date_for_events = signals_raw.get("date", run_date) if signals_raw else run_date
+            for ev in dd_events:
+                ev.setdefault("date", run_date)
+                ev.setdefault("market_regime", market_regime)
+                ev.setdefault("signal_date", signals_date_for_events)
+                ev.setdefault("prediction_date", predictions_date)
+                try:
+                    log_risk_event(conn, ev)
+                except Exception as e:
+                    logger.debug("risk_event log failed (drawdown): %s", e)
     
         # ── 2d. Strategy layer: evaluate exit rules on held positions ──────────
         strategy_config = load_strategy_config(config)
@@ -1137,7 +1166,7 @@ def run(
                             )
 
         # ── 3. Process ENTER signals ─────────────────────────────────────────────
-        n_entered, entry_orders, blocked_entries = _plan_entries(
+        n_entered, entry_orders, blocked_entries, plan_risk_events = _plan_entries(
             enter_signals=enter_signals,
             signals_raw=signals_raw,
             predictions_by_ticker=predictions_by_ticker,
@@ -1171,6 +1200,22 @@ def run(
                     log_shadow_book_block(conn, be)
                 except Exception as e:
                     logger.debug("Shadow book log failed for %s: %s", be.get("ticker"), e)
+
+        # Persist structured veto/override events (Phase 2 transparency-
+        # inventory — *risk decisions* row). Sibling of the shadow-book
+        # log: same family, different axis. Free-text block_reason stays
+        # in shadow_book; rule + value + threshold lands in risk_events.
+        if conn and plan_risk_events:
+            for ev in plan_risk_events:
+                try:
+                    log_risk_event(conn, ev)
+                except Exception as e:
+                    logger.debug(
+                        "risk_event log failed (%s/%s): %s",
+                        ev.get("event_type"),
+                        ev.get("rule"),
+                        e,
+                    )
 
         # ── 4–5. Process EXIT and REDUCE signals ────────────────────────────────
         exit_orders = _plan_exits_and_reduces(
