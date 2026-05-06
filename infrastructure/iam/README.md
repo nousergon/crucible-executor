@@ -35,6 +35,15 @@ is the inline policy name on that role.
   publish, and CloudWatch Logs delivery. Codified 2026-05-04 after an
   asymmetric `ec2:StartInstances` / `ec2:StopInstances` grant let the EOD
   SF stall on `StopTradingInstance` for an entire afternoon.
+- **`alpha-engine-eventbridge-sfn-role`** — assumed by EventBridge to
+  start the saturday + weekday SFN executions on cron. One inline policy
+  granting `states:StartExecution` on both state machine ARNs. Codified
+  2026-05-06 after a third recurrence of the same regression: the
+  `alpha-engine-data` deploy scripts each contained an inline
+  `aws iam put-role-policy` against this role, but only the weekday
+  script listed both ARNs — the saturday script overwrote the policy
+  with the saturday ARN alone, dropping weekday's grant. Inline blocks
+  are removed from those scripts; `apply.sh` is the only writer now.
 - **`github-actions-iam-drift-check`** — assumed by GitHub Actions via
   OIDC for the daily IAM-drift-check workflow. Single inline policy
   granting `iam:ListRolePolicies` + `iam:GetRolePolicy` scoped to the
