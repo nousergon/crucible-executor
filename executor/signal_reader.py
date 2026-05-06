@@ -395,6 +395,59 @@ def assert_predictions_cover_buy_candidates(
         )
 
 
+def patch_unknown_sectors_with_constituents(signals_raw: dict, s3_bucket: str) -> int:
+    """Backfill sector="Unknown" or missing on ENTER signals using
+    constituents.json sector_map as the authoritative GICS source.
+
+    Defense-in-depth against an escape from research's signals.json
+    preflight (alpha-engine-research#126). The 2026-05-04 EOG/NVT
+    incident wrote "Unknown" into trades.db because the planner consumed
+    research's first-pass file before sector_map had loaded. The research
+    preflight is the primary gate; this is the executor-side catch.
+
+    Mutates ``signals_raw["buy_candidates"]`` and ``signals_raw["universe"]``
+    in place. Returns count of patches applied for caller logging.
+    Lazy-loads the constituents map only when at least one ENTER signal
+    needs patching, so the typical clean path pays no S3 round-trip.
+    """
+    needs_patch = False
+    for key in ("buy_candidates", "universe"):
+        for s in signals_raw.get(key) or []:
+            if not isinstance(s, dict) or s.get("signal") != "ENTER":
+                continue
+            cur = s.get("sector")
+            if not cur or cur == "Unknown":
+                needs_patch = True
+                break
+        if needs_patch:
+            break
+
+    if not needs_patch:
+        return 0
+
+    from executor.eod_reconcile import _load_constituents_sector_map
+    constituents_map = _load_constituents_sector_map(s3_bucket)
+    if not constituents_map:
+        return 0
+
+    patched = 0
+    for key in ("buy_candidates", "universe"):
+        for s in signals_raw.get(key) or []:
+            if not isinstance(s, dict):
+                continue
+            cur = s.get("sector")
+            if cur and cur != "Unknown":
+                continue
+            ticker = s.get("ticker")
+            if not ticker:
+                continue
+            mapped = constituents_map.get(ticker)
+            if mapped:
+                s["sector"] = mapped
+                patched += 1
+    return patched
+
+
 def get_actionable_signals(signals: dict) -> dict:
     """
     Filter signals to actionable entries by signal type.
