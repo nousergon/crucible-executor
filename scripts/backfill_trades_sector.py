@@ -33,8 +33,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sqlite3
 import sys
+
+# Resolve `executor.*` imports when invoked as `python scripts/...` from the
+# repo root — same pattern as executor/main.py:34. Lets the script be run
+# directly without setting PYTHONPATH.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logger = logging.getLogger(__name__)
 
