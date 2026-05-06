@@ -612,6 +612,12 @@ def run_daemon(dry_run: bool = False) -> None:
                     "spy_return_during_hold": _spy_ret,
                     "realized_alpha_pct": _ralpha,
                     "days_held": _dheld,
+                    # Phase 2 lineage — signal_date / prediction_date are
+                    # the artifact filename dates the urgent_exits_with_meta
+                    # record sourced from. Both default to None for COVER
+                    # orders generated outside the deciders path.
+                    "signal_date": urgent.get("signal_date"),
+                    "prediction_date": urgent.get("prediction_date"),
                 })
 
                 order_book.mark_urgent_executed(ticker, action)
@@ -1102,7 +1108,11 @@ def _execute_entry(
         # omitted); signal_trading_day links back to the signals.json that
         # originated this entry — threaded through OrderBook from main.py's
         # _read_signals(). See alpha-engine-docs/private/DATE_CONVENTIONS.md.
+        # signal_date and prediction_date are the artifact filename dates
+        # (Phase 2 transparency-inventory; ROADMAP entry 2026-05-05).
         "signal_trading_day": entry.get("signal_date"),
+        "signal_date": entry.get("signal_date"),
+        "prediction_date": entry.get("prediction_date"),
     })
 
     # Mark entry as executed in order book

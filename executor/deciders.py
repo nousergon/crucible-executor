@@ -281,6 +281,7 @@ def decide_entries(
     signal_age_days: int,
     earnings_by_ticker: dict,
     run_date: str,
+    predictions_date: str | None = None,
 ) -> EntryPlan:
     """Pure decision pipeline for ENTER signals.
 
@@ -492,10 +493,19 @@ def decide_entries(
         ticker_hist = (price_histories or {}).get(ticker)
         pred = predictions_by_ticker.get(ticker, {})
 
+        # signal_date = signals.json filename date the order sourced from
+        # (signals_raw["date"]); falls back to run_date when the payload
+        # omits the field. This is the artifact-lineage column requested
+        # by the Phase 2 transparency-inventory ROADMAP item — distinct
+        # from signal_trading_day (NYSE attribution day inside the payload).
+        # prediction_date = predictions/{date}.json filename date the GBM
+        # veto gate consulted; None when predictions weren't loaded.
+        signals_date = signals_raw.get("date", run_date) if signals_raw else run_date
         plan.entries_with_meta.append({
             "ticker": ticker,
             "signal": "ENTER",
-            "signal_date": run_date,
+            "signal_date": signals_date,
+            "prediction_date": predictions_date,
             "shares": sizing["shares"],
             "current_price": current_price,
             "dollar_size": sizing["dollar_size"],
@@ -550,6 +560,8 @@ def decide_exits_and_reduces(
     market_regime: str,
     portfolio_nav: float,
     run_date: str,
+    signals_date: str | None = None,
+    predictions_date: str | None = None,
 ) -> ExitPlan:
     """Pure decision pipeline for EXIT and REDUCE signals.
 
@@ -615,6 +627,8 @@ def decide_exits_and_reduces(
         plan.urgent_exits_with_meta.append({
             "ticker": ticker,
             "signal": "EXIT",
+            "signal_date": signals_date,
+            "prediction_date": predictions_date,
             "shares": shares_held,
             "reason": sig.get("reason", "research_signal"),
             "detail": sig.get("detail", ""),
@@ -686,6 +700,8 @@ def decide_exits_and_reduces(
         plan.urgent_exits_with_meta.append({
             "ticker": ticker,
             "signal": "REDUCE",
+            "signal_date": signals_date,
+            "prediction_date": predictions_date,
             "shares": shares_to_sell,
             "reason": sig.get("reason", "research_signal"),
             "detail": sig.get("detail", ""),

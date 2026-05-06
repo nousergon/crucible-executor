@@ -267,10 +267,16 @@ def _read_signals(
     simulate: bool,
     signals_override: dict | None,
     conn,
-) -> tuple[dict, dict, str, dict]:
+) -> tuple[dict, dict, str, dict, str | None]:
     """Read and validate signals from S3 or override.
 
-    Returns (signals_raw, signals, run_date, predictions_by_ticker).
+    Returns ``(signals_raw, signals, run_date, predictions_by_ticker,
+    predictions_date)``. ``predictions_date`` is the
+    ``predictor/predictions/{date}.json`` filename date the GBM run
+    produced (None if predictions weren't loaded — simulate mode or S3
+    miss); ``signals_raw["date"]`` is the corresponding signals.json
+    filename date and is read directly off ``signals_raw`` by callers
+    that need it.
     """
     if signals_override is not None:
         signals_raw = signals_override
@@ -352,10 +358,11 @@ def _read_signals(
             logger.debug("Stale signals Telegram notification failed", exc_info=True)
 
     # Load GBM predictions for rationale capture
+    predictions_date: str | None = None
     if not simulate:
         try:
             from executor.signal_reader import read_predictions
-            predictions_by_ticker = read_predictions(signals_bucket)
+            predictions_by_ticker, predictions_date = read_predictions(signals_bucket)
         except Exception as e:
             logger.warning("Failed to load GBM predictions: %s", e)
             predictions_by_ticker = {}
@@ -379,7 +386,7 @@ def _read_signals(
         f"REDUCE={len(signals['reduce'])} HOLD={len(signals['hold'])}"
     )
 
-    return signals_raw, signals, run_date, predictions_by_ticker
+    return signals_raw, signals, run_date, predictions_by_ticker, predictions_date
 
 
 def _plan_entries(
@@ -405,6 +412,7 @@ def _plan_entries(
     run_date: str,
     dry_run: bool,
     simulate: bool,
+    predictions_date: str | None = None,
 ) -> tuple[int, list[dict], list[dict]]:
     """Live-shell wrapper around ``executor.deciders.decide_entries``.
 
@@ -454,6 +462,7 @@ def _plan_entries(
         signal_age_days=signal_age_days,
         earnings_by_ticker=earnings_by_ticker,
         run_date=run_date,
+        predictions_date=predictions_date,
     )
 
     # Dispatch decisions to side-effecting layer.
@@ -484,6 +493,8 @@ def _plan_exits_and_reduces(
     run_date: str,
     dry_run: bool,
     simulate: bool,
+    signals_date: str | None = None,
+    predictions_date: str | None = None,
 ) -> list[dict]:
     """Live-shell wrapper around ``executor.deciders.decide_exits_and_reduces``.
 
@@ -528,6 +539,8 @@ def _plan_exits_and_reduces(
         market_regime=market_regime,
         portfolio_nav=portfolio_nav,
         run_date=run_date,
+        signals_date=signals_date,
+        predictions_date=predictions_date,
     )
 
     if simulate:
@@ -869,7 +882,7 @@ def run(
 
     # ── 1. Read signals from S3 (or use injected override) ──────────────────
     try:
-        signals_raw, signals, run_date, predictions_by_ticker = _read_signals(
+        signals_raw, signals, run_date, predictions_by_ticker, predictions_date = _read_signals(
             config, signals_bucket, run_date, simulate, signals_override, conn,
         )
     except Exception as _sig_err:
@@ -1147,6 +1160,7 @@ def run(
             run_date=run_date,
             dry_run=dry_run,
             simulate=simulate,
+            predictions_date=predictions_date,
         )
         orders.extend(entry_orders)
 
@@ -1172,6 +1186,8 @@ def run(
             run_date=run_date,
             dry_run=dry_run,
             simulate=simulate,
+            signals_date=signals_raw.get("date") if signals_raw else None,
+            predictions_date=predictions_date,
         )
         orders.extend(exit_orders)
 

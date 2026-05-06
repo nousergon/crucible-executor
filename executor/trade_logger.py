@@ -80,6 +80,17 @@ _TRADES_MIGRATIONS = [
     # chain — get_entry_trade(...).sector now resolves instead of always
     # returning None and pushing the lookup through to constituents.json.
     "ALTER TABLE trades ADD COLUMN sector TEXT",
+    # ── Phase 2 transparency-inventory: artifact-filename lineage (2026-05-06) ──
+    # signal_date = signals/{date}/signals.json filename date the order was
+    # sourced from (distinct from signal_trading_day, which is the NYSE
+    # attribution day declared inside the payload — a holiday or backfilled
+    # file can have filename ≠ trading_day).
+    # prediction_date = predictor/predictions/{date}.json filename date the
+    # GBM veto gate consulted; NULL for non-predictor-gated orders (strategy-
+    # driven intraday exits, urgent COVERs).
+    # Both nullable for back-compat with rows logged before this PR.
+    "ALTER TABLE trades ADD COLUMN signal_date TEXT",
+    "ALTER TABLE trades ADD COLUMN prediction_date TEXT",
 ]
 
 _EOD_MIGRATIONS = [
@@ -194,8 +205,9 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             entry_trade_id, signal_price, trigger_price, trigger_type,
             spy_price_at_order, realized_pnl, realized_return_pct,
             spy_return_during_hold, realized_alpha_pct, days_held,
-            slippage_vs_signal, trading_day, signal_trading_day, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            slippage_vs_signal, trading_day, signal_trading_day,
+            signal_date, prediction_date, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -238,6 +250,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("slippage_vs_signal"),
             trading_day,
             trade.get("signal_trading_day"),
+            trade.get("signal_date"),
+            trade.get("prediction_date"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )

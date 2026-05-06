@@ -14,11 +14,21 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 
-def read_predictions(s3_bucket: str) -> dict[str, dict]:
+def read_predictions(s3_bucket: str) -> tuple[dict[str, dict], str | None]:
     """
     Read predictor/predictions/latest.json from S3.
 
-    Returns: {ticker: prediction_dict}. Empty dict if not available.
+    Returns: ``({ticker: prediction_dict}, predictions_date)`` where
+    ``predictions_date`` is the top-level ``date`` field on the JSON
+    payload (the ``predictions/{date}.json`` filename date the GBM run
+    produced). Returns ``({}, None)`` if not available.
+
+    The date is surfaced separately because ``latest.json`` is a pointer
+    that may resolve to a prior trading day's predictions during the
+    Saturday/holiday window — readers (esp. trade logging for
+    transparency lineage) need the actual filename date, not today's
+    date. See ROADMAP "Phase 2 transparency-inventory" → trade execution
+    decisions row.
     """
     s3 = boto3.client("s3")
     try:
@@ -31,12 +41,15 @@ def read_predictions(s3_bucket: str) -> dict[str, dict]:
             )
         preds = data.get("predictions", [])
         result = {p["ticker"]: p for p in preds if "ticker" in p}
-        logger.info("Predictions loaded | n=%d", len(result))
-        return result
+        predictions_date = data.get("date")
+        logger.info(
+            "Predictions loaded | n=%d | date=%s", len(result), predictions_date,
+        )
+        return result, predictions_date
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchKey":
             logger.warning("predictions/latest.json not found — running without GBM input")
-            return {}
+            return {}, None
         raise
 
 
