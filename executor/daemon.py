@@ -1109,6 +1109,12 @@ def _execute_entry(
         "signal_price": _signal_price,
         "trigger_price": _trigger_price,
         "trigger_type": trigger_reason,
+        # entry_trigger duplicates trigger_reason here intentionally —
+        # see _TRADES_MIGRATIONS for the canonical-name rationale (the
+        # substrate inventory expects entry_trigger; trigger_type is
+        # also populated on exits with the exit reason, so the two
+        # cannot be merged).
+        "entry_trigger": trigger_reason,
         "spy_price_at_order": _spy_now,
         "slippage_vs_signal": _slippage,
         # Date-convention dual-tracking. trading_day is the last completed
