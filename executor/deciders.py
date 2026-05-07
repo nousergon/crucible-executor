@@ -250,6 +250,82 @@ class ExitPlan:
     urgent_exits_with_meta: list[dict] = field(default_factory=list)
 
 
+def _batch_confidence_mean(predictions_by_ticker: dict) -> float | None:
+    """Mean of ``prediction_confidence`` across all valid predictions in the batch.
+
+    Returns ``None`` when the batch has no usable confidence values — caller
+    interprets None as "skip the tightening gate" rather than "tightening
+    triggered." Skips entries with missing or non-numeric confidence so a
+    sparse predictions file (e.g. early-cutover days) doesn't drag the mean
+    toward zero artificially.
+    """
+    if not predictions_by_ticker:
+        return None
+    confs: list[float] = []
+    for pred in predictions_by_ticker.values():
+        if not isinstance(pred, dict):
+            continue
+        c = pred.get("prediction_confidence")
+        if isinstance(c, (int, float)) and c is not None:
+            confs.append(float(c))
+    if not confs:
+        return None
+    return sum(confs) / len(confs)
+
+
+def _apply_batch_confidence_tightening(
+    config: dict,
+    predictions_by_ticker: dict,
+    run_date: str,
+) -> dict:
+    """Return a derived config with ``min_score_to_enter`` tightened when the
+    predictor batch's mean confidence is broadly low.
+
+    Per the 2026-05-07 predictor audit's Phase 1: today's predictor produced
+    16 of 27 tickers clamped to ``p_up=0.458`` (mean batch confidence ~0.60),
+    5 saturated at ``conf=0.99``. Mean across the batch was ~0.60 — broadly
+    low and a meaningful signal that the day's predictor output is degenerate
+    even when individual confidences look high. Bumping ``min_score_to_enter``
+    by a configurable step under that condition is a backstop tightening
+    that doesn't depend on per-ticker confidence (which is already noisy in
+    the degenerate case).
+
+    Feature-flagged off by default (``batch_confidence_tightening_enabled:
+    false``). Opt in via risk.yaml; validate in shadow before relying on it.
+
+    Returns the original config object unchanged when the gate is disabled
+    or the trigger doesn't fire — no copy is made in those cases. When the
+    trigger fires, returns a shallow copy with the bumped ``min_score_to_enter``
+    so the caller's config dict is never mutated.
+    """
+    if not config.get("batch_confidence_tightening_enabled", False):
+        return config
+
+    threshold = config.get("batch_confidence_threshold", 0.65)
+    bump = config.get("batch_confidence_min_score_bump", 10)
+    base_min_score = config.get("min_score_to_enter", 70)
+
+    mean_conf = _batch_confidence_mean(predictions_by_ticker)
+    if mean_conf is None or mean_conf >= threshold:
+        return config
+
+    tightened_min_score = base_min_score + bump
+    logger.warning(
+        "Batch confidence tightening triggered: mean_confidence=%.3f < %.3f; "
+        "min_score_to_enter %d → %d for run_date=%s",
+        mean_conf, threshold, base_min_score, tightened_min_score, run_date,
+    )
+    derived = dict(config)
+    derived["min_score_to_enter"] = tightened_min_score
+    derived["_batch_confidence_tightening_applied"] = {
+        "mean_confidence": mean_conf,
+        "threshold": threshold,
+        "base_min_score": base_min_score,
+        "tightened_min_score": tightened_min_score,
+    }
+    return derived
+
+
 def _entry_priority_key(sig: dict, predictions_by_ticker: dict) -> tuple[float, float]:
     """Sort key controlling the order in which ENTER candidates are processed.
 
@@ -347,6 +423,11 @@ def decide_entries(
     # payload). Both stamped on every structured risk event for artifact
     # lineage parity with PR #138's trades.signal_date column.
     signals_date = signals_raw.get("date", run_date) if signals_raw else run_date
+
+    # Tighten min_score_to_enter when batch-mean prediction_confidence is
+    # broadly low (degenerate-predictor backstop). Returns the original
+    # config when the feature flag is off or the trigger doesn't fire.
+    config = _apply_batch_confidence_tightening(config, predictions_by_ticker, run_date)
 
     # Process candidates in priority order: research composite score first,
     # predicted_alpha as the tie-break. The risk_guard's max_total_equity
