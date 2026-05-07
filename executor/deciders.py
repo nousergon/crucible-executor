@@ -250,6 +250,33 @@ class ExitPlan:
     urgent_exits_with_meta: list[dict] = field(default_factory=list)
 
 
+def _entry_priority_key(sig: dict, predictions_by_ticker: dict) -> tuple[float, float]:
+    """Sort key controlling the order in which ENTER candidates are processed.
+
+    Primary: research composite ``score`` (descending — higher score first).
+    Secondary: predictor ``predicted_alpha`` (descending — higher predicted
+    alpha breaks ties when research scores match).
+
+    Why this matters: ``decide_entries`` evaluates candidates one at a time,
+    and the risk_guard's ``max_total_equity`` / ``max_sector`` caps bind on
+    the running tally of approved entries. Without an explicit priority
+    sort, the order from ``signals.json`` is whatever order research wrote
+    them in — non-deterministic for the executor's purposes. Sorting here
+    makes cap-binding cases drop the *lower-priority* candidates rather
+    than the *later-listed* ones.
+
+    Returns a tuple of negated values so Python's natural ascending sort
+    yields highest-priority first. ``None`` and missing fields default to
+    0.0 so signals from older research runs that predate the score field
+    still get processed deterministically (just at the bottom).
+    """
+    score = sig.get("score") or 0.0
+    ticker = sig.get("ticker", "")
+    pred = predictions_by_ticker.get(ticker, {}) if predictions_by_ticker else {}
+    predicted_alpha = pred.get("predicted_alpha") or 0.0
+    return (-float(score), -float(predicted_alpha))
+
+
 def _compute_support_level(price_history, strategy_config: dict) -> float | None:
     """N-day low from price history for support-bounce entry trigger.
 
@@ -320,6 +347,20 @@ def decide_entries(
     # payload). Both stamped on every structured risk event for artifact
     # lineage parity with PR #138's trades.signal_date column.
     signals_date = signals_raw.get("date", run_date) if signals_raw else run_date
+
+    # Process candidates in priority order: research composite score first,
+    # predicted_alpha as the tie-break. The risk_guard's max_total_equity
+    # and max_sector caps bind based on the order entries are approved, so
+    # processing higher-priority candidates first means cap-binding cases
+    # surrender lower-priority candidates rather than higher-priority ones.
+    # Per the 2026-05-07 predictor audit, this is the smallest-blast-radius
+    # use of `predicted_alpha` — it informs ordering without affecting
+    # sizing. Stable on missing fields (None → 0.0) so signals from older
+    # research runs without scores still get processed deterministically.
+    enter_signals = sorted(
+        enter_signals,
+        key=lambda s: _entry_priority_key(s, predictions_by_ticker),
+    )
 
     for sig in enter_signals:
         ticker = sig["ticker"]
