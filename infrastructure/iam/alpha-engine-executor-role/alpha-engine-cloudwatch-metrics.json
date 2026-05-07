@@ -11,6 +11,16 @@
                     "cloudwatch:namespace": "AlphaEngine/*"
                 }
             }
+        },
+        {
+            "Sid": "ReadMetricsForSubstrateCheck",
+            "Effect": "Allow",
+            "Action": [
+                "cloudwatch:GetMetricStatistics",
+                "cloudwatch:GetMetricData",
+                "cloudwatch:ListMetrics"
+            ],
+            "Resource": "*"
         }
     ]
 }
