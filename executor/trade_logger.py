@@ -91,6 +91,14 @@ _TRADES_MIGRATIONS = [
     # Both nullable for back-compat with rows logged before this PR.
     "ALTER TABLE trades ADD COLUMN signal_date TEXT",
     "ALTER TABLE trades ADD COLUMN prediction_date TEXT",
+    # ── Phase 2 transparency-inventory: entry-trigger lineage (2026-05-07) ──
+    # entry_trigger is the canonical name in the substrate inventory
+    # (alpha_engine_lib/transparency_inventory.yaml row trade_execution_lineage).
+    # The existing trigger_type column overlaps but is also populated on exits
+    # (with the exit reason); separating entry_trigger keeps the
+    # entry-trigger-only contract clean. Populated only on ENTER rows; NULL
+    # elsewhere.
+    "ALTER TABLE trades ADD COLUMN entry_trigger TEXT",
 ]
 
 _EOD_MIGRATIONS = [
@@ -268,8 +276,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             spy_price_at_order, realized_pnl, realized_return_pct,
             spy_return_during_hold, realized_alpha_pct, days_held,
             slippage_vs_signal, trading_day, signal_trading_day,
-            signal_date, prediction_date, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            signal_date, prediction_date, entry_trigger, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -314,6 +322,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("signal_trading_day"),
             trade.get("signal_date"),
             trade.get("prediction_date"),
+            trade.get("entry_trigger"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )
