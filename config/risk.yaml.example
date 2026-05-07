@@ -20,6 +20,15 @@ drawdown_circuit_breaker: 0.06   # halt new entries if portfolio drawdown exceed
 
 # ── Entry gates ──────────────────────────────────────────────────────────────
 min_score_to_enter: 30           # backstop only — predictor veto is primary gate
+
+# Tighten min_score_to_enter when the predictor batch's mean prediction_confidence
+# is broadly low (degenerate-predictor backstop, per 2026-05-07 audit Phase 1).
+# Today's incident: 16 of 27 tickers clamped to p_up=0.458 (mean batch conf ~0.60),
+# 5 saturated at conf=0.99 — the per-ticker signal looked fine but the batch
+# distribution was degenerate. Default off; opt in only after shadow validation.
+batch_confidence_tightening_enabled: false
+batch_confidence_threshold: 0.65    # if mean batch confidence < this, tighten
+batch_confidence_min_score_bump: 10 # bump min_score_to_enter by this when triggered
 momentum_gate_enabled: false      # disabled — predictor mean-reversion conflicts with this
 min_conviction_to_enter:         # only these conviction levels allow new entries
   - rising
