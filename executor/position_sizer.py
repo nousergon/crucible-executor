@@ -39,6 +39,7 @@ def compute_position_size(
     signal_age_days: int | None = None,
     days_to_earnings: int | None = None,
     feature_coverage: float | None = None,
+    stance: str | None = None,
 ) -> dict:
     """
     Compute position size for a new ENTER order.
@@ -131,6 +132,35 @@ def compute_position_size(
     # fraction of non-NaN features, floored at ``coverage_derate_floor``
     # so we never size below a meaningful threshold. Continuous (no cliff)
     # so an 87%-covered ticker gets 87% of a 100%-covered ticker's size.
+    # Stance-conditional sizing (stance taxonomy arc PR 4 follow-up).
+    # Per-stance multipliers reflect the asymmetry between stance theses:
+    #   momentum (1.0×) — trend-following, the baseline thesis
+    #   value (0.7×)    — contrarian thesis carries higher uncertainty
+    #                     (catching a falling knife is structurally riskier
+    #                     than riding a trend), so smaller stake
+    #   quality (0.8×)  — defensive names accept smaller positions in
+    #                     exchange for longer hold + tighter exit gates
+    #   catalyst (0.6×) — event-driven = higher variance + binary outcome,
+    #                     smallest stake size
+    #
+    # Multipliers backtester-tunable from day 1 — once 4+ weeks of
+    # stance-tagged history exists, the optimizer can move them based
+    # on per-stance Sharpe / alpha attribution from
+    # backtester#182's ``by_stance`` table.
+    #
+    # Falls through to 1.0× (no adjustment) when stance is None
+    # (pre-stance-arc artifacts) — preserves legacy behavior.
+    if config.get("stance_sizing_enabled", True) and stance is not None:
+        stance_multipliers = {
+            "momentum": config.get("stance_size_momentum", 1.0),
+            "value":    config.get("stance_size_value",    0.7),
+            "quality":  config.get("stance_size_quality",  0.8),
+            "catalyst": config.get("stance_size_catalyst", 0.6),
+        }
+        stance_adj = stance_multipliers.get(stance, 1.0)
+    else:
+        stance_adj = 1.0
+
     if (
         config.get("coverage_sizing_enabled", True)
         and feature_coverage is not None
@@ -144,7 +174,8 @@ def compute_position_size(
     max_pct = config.get("max_position_pct", 0.05)
     raw_weight = (base_weight * sector_adj * conviction_adj * upside_adj
                   * drawdown_multiplier * atr_adj * confidence_adj
-                  * staleness_adj * earnings_adj * coverage_adj)
+                  * staleness_adj * earnings_adj * coverage_adj
+                  * stance_adj)
     position_weight = min(raw_weight, max_pct)
 
     # ATR volatility cap: ensure ATR constraint is not overridden by other
@@ -167,6 +198,7 @@ def compute_position_size(
         f"dd_mult={drawdown_multiplier} atr_adj={atr_adj} "
         f"confidence_adj={confidence_adj} staleness_adj={staleness_adj} "
         f"earnings_adj={earnings_adj} coverage_adj={coverage_adj} "
+        f"stance_adj={stance_adj} "
         f"→ {position_weight:.3f} NAV = ${dollar_size:.0f} = {shares} shares"
     )
 
@@ -183,4 +215,5 @@ def compute_position_size(
         "staleness_adj": staleness_adj,
         "earnings_adj": earnings_adj,
         "coverage_adj": coverage_adj,
+        "stance_adj": stance_adj,
     }

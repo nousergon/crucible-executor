@@ -481,3 +481,101 @@ class TestComputePositionSize:
         # base=0.04, sector=0.85, dd=0.25 → 0.04*0.85*0.25=0.0085
         # dollar = 5000 * 0.0085 = 42.50 < 500 min
         assert result["shares"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stance-conditional sizing (stance taxonomy arc PR 4 follow-up, 2026-05-11)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestStanceConditionalSizing:
+    """Per-stance position-size multipliers.
+
+    Defaults (executor falls back to these if config doesn't override):
+      momentum 1.0× — baseline thesis (trend-following)
+      value    0.7× — contrarian thesis carries higher uncertainty
+      quality  0.8× — defensive names: smaller stake, longer hold
+      catalyst 0.6× — event-driven: highest variance, smallest stake
+
+    Backtester-tunable from day 1 — multipliers in
+    config/executor_params.json. Auto-tuned weekly once 4+ weeks of
+    stance-tagged history accumulates.
+    """
+
+    def _sizing(self, stance, **cfg_overrides):
+        """Single-entry helper — returns the full sizing dict."""
+        cfg_kwargs = {
+            "max_position_pct": 1.0,        # disable cap so the multiplier shows through
+            "stance_sizing_enabled": True,
+        }
+        cfg_kwargs.update(cfg_overrides)
+        cfg = _base_config(**cfg_kwargs)
+        return compute_position_size(
+            ticker="X",
+            portfolio_nav=1_000_000,
+            enter_signals=[{"ticker": "X"}],
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=100.0,
+            config=cfg,
+            stance=stance,
+        )
+
+    def test_momentum_stance_default_multiplier_is_1_0(self):
+        r = self._sizing("momentum")
+        assert r["stance_adj"] == pytest.approx(1.0)
+
+    def test_value_stance_default_multiplier_is_0_7(self):
+        r = self._sizing("value")
+        assert r["stance_adj"] == pytest.approx(0.7)
+
+    def test_quality_stance_default_multiplier_is_0_8(self):
+        r = self._sizing("quality")
+        assert r["stance_adj"] == pytest.approx(0.8)
+
+    def test_catalyst_stance_default_multiplier_is_0_6(self):
+        r = self._sizing("catalyst")
+        assert r["stance_adj"] == pytest.approx(0.6)
+
+    def test_unknown_stance_falls_back_to_1_0(self):
+        """A stance label not in the canonical set falls back to 1.0×
+        (no adjustment). Defensive — protects against a future
+        vocabulary change that ships before this PR is updated."""
+        r = self._sizing("growth")  # not in canonical 4
+        assert r["stance_adj"] == pytest.approx(1.0)
+
+    def test_stance_none_no_adjustment(self):
+        """stance=None (pre-stance-arc artifacts) → no multiplier
+        applied. Legacy behavior preserved."""
+        r = self._sizing(None)
+        assert r["stance_adj"] == pytest.approx(1.0)
+
+    def test_stance_sizing_disabled_via_config_flag(self):
+        """``stance_sizing_enabled=False`` break-glass flag disables
+        the multiplier even when stance is provided. Used for A/B
+        comparison during the rollout window."""
+        r = self._sizing("catalyst", stance_sizing_enabled=False)
+        assert r["stance_adj"] == pytest.approx(1.0)
+
+    def test_stance_multipliers_overridable_via_config(self):
+        """Backtester-tunable: each multiplier reads from config first,
+        falls back to the canonical default. Pinned so the
+        executor_optimizer auto-tune path can move them."""
+        r = self._sizing("value", stance_size_value=0.5)
+        assert r["stance_adj"] == pytest.approx(0.5)
+
+    def test_stance_multiplier_propagates_through_to_position_pct(self):
+        """End-to-end: a catalyst pick should size at 0.6× of a momentum
+        pick with otherwise-identical inputs."""
+        r_momentum = self._sizing("momentum")
+        r_catalyst = self._sizing("catalyst")
+        ratio = r_catalyst["position_pct"] / r_momentum["position_pct"]
+        assert ratio == pytest.approx(0.6, rel=1e-3)
+
+    def test_value_stance_smaller_dollar_size_than_momentum(self):
+        """A value pick gets ~70% of a momentum pick's dollars on the
+        same setup — the institutional contrarian-stance discipline."""
+        r_momentum = self._sizing("momentum")
+        r_value = self._sizing("value")
+        assert r_value["dollar_size"] < r_momentum["dollar_size"]
+        assert r_value["dollar_size"] / r_momentum["dollar_size"] == pytest.approx(0.7, rel=1e-3)

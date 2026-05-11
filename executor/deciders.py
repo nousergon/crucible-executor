@@ -706,6 +706,7 @@ def decide_entries(
             signal_age_days=signal_age_days,
             days_to_earnings=earnings_by_ticker.get(ticker),
             feature_coverage=coverage_map.get(ticker),
+            stance=pred_data.get("stance"),
         )
 
         if sizing["shares"] == 0:
