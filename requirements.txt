@@ -20,4 +20,10 @@ requests~=2.32
 # Gateway noise (10197 = iOS app steals live-data session, 10349 = TIF
 # coerced to DAY per order preset — order still placed). See daemon.py /
 # main.py / eod_reconcile.py.
-alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.2
+#
+# v0.2.4 is the minimum that bundles flow-doctor>=0.4.0, which adds the
+# `s3` notifier type required by `flow-doctor.yaml`. v0.2.2 + flow-doctor
+# 0.3.0 crashed the daemon at `setup_logging` with
+# `ConfigError: notify[2] (type=s3): unknown notifier type 's3'`
+# (2026-05-11 incident — 205 systemd restarts before stop).
+alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.4
