@@ -40,6 +40,68 @@ SECTOR_ETF_MAP = {
 }
 
 
+# Stance-conditional exit rule overrides (stance taxonomy arc 2026-05-11).
+# Maps stance label → keys to override on strategy_config when evaluating
+# exits for a position with that stance. None values in the override dict
+# disable the corresponding rule outright. Falls through to baseline
+# config when stance is None / unknown (legacy entries, ML drift, etc.).
+#
+# Defaults below are the cold-start values; backtester adds them to the
+# parameter search space in a follow-up PR.
+STANCE_EXIT_OVERRIDES: dict[str, dict] = {
+    "momentum": {
+        # Baseline — no overrides. Pinned explicitly so future readers see
+        # the contrast with the other stances; the dict is otherwise
+        # empty for performance + clarity.
+    },
+    "value": {
+        # Contrarian thesis needs room to play out. Wider stop +
+        # extended hold:
+        "atr_multiplier": 4.5,           # vs default 3.0 — give bounce more room
+        "time_decay_reduce_days": 20,    # vs default 5
+        "time_decay_exit_days": 30,      # vs default 10 — full 30d window for mean reversion
+    },
+    "quality": {
+        # Defensive: long hold, time decay disabled. ATR untouched
+        # (rare exit on the trailing stop is still appropriate).
+        "time_decay_enabled": False,
+    },
+    "catalyst": {
+        # Event-driven: standard checks PLUS the hard catalyst-date
+        # exit (see check_catalyst_hard_exit). Time decay disabled
+        # because the catalyst_date deadline is the canonical exit
+        # boundary — having time_decay fire earlier would defeat the
+        # stance's "ride to the event" thesis.
+        "time_decay_enabled": False,
+    },
+}
+
+
+def _resolve_strategy_config_for_stance(
+    base_config: dict, stance: str | None,
+) -> dict:
+    """Return a stance-overridden view of strategy_config.
+
+    Returns the base config unmodified when stance is None or unknown
+    (legacy / ML drift / break-glass). When stance is recognized,
+    returns a shallow-copy with the stance's overrides merged in. The
+    base config is never mutated — callers can re-use it for other
+    positions with different stances.
+
+    Idempotent + pure — no I/O. Stance-conditional behavior should
+    flow through this helper rather than per-check inline branches so
+    the override surface stays auditable.
+    """
+    if stance is None or stance not in STANCE_EXIT_OVERRIDES:
+        return base_config
+    overrides = STANCE_EXIT_OVERRIDES[stance]
+    if not overrides:
+        return base_config
+    merged = dict(base_config)
+    merged.update(overrides)
+    return merged
+
+
 def check_atr_trailing_stop(
     ticker: str,
     current_price: float,
@@ -244,6 +306,72 @@ def check_time_decay(
         }
 
     return None
+
+
+def check_catalyst_hard_exit(
+    ticker: str,
+    catalyst_date: str | None,
+    run_date: str,
+    strategy_config: dict,
+) -> dict | None:
+    """Hard exit catalyst-stance positions at ``catalyst_date + N`` trading days.
+
+    Stance taxonomy arc — catalyst stance's exit boundary. Event-driven
+    theses depend on the catalyst date arriving; once the event passes
+    (plus a short follow-through window for the post-event move to
+    settle), the thesis is mechanically expired regardless of price
+    action. Standard ATR / profit-take / momentum checks still run
+    before this — those can exit earlier on adverse moves; this is the
+    terminal exit-by-deadline.
+
+    Args:
+        ticker: stock symbol
+        catalyst_date: ISO date (YYYY-MM-DD) of the expected event,
+                       set at entry from predictions.json catalyst_date.
+                       None → not a catalyst-stance position, no-op.
+        run_date: today's date (ISO string)
+        strategy_config: must include ``catalyst_followthrough_days``
+                         (default 3) — trading days after catalyst_date
+                         before the hard exit fires.
+
+    Returns:
+        EXIT signal dict if today > catalyst_date + N trading days,
+        else None.
+    """
+    if not catalyst_date:
+        return None
+    try:
+        cat_dt = date.fromisoformat(catalyst_date)
+        run_dt = date.fromisoformat(run_date)
+    except ValueError:
+        logger.warning(
+            "check_catalyst_hard_exit %s: invalid date "
+            "(catalyst_date=%r, run_date=%r); skipping",
+            ticker, catalyst_date, run_date,
+        )
+        return None
+
+    followthrough_days = strategy_config.get("catalyst_followthrough_days", 3)
+    trading_days_past = _approx_trading_days(cat_dt, run_dt)
+    if trading_days_past < followthrough_days:
+        return None
+
+    logger.info(
+        f"CATALYST HARD EXIT for {ticker}: catalyst_date={catalyst_date}, "
+        f"~{trading_days_past} trading days past (>= {followthrough_days} "
+        f"follow-through threshold)"
+    )
+    return {
+        "ticker": ticker,
+        "action": "EXIT",
+        "reason": "catalyst_hard_exit",
+        "detail": (
+            f"catalyst_date={catalyst_date}, ~{trading_days_past} trading "
+            f"days past (follow-through threshold: {followthrough_days})"
+        ),
+        "catalyst_date": catalyst_date,
+        "trading_days_past_catalyst": trading_days_past,
+    }
 
 
 def check_profit_take(
@@ -479,13 +607,43 @@ def evaluate_exits(
 
         history = price_histories.get(ticker)
 
+        # Resolve stance-conditional config view. ``stance`` and
+        # ``catalyst_date`` are denormalized onto the trades row at
+        # ENTER time (trade_logger.py stance/catalyst_date columns,
+        # 2026-05-11). Position-side propagation via
+        # ``get_entry_stance_and_catalyst`` from trade_logger.
+        # Stance overrides cascade per STANCE_EXIT_OVERRIDES: value
+        # widens ATR + extends time decay, quality + catalyst
+        # disable time decay, catalyst adds the hard exit check below.
+        # Legacy positions (no stance) fall through to baseline config.
+        stance = pos.get("stance")
+        catalyst_date = pos.get("catalyst_date")
+        stance_config = _resolve_strategy_config_for_stance(
+            strategy_config, stance,
+        )
+
+        # 0. Catalyst hard exit — catalyst-stance positions exit at
+        # catalyst_date + follow-through days regardless of price.
+        # Runs FIRST so the deadline supersedes other checks (the
+        # thesis is mechanically expired; price-based checks would
+        # otherwise hold the position past its event window).
+        catalyst_exit = check_catalyst_hard_exit(
+            ticker=ticker,
+            catalyst_date=catalyst_date,
+            run_date=run_date,
+            strategy_config=stance_config,
+        )
+        if catalyst_exit:
+            strategy_signals.append(catalyst_exit)
+            continue
+
         # 1. ATR trailing stop (with sector-relative veto)
         atr_signal = check_atr_trailing_stop(
             ticker=ticker,
             current_price=current_price,
             entry_date=entry_date,
             price_history=history,
-            strategy_config=strategy_config,
+            strategy_config=stance_config,
             feature_lookup=feature_lookup,
             run_date=run_date,
         )
@@ -499,7 +657,7 @@ def evaluate_exits(
                 else None
             )
             if check_sector_relative_veto(
-                ticker, sector, history, etf_history, strategy_config
+                ticker, sector, history, etf_history, stance_config
             ):
                 logger.info(
                     f"ATR exit for {ticker} vetoed — outperforming sector ({sector})"
@@ -507,13 +665,13 @@ def evaluate_exits(
             else:
                 strategy_signals.append(atr_signal)
                 continue  # ATR exit takes priority over other checks
-        elif strategy_config.get("fallback_stop_enabled", True):
+        elif stance_config.get("fallback_stop_enabled", True):
             # ATR returned None — try fallback fixed-percentage stop
             fallback_signal = check_fallback_stop(
                 ticker=ticker,
                 current_price=current_price,
                 entry_price=pos.get("avg_cost"),
-                strategy_config=strategy_config,
+                strategy_config=stance_config,
             )
             if fallback_signal:
                 strategy_signals.append(fallback_signal)
@@ -525,7 +683,7 @@ def evaluate_exits(
             ticker=ticker,
             current_price=current_price,
             avg_cost=avg_cost,
-            strategy_config=strategy_config,
+            strategy_config=stance_config,
         )
         if profit_signal:
             strategy_signals.append(profit_signal)
@@ -535,7 +693,7 @@ def evaluate_exits(
         momentum_signal = check_momentum_exit(
             ticker=ticker,
             price_history=history,
-            strategy_config=strategy_config,
+            strategy_config=stance_config,
             feature_lookup=feature_lookup,
             run_date=run_date,
         )
@@ -543,13 +701,14 @@ def evaluate_exits(
             strategy_signals.append(momentum_signal)
             continue  # Momentum exit fires, skip time decay
 
-        # 4. Time-based decay
+        # 4. Time-based decay (quality + catalyst stances disable this
+        # via STANCE_EXIT_OVERRIDES; value extends it to 30 trading days).
         time_signal = check_time_decay(
             ticker=ticker,
             entry_date=entry_date,
             run_date=run_date,
             signal_action=research_action,
-            strategy_config=strategy_config,
+            strategy_config=stance_config,
         )
         if time_signal:
             strategy_signals.append(time_signal)

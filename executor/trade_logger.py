@@ -99,6 +99,24 @@ _TRADES_MIGRATIONS = [
     # entry-trigger-only contract clean. Populated only on ENTER rows; NULL
     # elsewhere.
     "ALTER TABLE trades ADD COLUMN entry_trigger TEXT",
+    # ── Stance taxonomy arc (2026-05-11) ──────────────────────────────────
+    # Denormalize predictor's stance label + catalyst_date onto the trade
+    # row at ENTER time. Stance routes the executor's stance-conditional
+    # exit rules in strategies/exit_manager.py:
+    #
+    #   stance="value"    → ATR multiplier widened (looser stop on
+    #                       contrarian bounce play); time decay extended
+    #                       to ~30 trading days
+    #   stance="quality"  → time decay DISABLED (defensive, hold-through-
+    #                       cycle); standard ATR
+    #   stance="catalyst" → hard exit at catalyst_date + 3 trading days
+    #                       (event-driven exit boundary)
+    #   stance="momentum" → unchanged (baseline)
+    #
+    # Both nullable — rows from pre-stance-arc entries stay NULL and the
+    # exit logic falls through to legacy behavior.
+    "ALTER TABLE trades ADD COLUMN stance TEXT",
+    "ALTER TABLE trades ADD COLUMN catalyst_date TEXT",
 ]
 
 _EOD_MIGRATIONS = [
@@ -276,8 +294,9 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             spy_price_at_order, realized_pnl, realized_return_pct,
             spy_return_during_hold, realized_alpha_pct, days_held,
             slippage_vs_signal, trading_day, signal_trading_day,
-            signal_date, prediction_date, entry_trigger, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            signal_date, prediction_date, entry_trigger,
+            stance, catalyst_date, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -323,6 +342,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("signal_date"),
             trade.get("prediction_date"),
             trade.get("entry_trigger"),
+            trade.get("stance"),
+            trade.get("catalyst_date"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )
@@ -497,6 +518,36 @@ def get_entry_dates(conn: sqlite3.Connection, tickers: list[str]) -> dict[str, s
         if row:
             entry_dates[ticker] = row[0]
     return entry_dates
+
+
+def get_entry_stance_and_catalyst(
+    conn: sqlite3.Connection, tickers: list[str],
+) -> dict[str, dict]:
+    """Look up the most recent ENTER stance + catalyst_date per ticker.
+
+    Returns ``{ticker: {"stance": str | None, "catalyst_date": str | None}}``
+    for tickers that have an ENTER record. Tickers with no ENTER are
+    omitted (caller falls through to legacy non-stance exit logic).
+
+    Used by ``strategies.exit_manager.evaluate_exits`` to resolve
+    stance-conditional exit rules — ATR multiplier override for
+    value-stance, time-decay disable for quality-stance, hard exit
+    at catalyst_date+3 trading days for catalyst-stance.
+
+    Both stance and catalyst_date are nullable in the trades table
+    (rows logged before the 2026-05-11 stance arc don't have them);
+    callers must tolerate either being None.
+    """
+    out: dict[str, dict] = {}
+    for ticker in tickers:
+        row = conn.execute(
+            "SELECT stance, catalyst_date FROM trades "
+            "WHERE ticker=? AND action='ENTER' ORDER BY date DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+        if row:
+            out[ticker] = {"stance": row[0], "catalyst_date": row[1]}
+    return out
 
 
 def get_todays_trades(conn: sqlite3.Connection, run_date: str) -> list[dict]:
