@@ -946,10 +946,23 @@ def run(
             pos["sector"] = universe_sectors.get(ticker, "")
     
         # ── 2b. Enrich positions with entry_date from trades.db ──────────────────
+        # Also pulls stance + catalyst_date (stance taxonomy arc 2026-05-11):
+        # exit_manager.evaluate_exits reads pos["stance"] / pos["catalyst_date"]
+        # to apply stance-conditional exit rules (ATR multiplier override,
+        # time-decay disable for quality/catalyst, hard exit at
+        # catalyst_date+3d for catalyst). NULL for legacy positions logged
+        # before this PR — falls through to baseline behavior.
         if conn and current_positions:
+            from executor.trade_logger import get_entry_stance_and_catalyst
             entry_dates = get_entry_dates(conn, list(current_positions.keys()))
+            stance_lookup = get_entry_stance_and_catalyst(
+                conn, list(current_positions.keys()),
+            )
             for ticker, pos in current_positions.items():
                 pos["entry_date"] = entry_dates.get(ticker)
+                stance_info = stance_lookup.get(ticker, {})
+                pos["stance"] = stance_info.get("stance")
+                pos["catalyst_date"] = stance_info.get("catalyst_date")
             logger.info(f"Entry dates resolved for {len(entry_dates)}/{len(current_positions)} positions")
     
         # ── 2c. Compute graduated drawdown multiplier ──────────────────────────

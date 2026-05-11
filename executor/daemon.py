@@ -1127,6 +1127,14 @@ def _execute_entry(
         "signal_trading_day": entry.get("signal_date"),
         "signal_date": entry.get("signal_date"),
         "prediction_date": entry.get("prediction_date"),
+        # Stance taxonomy arc (2026-05-11) — denormalize stance + catalyst_date
+        # onto the trade row so exit_manager.evaluate_exits can read them via
+        # trade_logger.get_entry_stance_and_catalyst at exit time. Stance routes
+        # ATR-multiplier override, time-decay disable, and catalyst hard exit.
+        # NULL on entries from planners that haven't been bumped to surface
+        # these fields yet — exit_manager falls through to baseline behavior.
+        "stance": entry.get("stance"),
+        "catalyst_date": entry.get("catalyst_date"),
     })
 
     # Mark entry as executed in order book

@@ -887,6 +887,12 @@ def decide_entries(
             "predicted_direction": pred.get("predicted_direction"),
             "prediction_confidence": pred.get("prediction_confidence"),
             "predicted_alpha": pred.get("predicted_alpha"),
+            # Stance taxonomy arc (2026-05-11) — denormalize predictor's
+            # stance + catalyst_date onto the OrderBook entry so the daemon
+            # propagates them onto the trade row at ENTER fill time. Exit
+            # logic reads them via trade_logger.get_entry_stance_and_catalyst.
+            "stance": pred.get("stance"),
+            "catalyst_date": pred.get("catalyst_date"),
             "sizing_factors": {
                 "sector_adj": sizing.get("sector_adj"),
                 "conviction_adj": sizing.get("conviction_adj"),
@@ -896,6 +902,7 @@ def decide_entries(
                 "confidence_adj": sizing.get("confidence_adj"),
                 "staleness_adj": sizing.get("staleness_adj"),
                 "earnings_adj": sizing.get("earnings_adj"),
+                "stance_adj": sizing.get("stance_adj"),
             },
         })
 
