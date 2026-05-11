@@ -26,4 +26,4 @@ requests~=2.32
 # 0.3.0 crashed the daemon at `setup_logging` with
 # `ConfigError: notify[2] (type=s3): unknown notifier type 's3'`
 # (2026-05-11 incident — 205 systemd restarts before stop).
-alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.4
+alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.9.1
