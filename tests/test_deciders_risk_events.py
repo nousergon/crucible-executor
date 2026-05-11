@@ -8,6 +8,7 @@ Phase 2 transparency-inventory — closes the *risk decisions* row.
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from executor.deciders import decide_entries
 
@@ -154,6 +155,161 @@ def test_momentum_gate_emits_veto_event():
     assert ev["ticker"] == "NVDA"
     assert ev["signal_date"] == "2026-05-06"
     assert ev["prediction_date"] == "2026-05-06"
+
+
+# ── Predictor-emitted momentum_veto (PR alpha-engine-predictor#136) ─────────
+
+
+def test_predictor_momentum_veto_blocks_entry_and_records_source():
+    """When the predictor emits ``momentum_veto=True`` on a ticker,
+    the executor must skip the entry and tag the risk event with
+    ``veto_source='predictor'``. Replaces the executor's inline
+    momentum_gate computation (which becomes the fallback path)."""
+    enter = [{"ticker": "WING", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Consumer Discretionary",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    predictions = {"WING": {
+        # Predictor saw -27.9% over 20d → emits the veto flag.
+        # Executor consumes the boolean; the inline price-history path
+        # is bypassed even if price_histories has the same ticker.
+        "momentum_veto": True,
+        "momentum_20d": -0.279,
+        "predicted_alpha": 0.01,
+        "predicted_direction": "UP",  # alpha-positive but momentum says no
+        "prediction_confidence": 0.55,
+        "combined_rank": 5,
+        "gbm_veto": False,
+    }}
+    # Flat history that on its own would NOT trip the executor inline
+    # gate — pins that the predictor's flag is authoritative.
+    histories = {"WING": _df_history(trend=0.1)}
+    for t in ("SPY", "XLK", "XLV", "XLF", "XLY"):
+        histories[t] = _df_history(trend=0.1)
+    inputs = _make_inputs(
+        signals_date="2026-05-08", run_date="2026-05-11",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True,
+                          "momentum_gate_threshold": -5.0},
+        price_histories=histories,
+    )
+    plan = decide_entries(predictions_date="2026-05-11", **inputs)
+    assert plan.n_entered == 0, "predictor momentum_veto must block entry"
+    veto_events = [e for e in plan.risk_events if e["rule"] == "momentum_gate"]
+    assert len(veto_events) == 1
+    ev = veto_events[0]
+    assert ev["event_type"] == "veto"
+    assert ev["ticker"] == "WING"
+    assert ev["veto_source"] == "predictor", (
+        "Risk event must record that the predictor authored the veto — "
+        "backtester attribution depends on this field to split"
+        " predictor-vs-executor contribution to the veto distribution."
+    )
+    assert ev["value"] == pytest.approx(-0.279)
+
+
+def test_predictor_momentum_veto_false_does_not_block_even_on_bad_history():
+    """If the predictor emits ``momentum_veto=False``, the executor must
+    trust the predictor and skip the inline-history fallback. Pinned so
+    a future refactor doesn't accidentally re-introduce the fallback
+    when the predictor has already weighed in."""
+    enter = [{"ticker": "AAPL", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    predictions = {"AAPL": {
+        # Predictor saw the 20d return + macro context and decided NOT
+        # to veto (perhaps because sector ETF is up while individual
+        # ticker is mildly down — relative strength).
+        "momentum_veto": False,
+        "momentum_20d": -0.07,  # would trip inline -5% gate
+        "predicted_alpha": 0.01,
+        "predicted_direction": "UP",
+        "prediction_confidence": 0.65,
+        "combined_rank": 5,
+        "gbm_veto": False,
+    }}
+    # Bad history that WOULD trip the inline gate if we ran it.
+    histories = {"AAPL": _df_history(trend=-0.5)}
+    for t in ("SPY", "XLK", "XLV", "XLF", "XLY"):
+        histories[t] = _df_history(trend=0.1)
+    inputs = _make_inputs(
+        signals_date="2026-05-02", run_date="2026-05-02",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True,
+                          "momentum_gate_threshold": -5.0},
+        price_histories=histories,
+    )
+    plan = decide_entries(predictions_date="2026-05-02", **inputs)
+    veto_events = [e for e in plan.risk_events if e["rule"] == "momentum_gate"]
+    assert veto_events == [], (
+        "Predictor said momentum_veto=False — executor must NOT run the "
+        "inline fallback as a second-opinion override"
+    )
+
+
+def test_executor_inline_fallback_when_predictor_field_absent():
+    """During the rollout transition (predictor PR shipped, executor PR
+    being deployed), predictions may not yet carry ``momentum_veto``.
+    Pin the fallback to the executor's inline computation so today's
+    entries aren't silently un-gated.
+
+    After ~1 trading week of predictor PR being live (every prediction
+    carries the field), this fallback can be removed."""
+    enter = [{"ticker": "TSLA", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Technology",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    # No predictions_by_ticker entry → predictor field absent.
+    histories = {"TSLA": _df_history(trend=-0.5)}
+    for t in ("SPY", "XLK", "XLV", "XLF", "XLY"):
+        histories[t] = _df_history(trend=0.1)
+    inputs = _make_inputs(
+        signals_date="2026-05-02", run_date="2026-05-02",
+        enter_signals=enter,
+        config_overrides={"momentum_gate_enabled": True,
+                          "momentum_gate_threshold": -5.0},
+        price_histories=histories,
+    )
+    plan = decide_entries(predictions_date="2026-05-02", **inputs)
+    assert plan.n_entered == 0
+    veto_events = [e for e in plan.risk_events if e["rule"] == "momentum_gate"]
+    assert len(veto_events) == 1
+    ev = veto_events[0]
+    assert ev["veto_source"] == "executor_fallback", (
+        "When predictor lacks momentum_veto field, executor must fall "
+        "through to inline computation and tag the source for attribution"
+    )
+
+
+def test_predictor_momentum_veto_with_missing_momentum_20d_logs_unknown():
+    """Defensive: predictor may emit ``momentum_veto=True`` but omit
+    ``momentum_20d`` (unlikely but tolerated). The veto still fires;
+    the diagnostic value is unset rather than crashing."""
+    enter = [{"ticker": "MDT", "signal": "ENTER", "score": 85,
+              "conviction": "rising", "sector": "Health Care",
+              "rating": "BUY", "price_target_upside": 0.20}]
+    predictions = {"MDT": {
+        "momentum_veto": True,
+        # momentum_20d omitted
+        "predicted_alpha": 0.01,
+        "predicted_direction": "UP",
+        "prediction_confidence": 0.55,
+        "combined_rank": 5,
+        "gbm_veto": False,
+    }}
+    inputs = _make_inputs(
+        signals_date="2026-05-02", run_date="2026-05-02",
+        enter_signals=enter,
+        predictions_by_ticker=predictions,
+        config_overrides={"momentum_gate_enabled": True,
+                          "momentum_gate_threshold": -5.0},
+    )
+    plan = decide_entries(predictions_date="2026-05-02", **inputs)
+    veto_events = [e for e in plan.risk_events if e["rule"] == "momentum_gate"]
+    assert len(veto_events) == 1
+    ev = veto_events[0]
+    assert ev["veto_source"] == "predictor"
+    assert ev["value"] is None  # no diagnostic value to record
 
 
 # ── Predictor GBM veto override ─────────────────────────────────────────────

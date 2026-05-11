@@ -478,25 +478,84 @@ def decide_entries(
             plan.blocked.append({**_shadow_base, "block_reason": "already in portfolio"})
             continue
 
-        # Momentum confirmation gate
-        if config.get("momentum_gate_enabled", True) and price_histories:
-            ticker_history = price_histories.get(ticker)
-            if ticker_history is not None and len(ticker_history) >= 21:
-                close = ticker_history["close"]
-                momentum_20d = (float(close.iloc[-1]) / float(close.iloc[-21]) - 1) * 100
-                mom_threshold = config.get("momentum_gate_threshold", -5.0)
-                if momentum_20d < mom_threshold:
-                    reason = f"momentum gate: 20d={momentum_20d:.1f}% < {mom_threshold}%"
+        # Momentum confirmation gate.
+        # As of 2026-05-11 (alpha-engine-predictor#136), the predictor
+        # emits ``momentum_veto`` + ``momentum_20d`` on every prediction —
+        # rule computation lives with the predictor (alongside gbm_veto)
+        # so signal-side logic is consolidated and can leverage the
+        # predictor's macro/regime context. The executor consumes the
+        # boolean here; ``momentum_gate_enabled`` config still gates the
+        # whole rule for break-glass.
+        #
+        # Backward-compat fallback: if ``momentum_veto`` is absent from
+        # the prediction (older predictor build OR ticker missing from
+        # predictions_by_ticker), fall back to the executor-side inline
+        # computation from ``price_histories``. Once the predictor half
+        # has been live for 1+ trading week and all predictions carry
+        # the field, this fallback can be removed.
+        pred_data_for_veto = predictions_by_ticker.get(ticker, {})
+        if config.get("momentum_gate_enabled", True):
+            mom_threshold_pct = config.get("momentum_gate_threshold", -5.0)
+            mom_threshold_decimal = float(mom_threshold_pct) / 100.0
+            predictor_momentum_veto = pred_data_for_veto.get("momentum_veto")
+            predictor_momentum_20d = pred_data_for_veto.get("momentum_20d")
+
+            momentum_20d_decimal: float | None = None
+            veto_source: str | None = None  # "predictor" | "executor_fallback" | None
+            if predictor_momentum_veto is not None:
+                # Predictor-side veto is authoritative. ``momentum_20d``
+                # in the prediction is a decimal (matches feature
+                # engineering's ``close/close.shift(20) - 1``).
+                veto_source = "predictor"
+                if isinstance(predictor_momentum_20d, (int, float)):
+                    momentum_20d_decimal = float(predictor_momentum_20d)
+                if predictor_momentum_veto:
+                    momentum_20d_pct = (
+                        f"{momentum_20d_decimal * 100:.1f}%"
+                        if momentum_20d_decimal is not None else "?"
+                    )
+                    reason = (
+                        f"momentum gate (predictor): 20d={momentum_20d_pct} "
+                        f"< {mom_threshold_pct}%"
+                    )
                     logger.info(f"SKIP ENTER {ticker} — {reason}")
                     plan.blocked.append({**_shadow_base, "block_reason": reason})
                     plan.risk_events.append({**_event_base,
                         "event_type": "veto",
                         "rule": "momentum_gate",
                         "reason": reason,
-                        "value": float(momentum_20d) / 100.0,
-                        "threshold": float(mom_threshold) / 100.0,
+                        "value": momentum_20d_decimal,
+                        "threshold": mom_threshold_decimal,
+                        "veto_source": "predictor",
                     })
                     continue
+            elif price_histories:
+                # Backward-compat: predictor didn't emit momentum_veto
+                # for this ticker. Fall through to the inline calc.
+                ticker_history = price_histories.get(ticker)
+                if ticker_history is not None and len(ticker_history) >= 21:
+                    veto_source = "executor_fallback"
+                    close = ticker_history["close"]
+                    momentum_20d_decimal = (
+                        float(close.iloc[-1]) / float(close.iloc[-21]) - 1
+                    )
+                    if momentum_20d_decimal < mom_threshold_decimal:
+                        reason = (
+                            f"momentum gate (executor fallback): "
+                            f"20d={momentum_20d_decimal * 100:.1f}% < "
+                            f"{mom_threshold_pct}%"
+                        )
+                        logger.info(f"SKIP ENTER {ticker} — {reason}")
+                        plan.blocked.append({**_shadow_base, "block_reason": reason})
+                        plan.risk_events.append({**_event_base,
+                            "event_type": "veto",
+                            "rule": "momentum_gate",
+                            "reason": reason,
+                            "value": momentum_20d_decimal,
+                            "threshold": mom_threshold_decimal,
+                            "veto_source": "executor_fallback",
+                        })
+                        continue
 
         # Earnings proximity warning (logs only)
         earnings_warning_days = config.get("earnings_proximity_warning_days", 2)
