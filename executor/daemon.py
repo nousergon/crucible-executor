@@ -40,6 +40,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from ssm_secrets import load_secrets
 load_secrets()
 
+from executor.decision_capture import (
+    DecisionCaptureWriteError,
+    capture_entry_trigger,
+    is_decision_capture_enabled,
+)
 from executor.entry_triggers import EntryTriggerEngine
 from executor.ibkr import IBKRClient
 from executor.intraday_exit_manager import IntradayExitManager
@@ -70,6 +75,11 @@ ORDER_RETRY_DELAYS = [0, 2, 5]  # seconds between attempts
 # Market timing constants (US Eastern)
 MARKET_OPEN_HOUR = 9
 MARKET_OPEN_MINUTE = 30
+
+# US Eastern timezone — hoisted to module scope so helper functions like
+# ``_execute_entry`` (decision-capture wiring, L2308) can read it without
+# threading the tz through every call site.
+_ET = pytz.timezone("US/Eastern")
 
 # Connection retry limits
 MAX_RECONNECT_BACKOFF_SECS = 300
@@ -333,7 +343,8 @@ def run_daemon(dry_run: bool = False) -> None:
 
     # Wait for order book — polls every 2 minutes until one appears or market closes.
     # This allows the daemon to recover from a late predictor inference or morning batch.
-    _ET = pytz.timezone("US/Eastern")
+    # _ET timezone is module-scoped now (decision-capture wiring needs it from
+    # _execute_entry); rebinding here would shadow the module constant.
     order_book_poll_secs = strategy_config.get("order_book_poll_interval_sec", 120)
     order_book = OrderBook.load()
     notified_no_order_book = False
@@ -1139,6 +1150,37 @@ def _execute_entry(
 
     # Mark entry as executed in order book
     order_book.mark_entry_executed(ticker, trigger_reason)
+
+    # Emit executor:entry_triggers DecisionArtifact (L2308 PR 1).
+    # Best-effort: capture is observability, not load-bearing for the trade
+    # itself. Swallow DecisionCaptureWriteError + log loudly so a transient
+    # S3 outage doesn't kill subsequent trade executions. No-op when the
+    # ALPHA_ENGINE_DECISION_CAPTURE_ENABLED env var is unset (default off).
+    if is_decision_capture_enabled():
+        try:
+            capture_entry_trigger(
+                run_date=run_date,
+                entry=entry,
+                price_state=price_state,
+                trigger_reason=trigger_reason,
+                strategy_config=strategy_config,
+                disabled_triggers=list(strategy_config.get("disabled_triggers", [])),
+                now_et_iso=datetime.now(_ET).isoformat(),
+                fill_price=fill_price,
+                actual_shares=actual_shares,
+                trade_id=trade_id,
+            )
+        except DecisionCaptureWriteError as _cap_exc:
+            logger.warning(
+                "decision_capture S3 write failed for ENTER %s — continuing "
+                "trade flow (capture is observability, not load-bearing): %s",
+                ticker, _cap_exc,
+            )
+        except Exception:  # noqa: BLE001 — capture must never kill trading
+            logger.exception(
+                "decision_capture raised unexpected exception for ENTER %s "
+                "— continuing trade flow", ticker,
+            )
 
     # Add stop record for the new position (skip if ATR unavailable)
     trail_atr = entry.get("atr_value", 0)
