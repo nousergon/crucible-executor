@@ -25,8 +25,10 @@ from executor.decision_capture import (
     _classify_trigger_kind,
     build_entry_trigger_payload,
     build_position_sizer_payload,
+    build_risk_guard_payload,
     capture_entry_trigger,
     capture_position_sizer,
+    capture_risk_guard,
     is_decision_capture_enabled,
 )
 
@@ -671,3 +673,279 @@ class TestPositionSizerCapture:
                 sized_outcome="approved",
                 s3_client=s3,
             )
+
+
+# ── Risk guard (PR 3) ────────────────────────────────────────────────────
+
+
+def _make_risk_guard_signal() -> dict:
+    """Signal dict shape as it lands in risk_guard.check_order."""
+    return {
+        "ticker": "AAPL",
+        "score": 78.5,
+        "conviction": "rising",
+        "rating": "BUY",
+        "price_target_upside": 0.18,
+        "sector": "technology",
+        "sector_rating": "overweight",
+    }
+
+
+def _make_current_positions(sector_for_held: str = "technology") -> dict:
+    """Sample current_positions dict — risk_guard reads market_value +
+    sector to compute sector exposure."""
+    return {
+        "MSFT": {"market_value": 50_000.0, "sector": sector_for_held},
+        "JPM":  {"market_value": 30_000.0, "sector": "financials"},
+    }
+
+
+def _make_risk_config() -> dict:
+    return {
+        "min_score_to_enter": 70,
+        "max_position_pct": 0.05,
+        "bear_max_position_pct": 0.025,
+        "max_sector_pct": 0.25,
+        "max_equity_pct": 1.00,
+        "bear_block_underweight": True,
+        "drawdown_halt_pct": 0.15,
+        "correlation_block_threshold": 0.80,
+    }
+
+
+class TestRiskGuardPayloadShape:
+    """Snapshot + agent_output for both approved and vetoed paths."""
+
+    def test_snapshot_carries_producer_provenance(self):
+        snapshot, _, _ = build_risk_guard_payload(
+            ticker="AAPL", action="ENTER", dollar_size=26_000.0,
+            portfolio_nav=1_000_000.0, peak_nav=1_050_000.0,
+            current_positions=_make_current_positions(),
+            sector="technology", market_regime="neutral",
+            signal=_make_risk_guard_signal(), config=_make_risk_config(),
+            approved=True, reason="ok", events=[],
+        )
+        assert snapshot["_producer"] == "alpha-engine.executor.risk_guard"
+        assert snapshot["_producer_version"] == "1.0.0"
+
+    def test_snapshot_carries_portfolio_state_and_drawdown(self):
+        snapshot, _, _ = build_risk_guard_payload(
+            ticker="AAPL", action="ENTER", dollar_size=26_000.0,
+            portfolio_nav=950_000.0, peak_nav=1_000_000.0,
+            current_positions=_make_current_positions(),
+            sector="technology", market_regime="neutral",
+            signal=_make_risk_guard_signal(), config=_make_risk_config(),
+            approved=True, reason="ok", events=[],
+        )
+        assert snapshot["portfolio_nav"] == 950_000.0
+        assert snapshot["peak_nav"] == 1_000_000.0
+        # drawdown_fraction = (peak - nav) / peak = 50000 / 1000000 = 0.05
+        assert abs(snapshot["drawdown_fraction"] - 0.05) < 1e-9
+        assert snapshot["n_open_positions"] == 2
+        # existing_sector_exposure for technology = MSFT's 50k (JPM is
+        # financials, excluded).
+        assert snapshot["existing_sector_exposure"] == 50_000.0
+
+    def test_snapshot_carries_full_gate_thresholds(self):
+        snapshot, _, _ = build_risk_guard_payload(
+            ticker="AAPL", action="ENTER", dollar_size=26_000.0,
+            portfolio_nav=1_000_000.0, peak_nav=1_050_000.0,
+            current_positions={}, sector="technology",
+            market_regime="neutral", signal=_make_risk_guard_signal(),
+            config=_make_risk_config(),
+            approved=True, reason="ok", events=[],
+        )
+        thr = snapshot["thresholds"]
+        # All 8 gates captured so a future replay can re-evaluate
+        # against a different threshold set.
+        assert thr["min_score_to_enter"] == 70
+        assert thr["max_position_pct"] == 0.05
+        assert thr["bear_max_position_pct"] == 0.025
+        assert thr["max_sector_pct"] == 0.25
+        assert thr["max_equity_pct"] == 1.00
+        assert thr["bear_block_underweight"] is True
+        assert thr["drawdown_halt_pct"] == 0.15
+        assert thr["correlation_block_threshold"] == 0.80
+
+    def test_approved_path_records_outcome_approved(self):
+        _, output, summary = build_risk_guard_payload(
+            ticker="AAPL", action="ENTER", dollar_size=26_000.0,
+            portfolio_nav=1_000_000.0, peak_nav=1_050_000.0,
+            current_positions={}, sector="technology",
+            market_regime="neutral", signal=_make_risk_guard_signal(),
+            config=_make_risk_config(),
+            approved=True, reason="ok", events=[],
+        )
+        assert output["outcome"] == "approved"
+        assert output["reason"] == "ok"
+        assert output["vetoed_rule"] is None
+        assert output["events"] == []
+        assert "outcome=approved" in summary
+
+    def test_vetoed_path_extracts_rule_from_events(self):
+        events = [
+            {
+                "ticker": "AAPL", "event_type": "veto", "rule": "min_score",
+                "reason": "Score 58.0 < minimum 70", "value": 58.0,
+                "threshold": 70.0,
+            },
+        ]
+        _, output, summary = build_risk_guard_payload(
+            ticker="AAPL", action="ENTER", dollar_size=26_000.0,
+            portfolio_nav=1_000_000.0, peak_nav=1_050_000.0,
+            current_positions={}, sector="technology",
+            market_regime="neutral", signal=_make_risk_guard_signal(),
+            config=_make_risk_config(),
+            approved=False, reason="Score 58.0 < minimum 70", events=events,
+        )
+        assert output["outcome"] == "vetoed"
+        assert output["vetoed_rule"] == "min_score"
+        assert output["events"] == events
+        assert "outcome=vetoed" in summary
+
+    def test_events_filtered_to_per_ticker_veto_only(self):
+        """Approved path with portfolio-level events in scope: those must
+        not leak into the per-ticker artifact's events list."""
+        events = [
+            # Portfolio-level halt — different ticker / no ticker
+            {"event_type": "halt", "rule": "drawdown_halt", "reason": "p"},
+            # Some other ticker's veto (defensive — shouldn't happen in
+            # practice but the filter must be robust)
+            {
+                "ticker": "OTHER", "event_type": "veto", "rule": "min_score",
+                "reason": "x",
+            },
+        ]
+        _, output, _ = build_risk_guard_payload(
+            ticker="AAPL", action="ENTER", dollar_size=26_000.0,
+            portfolio_nav=1_000_000.0, peak_nav=1_050_000.0,
+            current_positions={}, sector="technology",
+            market_regime="neutral", signal=_make_risk_guard_signal(),
+            config=_make_risk_config(),
+            approved=True, reason="ok", events=events,
+        )
+        assert output["outcome"] == "approved"
+        assert output["vetoed_rule"] is None
+        # Only this ticker's veto events would land in `events` — both
+        # input rows belong to other contexts, so the list is empty.
+        assert output["events"] == []
+
+    def test_zero_peak_nav_produces_zero_drawdown_safely(self):
+        """Anti-regression: division-by-zero guard on peak_nav=0."""
+        snapshot, _, _ = build_risk_guard_payload(
+            ticker="AAPL", action="ENTER", dollar_size=26_000.0,
+            portfolio_nav=1_000_000.0, peak_nav=0.0,
+            current_positions={}, sector="technology",
+            market_regime="neutral", signal=_make_risk_guard_signal(),
+            config=_make_risk_config(),
+            approved=True, reason="ok", events=[],
+        )
+        assert snapshot["drawdown_fraction"] == 0.0
+
+
+class TestRiskGuardCapture:
+    """End-to-end capture path with env-flag + S3 stub."""
+
+    def test_writes_v2_artifact_to_canonical_key(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        s3_key = capture_risk_guard(
+            run_date="2026-05-15", ticker="AAPL", action="ENTER",
+            dollar_size=26_000.0, portfolio_nav=1_000_000.0,
+            peak_nav=1_050_000.0,
+            current_positions=_make_current_positions(),
+            sector="technology", market_regime="neutral",
+            signal=_make_risk_guard_signal(), config=_make_risk_config(),
+            approved=True, reason="ok", events=[], s3_client=s3,
+        )
+        s3.put_object.assert_called_once()
+        put_kwargs = s3.put_object.call_args.kwargs
+        assert put_kwargs["Bucket"] == "alpha-engine-research"
+        assert "/executor:risk_guard/" in put_kwargs["Key"]
+        assert put_kwargs["Key"].endswith(".json")
+        assert s3_key == put_kwargs["Key"]
+        body = json.loads(put_kwargs["Body"].decode("utf-8"))
+        assert body["schema_version"] == 2
+        assert body["agent_id"] == "executor:risk_guard"
+        assert body["model_metadata"] is None
+        assert body["full_prompt_context"] is None
+        assert body["input_data_snapshot"]["ticker"] == "AAPL"
+        assert body["agent_output"]["outcome"] == "approved"
+
+    def test_vetoed_artifact_carries_rule_and_events(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        events = [
+            {
+                "ticker": "AAPL", "event_type": "veto",
+                "rule": "max_position", "reason": "too big",
+                "value": 0.08, "threshold": 0.05,
+            },
+        ]
+        capture_risk_guard(
+            run_date="2026-05-15", ticker="AAPL", action="ENTER",
+            dollar_size=80_000.0, portfolio_nav=1_000_000.0,
+            peak_nav=1_050_000.0, current_positions={},
+            sector="technology", market_regime="neutral",
+            signal=_make_risk_guard_signal(), config=_make_risk_config(),
+            approved=False, reason="too big", events=events, s3_client=s3,
+        )
+        body = json.loads(s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+        assert body["agent_output"]["outcome"] == "vetoed"
+        assert body["agent_output"]["vetoed_rule"] == "max_position"
+        assert body["agent_output"]["events"] == events
+
+    def test_disabled_when_env_off(self, monkeypatch):
+        monkeypatch.delenv(
+            "ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", raising=False,
+        )
+        s3 = _make_s3_stub()
+        result = capture_risk_guard(
+            run_date="2026-05-15", ticker="AAPL", action="ENTER",
+            dollar_size=26_000.0, portfolio_nav=1_000_000.0,
+            peak_nav=1_050_000.0, current_positions={},
+            sector="technology", market_regime="neutral",
+            signal=_make_risk_guard_signal(), config=_make_risk_config(),
+            approved=True, reason="ok", events=[], s3_client=s3,
+        )
+        assert result is None
+        s3.put_object.assert_not_called()
+
+    def test_s3_failure_propagates_capture_write_error(self, monkeypatch):
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        s3.put_object.side_effect = ClientError(
+            error_response={
+                "Error": {"Code": "AccessDenied", "Message": "Denied"},
+            },
+            operation_name="PutObject",
+        )
+        with pytest.raises(DecisionCaptureWriteError):
+            capture_risk_guard(
+                run_date="2026-05-15", ticker="AAPL", action="ENTER",
+                dollar_size=26_000.0, portfolio_nav=1_000_000.0,
+                peak_nav=1_050_000.0, current_positions={},
+                sector="technology", market_regime="neutral",
+                signal=_make_risk_guard_signal(), config=_make_risk_config(),
+                approved=True, reason="ok", events=[], s3_client=s3,
+            )
+
+    def test_run_id_includes_ticker_and_uuid_suffix(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        capture_risk_guard(
+            run_date="2026-05-15", ticker="NVDA", action="ENTER",
+            dollar_size=30_000.0, portfolio_nav=1_000_000.0,
+            peak_nav=1_050_000.0, current_positions={},
+            sector="technology", market_regime="neutral",
+            signal=_make_risk_guard_signal(), config=_make_risk_config(),
+            approved=True, reason="ok", events=[], s3_client=s3,
+        )
+        body = json.loads(s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+        run_id = body["run_id"]
+        assert run_id.startswith("2026-05-15_NVDA_")
+        suffix = run_id.split("_")[-1]
+        assert len(suffix) == 8
+        assert all(c in "0123456789abcdef" for c in suffix)
