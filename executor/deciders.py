@@ -41,6 +41,11 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date
 
+from executor.decision_capture import (
+    DecisionCaptureWriteError,
+    capture_position_sizer,
+    is_decision_capture_enabled,
+)
 from executor.position_sizer import compute_position_size
 from executor.risk_guard import (
     check_order,
@@ -708,6 +713,57 @@ def decide_entries(
             feature_coverage=coverage_map.get(ticker),
             stance=pred_data.get("stance"),
         )
+
+        # Emit executor:position_sizer DecisionArtifact (L2308 PR 2).
+        # Captured BEFORE any downstream filtering (shares==0, GBM veto,
+        # risk_guard veto) so grading analytics can measure "sizing
+        # decisions that got refused" (precision of refusal) alongside
+        # "sized → ordered" decisions. Risk-guard + GBM veto captures
+        # land in PR 3 (executor:risk_guard).
+        # Best-effort: capture failure must never kill planning flow.
+        if is_decision_capture_enabled():
+            sized_outcome = (
+                "shares_zero" if sizing.get("shares", 0) == 0 else "approved"
+            )
+            sized_outcome_reason = (
+                f"shares round to 0 (${sizing['dollar_size']:.0f} / "
+                f"${current_price:.2f})"
+                if sized_outcome == "shares_zero"
+                else None
+            )
+            try:
+                capture_position_sizer(
+                    run_date=run_date,
+                    ticker=ticker,
+                    signal=sig,
+                    sector_rating=sector_rating_str,
+                    current_price=current_price,
+                    portfolio_nav=portfolio_nav,
+                    n_enter_signals=len(enter_signals),
+                    drawdown_multiplier=dd_multiplier,
+                    atr_pct=atr_pct,
+                    prediction_confidence=pred_confidence,
+                    p_up=pred_data.get("p_up"),
+                    signal_age_days=signal_age_days,
+                    days_to_earnings=earnings_by_ticker.get(ticker),
+                    feature_coverage=coverage_map.get(ticker),
+                    stance=pred_data.get("stance"),
+                    sizing_result=sizing,
+                    sized_outcome=sized_outcome,
+                    sized_outcome_reason=sized_outcome_reason,
+                )
+            except DecisionCaptureWriteError as _cap_exc:
+                logger.warning(
+                    "decision_capture S3 write failed for SIZE %s — "
+                    "continuing planning (capture is observability, not "
+                    "load-bearing): %s",
+                    ticker, _cap_exc,
+                )
+            except Exception:  # noqa: BLE001 — capture must never kill planning
+                logger.exception(
+                    "decision_capture raised unexpected exception for "
+                    "SIZE %s — continuing planning", ticker,
+                )
 
         if sizing["shares"] == 0:
             logger.info(

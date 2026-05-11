@@ -68,8 +68,14 @@ def is_decision_capture_enabled() -> bool:
 
 _AGENT_ID_ENTRY_TRIGGERS = "executor:entry_triggers"
 _PRODUCER_NAME_ENTRY_TRIGGERS = "alpha-engine.executor.entry_triggers"
+
+_AGENT_ID_POSITION_SIZER = "executor:position_sizer"
+_PRODUCER_NAME_POSITION_SIZER = "alpha-engine.executor.position_sizer"
+
 # Bump when the snapshot/output shape changes; readers can filter on this
-# rather than guessing from S3 timestamps.
+# rather than guessing from S3 timestamps. Per-component versioning so a
+# bump in one producer (e.g. entry_triggers) doesn't force a re-tag of
+# every other deterministic-decision producer.
 _PRODUCER_VERSION = "1.0.0"
 
 
@@ -263,9 +269,191 @@ def capture_entry_trigger(
     return s3_key
 
 
+# ── Position sizer payload + capture ─────────────────────────────────────
+
+
+def build_position_sizer_payload(
+    *,
+    ticker: str,
+    signal: dict,
+    sector_rating: str,
+    current_price: float,
+    portfolio_nav: float,
+    n_enter_signals: int,
+    drawdown_multiplier: float,
+    atr_pct: float | None,
+    prediction_confidence: float | None,
+    p_up: float | None,
+    signal_age_days: int | None,
+    days_to_earnings: int | None,
+    feature_coverage: float | None,
+    stance: str | None,
+    sizing_result: dict,
+    sized_outcome: str,
+    sized_outcome_reason: str | None,
+) -> tuple[dict, dict, str]:
+    """Build ``(input_data_snapshot, agent_output, input_data_summary)``
+    for one ``compute_position_size`` invocation.
+
+    Snapshot mirrors every argument passed into the sizer plus the
+    portfolio context (NAV, n_entries today) so a replay can re-derive
+    the sizing decision from inputs without hitting S3 again.
+
+    ``agent_output`` records the sized result (shares + dollars + pct NAV)
+    plus the per-multiplier breakdown (sector_adj, conviction_adj,
+    upside_adj, drawdown_multiplier, atr_adj, confidence_adj,
+    staleness_adj, earnings_adj, coverage_adj, stance_adj). Joining
+    against ``trades.csv`` by ``ticker + date`` lets the backtester
+    grading analytics (PR 5) measure sizing-skill — e.g. did high-
+    multiplier sizes systematically outperform low-multiplier ones over
+    5d.
+
+    ``sized_outcome`` is one of ``{"approved", "shares_zero"}`` — captured
+    at the call site so downstream consumers know whether the sized
+    quantity became an order or got filtered. (Risk-guard vetoes and
+    GBM vetoes that happen AFTER sizing are captured by PR 3
+    ``executor:risk_guard``, not here.)
+    """
+    snapshot = {
+        "_producer": _PRODUCER_NAME_POSITION_SIZER,
+        "_producer_version": _PRODUCER_VERSION,
+        # Inputs passed into compute_position_size
+        "ticker": ticker,
+        "signal": {
+            "score": signal.get("score"),
+            "conviction": signal.get("conviction"),
+            "rating": signal.get("rating"),
+            "price_target_upside": signal.get("price_target_upside"),
+            "sector": signal.get("sector"),
+        },
+        "sector_rating": sector_rating,
+        "current_price": current_price,
+        "portfolio_nav": portfolio_nav,
+        "n_enter_signals": n_enter_signals,
+        "drawdown_multiplier": drawdown_multiplier,
+        "atr_pct": atr_pct,
+        "prediction_confidence": prediction_confidence,
+        "p_up": p_up,
+        "signal_age_days": signal_age_days,
+        "days_to_earnings": days_to_earnings,
+        "feature_coverage": feature_coverage,
+        "stance": stance,
+    }
+
+    # The sizer return dict carries the full multiplier breakdown — copy
+    # it through so grading analytics can decompose any subsequent
+    # under/over-performance against any single multiplier.
+    agent_output = {
+        "shares": sizing_result.get("shares"),
+        "dollar_size": sizing_result.get("dollar_size"),
+        "position_pct": sizing_result.get("position_pct"),
+        "sector_adj": sizing_result.get("sector_adj"),
+        "conviction_adj": sizing_result.get("conviction_adj"),
+        "upside_adj": sizing_result.get("upside_adj"),
+        "dd_multiplier": sizing_result.get("dd_multiplier"),
+        "atr_adj": sizing_result.get("atr_adj"),
+        "confidence_adj": sizing_result.get("confidence_adj"),
+        "staleness_adj": sizing_result.get("staleness_adj"),
+        "earnings_adj": sizing_result.get("earnings_adj"),
+        "coverage_adj": sizing_result.get("coverage_adj"),
+        "stance_adj": sizing_result.get("stance_adj"),
+        "sized_outcome": sized_outcome,
+        "sized_outcome_reason": sized_outcome_reason,
+    }
+
+    summary = (
+        f"{ticker} sizing: shares={sizing_result.get('shares')} "
+        f"dollars=${sizing_result.get('dollar_size'):.0f} "
+        f"pct={sizing_result.get('position_pct'):.4f} "
+        f"outcome={sized_outcome}"
+        if sizing_result.get("dollar_size") is not None
+        and sizing_result.get("position_pct") is not None
+        else f"{ticker} sizing: outcome={sized_outcome}"
+    )
+    return snapshot, agent_output, summary
+
+
+def capture_position_sizer(
+    *,
+    run_date: str,
+    ticker: str,
+    signal: dict,
+    sector_rating: str,
+    current_price: float,
+    portfolio_nav: float,
+    n_enter_signals: int,
+    drawdown_multiplier: float,
+    atr_pct: float | None,
+    prediction_confidence: float | None,
+    p_up: float | None,
+    signal_age_days: int | None,
+    days_to_earnings: int | None,
+    feature_coverage: float | None,
+    stance: str | None,
+    sizing_result: dict,
+    sized_outcome: str,
+    sized_outcome_reason: str | None = None,
+    s3_client: Any | None = None,
+    s3_bucket: str = "alpha-engine-research",
+) -> str | None:
+    """Emit one ``executor:position_sizer`` artifact for a single
+    ``compute_position_size`` invocation.
+
+    No-op when the env-flag feature gate is off. Raises
+    ``DecisionCaptureWriteError`` on S3 failure per
+    ``feedback_no_silent_fails`` — caller is responsible for the
+    best-effort try/except.
+
+    ``run_id`` is ``{run_date}_{ticker}_{uuid8}`` (per the plan doc Q1
+    anchor — multiple sizing calls per ticker per day don't overwrite
+    at the S3 leaf; in practice the morning planner sizes each ticker
+    at most once, but the uniqueness invariant is preserved for
+    correctness rather than relying on assumed call frequency).
+    """
+    if not is_decision_capture_enabled():
+        return None
+
+    snapshot, agent_output, summary = build_position_sizer_payload(
+        ticker=ticker,
+        signal=signal,
+        sector_rating=sector_rating,
+        current_price=current_price,
+        portfolio_nav=portfolio_nav,
+        n_enter_signals=n_enter_signals,
+        drawdown_multiplier=drawdown_multiplier,
+        atr_pct=atr_pct,
+        prediction_confidence=prediction_confidence,
+        p_up=p_up,
+        signal_age_days=signal_age_days,
+        days_to_earnings=days_to_earnings,
+        feature_coverage=feature_coverage,
+        stance=stance,
+        sizing_result=sizing_result,
+        sized_outcome=sized_outcome,
+        sized_outcome_reason=sized_outcome_reason,
+    )
+
+    run_id = f"{run_date}_{ticker}_{uuid.uuid4().hex[:8]}"
+
+    s3_key = capture_decision(
+        run_id=run_id,
+        agent_id=_AGENT_ID_POSITION_SIZER,
+        model_metadata=None,
+        full_prompt_context=None,
+        input_data_snapshot=snapshot,
+        agent_output=agent_output,
+        input_data_summary=summary,
+        s3_client=s3_client,
+        s3_bucket=s3_bucket,
+    )
+    return s3_key
+
+
 __all__ = [
     "DecisionCaptureWriteError",
     "build_entry_trigger_payload",
+    "build_position_sizer_payload",
     "capture_entry_trigger",
+    "capture_position_sizer",
     "is_decision_capture_enabled",
 ]

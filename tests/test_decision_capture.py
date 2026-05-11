@@ -24,7 +24,9 @@ from executor.decision_capture import (
     DecisionCaptureWriteError,
     _classify_trigger_kind,
     build_entry_trigger_payload,
+    build_position_sizer_payload,
     capture_entry_trigger,
+    capture_position_sizer,
     is_decision_capture_enabled,
 )
 
@@ -370,5 +372,302 @@ class TestHardFail:
                 strategy_config=_make_strategy_config(),
                 disabled_triggers=[],
                 now_et_iso="t",
+                s3_client=s3,
+            )
+
+
+# ── Position sizer (PR 2) ────────────────────────────────────────────────
+
+
+def _make_signal() -> dict:
+    """Research signal dict shape as it lands in deciders.decide_entries."""
+    return {
+        "ticker": "AAPL",
+        "score": 78.5,
+        "conviction": "rising",
+        "rating": "BUY",
+        "price_target_upside": 0.18,
+        "sector": "technology",
+    }
+
+
+def _make_sizing_result(shares: int = 150) -> dict:
+    """compute_position_size return dict shape."""
+    return {
+        "shares": shares,
+        "dollar_size": 26287.50 if shares else 0.0,
+        "position_pct": 0.0263 if shares else 0.0,
+        "sector_adj": 1.05,
+        "conviction_adj": 1.00,
+        "upside_adj": 1.00,
+        "dd_multiplier": 1.0,
+        "atr_adj": 0.95,
+        "confidence_adj": 1.10,
+        "staleness_adj": 1.0,
+        "earnings_adj": 1.0,
+        "coverage_adj": 1.0,
+        "stance_adj": 1.0,
+    }
+
+
+class TestPositionSizerPayloadShape:
+    """Snapshot + agent_output shape match the plan-doc + sizer return dict."""
+
+    def test_snapshot_carries_producer_provenance(self):
+        snapshot, _, _ = build_position_sizer_payload(
+            ticker="AAPL",
+            signal=_make_signal(),
+            sector_rating="overweight",
+            current_price=175.25,
+            portfolio_nav=1_000_000.0,
+            n_enter_signals=10,
+            drawdown_multiplier=1.0,
+            atr_pct=0.018,
+            prediction_confidence=0.72,
+            p_up=0.61,
+            signal_age_days=2,
+            days_to_earnings=18,
+            feature_coverage=0.97,
+            stance="momentum",
+            sizing_result=_make_sizing_result(),
+            sized_outcome="approved",
+            sized_outcome_reason=None,
+        )
+        assert snapshot["_producer"] == "alpha-engine.executor.position_sizer"
+        assert snapshot["_producer_version"] == "1.0.0"
+
+    def test_snapshot_carries_full_sizer_inputs(self):
+        snapshot, _, _ = build_position_sizer_payload(
+            ticker="AAPL",
+            signal=_make_signal(),
+            sector_rating="overweight",
+            current_price=175.25,
+            portfolio_nav=1_000_000.0,
+            n_enter_signals=10,
+            drawdown_multiplier=0.50,
+            atr_pct=0.018,
+            prediction_confidence=0.72,
+            p_up=0.61,
+            signal_age_days=2,
+            days_to_earnings=18,
+            feature_coverage=0.97,
+            stance="momentum",
+            sizing_result=_make_sizing_result(),
+            sized_outcome="approved",
+            sized_outcome_reason=None,
+        )
+        assert snapshot["ticker"] == "AAPL"
+        assert snapshot["sector_rating"] == "overweight"
+        assert snapshot["current_price"] == 175.25
+        assert snapshot["portfolio_nav"] == 1_000_000.0
+        assert snapshot["n_enter_signals"] == 10
+        assert snapshot["drawdown_multiplier"] == 0.50
+        assert snapshot["atr_pct"] == 0.018
+        assert snapshot["prediction_confidence"] == 0.72
+        assert snapshot["p_up"] == 0.61
+        assert snapshot["signal_age_days"] == 2
+        assert snapshot["days_to_earnings"] == 18
+        assert snapshot["feature_coverage"] == 0.97
+        assert snapshot["stance"] == "momentum"
+        # Signal sub-dict carries the research-decision context.
+        assert snapshot["signal"]["score"] == 78.5
+        assert snapshot["signal"]["conviction"] == "rising"
+        assert snapshot["signal"]["price_target_upside"] == 0.18
+
+    def test_agent_output_carries_full_sizer_breakdown(self):
+        """Per-multiplier breakdown lets grading analytics decompose
+        under/over-performance against any single adjustment factor."""
+        _, output, _ = build_position_sizer_payload(
+            ticker="AAPL",
+            signal=_make_signal(),
+            sector_rating="overweight",
+            current_price=175.25,
+            portfolio_nav=1_000_000.0,
+            n_enter_signals=10,
+            drawdown_multiplier=1.0,
+            atr_pct=0.018,
+            prediction_confidence=0.72,
+            p_up=0.61,
+            signal_age_days=2,
+            days_to_earnings=18,
+            feature_coverage=0.97,
+            stance="momentum",
+            sizing_result=_make_sizing_result(),
+            sized_outcome="approved",
+            sized_outcome_reason=None,
+        )
+        assert output["shares"] == 150
+        assert output["dollar_size"] == 26287.50
+        assert output["position_pct"] == 0.0263
+        # All 10 multiplier fields present + carried through.
+        assert output["sector_adj"] == 1.05
+        assert output["conviction_adj"] == 1.00
+        assert output["upside_adj"] == 1.00
+        assert output["dd_multiplier"] == 1.0
+        assert output["atr_adj"] == 0.95
+        assert output["confidence_adj"] == 1.10
+        assert output["staleness_adj"] == 1.0
+        assert output["earnings_adj"] == 1.0
+        assert output["coverage_adj"] == 1.0
+        assert output["stance_adj"] == 1.0
+        assert output["sized_outcome"] == "approved"
+        assert output["sized_outcome_reason"] is None
+
+    def test_shares_zero_outcome_captured(self):
+        _, output, summary = build_position_sizer_payload(
+            ticker="ABNB",
+            signal=_make_signal(),
+            sector_rating="market_weight",
+            current_price=120.0,
+            portfolio_nav=10_000.0,  # tiny NAV → shares rounds to 0
+            n_enter_signals=50,
+            drawdown_multiplier=1.0,
+            atr_pct=None,
+            prediction_confidence=None,
+            p_up=None,
+            signal_age_days=None,
+            days_to_earnings=None,
+            feature_coverage=None,
+            stance=None,
+            sizing_result=_make_sizing_result(shares=0),
+            sized_outcome="shares_zero",
+            sized_outcome_reason="shares round to 0 ($0 / $120.00)",
+        )
+        assert output["shares"] == 0
+        assert output["sized_outcome"] == "shares_zero"
+        assert "$0 / $120.00" in output["sized_outcome_reason"]
+        assert "outcome=shares_zero" in summary
+
+
+class TestPositionSizerCapture:
+    """End-to-end: env-flag on + S3 stub → put_object lands at canonical
+    executor:position_sizer key with v2 deterministic body."""
+
+    def test_writes_v2_artifact_to_canonical_key(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        s3_key = capture_position_sizer(
+            run_date="2026-05-15",
+            ticker="AAPL",
+            signal=_make_signal(),
+            sector_rating="overweight",
+            current_price=175.25,
+            portfolio_nav=1_000_000.0,
+            n_enter_signals=10,
+            drawdown_multiplier=1.0,
+            atr_pct=0.018,
+            prediction_confidence=0.72,
+            p_up=0.61,
+            signal_age_days=2,
+            days_to_earnings=18,
+            feature_coverage=0.97,
+            stance="momentum",
+            sizing_result=_make_sizing_result(),
+            sized_outcome="approved",
+            s3_client=s3,
+        )
+        s3.put_object.assert_called_once()
+        put_kwargs = s3.put_object.call_args.kwargs
+        assert put_kwargs["Bucket"] == "alpha-engine-research"
+        assert "/executor:position_sizer/" in put_kwargs["Key"]
+        assert put_kwargs["Key"].endswith(".json")
+        assert s3_key == put_kwargs["Key"]
+        body = json.loads(put_kwargs["Body"].decode("utf-8"))
+        # v2 + deterministic shape per lib v0.10.0 contract.
+        assert body["schema_version"] == 2
+        assert body["agent_id"] == "executor:position_sizer"
+        assert body["model_metadata"] is None
+        assert body["full_prompt_context"] is None
+        assert body["input_data_snapshot"]["ticker"] == "AAPL"
+        assert body["agent_output"]["shares"] == 150
+
+    def test_disabled_when_env_off(self, monkeypatch):
+        monkeypatch.delenv(
+            "ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", raising=False,
+        )
+        s3 = _make_s3_stub()
+        result = capture_position_sizer(
+            run_date="2026-05-15",
+            ticker="AAPL",
+            signal=_make_signal(),
+            sector_rating="overweight",
+            current_price=175.25,
+            portfolio_nav=1_000_000.0,
+            n_enter_signals=10,
+            drawdown_multiplier=1.0,
+            atr_pct=0.018,
+            prediction_confidence=0.72,
+            p_up=0.61,
+            signal_age_days=2,
+            days_to_earnings=18,
+            feature_coverage=0.97,
+            stance="momentum",
+            sizing_result=_make_sizing_result(),
+            sized_outcome="approved",
+            s3_client=s3,
+        )
+        assert result is None
+        s3.put_object.assert_not_called()
+
+    def test_run_id_includes_ticker_and_uuid_suffix(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        capture_position_sizer(
+            run_date="2026-05-15",
+            ticker="MSFT",
+            signal=_make_signal(),
+            sector_rating="market_weight",
+            current_price=410.00,
+            portfolio_nav=1_000_000.0,
+            n_enter_signals=5,
+            drawdown_multiplier=1.0,
+            atr_pct=None,
+            prediction_confidence=None,
+            p_up=None,
+            signal_age_days=None,
+            days_to_earnings=None,
+            feature_coverage=None,
+            stance=None,
+            sizing_result=_make_sizing_result(shares=100),
+            sized_outcome="approved",
+            s3_client=s3,
+        )
+        body = json.loads(s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+        run_id = body["run_id"]
+        assert run_id.startswith("2026-05-15_MSFT_")
+        suffix = run_id.split("_")[-1]
+        assert len(suffix) == 8
+        assert all(c in "0123456789abcdef" for c in suffix)
+
+    def test_s3_failure_propagates_capture_write_error(self, monkeypatch):
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        s3.put_object.side_effect = ClientError(
+            error_response={
+                "Error": {"Code": "AccessDenied", "Message": "Denied"},
+            },
+            operation_name="PutObject",
+        )
+        with pytest.raises(DecisionCaptureWriteError):
+            capture_position_sizer(
+                run_date="2026-05-15",
+                ticker="AAPL",
+                signal=_make_signal(),
+                sector_rating="overweight",
+                current_price=175.25,
+                portfolio_nav=1_000_000.0,
+                n_enter_signals=10,
+                drawdown_multiplier=1.0,
+                atr_pct=0.018,
+                prediction_confidence=0.72,
+                p_up=0.61,
+                signal_age_days=2,
+                days_to_earnings=18,
+                feature_coverage=0.97,
+                stance="momentum",
+                sizing_result=_make_sizing_result(),
+                sized_outcome="approved",
                 s3_client=s3,
             )
