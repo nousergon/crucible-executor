@@ -543,6 +543,143 @@ def check_momentum_exit(
     return None
 
 
+def _evaluate_single_position(
+    *,
+    ticker: str,
+    pos: dict,
+    research_action: str,
+    current_price: float,
+    history,
+    sector_etf_histories: dict | None,
+    stance_config: dict,
+    catalyst_date,
+    entry_date,
+    run_date: str,
+    feature_lookup,
+) -> tuple[dict | None, str | None]:
+    """Run all exit-rule checks for a single held position.
+
+    Returns ``(signal, fired_rule_key)`` where ``fired_rule_key`` is one of:
+    ``catalyst_hard_exit`` / ``atr_trailing_stop`` / ``sector_veto_blocked`` /
+    ``fallback_stop`` / ``profit_take`` / ``momentum_exit`` / ``time_decay``,
+    or ``(None, None)`` if no rule fired.
+
+    Extracted from the loop body of ``evaluate_exits`` to enable per-
+    position capture wiring (L2308 PR 4b) without losing the existing
+    mid-iteration short-circuit semantics. Behavior is identical to the
+    pre-refactor loop body — caller verifies via the existing
+    ``test_exit_manager.py`` suite.
+
+    Note: ``sector_veto_blocked`` is reported when ATR fired but the
+    sector-relative veto suppressed it (load-bearing for grading the
+    sector-veto decision separately from the ATR-fire decision).
+    """
+    # 0. Catalyst hard exit — runs FIRST so the deadline supersedes
+    # price-based checks (the thesis is mechanically expired).
+    catalyst_exit = check_catalyst_hard_exit(
+        ticker=ticker,
+        catalyst_date=catalyst_date,
+        run_date=run_date,
+        strategy_config=stance_config,
+    )
+    if catalyst_exit:
+        return catalyst_exit, "catalyst_hard_exit"
+
+    # 1. ATR trailing stop (with sector-relative veto)
+    atr_signal = check_atr_trailing_stop(
+        ticker=ticker,
+        current_price=current_price,
+        entry_date=entry_date,
+        price_history=history,
+        strategy_config=stance_config,
+        feature_lookup=feature_lookup,
+        run_date=run_date,
+    )
+    if atr_signal:
+        sector = pos.get("sector", "")
+        etf_ticker = SECTOR_ETF_MAP.get(sector, "SPY")
+        etf_history = (
+            sector_etf_histories.get(etf_ticker)
+            if sector_etf_histories
+            else None
+        )
+        if check_sector_relative_veto(
+            ticker, sector, history, etf_history, stance_config
+        ):
+            logger.info(
+                f"ATR exit for {ticker} vetoed — outperforming sector ({sector})"
+            )
+            # Sector veto blocked the ATR exit; fall through to other
+            # checks. Mark this position-iteration so capture can record
+            # the suppressed-fire event separately from the ultimate
+            # outcome (no-fire / time-decay / etc.).
+            atr_signal = None  # consumed by veto
+            atr_fired_then_vetoed = True
+        else:
+            return atr_signal, "atr_trailing_stop"
+    else:
+        atr_fired_then_vetoed = False
+
+    if atr_signal is None and stance_config.get("fallback_stop_enabled", True):
+        # ATR returned None (or was vetoed by sector check) — try fallback
+        # fixed-percentage stop. Note: post-sector-veto the fallback stop
+        # is still considered (matches pre-refactor behavior where the
+        # `elif stance_config.get(...)` only ran when ATR returned None
+        # AT THE check_atr_trailing_stop call site, not after sector veto.
+        # To preserve identical behavior, guard fallback on "ATR returned
+        # None at the call site" — track via the original `atr_signal`
+        # before the veto branch consumed it).
+        if not atr_fired_then_vetoed:
+            fallback_signal = check_fallback_stop(
+                ticker=ticker,
+                current_price=current_price,
+                entry_price=pos.get("avg_cost"),
+                strategy_config=stance_config,
+            )
+            if fallback_signal:
+                return fallback_signal, "fallback_stop"
+
+    # 2. Profit-taking
+    avg_cost = pos.get("avg_cost")
+    profit_signal = check_profit_take(
+        ticker=ticker,
+        current_price=current_price,
+        avg_cost=avg_cost,
+        strategy_config=stance_config,
+    )
+    if profit_signal:
+        return profit_signal, "profit_take"
+
+    # 3. Momentum exit
+    momentum_signal = check_momentum_exit(
+        ticker=ticker,
+        price_history=history,
+        strategy_config=stance_config,
+        feature_lookup=feature_lookup,
+        run_date=run_date,
+    )
+    if momentum_signal:
+        return momentum_signal, "momentum_exit"
+
+    # 4. Time-based decay
+    time_signal = check_time_decay(
+        ticker=ticker,
+        entry_date=entry_date,
+        run_date=run_date,
+        signal_action=research_action,
+        strategy_config=stance_config,
+    )
+    if time_signal:
+        return time_signal, "time_decay"
+
+    # Sector-vetoed-ATR positions are recorded for the artifact's
+    # fired-then-vetoed signal even though the outcome is no_fire.
+    if atr_fired_then_vetoed:
+        return None, "sector_veto_blocked"
+
+    return None, None
+
+
 def evaluate_exits(
     current_positions: dict[str, dict],
     signals_by_ticker: dict[str, dict],
@@ -586,7 +723,25 @@ def evaluate_exits(
 
     Returns:
         List of signal dicts with action="EXIT" or "REDUCE" and reason field.
+
+    L2308 PR 4b: per-position decision-capture artifacts are emitted via
+    ``executor.decision_capture.capture_planner_exit`` for every position
+    that reaches the rule-evaluation phase (regardless of whether a rule
+    fired). Skipped positions (missing entry_date, research-already-
+    exiting, no price) are NOT captured — they have no exit-decision
+    semantics to grade.
     """
+    # Local import to avoid circular: decision_capture imports the lib,
+    # exit_manager is imported deep in the planner stack — keep the
+    # capture dependency at call time only.
+    from executor.decision_capture import (
+        DecisionCaptureWriteError,
+        capture_planner_exit,
+        is_decision_capture_enabled,
+    )
+
+    capture_enabled = is_decision_capture_enabled()
+
     strategy_signals = []
 
     for ticker, pos in current_positions.items():
@@ -607,111 +762,62 @@ def evaluate_exits(
 
         history = price_histories.get(ticker)
 
-        # Resolve stance-conditional config view. ``stance`` and
-        # ``catalyst_date`` are denormalized onto the trades row at
-        # ENTER time (trade_logger.py stance/catalyst_date columns,
-        # 2026-05-11). Position-side propagation via
-        # ``get_entry_stance_and_catalyst`` from trade_logger.
-        # Stance overrides cascade per STANCE_EXIT_OVERRIDES: value
-        # widens ATR + extends time decay, quality + catalyst
-        # disable time decay, catalyst adds the hard exit check below.
-        # Legacy positions (no stance) fall through to baseline config.
+        # Resolve stance-conditional config view.
         stance = pos.get("stance")
         catalyst_date = pos.get("catalyst_date")
         stance_config = _resolve_strategy_config_for_stance(
             strategy_config, stance,
         )
 
-        # 0. Catalyst hard exit — catalyst-stance positions exit at
-        # catalyst_date + follow-through days regardless of price.
-        # Runs FIRST so the deadline supersedes other checks (the
-        # thesis is mechanically expired; price-based checks would
-        # otherwise hold the position past its event window).
-        catalyst_exit = check_catalyst_hard_exit(
+        signal, fired_rule_key = _evaluate_single_position(
             ticker=ticker,
+            pos=pos,
+            research_action=research_action,
+            current_price=current_price,
+            history=history,
+            sector_etf_histories=sector_etf_histories,
+            stance_config=stance_config,
             catalyst_date=catalyst_date,
-            run_date=run_date,
-            strategy_config=stance_config,
-        )
-        if catalyst_exit:
-            strategy_signals.append(catalyst_exit)
-            continue
-
-        # 1. ATR trailing stop (with sector-relative veto)
-        atr_signal = check_atr_trailing_stop(
-            ticker=ticker,
-            current_price=current_price,
             entry_date=entry_date,
-            price_history=history,
-            strategy_config=stance_config,
-            feature_lookup=feature_lookup,
             run_date=run_date,
+            feature_lookup=feature_lookup,
         )
-        if atr_signal:
-            # Check sector-relative veto before accepting ATR exit
-            sector = pos.get("sector", "")
-            etf_ticker = SECTOR_ETF_MAP.get(sector, "SPY")
-            etf_history = (
-                sector_etf_histories.get(etf_ticker)
-                if sector_etf_histories
-                else None
-            )
-            if check_sector_relative_veto(
-                ticker, sector, history, etf_history, stance_config
-            ):
-                logger.info(
-                    f"ATR exit for {ticker} vetoed — outperforming sector ({sector})"
+
+        if signal is not None:
+            strategy_signals.append(signal)
+
+        # Emit executor:exit_rules planner-side DecisionArtifact (L2308
+        # PR 4b). Captures BOTH fired and no-fire positions to give
+        # grading the counterfactual coverage (no-fire decisions that
+        # later produced drawdowns are gradable as missed exits).
+        # Best-effort: capture failure must never kill planning flow.
+        if capture_enabled:
+            try:
+                capture_planner_exit(
+                    run_date=run_date,
+                    ticker=ticker,
+                    pos=pos,
+                    research_signal=research_signal,
+                    current_price=current_price,
+                    stance=stance,
+                    catalyst_date=catalyst_date,
+                    stance_config=stance_config,
+                    signal=signal,
+                    fired_rule_key=fired_rule_key,
                 )
-            else:
-                strategy_signals.append(atr_signal)
-                continue  # ATR exit takes priority over other checks
-        elif stance_config.get("fallback_stop_enabled", True):
-            # ATR returned None — try fallback fixed-percentage stop
-            fallback_signal = check_fallback_stop(
-                ticker=ticker,
-                current_price=current_price,
-                entry_price=pos.get("avg_cost"),
-                strategy_config=stance_config,
-            )
-            if fallback_signal:
-                strategy_signals.append(fallback_signal)
-                continue
-
-        # 2. Profit-taking
-        avg_cost = pos.get("avg_cost")
-        profit_signal = check_profit_take(
-            ticker=ticker,
-            current_price=current_price,
-            avg_cost=avg_cost,
-            strategy_config=stance_config,
-        )
-        if profit_signal:
-            strategy_signals.append(profit_signal)
-            continue  # Profit-take fires, skip remaining checks
-
-        # 3. Momentum exit
-        momentum_signal = check_momentum_exit(
-            ticker=ticker,
-            price_history=history,
-            strategy_config=stance_config,
-            feature_lookup=feature_lookup,
-            run_date=run_date,
-        )
-        if momentum_signal:
-            strategy_signals.append(momentum_signal)
-            continue  # Momentum exit fires, skip time decay
-
-        # 4. Time-based decay (quality + catalyst stances disable this
-        # via STANCE_EXIT_OVERRIDES; value extends it to 30 trading days).
-        time_signal = check_time_decay(
-            ticker=ticker,
-            entry_date=entry_date,
-            run_date=run_date,
-            signal_action=research_action,
-            strategy_config=stance_config,
-        )
-        if time_signal:
-            strategy_signals.append(time_signal)
+            except DecisionCaptureWriteError as _cap_exc:
+                logger.warning(
+                    "decision_capture S3 write failed for PLANNER_EXIT %s "
+                    "— continuing planning (capture is observability, not "
+                    "load-bearing): %s",
+                    ticker, _cap_exc,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "decision_capture raised unexpected exception for "
+                    "PLANNER_EXIT %s — continuing planning",
+                    ticker,
+                )
 
     return strategy_signals
 

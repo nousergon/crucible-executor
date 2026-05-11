@@ -660,19 +660,50 @@ _INTRADAY_EXIT_REASON_TO_KIND = {
     "intraday_collapse": "collapse",
 }
 
+# Planner-side fired_rule_key values from
+# ``executor/strategies/exit_manager.py::_evaluate_single_position``.
+# Canonical kinds for the morning-planner exit-rule decision layer.
+# Where overlapping with daemon-side kinds (atr_trail, profit_take), the
+# planner key maps to the same canonical kind so grading analytics can
+# treat both layers consistently for those rules. Planner-only kinds
+# (catalyst_hard_exit, fallback_stop, momentum_exit, time_decay,
+# sector_veto_blocked) extend the vocabulary.
+_PLANNER_EXIT_RULE_KEY_TO_KIND = {
+    "catalyst_hard_exit": "catalyst_hard_exit",
+    "atr_trailing_stop": "atr_trail",
+    "sector_veto_blocked": "sector_veto_blocked",
+    "fallback_stop": "fallback_stop",
+    "profit_take": "profit_take",
+    "momentum_exit": "momentum_exit",
+    "time_decay": "time_decay",
+}
+
 
 def _classify_exit_rule_kind(exit_reason: str) -> str:
-    """Map an exit signal's ``reason`` field to a canonical rule kind.
+    """Map an exit signal's ``reason`` field to a canonical rule kind
+    for daemon-side intraday captures (PR 4).
 
     Returns ``"unknown"`` for unmapped reasons — surfaces a producer-side
-    gap rather than silently labeling. Future planner-side captures (PR 4b)
-    will add entries for ``atr_trail`` / ``time_decay`` /
-    ``catalyst_hard_exit`` / ``momentum_exit`` / ``fallback_stop`` etc.
-    via the same map.
+    gap rather than silently labeling.
     """
     if not exit_reason:
         return "unknown"
     return _INTRADAY_EXIT_REASON_TO_KIND.get(exit_reason, "unknown")
+
+
+def _classify_planner_exit_kind(fired_rule_key: str | None) -> str:
+    """Map planner-side ``fired_rule_key`` to a canonical rule kind for
+    planner-side captures (PR 4b).
+
+    ``None`` → ``"no_fire"`` (no rule fired — counterfactual coverage
+    row that grading uses to measure missed-exit precision).
+    Unmapped key → ``"unknown"`` (defensive; surfaces if a new rule
+    branch in ``_evaluate_single_position`` ships without updating this
+    map).
+    """
+    if fired_rule_key is None:
+        return "no_fire"
+    return _PLANNER_EXIT_RULE_KEY_TO_KIND.get(fired_rule_key, "unknown")
 
 
 def build_exit_rule_payload(
@@ -839,14 +870,194 @@ def capture_exit_rule(
     return s3_key
 
 
+# ── Planner-side exit rules payload + capture (PR 4b) ────────────────────
+
+
+def build_planner_exit_payload(
+    *,
+    ticker: str,
+    pos: dict,
+    research_signal: dict,
+    current_price: float,
+    stance: str | None,
+    catalyst_date,
+    stance_config: dict,
+    signal: dict | None,
+    fired_rule_key: str | None,
+) -> tuple[dict, dict, str]:
+    """Build ``(input_data_snapshot, agent_output, input_data_summary)``
+    for one ``evaluate_exits._evaluate_single_position`` invocation
+    (planner-side morning exit-rule layer).
+
+    Captures BOTH fired (signal non-None) and no-fire (signal is None)
+    positions. The no-fire counterfactual lets grading measure missed-
+    exit precision: positions where no exit rule fired in the planner
+    but later produced drawdowns are gradable as missed exits.
+
+    Snapshot mirrors what ``_evaluate_single_position`` saw at decision
+    time:
+    - Position state from ``pos`` (entry_date, avg_cost, sector, shares,
+      stance, catalyst_date)
+    - Research signal context (action, score, conviction)
+    - Resolved stance_config thresholds for each rule the planner
+      evaluated (atr_*, profit_take_pct, time_decay_*, momentum_*,
+      catalyst_*, sector_relative_*)
+    - Market state (current_price)
+    """
+    avg_cost = pos.get("avg_cost")
+    gain_pct: float | None = None
+    if avg_cost and avg_cost > 0:
+        gain_pct = (current_price - avg_cost) / avg_cost
+
+    snapshot = {
+        "_producer": _PRODUCER_NAME_EXIT_RULES,
+        "_producer_version": _PRODUCER_VERSION,
+        "ticker": ticker,
+        # Position state
+        "entry_date": pos.get("entry_date"),
+        "avg_cost": avg_cost,
+        "shares_held": pos.get("shares"),
+        "market_value": pos.get("market_value"),
+        "sector": pos.get("sector"),
+        "stance": stance,
+        "catalyst_date": catalyst_date,
+        # Market state
+        "current_price": current_price,
+        "gain_pct": gain_pct,
+        # Research-side signal context (the planner reads this to decide
+        # whether the position is still in HOLD vs already exiting)
+        "research_action": research_signal.get("signal", "HOLD"),
+        "research_score": research_signal.get("score"),
+        "research_conviction": research_signal.get("conviction"),
+        # Resolved (stance-aware) config thresholds for each rule
+        # branch ``_evaluate_single_position`` evaluated. Captured so a
+        # replay can re-evaluate with different thresholds without
+        # re-running the planner.
+        "thresholds": {
+            "atr_period": stance_config.get("atr_period"),
+            "atr_multiple": stance_config.get("atr_multiple"),
+            "fallback_stop_enabled": stance_config.get(
+                "fallback_stop_enabled", True,
+            ),
+            "fallback_stop_pct": stance_config.get("fallback_stop_pct"),
+            "profit_take_pct": stance_config.get("profit_take_pct"),
+            "time_decay_enabled": stance_config.get("time_decay_enabled"),
+            "time_decay_days": stance_config.get("time_decay_days"),
+            "momentum_exit_enabled": stance_config.get(
+                "momentum_exit_enabled",
+            ),
+            "momentum_exit_threshold": stance_config.get(
+                "momentum_exit_threshold",
+            ),
+            "catalyst_follow_through_days": stance_config.get(
+                "catalyst_follow_through_days",
+            ),
+        },
+        "evaluation_layer": "planner",
+    }
+
+    fired_rule_kind = _classify_planner_exit_kind(fired_rule_key)
+    if signal is not None:
+        agent_output = {
+            "outcome": "fired",
+            "action": signal.get("action"),  # "EXIT" | "REDUCE"
+            "fired_rule": signal.get("reason"),
+            "fired_rule_key": fired_rule_key,
+            "fired_rule_kind": fired_rule_kind,
+            "shares_requested": signal.get("shares"),
+            "detail": signal.get("detail"),
+        }
+        summary = (
+            f"{ticker} {signal.get('action', 'EXIT')} "
+            f"fired={fired_rule_key} kind={fired_rule_kind}"
+        )
+    else:
+        # No-fire counterfactual row. fired_rule_key may be None (truly
+        # nothing fired) or "sector_veto_blocked" (ATR fired but was
+        # suppressed by sector veto — load-bearing for grading the veto
+        # decision separately from the no-fire decision).
+        agent_output = {
+            "outcome": "no_fire",
+            "action": None,
+            "fired_rule": None,
+            "fired_rule_key": fired_rule_key,
+            "fired_rule_kind": fired_rule_kind,
+            "shares_requested": None,
+            "detail": None,
+        }
+        summary = f"{ticker} no_fire kind={fired_rule_kind}"
+
+    return snapshot, agent_output, summary
+
+
+def capture_planner_exit(
+    *,
+    run_date: str,
+    ticker: str,
+    pos: dict,
+    research_signal: dict,
+    current_price: float,
+    stance: str | None,
+    catalyst_date,
+    stance_config: dict,
+    signal: dict | None,
+    fired_rule_key: str | None,
+    s3_client: Any | None = None,
+    s3_bucket: str = "alpha-engine-research",
+) -> str | None:
+    """Emit one ``executor:exit_rules`` artifact for a single planner-
+    side ``_evaluate_single_position`` invocation.
+
+    Same agent_id as PR 4's daemon-side captures (``executor:exit_rules``)
+    so grading analytics can read them from one S3 prefix. The
+    ``evaluation_layer`` field on the snapshot distinguishes
+    ``"planner"`` (PR 4b) from ``"daemon_intraday"`` (PR 4).
+
+    No-op when the env-flag feature gate is off. Raises
+    ``DecisionCaptureWriteError`` on S3 failure per
+    ``feedback_no_silent_fails``.
+    """
+    if not is_decision_capture_enabled():
+        return None
+
+    snapshot, agent_output, summary = build_planner_exit_payload(
+        ticker=ticker,
+        pos=pos,
+        research_signal=research_signal,
+        current_price=current_price,
+        stance=stance,
+        catalyst_date=catalyst_date,
+        stance_config=stance_config,
+        signal=signal,
+        fired_rule_key=fired_rule_key,
+    )
+
+    run_id = f"{run_date}_{ticker}_{uuid.uuid4().hex[:8]}"
+
+    s3_key = capture_decision(
+        run_id=run_id,
+        agent_id=_AGENT_ID_EXIT_RULES,
+        model_metadata=None,
+        full_prompt_context=None,
+        input_data_snapshot=snapshot,
+        agent_output=agent_output,
+        input_data_summary=summary,
+        s3_client=s3_client,
+        s3_bucket=s3_bucket,
+    )
+    return s3_key
+
+
 __all__ = [
     "DecisionCaptureWriteError",
     "build_entry_trigger_payload",
     "build_exit_rule_payload",
+    "build_planner_exit_payload",
     "build_position_sizer_payload",
     "build_risk_guard_payload",
     "capture_entry_trigger",
     "capture_exit_rule",
+    "capture_planner_exit",
     "capture_position_sizer",
     "capture_risk_guard",
     "is_decision_capture_enabled",

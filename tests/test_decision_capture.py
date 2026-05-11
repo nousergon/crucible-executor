@@ -23,13 +23,16 @@ import pytest
 from executor.decision_capture import (
     DecisionCaptureWriteError,
     _classify_exit_rule_kind,
+    _classify_planner_exit_kind,
     _classify_trigger_kind,
     build_entry_trigger_payload,
     build_exit_rule_payload,
+    build_planner_exit_payload,
     build_position_sizer_payload,
     build_risk_guard_payload,
     capture_entry_trigger,
     capture_exit_rule,
+    capture_planner_exit,
     capture_position_sizer,
     capture_risk_guard,
     is_decision_capture_enabled,
@@ -1197,3 +1200,298 @@ class TestExitRuleCapture:
                 strategy_config=_make_exit_strategy_config(),
                 s3_client=s3,
             )
+
+
+# ── Planner-side exit rules (PR 4b) ──────────────────────────────────────
+
+
+def _make_planner_pos() -> dict:
+    """Held-position fixture matching what main.py builds for evaluate_exits."""
+    return {
+        "shares": 150,
+        "market_value": 26_287.50,
+        "avg_cost": 170.00,
+        "sector": "technology",
+        "entry_date": "2026-05-08",
+        "stance": "momentum",
+        "catalyst_date": None,
+    }
+
+
+def _make_planner_research_signal(action: str = "HOLD") -> dict:
+    return {
+        "signal": action,
+        "score": 78.5,
+        "conviction": "rising",
+    }
+
+
+def _make_planner_stance_config() -> dict:
+    """Stance-resolved strategy config — what _resolve_strategy_config_for_stance
+    returns inside evaluate_exits."""
+    return {
+        "atr_period": 14,
+        "atr_multiple": 2.0,
+        "fallback_stop_enabled": True,
+        "fallback_stop_pct": 0.10,
+        "profit_take_pct": 0.20,
+        "time_decay_enabled": True,
+        "time_decay_days": 21,
+        "momentum_exit_enabled": True,
+        "momentum_exit_threshold": -0.05,
+        "catalyst_follow_through_days": 3,
+    }
+
+
+def _make_planner_signal(action: str = "EXIT", reason: str = "atr_trailing_stop") -> dict:
+    """evaluate_exits' returned signal-dict shape."""
+    return {
+        "ticker": "AAPL",
+        "action": action,
+        "shares": 150,
+        "reason": reason,
+        "detail": "trail stop at $167.50",
+    }
+
+
+class TestPlannerExitKindClassifier:
+    @pytest.mark.parametrize("key,expected", [
+        ("catalyst_hard_exit", "catalyst_hard_exit"),
+        ("atr_trailing_stop", "atr_trail"),
+        ("sector_veto_blocked", "sector_veto_blocked"),
+        ("fallback_stop", "fallback_stop"),
+        ("profit_take", "profit_take"),
+        ("momentum_exit", "momentum_exit"),
+        ("time_decay", "time_decay"),
+        ("unknown_key", "unknown"),
+    ])
+    def test_known_keys(self, key, expected):
+        assert _classify_planner_exit_kind(key) == expected
+
+    def test_none_maps_to_no_fire(self):
+        """None fired_rule_key → 'no_fire' — the counterfactual coverage
+        row for grading."""
+        assert _classify_planner_exit_kind(None) == "no_fire"
+
+
+class TestPlannerExitPayloadShape:
+    def test_snapshot_carries_producer_provenance_and_layer(self):
+        snapshot, _, _ = build_planner_exit_payload(
+            ticker="AAPL", pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(),
+            current_price=175.25, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=None, fired_rule_key=None,
+        )
+        assert snapshot["_producer"] == "alpha-engine.executor.exit_rules"
+        # evaluation_layer distinguishes from daemon_intraday — same
+        # agent_id (executor:exit_rules) but different decision layer.
+        assert snapshot["evaluation_layer"] == "planner"
+
+    def test_snapshot_carries_full_position_and_market_state(self):
+        snapshot, _, _ = build_planner_exit_payload(
+            ticker="AAPL", pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(action="HOLD"),
+            current_price=175.25, stance="momentum",
+            catalyst_date="2026-05-20",
+            stance_config=_make_planner_stance_config(),
+            signal=None, fired_rule_key=None,
+        )
+        assert snapshot["ticker"] == "AAPL"
+        assert snapshot["entry_date"] == "2026-05-08"
+        assert snapshot["avg_cost"] == 170.00
+        assert snapshot["shares_held"] == 150
+        assert snapshot["market_value"] == 26_287.50
+        assert snapshot["sector"] == "technology"
+        assert snapshot["stance"] == "momentum"
+        assert snapshot["catalyst_date"] == "2026-05-20"
+        assert snapshot["current_price"] == 175.25
+        assert snapshot["research_action"] == "HOLD"
+        assert snapshot["research_score"] == 78.5
+        assert snapshot["research_conviction"] == "rising"
+        # gain_pct = (175.25 - 170) / 170 = 0.030882...
+        assert abs(snapshot["gain_pct"] - 0.030882) < 1e-5
+
+    def test_snapshot_thresholds_carry_resolved_stance_config(self):
+        snapshot, _, _ = build_planner_exit_payload(
+            ticker="AAPL", pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(),
+            current_price=175.25, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=None, fired_rule_key=None,
+        )
+        thr = snapshot["thresholds"]
+        # All 10 rule thresholds captured so replay can re-evaluate.
+        assert thr["atr_period"] == 14
+        assert thr["atr_multiple"] == 2.0
+        assert thr["fallback_stop_enabled"] is True
+        assert thr["profit_take_pct"] == 0.20
+        assert thr["time_decay_enabled"] is True
+        assert thr["time_decay_days"] == 21
+        assert thr["momentum_exit_threshold"] == -0.05
+        assert thr["catalyst_follow_through_days"] == 3
+
+    def test_fired_outcome_records_rule_key_and_kind(self):
+        _, output, summary = build_planner_exit_payload(
+            ticker="AAPL", pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(),
+            current_price=175.25, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=_make_planner_signal(action="EXIT", reason="trail stop"),
+            fired_rule_key="atr_trailing_stop",
+        )
+        assert output["outcome"] == "fired"
+        assert output["action"] == "EXIT"
+        assert output["fired_rule"] == "trail stop"
+        assert output["fired_rule_key"] == "atr_trailing_stop"
+        assert output["fired_rule_kind"] == "atr_trail"
+        assert output["shares_requested"] == 150
+        assert "fired=atr_trailing_stop" in summary
+
+    def test_no_fire_outcome_with_none_key(self):
+        _, output, summary = build_planner_exit_payload(
+            ticker="AAPL", pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(),
+            current_price=175.25, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=None, fired_rule_key=None,
+        )
+        assert output["outcome"] == "no_fire"
+        assert output["fired_rule_key"] is None
+        assert output["fired_rule_kind"] == "no_fire"
+        assert output["action"] is None
+        assert "no_fire" in summary
+
+    def test_sector_veto_blocked_carried_as_no_fire_with_specific_kind(self):
+        """When ATR fires but the sector-relative veto suppresses it,
+        the planner returns (None, 'sector_veto_blocked') — the artifact
+        must record this distinct kind separately from a normal no_fire."""
+        _, output, _ = build_planner_exit_payload(
+            ticker="AAPL", pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(),
+            current_price=175.25, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=None, fired_rule_key="sector_veto_blocked",
+        )
+        assert output["outcome"] == "no_fire"
+        assert output["fired_rule_key"] == "sector_veto_blocked"
+        assert output["fired_rule_kind"] == "sector_veto_blocked"
+
+    def test_zero_avg_cost_safely_nulls_gain_pct(self):
+        pos = _make_planner_pos()
+        pos["avg_cost"] = 0.0
+        snapshot, _, _ = build_planner_exit_payload(
+            ticker="AAPL", pos=pos,
+            research_signal=_make_planner_research_signal(),
+            current_price=175.25, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=None, fired_rule_key=None,
+        )
+        assert snapshot["gain_pct"] is None
+
+
+class TestPlannerExitCapture:
+    """End-to-end capture path with env-flag + S3 stub."""
+
+    def test_writes_v2_artifact_to_canonical_key(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        s3_key = capture_planner_exit(
+            run_date="2026-05-15", ticker="AAPL",
+            pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(),
+            current_price=175.25, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=_make_planner_signal(),
+            fired_rule_key="atr_trailing_stop",
+            s3_client=s3,
+        )
+        s3.put_object.assert_called_once()
+        put_kwargs = s3.put_object.call_args.kwargs
+        # Same agent_id as PR 4 daemon-side captures so grading reads
+        # one S3 prefix; layer field distinguishes producer.
+        assert "/executor:exit_rules/" in put_kwargs["Key"]
+        assert s3_key == put_kwargs["Key"]
+        body = json.loads(put_kwargs["Body"].decode("utf-8"))
+        assert body["schema_version"] == 2
+        assert body["agent_id"] == "executor:exit_rules"
+        assert body["model_metadata"] is None
+        assert body["input_data_snapshot"]["evaluation_layer"] == "planner"
+        assert body["agent_output"]["fired_rule_kind"] == "atr_trail"
+
+    def test_no_fire_captured_as_counterfactual(self, monkeypatch):
+        """Counterfactual coverage: every position that reaches the
+        rule-evaluation phase produces an artifact, including no-fire
+        positions. Grading uses these to measure missed-exit precision."""
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        capture_planner_exit(
+            run_date="2026-05-15", ticker="MSFT",
+            pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(),
+            current_price=180.00, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=None, fired_rule_key=None,
+            s3_client=s3,
+        )
+        body = json.loads(s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+        assert body["agent_output"]["outcome"] == "no_fire"
+        assert body["agent_output"]["fired_rule_kind"] == "no_fire"
+
+    def test_disabled_when_env_off(self, monkeypatch):
+        monkeypatch.delenv(
+            "ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", raising=False,
+        )
+        s3 = _make_s3_stub()
+        result = capture_planner_exit(
+            run_date="2026-05-15", ticker="AAPL",
+            pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(),
+            current_price=175.25, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=None, fired_rule_key=None,
+            s3_client=s3,
+        )
+        assert result is None
+        s3.put_object.assert_not_called()
+
+    def test_s3_failure_propagates_capture_write_error(self, monkeypatch):
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        s3.put_object.side_effect = ClientError(
+            error_response={
+                "Error": {"Code": "AccessDenied", "Message": "Denied"},
+            },
+            operation_name="PutObject",
+        )
+        with pytest.raises(DecisionCaptureWriteError):
+            capture_planner_exit(
+                run_date="2026-05-15", ticker="AAPL",
+                pos=_make_planner_pos(),
+                research_signal=_make_planner_research_signal(),
+                current_price=175.25, stance="momentum", catalyst_date=None,
+                stance_config=_make_planner_stance_config(),
+                signal=None, fired_rule_key=None,
+                s3_client=s3,
+            )
+
+    def test_run_id_format_pinned(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        s3 = _make_s3_stub()
+        capture_planner_exit(
+            run_date="2026-05-15", ticker="NVDA",
+            pos=_make_planner_pos(),
+            research_signal=_make_planner_research_signal(),
+            current_price=400.00, stance="momentum", catalyst_date=None,
+            stance_config=_make_planner_stance_config(),
+            signal=None, fired_rule_key=None,
+            s3_client=s3,
+        )
+        body = json.loads(s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+        run_id = body["run_id"]
+        assert run_id.startswith("2026-05-15_NVDA_")
+        suffix = run_id.split("_")[-1]
+        assert len(suffix) == 8
+        assert all(c in "0123456789abcdef" for c in suffix)
