@@ -237,12 +237,22 @@ def _build_returns_panel(
     price_histories: dict[str, pd.DataFrame],
     cash_idx: int,
 ) -> np.ndarray:
+    """Daily LOG returns for covariance estimation.
+
+    Convention matches the 2026-05-09 21d log-domain canonical-alpha cutover
+    (alpha-engine-predictor PRs A-E + 2026-05-10 transition arc): alpha_hat
+    consumed by the optimizer is 21d log alpha (predictor's predicted_alpha
+    field), so the Sigma fed in must be in the same log-units family. Daily
+    log variance compounds linearly to higher horizons (Var_T = T · Var_daily
+    for iid log returns).
+    """
     series_by_ticker: dict[str, pd.Series] = {}
     for i, t in enumerate(tickers):
         if i == cash_idx:
             continue
         df = price_histories[t]
-        s = df["close"].tail(_RETURNS_LOOKBACK_DAYS + 1).pct_change().dropna()
+        close = df["close"].tail(_RETURNS_LOOKBACK_DAYS + 1)
+        s = np.log(close).diff().dropna()
         series_by_ticker[t] = s
 
     aligned = pd.DataFrame(series_by_ticker).dropna()
