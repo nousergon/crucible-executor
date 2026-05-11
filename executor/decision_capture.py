@@ -72,6 +72,9 @@ _PRODUCER_NAME_ENTRY_TRIGGERS = "alpha-engine.executor.entry_triggers"
 _AGENT_ID_POSITION_SIZER = "executor:position_sizer"
 _PRODUCER_NAME_POSITION_SIZER = "alpha-engine.executor.position_sizer"
 
+_AGENT_ID_RISK_GUARD = "executor:risk_guard"
+_PRODUCER_NAME_RISK_GUARD = "alpha-engine.executor.risk_guard"
+
 # Bump when the snapshot/output shape changes; readers can filter on this
 # rather than guessing from S3 timestamps. Per-component versioning so a
 # bump in one producer (e.g. entry_triggers) doesn't force a re-tag of
@@ -449,11 +452,207 @@ def capture_position_sizer(
     return s3_key
 
 
+# ── Risk guard payload + capture ─────────────────────────────────────────
+
+
+def _compute_existing_sector_exposure(
+    current_positions: dict, sector: str | None,
+) -> float:
+    """Sum market_value across current positions in the same sector.
+
+    Mirrors the risk_guard internal computation so the capture snapshot
+    carries the same view risk_guard saw at gate-evaluation time —
+    important for grading the max_sector veto in particular (the
+    threshold check uses `(existing + new) / nav`).
+    """
+    if not sector:
+        return 0.0
+    return float(sum(
+        pos.get("market_value", 0.0) or 0.0
+        for pos in (current_positions or {}).values()
+        if pos.get("sector") == sector
+    ))
+
+
+def build_risk_guard_payload(
+    *,
+    ticker: str,
+    action: str,
+    dollar_size: float,
+    portfolio_nav: float,
+    peak_nav: float,
+    current_positions: dict,
+    sector: str | None,
+    market_regime: str,
+    signal: dict,
+    config: dict,
+    approved: bool,
+    reason: str,
+    events: list[dict] | None,
+) -> tuple[dict, dict, str]:
+    """Build ``(input_data_snapshot, agent_output, input_data_summary)``
+    for one ``risk_guard.check_order`` invocation.
+
+    Captures both the **vetoed** path (artifact mirrors the risk_events
+    table row with full input context) AND the **counterfactual** —
+    every approved ticker also gets one artifact recording the
+    "non-vetoed" path inputs so backtester grading (PR 5) can measure
+    precision-of-refusal: of the entries risk_guard approved, how many
+    became drawdowns? Of the ones it vetoed, how many would have been
+    winners? Without the counterfactual, only one direction is gradable.
+
+    Snapshot mirrors every variable risk_guard reads at decision time:
+    portfolio state (nav, peak_nav, drawdown fraction), per-ticker
+    proposal (dollar_size, sector, sector_rating), market regime, and
+    every gate threshold from config that's evaluated for ENTER.
+
+    ``agent_output.outcome`` is ``"approved"`` or ``"vetoed"``;
+    ``vetoed_rule`` carries the rule name (``"min_score"``, ``"max_position"``,
+    ``"bear_underweight"``, ``"max_sector"``, ``"max_equity"``,
+    ``"correlation_block"``, etc.) for grading-side filtering.
+    ``events`` is the raw list emitted by risk_guard for the per-rule
+    audit trail (one row per veto event — usually 0 or 1, never more
+    than 1 per ticker because the function short-circuits on first fail).
+    """
+    drawdown_frac = (
+        (peak_nav - portfolio_nav) / peak_nav
+        if peak_nav and peak_nav > 0 else 0.0
+    )
+    sector_rating = signal.get("sector_rating", "market_weight")
+    existing_sector_exposure = _compute_existing_sector_exposure(
+        current_positions, sector,
+    )
+    snapshot = {
+        "_producer": _PRODUCER_NAME_RISK_GUARD,
+        "_producer_version": _PRODUCER_VERSION,
+        # Per-ticker proposal
+        "ticker": ticker,
+        "action": action,
+        "dollar_size": dollar_size,
+        "sector": sector,
+        "sector_rating": sector_rating,
+        # Portfolio state at gate-evaluation time
+        "portfolio_nav": portfolio_nav,
+        "peak_nav": peak_nav,
+        "drawdown_fraction": drawdown_frac,
+        "n_open_positions": len(current_positions or {}),
+        "existing_sector_exposure": existing_sector_exposure,
+        # Signal context (the values gates read against thresholds)
+        "signal": {
+            "score": signal.get("score"),
+            "conviction": signal.get("conviction"),
+            "rating": signal.get("rating"),
+            "price_target_upside": signal.get("price_target_upside"),
+        },
+        "market_regime": market_regime,
+        # Config-derived gate thresholds — every one risk_guard evaluates
+        # on the ENTER path. Captured so grading can replay against a
+        # different threshold set without re-running the risk gate.
+        "thresholds": {
+            "min_score_to_enter": config.get("min_score_to_enter", 70),
+            "max_position_pct": config.get("max_position_pct", 0.05),
+            "bear_max_position_pct": config.get("bear_max_position_pct", 0.025),
+            "max_sector_pct": config.get("max_sector_pct", 0.25),
+            "max_equity_pct": config.get("max_equity_pct", 1.00),
+            "bear_block_underweight": config.get("bear_block_underweight", True),
+            "drawdown_halt_pct": config.get("drawdown_halt_pct"),
+            "correlation_block_threshold": config.get(
+                "correlation_block_threshold",
+            ),
+        },
+    }
+
+    outcome = "approved" if approved else "vetoed"
+    # First fired veto rule (the one that short-circuited). risk_guard
+    # only emits one veto event per ticker due to short-circuit; on the
+    # approved path the events list may still carry portfolio-level
+    # rows from the caller, so filter to per-ticker veto events.
+    veto_events = [
+        ev for ev in (events or [])
+        if ev.get("ticker") == ticker and ev.get("event_type") == "veto"
+    ]
+    vetoed_rule = veto_events[0].get("rule") if veto_events else None
+    agent_output = {
+        "outcome": outcome,
+        "reason": reason,
+        "vetoed_rule": vetoed_rule,
+        "events": veto_events,
+    }
+
+    summary = f"{ticker} risk_guard: outcome={outcome} reason={reason}"
+    return snapshot, agent_output, summary
+
+
+def capture_risk_guard(
+    *,
+    run_date: str,
+    ticker: str,
+    action: str,
+    dollar_size: float,
+    portfolio_nav: float,
+    peak_nav: float,
+    current_positions: dict,
+    sector: str | None,
+    market_regime: str,
+    signal: dict,
+    config: dict,
+    approved: bool,
+    reason: str,
+    events: list[dict] | None,
+    s3_client: Any | None = None,
+    s3_bucket: str = "alpha-engine-research",
+) -> str | None:
+    """Emit one ``executor:risk_guard`` artifact for a single
+    ``check_order`` invocation. Captures both vetoed and approved paths
+    (the counterfactual coverage that grading needs for precision-of-
+    refusal analytics).
+
+    No-op when the env-flag feature gate is off. Raises
+    ``DecisionCaptureWriteError`` on S3 failure per
+    ``feedback_no_silent_fails``.
+    """
+    if not is_decision_capture_enabled():
+        return None
+
+    snapshot, agent_output, summary = build_risk_guard_payload(
+        ticker=ticker,
+        action=action,
+        dollar_size=dollar_size,
+        portfolio_nav=portfolio_nav,
+        peak_nav=peak_nav,
+        current_positions=current_positions,
+        sector=sector,
+        market_regime=market_regime,
+        signal=signal,
+        config=config,
+        approved=approved,
+        reason=reason,
+        events=events,
+    )
+
+    run_id = f"{run_date}_{ticker}_{uuid.uuid4().hex[:8]}"
+
+    s3_key = capture_decision(
+        run_id=run_id,
+        agent_id=_AGENT_ID_RISK_GUARD,
+        model_metadata=None,
+        full_prompt_context=None,
+        input_data_snapshot=snapshot,
+        agent_output=agent_output,
+        input_data_summary=summary,
+        s3_client=s3_client,
+        s3_bucket=s3_bucket,
+    )
+    return s3_key
+
+
 __all__ = [
     "DecisionCaptureWriteError",
     "build_entry_trigger_payload",
     "build_position_sizer_payload",
+    "build_risk_guard_payload",
     "capture_entry_trigger",
     "capture_position_sizer",
+    "capture_risk_guard",
     "is_decision_capture_enabled",
 ]

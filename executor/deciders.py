@@ -44,6 +44,7 @@ from datetime import date
 from executor.decision_capture import (
     DecisionCaptureWriteError,
     capture_position_sizer,
+    capture_risk_guard,
     is_decision_capture_enabled,
 )
 from executor.position_sizer import compute_position_size
@@ -846,6 +847,45 @@ def decide_entries(
             ev.setdefault("signal_date", signals_date)
             ev.setdefault("prediction_date", predictions_date)
             plan.risk_events.append(ev)
+
+        # Emit executor:risk_guard DecisionArtifact (L2308 PR 3).
+        # Captures BOTH the vetoed and approved paths (counterfactual
+        # coverage) so backtester grading can measure precision-of-
+        # refusal: vetoed entries that would have won → false-positive
+        # vetoes; approved entries that became drawdowns → false-
+        # negative approvals. Without both directions, only one half of
+        # the precision/recall surface is gradable.
+        # Best-effort: capture failure must never kill planning flow.
+        if is_decision_capture_enabled():
+            try:
+                capture_risk_guard(
+                    run_date=run_date,
+                    ticker=ticker,
+                    action="ENTER",
+                    dollar_size=sizing["dollar_size"],
+                    portfolio_nav=portfolio_nav,
+                    peak_nav=peak_nav,
+                    current_positions=current_positions,
+                    sector=sector,
+                    market_regime=market_regime,
+                    signal=sig_with_sector,
+                    config=config,
+                    approved=approved,
+                    reason=reason,
+                    events=check_events,
+                )
+            except DecisionCaptureWriteError as _cap_exc:
+                logger.warning(
+                    "decision_capture S3 write failed for RISK_GUARD %s — "
+                    "continuing planning (capture is observability, not "
+                    "load-bearing): %s",
+                    ticker, _cap_exc,
+                )
+            except Exception:  # noqa: BLE001 — capture must never kill planning
+                logger.exception(
+                    "decision_capture raised unexpected exception for "
+                    "RISK_GUARD %s — continuing planning", ticker,
+                )
 
         if not approved:
             logger.info(f"BLOCKED {ticker} — {reason}")
