@@ -1262,6 +1262,36 @@ def run(
         )
         orders.extend(exit_orders)
 
+        # ── 5b. Shadow portfolio optimizer (PR 2 of portfolio-optimizer-260511) ──
+        #
+        # Runs the constrained MVO optimizer on the same inputs the legacy
+        # planner just used, logs target weights + diagnostics to S3, and
+        # NEVER raises into the legacy path. Production behaviour is
+        # unchanged. The shadow log is the primary observability artifact
+        # for deciding when to cut over (PR 5).
+        if (
+            not simulate and not dry_run
+            and config.get("shadow_portfolio_optimizer", False)
+        ):
+            try:
+                from executor.optimizer_shadow import run_shadow_optimizer
+                run_shadow_optimizer(
+                    signals_raw=signals_raw,
+                    predictions_by_ticker=predictions_by_ticker,
+                    current_positions=current_positions,
+                    portfolio_nav=portfolio_nav,
+                    price_histories=price_histories or {},
+                    config=config,
+                    signals_bucket=signals_bucket,
+                    run_date=run_date,
+                    legacy_orders=orders,
+                )
+            except Exception as _shadow_err:
+                logger.warning(
+                    f"Shadow portfolio optimizer wrapper raised "
+                    f"(non-blocking): {_shadow_err}"
+                )
+
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
             try:

@@ -186,5 +186,41 @@ notifications:
 # Informational only — not a gate. The predictor features handle the signal.
 earnings_proximity_warning_days: 2
 
+# ── Portfolio optimizer (PR 2 of portfolio-optimizer-260511 arc) ────────────
+# Shadow-mode MVO optimizer runs alongside the legacy 1/n sizer and writes
+# target weights + diagnostics to S3 (predictor/optimizer_shadow/{date}.json)
+# without affecting order placement. Default OFF — enable per-environment.
+# Cutover to drive actual order placement lands in a later PR after 2-3 days
+# of shadow logs confirm plausible target weights.
+shadow_portfolio_optimizer: false
+
+portfolio_optimizer:
+  # Risk aversion λ in the MVO objective. Higher = stronger Σ penalty.
+  risk_aversion: 5.0
+  # Transaction cost penalty (bps per dollar traded) used in the L1 turnover
+  # term. 5 bps is conservative for liquid US large-caps; backtester tunes.
+  tcost_bps: 5.0
+  # Cash sleeve (fraction of NAV) pinned via equality constraint. Operational
+  # liquidity in SGOV/BIL; the rest of NAV deploys to SPY + conviction picks.
+  cash_sleeve_pct: 0.03
+  # Sector cap (fraction of NAV). Mirrors the legacy max_sector_pct above.
+  max_sector_pct: 0.25
+  # Rebalance band — trades smaller than this weight delta are skipped to
+  # control turnover. Applies to the would_be_trades list in shadow logs.
+  rebalance_band_pct: 0.005
+  # Vol-target constraint. null = disabled (default). A long-only enhanced-
+  # index portfolio with SPY as no-conviction fill has portfolio vol bounded
+  # below by SPY's vol (~16% annual); sub-SPY targeting is structurally
+  # infeasible without bonds. Set to e.g. 0.25 to enable a stress-regime cap
+  # that only binds in high-vol periods. Sub-SPY targeting reserved for v2
+  # multi-asset / risk-parity layer.
+  vol_target_annual: null
+  # Covariance estimator. "ledoit_wolf" is the institutional default;
+  # "sample" disables shrinkage (useful only for synthetic-input tests).
+  covariance_shrinkage: ledoit_wolf
+  # Minimum position pct — weights below this are clipped to 0 (clean output;
+  # avoid tiny stub positions like today's UNP 0.1% NAV residual).
+  min_position_pct: 0.005
+
 # ── Paths (adjust to your deployment) ───────────────────────────────────────
 db_path: "/path/to/trades.db"
