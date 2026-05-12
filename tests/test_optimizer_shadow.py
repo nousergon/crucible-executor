@@ -32,6 +32,7 @@ from executor.optimizer_shadow import (
     _build_universe,
     _build_w_prev,
     _compute_trade_deltas,
+    _extract_universe_tickers,
     run_shadow_optimizer,
 )
 
@@ -103,6 +104,61 @@ def test_happy_path_assembles_inputs_and_writes_to_s3():
     assert latest_call["Key"] == "predictor/optimizer_shadow/latest.json"
     body = json.loads(dated_call["Body"])
     assert body["shadow_status"] == "ok"
+
+
+def test_extract_universe_tickers_accepts_production_dict_shape():
+    """Production signals.json emits `universe` as a list of per-ticker dicts.
+
+    Regression for the 2026-05-12 first-shadow-run failure where the wrapper
+    blindly called `candidates.update(universe_list)` and raised
+    `TypeError: unhashable type: 'dict'` on the live payload shape.
+    """
+    universe = [
+        {"ticker": "COST", "signal": "ENTER", "score": 55.3, "rating": "BUY"},
+        {"ticker": "AAPL", "signal": "HOLD", "score": 70.1},
+    ]
+    assert _extract_universe_tickers(universe) == ["COST", "AAPL"]
+
+
+def test_extract_universe_tickers_accepts_legacy_string_shape():
+    """Legacy / minimal payloads emit a flat list of ticker strings."""
+    assert _extract_universe_tickers(["AAPL", "MSFT"]) == ["AAPL", "MSFT"]
+
+
+def test_extract_universe_tickers_skips_malformed_entries():
+    """Mixed / malformed shapes degrade silently; valid entries still extracted."""
+    universe = [
+        {"ticker": "AAPL"},
+        {"no_ticker_key": "foo"},
+        "MSFT",
+        42,
+        None,
+        {"ticker": ""},
+        {"ticker": None},
+    ]
+    assert _extract_universe_tickers(universe) == ["AAPL", "MSFT"]
+
+
+def test_extract_universe_tickers_handles_non_list_input():
+    assert _extract_universe_tickers(None) == []
+    assert _extract_universe_tickers({"unexpected": "shape"}) == []
+
+
+def test_build_universe_accepts_production_universe_dict_shape():
+    """Full _build_universe call must succeed when signals_raw['universe'] is
+    a list of dicts (the live signals.json shape)."""
+    inputs = _baseline_inputs()
+    inputs["signals_raw"]["universe"] = [
+        {"ticker": "AAPL", "signal": "ENTER", "score": 72.0},
+        {"ticker": "MSFT", "signal": "HOLD", "score": 65.0},
+        {"ticker": "JNJ", "signal": "ENTER", "score": 60.0},
+    ]
+    tickers = _build_universe(
+        inputs["signals_raw"], inputs["predictions_by_ticker"],
+        inputs["current_positions"], inputs["price_histories"],
+    )
+    assert set(tickers[:-2]) == {"AAPL", "MSFT", "JNJ"}
+    assert tickers[-2:] == ["SPY", "CASH"]
 
 
 def test_universe_assembly_filters_tickers_without_history():
