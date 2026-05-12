@@ -11,6 +11,8 @@ from datetime import date, timedelta
 import boto3
 from botocore.exceptions import ClientError
 
+from alpha_engine_lib.universe import filter_to_universe
+
 logger = logging.getLogger(__name__)
 
 
@@ -201,7 +203,7 @@ def filter_buy_candidates_to_universe(
         # executor.market_hours which touches signal_reader indirectly).
         from executor.price_cache import _open_universe_library
         universe_lib = _open_universe_library(signals_bucket)
-        universe_symbols = set(universe_lib.list_symbols())
+        universe_symbols = frozenset(universe_lib.list_symbols())
     except Exception as exc:  # noqa: BLE001 — see docstring
         logger.warning(
             "Skipping buy-candidate universe filter — could not open ArcticDB "
@@ -211,16 +213,17 @@ def filter_buy_candidates_to_universe(
         )
         return signals
 
-    allowed: list[dict] = []
-    dropped: list[str] = []
-    for entry in buy:
-        ticker = entry.get("ticker") if isinstance(entry, dict) else None
-        if ticker and ticker in universe_symbols:
-            allowed.append(entry)
-        elif ticker:
-            dropped.append(ticker)
+    # Membership predicate is delegated to ``alpha_engine_lib.universe`` so
+    # this Layer 2 filter and research's Layer 1 ``population_selector`` filter
+    # share one canonical code path (no silent divergence on universe drift —
+    # see lib v0.13.0 docstring).
+    allowed, dropped_entries = filter_to_universe(buy, universe_symbols)
+    dropped_tickers = [
+        entry["ticker"] for entry in dropped_entries
+        if isinstance(entry, dict) and isinstance(entry.get("ticker"), str)
+    ]
 
-    if dropped:
+    if dropped_tickers:
         logger.warning(
             "[signal_reader] dropped %d buy_candidate(s) not in ArcticDB "
             "universe: %s. Research's population_selector (alpha-engine-"
@@ -228,8 +231,8 @@ def filter_buy_candidates_to_universe(
             "reached here means one of: (a) Research bug, (b) manual edit "
             "to signals.json, (c) universe-library drift window. Not hard-"
             "failing because the remaining %d buy_candidate(s) are valid.",
-            len(dropped),
-            dropped,
+            len(dropped_tickers),
+            dropped_tickers,
             len(allowed),
         )
         signals = dict(signals)  # shallow copy to avoid mutating caller's dict
