@@ -181,9 +181,7 @@ def _build_universe(
     candidates: set[str] = set()
     candidates.update(predictions_by_ticker.keys())
     candidates.update(current_positions.keys())
-    universe_list = signals_raw.get("universe", [])
-    if isinstance(universe_list, list):
-        candidates.update(universe_list)
+    candidates.update(_extract_universe_tickers(signals_raw.get("universe", [])))
 
     candidates.discard(_SPY)
     candidates.discard(_CASH)
@@ -196,6 +194,28 @@ def _build_universe(
         )
 
     return eligible + [_SPY, _CASH]
+
+
+def _extract_universe_tickers(universe_list: Any) -> list[str]:
+    """Normalize `signals_raw['universe']` to a list of ticker strings.
+
+    Production signals.json emits the universe as a list of per-ticker dicts
+    (`{"ticker": "COST", "signal": "ENTER", "score": 55.3, ...}`); legacy /
+    minimal payloads emit a flat list of ticker strings. Accept both shapes —
+    unknown shapes are skipped silently so the wrapper degrades to a
+    smaller universe rather than failing the whole optimizer call.
+    """
+    if not isinstance(universe_list, list):
+        return []
+    out: list[str] = []
+    for el in universe_list:
+        if isinstance(el, str):
+            out.append(el)
+        elif isinstance(el, dict):
+            t = el.get("ticker")
+            if isinstance(t, str) and t:
+                out.append(t)
+    return out
 
 
 def _has_usable_history(ticker: str, price_histories: dict[str, pd.DataFrame]) -> bool:
