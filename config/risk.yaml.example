@@ -189,13 +189,28 @@ notifications:
 # Informational only — not a gate. The predictor features handle the signal.
 earnings_proximity_warning_days: 2
 
-# ── Portfolio optimizer (PR 2 of portfolio-optimizer-260511 arc) ────────────
-# Shadow-mode MVO optimizer runs alongside the legacy 1/n sizer and writes
-# target weights + diagnostics to S3 (predictor/optimizer_shadow/{date}.json)
-# without affecting order placement. Default OFF — enable per-environment.
-# Cutover to drive actual order placement lands in a later PR after 2-3 days
-# of shadow logs confirm plausible target weights.
+# ── Portfolio optimizer (PR 2 + PR 5 of portfolio-optimizer-260511 arc) ─────
+# Two flags govern the optimizer's effect on the order book:
+#
+#   shadow_portfolio_optimizer: runs the MVO optimizer alongside the legacy
+#     1/n sizer and writes target weights + diagnostics to S3
+#     (predictor/optimizer_shadow/{date}.json) without affecting order
+#     placement. Safe to enable any time — read-only observability.
+#
+#   use_portfolio_optimizer: PR 5 cutover. When true, the legacy
+#     _plan_entries path is SKIPPED and the optimizer's would_be_trades
+#     drive the order book directly. Exits (_plan_exits_and_reduces +
+#     strategy_exits + drawdown forced exits) still fire as protective
+#     overrides. Requires shadow_portfolio_optimizer: true (the cutover
+#     reads the same shadow log).
+#
+# Pre-flip checklist for use_portfolio_optimizer (alpha-engine-config side):
+#   1. Ad-hoc backtester cutover-gate verdict: pass (ROADMAP L156-157)
+#   2. ≥ 2-3 trading days of plausible shadow logs in S3
+#   3. No optimizer infeasibility errors (diagnostics.status: optimal)
+#   4. Operator explicit go-ahead
 shadow_portfolio_optimizer: false
+use_portfolio_optimizer: false
 
 portfolio_optimizer:
   # Risk aversion λ in the MVO objective. Higher = stronger Σ penalty.
