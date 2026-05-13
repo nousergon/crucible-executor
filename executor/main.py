@@ -1192,31 +1192,47 @@ def run(
                             )
 
         # ── 3. Process ENTER signals ─────────────────────────────────────────────
-        n_entered, entry_orders, blocked_entries, plan_risk_events = _plan_entries(
-            enter_signals=enter_signals,
-            signals_raw=signals_raw,
-            predictions_by_ticker=predictions_by_ticker,
-            config=config,
-            strategy_config=strategy_config,
-            market_regime=market_regime,
-            sector_ratings=sector_ratings,
-            ibkr=ibkr,
-            portfolio_nav=portfolio_nav,
-            peak_nav=peak_nav,
-            current_positions=current_positions,
-            price_histories=price_histories,
-            atr_map=atr_map,
-            dd_multiplier=dd_multiplier,
-            signal_age_days=signal_age_days,
-            earnings_by_ticker=earnings_by_ticker,
-            vwap_map=vwap_map,
-            coverage_map=coverage_map,
-            ob=ob,
-            run_date=run_date,
-            dry_run=dry_run,
-            simulate=simulate,
-            predictions_date=predictions_date,
-        )
+        # Cutover flag (PR 5 of portfolio-optimizer-260511): when true, the
+        # legacy 1/n entry planner is skipped — the optimizer's MVO solution
+        # in step 5b drives the order book directly. Research EXIT / REDUCE
+        # signals + strategy_exits + drawdown forced exits still fire in
+        # step 4–5 below as protective overrides.
+        use_optimizer = bool(config.get("use_portfolio_optimizer", False))
+        if use_optimizer and not simulate and not dry_run:
+            logger.info(
+                "use_portfolio_optimizer=True — skipping legacy _plan_entries; "
+                "optimizer drives entries from step 5b would_be_trades"
+            )
+            n_entered = 0
+            entry_orders: list[dict] = []
+            blocked_entries: list[dict] = []
+            plan_risk_events: list[dict] = []
+        else:
+            n_entered, entry_orders, blocked_entries, plan_risk_events = _plan_entries(
+                enter_signals=enter_signals,
+                signals_raw=signals_raw,
+                predictions_by_ticker=predictions_by_ticker,
+                config=config,
+                strategy_config=strategy_config,
+                market_regime=market_regime,
+                sector_ratings=sector_ratings,
+                ibkr=ibkr,
+                portfolio_nav=portfolio_nav,
+                peak_nav=peak_nav,
+                current_positions=current_positions,
+                price_histories=price_histories,
+                atr_map=atr_map,
+                dd_multiplier=dd_multiplier,
+                signal_age_days=signal_age_days,
+                earnings_by_ticker=earnings_by_ticker,
+                vwap_map=vwap_map,
+                coverage_map=coverage_map,
+                ob=ob,
+                run_date=run_date,
+                dry_run=dry_run,
+                simulate=simulate,
+                predictions_date=predictions_date,
+            )
         orders.extend(entry_orders)
 
         # Log blocked entries to shadow book for evaluation
@@ -1262,20 +1278,35 @@ def run(
         )
         orders.extend(exit_orders)
 
-        # ── 5b. Shadow portfolio optimizer (PR 2 of portfolio-optimizer-260511) ──
+        # ── 5b. Portfolio optimizer — shadow (PR 2) or live (PR 5) ───────────────
         #
-        # Runs the constrained MVO optimizer on the same inputs the legacy
-        # planner just used, logs target weights + diagnostics to S3, and
-        # NEVER raises into the legacy path. Production behaviour is
-        # unchanged. The shadow log is the primary observability artifact
-        # for deciding when to cut over (PR 5).
-        if (
+        # Shadow mode (``shadow_portfolio_optimizer: true``): runs the MVO
+        # optimizer alongside the legacy 1/n planner, logs target weights +
+        # diagnostics to S3, NEVER touches the order book.
+        #
+        # Cutover mode (``use_portfolio_optimizer: true``, PR 5 of
+        # portfolio-optimizer-260511): the legacy ``_plan_entries`` above
+        # was skipped; here we translate ``would_be_trades`` from the
+        # optimizer log into ``ob.add_entry`` / ``ob.add_urgent_exit``
+        # records. Exits already populated by ``_plan_exits_and_reduces``
+        # take precedence (OrderBook dedup-by-ticker handles overlaps).
+        #
+        # On failure of the optimizer in cutover mode we leave the order
+        # book empty rather than fall back to the legacy path — wrong
+        # trades are strictly worse than no trades for a one-day window.
+        # ``legacy_sizer_fallback`` is deferred to a later PR.
+        shadow_log: dict | None = None
+        run_optimizer_now = (
             not simulate and not dry_run
-            and config.get("shadow_portfolio_optimizer", False)
-        ):
+            and (
+                config.get("shadow_portfolio_optimizer", False)
+                or use_optimizer
+            )
+        )
+        if run_optimizer_now:
             try:
                 from executor.optimizer_shadow import run_shadow_optimizer
-                run_shadow_optimizer(
+                shadow_log = run_shadow_optimizer(
                     signals_raw=signals_raw,
                     predictions_by_ticker=predictions_by_ticker,
                     current_positions=current_positions,
@@ -1290,6 +1321,38 @@ def run(
                 logger.warning(
                     f"Shadow portfolio optimizer wrapper raised "
                     f"(non-blocking): {_shadow_err}"
+                )
+                shadow_log = None
+
+        if use_optimizer and not simulate and not dry_run:
+            from executor.optimizer_cutover import (
+                apply_optimizer_targets_to_orderbook,
+                is_log_usable,
+            )
+            if is_log_usable(shadow_log):
+                opt_entries, opt_exits = apply_optimizer_targets_to_orderbook(
+                    log=shadow_log,
+                    ob=ob,
+                    ibkr=ibkr,
+                    current_positions=current_positions,
+                    price_histories=price_histories,
+                    atr_map=atr_map,
+                    strategy_config=strategy_config,
+                    vwap_map=vwap_map,
+                    signals_raw=signals_raw,
+                    predictions_by_ticker=predictions_by_ticker,
+                    market_regime=market_regime,
+                    run_date=run_date,
+                    predictions_date=predictions_date,
+                )
+                n_entered = len(opt_entries)
+            else:
+                logger.error(
+                    "use_portfolio_optimizer=True but optimizer log is not "
+                    "usable (shadow_status=%r, diag=%r) — leaving order book "
+                    "empty for safety. Operator must investigate.",
+                    (shadow_log or {}).get("shadow_status"),
+                    ((shadow_log or {}).get("diagnostics") or {}).get("status"),
                 )
 
         # ── 6. Write stop records and save order book for daemon ────────────────
