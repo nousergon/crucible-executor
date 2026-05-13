@@ -49,6 +49,10 @@ from executor.decision_capture import (
 from executor.entry_triggers import EntryTriggerEngine
 from executor.ibkr import IBKRClient
 from executor.intraday_exit_manager import IntradayExitManager
+from executor.intraday_snapshot import (
+    IntradaySnapshotWriter,
+    compute_surveillance_universe,
+)
 from executor.market_hours import is_market_hours
 from executor.notifier import send_daemon_status, send_trade_alert
 from executor.order_book import OrderBook
@@ -453,11 +457,45 @@ def run_daemon(dry_run: bool = False) -> None:
     exit_mgr = IntradayExitManager(strategy_config)
     entry_engine = EntryTriggerEngine(strategy_config)
 
-    # Subscribe to all tickers in the order book (+ SPY for roundtrip benchmarking)
-    tickers = order_book.all_tickers()
-    if "SPY" not in tickers:
-        tickers.append("SPY")
+    # Surveillance universe — signals.signals ∪ buy_candidates ∪ order_book ∪
+    # current_positions (+ SPY). Same universe is derived independently by
+    # the surveillance Lambda from the same canonical artifacts, so producer
+    # and consumer agree by construction (ROADMAP L1067). Best-effort:
+    # signals.json read failure degrades to order_book + positions only, so
+    # daemon still trades the order book even if signals are unreadable.
+    try:
+        from executor.signal_reader import read_signals_with_fallback
+        signals_for_surveillance = read_signals_with_fallback(
+            config["signals_bucket"], run_date,
+        )
+    except Exception as _sig_err:  # noqa: BLE001
+        logger.warning(
+            "surveillance: read_signals_with_fallback failed (%s) — "
+            "universe degrades to order_book + positions only",
+            _sig_err,
+        )
+        signals_for_surveillance = None
+    try:
+        positions_for_surveillance = (
+            list(ibkr.get_positions().keys()) if not dry_run else []
+        )
+    except Exception as _pos_err:  # noqa: BLE001
+        logger.warning("surveillance: get_positions failed (%s) — universe degrades", _pos_err)
+        positions_for_surveillance = []
+
+    tickers = compute_surveillance_universe(
+        signals_for_surveillance,
+        order_book_tickers=order_book.all_tickers(),
+        current_positions=positions_for_surveillance,
+    )
     monitor.subscribe(tickers)
+
+    # S3 snapshot writer — publishes latest_prices + heartbeat at every poll
+    # tick. Surveillance Lambda treats heartbeat staleness as daemon-down.
+    snapshot_writer = IntradaySnapshotWriter(
+        bucket=config["signals_bucket"],
+        daemon_pid=os.getpid(),
+    )
 
     n_urgent = len(order_book.pending_urgent_exits())
     send_daemon_status(
@@ -694,6 +732,21 @@ def run_daemon(dry_run: bool = False) -> None:
             # Per-tick structured log line consumed by uptime_tracker.
             # Format is stable — parsers match on the DAEMON_TICK prefix.
             logger.info("DAEMON_TICK ib_connected=%s", str(ibkr.ib.isConnected()).lower())
+
+            # ── Intraday S3 snapshot (surveillance Lambda producer) ───
+            # Fire-and-forget; failures log a warning. Surveillance Lambda
+            # treats heartbeat staleness as daemon-down (ROADMAP L1067).
+            try:
+                snapshot_writer.write(
+                    monitor.prices,
+                    ib_connected=ibkr.ib.isConnected(),
+                    subscribed_tickers=tickers,
+                )
+            except Exception as _snap_err:  # noqa: BLE001
+                # Defensive — IntradaySnapshotWriter.write should already
+                # swallow S3 errors. This catch ensures no unexpected
+                # exception from the writer leaks into the trade loop.
+                logger.warning("intraday snapshot writer raised: %s", _snap_err)
 
             # ── Heartbeat ─────────────────────────────────────────────
             _elapsed = _time.time() - _last_heartbeat
