@@ -128,6 +128,30 @@ class TestFeatureFlag:
         assert result is None
         s3.put_object.assert_not_called()
 
+    def test_suppress_flag_overrides_enabled(self, monkeypatch):
+        """ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true forces capture off
+        even when ALPHA_ENGINE_DECISION_CAPTURE_ENABLED=true. Used by the
+        backtester spot to keep the simulation hot loop from emitting
+        50k-200k per-decision S3 PUTs (sweep can't afford their cost +
+        artifacts are observability for prod, not sweep semantics)."""
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        for v in ("true", "True", "1", "yes", "YES"):
+            monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS", v)
+            assert is_decision_capture_enabled() is False, (
+                f"suppress={v!r} should force capture off even with enable=true"
+            )
+
+    def test_suppress_falsy_or_unset_does_not_disable(self, monkeypatch):
+        """Falsy or absent SUPPRESS leaves the enable flag in charge."""
+        monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_ENABLED", "true")
+        for v in ("false", "0", "no", "", "off"):
+            monkeypatch.setenv("ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS", v)
+            assert is_decision_capture_enabled() is True, (
+                f"suppress={v!r} should not disable when enable=true"
+            )
+        monkeypatch.delenv("ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS", raising=False)
+        assert is_decision_capture_enabled() is True
+
 
 # ── Trigger-kind classifier ──────────────────────────────────────────────
 
