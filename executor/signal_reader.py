@@ -11,9 +11,52 @@ from datetime import date, timedelta
 import boto3
 from botocore.exceptions import ClientError
 
+from alpha_engine_lib.eval_artifacts import load_latest_eval_artifact
 from alpha_engine_lib.universe import filter_to_universe
 
 logger = logging.getLogger(__name__)
+
+REGIME_SUBSTRATE_PREFIX = "regime"
+
+
+def read_regime_substrate(s3_bucket: str) -> dict | None:
+    """Read the latest regime substrate artifact via canonical sidecar.
+
+    Wraps ``alpha_engine_lib.eval_artifacts.load_latest_eval_artifact``
+    pointed at ``s3://{bucket}/regime/latest.json``. Returns the parsed
+    payload dict (composite.intensity_z, hmm.posterior, bocpd.run_length_z,
+    guardrails, run_id) or ``None`` if the artifact is unavailable.
+
+    Substrate is produced weekly by alpha-engine-predictor's regime
+    Lambda (Saturday SF ``RegimeSubstrate`` state) — see
+    ``regime-v3-260514.md`` §6 Stage A. Returning None on read failure
+    is the contract: the executor's regime-aware sizing defaults to a
+    1.0× multiplier when intensity_z is unavailable (legacy behavior
+    preserved).
+    """
+    s3 = boto3.client("s3")
+    return load_latest_eval_artifact(
+        s3, bucket=s3_bucket, prefix=REGIME_SUBSTRATE_PREFIX,
+    )
+
+
+def extract_intensity_z(substrate: dict | None) -> float | None:
+    """Pull ``composite.intensity_z`` out of a regime substrate payload.
+
+    Returns ``None`` if ``substrate`` is None, missing the ``composite``
+    block, or its ``intensity_z`` is non-numeric. The substrate writer
+    (predictor regime/substrate.py) guarantees the shape on success;
+    this helper just defends against schema drift + None propagation.
+    """
+    if not isinstance(substrate, dict):
+        return None
+    composite = substrate.get("composite")
+    if not isinstance(composite, dict):
+        return None
+    val = composite.get("intensity_z")
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return float(val)
+    return None
 
 
 def read_predictions(s3_bucket: str) -> tuple[dict[str, dict], str | None]:

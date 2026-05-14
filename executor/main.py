@@ -433,6 +433,7 @@ def _plan_entries(
     dry_run: bool,
     simulate: bool,
     predictions_date: str | None = None,
+    regime_intensity_z: float | None = None,
 ) -> tuple[int, list[dict], list[dict], list[dict]]:
     """Live-shell wrapper around ``executor.deciders.decide_entries``.
 
@@ -485,6 +486,7 @@ def _plan_entries(
         earnings_by_ticker=earnings_by_ticker,
         run_date=run_date,
         predictions_date=predictions_date,
+        regime_intensity_z=regime_intensity_z,
     )
 
     # Dispatch decisions to side-effecting layer.
@@ -1208,6 +1210,33 @@ def run(
             blocked_entries: list[dict] = []
             plan_risk_events: list[dict] = []
         else:
+            # Stage D' Wire 2: optionally load regime substrate so
+            # position_sizer can apply a regime-conditional multiplier.
+            # Gated by config so the read is skipped entirely when the
+            # wire is off — avoids a per-cycle S3 GET when the feature
+            # is disabled. Returns None when substrate is unavailable
+            # (fresh deploy, sidecar miss, etc.) — sizing falls back to
+            # 1.0× under the helper's guard.
+            regime_intensity_z = None
+            if config.get("regime_sizing_enabled", False) and not simulate:
+                try:
+                    from executor.signal_reader import (
+                        extract_intensity_z,
+                        read_regime_substrate,
+                    )
+                    substrate = read_regime_substrate(signals_bucket)
+                    regime_intensity_z = extract_intensity_z(substrate)
+                    logger.info(
+                        "regime_sizing_enabled=True | intensity_z=%s",
+                        f"{regime_intensity_z:.3f}" if regime_intensity_z is not None else "None",
+                    )
+                except Exception as _rs_err:
+                    logger.warning(
+                        "regime substrate read failed (%s) — falling back to 1.0× sizing",
+                        _rs_err,
+                    )
+                    regime_intensity_z = None
+
             n_entered, entry_orders, blocked_entries, plan_risk_events = _plan_entries(
                 enter_signals=enter_signals,
                 signals_raw=signals_raw,
@@ -1232,6 +1261,7 @@ def run(
                 dry_run=dry_run,
                 simulate=simulate,
                 predictions_date=predictions_date,
+                regime_intensity_z=regime_intensity_z,
             )
         orders.extend(entry_orders)
 

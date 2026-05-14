@@ -105,6 +105,19 @@ coverage_derate_floor: 0.25      # never derate below 25% of normal size (backte
 coverage_admission_enabled: true        # hard-refuse buy_candidates below min_coverage_for_admission
 min_coverage_for_admission: 0.30        # feature-coverage floor for NEW entries (backtester-tunable: [0.20, 0.30, 0.50])
 
+# ── Regime-conditional sizing (Stage D' Wire 2, regime-v3-260514) ───────────
+# Off by default; ships dormant. When ON, position_sizer multiplies the raw
+# weight by ``1.0 + intensity_z * regime_sizing_scale`` clamped to
+# ``[regime_sizing_floor, regime_sizing_ceil]``. intensity_z comes from
+# alpha-engine-predictor's regime substrate (s3://.../regime/latest.json);
+# follows risk-on convention (positive=risk-on → upweight, negative=risk-off
+# → downweight). Operator flips ``regime_sizing_enabled: true`` after 4+
+# weeks of substrate observation via the dashboard's Regime page.
+regime_sizing_enabled: false     # gate-off by default; flip after observation window
+regime_sizing_scale: 0.05        # per-σ sensitivity; +1σ → 1.05× tilt
+regime_sizing_floor: 0.70        # clamp lower bound on the multiplier
+regime_sizing_ceil:  1.30        # clamp upper bound on the multiplier
+
 # ── IBKR connection ─────────────────────────────────────────────────────────
 ibkr_host: "127.0.0.1"
 ibkr_port: 4002                  # 4002 = paper trading, 4001 = live

@@ -401,6 +401,7 @@ def decide_entries(
     earnings_by_ticker: dict,
     run_date: str,
     predictions_date: str | None = None,
+    regime_intensity_z: float | None = None,
 ) -> EntryPlan:
     """Pure decision pipeline for ENTER signals.
 
@@ -716,6 +717,7 @@ def decide_entries(
             days_to_earnings=earnings_by_ticker.get(ticker),
             feature_coverage=coverage_map.get(ticker),
             stance=pred_data.get("stance"),
+            regime_intensity_z=regime_intensity_z,
         )
 
         # Emit executor:position_sizer DecisionArtifact (L2308 PR 2).

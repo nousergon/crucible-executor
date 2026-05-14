@@ -24,6 +24,37 @@ _DEFAULT_SECTOR_ADJ = {
 }
 
 
+def regime_conditional_size_multiplier(
+    intensity_z: float | None,
+    *,
+    scale: float = 0.05,
+    floor: float = 0.70,
+    ceil: float = 1.30,
+) -> float:
+    """Map regime composite intensity_z to a sizing multiplier.
+
+    intensity_z follows the risk-on convention from the predictor's
+    regime substrate (alpha-engine-predictor/regime/composite.py): positive
+    values = risk-on conditions, negative = risk-off. Sizing follows the
+    same direction — upweight in risk-on, downweight in risk-off.
+
+    Linear with clamping: ``1.0 + intensity_z * scale`` then clamped to
+    ``[floor, ceil]``. ``scale=0.05`` means a +1σ risk-on reading yields
+    a 1.05× tilt, a -1σ risk-off reading a 0.95× tilt — small enough
+    that it composes with the other (multiplicative) adjustments without
+    dominating, large enough to register vs sector_adj (1.05/0.85).
+    Clamp prevents pathological tails from blowing past max_position_pct.
+
+    Returns 1.0 when ``intensity_z`` is None (substrate unavailable) —
+    preserves legacy behavior so a substrate read failure does not
+    silently change sizing.
+    """
+    if intensity_z is None:
+        return 1.0
+    raw = 1.0 + float(intensity_z) * float(scale)
+    return max(float(floor), min(float(ceil), raw))
+
+
 def compute_position_size(
     ticker: str,
     portfolio_nav: float,
@@ -40,6 +71,7 @@ def compute_position_size(
     days_to_earnings: int | None = None,
     feature_coverage: float | None = None,
     stance: str | None = None,
+    regime_intensity_z: float | None = None,
 ) -> dict:
     """
     Compute position size for a new ENTER order.
@@ -171,11 +203,28 @@ def compute_position_size(
     else:
         coverage_adj = 1.0
 
+    # Regime sizing adjustment (Stage D' Wire 2, regime-v3-260514). Reads
+    # the composite intensity_z from the regime substrate (predictor-side,
+    # see regime/composite.py — positive=risk-on, negative=risk-off).
+    # Default OFF so the wire ships dormant; operator flips ON via
+    # risk.yaml ``regime_sizing_enabled`` after observing 4 weeks of
+    # SF runs with intensity_z surfaced through the dashboard. Composes
+    # multiplicatively with the other adjustments.
+    if config.get("regime_sizing_enabled", False):
+        regime_adj = regime_conditional_size_multiplier(
+            regime_intensity_z,
+            scale=config.get("regime_sizing_scale", 0.05),
+            floor=config.get("regime_sizing_floor", 0.70),
+            ceil=config.get("regime_sizing_ceil", 1.30),
+        )
+    else:
+        regime_adj = 1.0
+
     max_pct = config.get("max_position_pct", 0.05)
     raw_weight = (base_weight * sector_adj * conviction_adj * upside_adj
                   * drawdown_multiplier * atr_adj * confidence_adj
                   * staleness_adj * earnings_adj * coverage_adj
-                  * stance_adj)
+                  * stance_adj * regime_adj)
     position_weight = min(raw_weight, max_pct)
 
     # ATR volatility cap: ensure ATR constraint is not overridden by other
@@ -198,7 +247,7 @@ def compute_position_size(
         f"dd_mult={drawdown_multiplier} atr_adj={atr_adj} "
         f"confidence_adj={confidence_adj} staleness_adj={staleness_adj} "
         f"earnings_adj={earnings_adj} coverage_adj={coverage_adj} "
-        f"stance_adj={stance_adj} "
+        f"stance_adj={stance_adj} regime_adj={regime_adj} "
         f"→ {position_weight:.3f} NAV = ${dollar_size:.0f} = {shares} shares"
     )
 
@@ -216,4 +265,5 @@ def compute_position_size(
         "earnings_adj": earnings_adj,
         "coverage_adj": coverage_adj,
         "stance_adj": stance_adj,
+        "regime_adj": regime_adj,
     }

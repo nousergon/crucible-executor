@@ -374,6 +374,7 @@ def build_position_sizer_payload(
         "earnings_adj": sizing_result.get("earnings_adj"),
         "coverage_adj": sizing_result.get("coverage_adj"),
         "stance_adj": sizing_result.get("stance_adj"),
+        "regime_adj": sizing_result.get("regime_adj"),
         "sized_outcome": sized_outcome,
         "sized_outcome_reason": sized_outcome_reason,
     }
