@@ -52,14 +52,25 @@ logger = logging.getLogger(__name__)
 
 
 _ENV_VAR = "ALPHA_ENGINE_DECISION_CAPTURE_ENABLED"
+_SUPPRESS_ENV_VAR = "ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS"
 
 
 def is_decision_capture_enabled() -> bool:
-    """Read the env var fresh on each call (allows toggling in tests).
+    """Read the env vars fresh on each call (allows toggling in tests).
 
     Returns True iff ``ALPHA_ENGINE_DECISION_CAPTURE_ENABLED`` is set to
-    ``"true"`` / ``"1"`` / ``"yes"`` (case-insensitive). Default off.
+    ``"true"`` / ``"1"`` / ``"yes"`` (case-insensitive) AND
+    ``ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS`` is NOT truthy. The
+    suppress flag is set by alpha-engine-backtester's spot_backtest.sh
+    on the spot instance so the simulation hot loop (param_sweep ×
+    N_dates × N_positions) doesn't emit ~50k-200k per-decision S3 PUTs
+    that blow the simulation_pipeline watchdog. Capture artifacts exist
+    for production observability — they have no semantic meaning inside
+    the sweep, and the sweep can't afford their cost. Default both off
+    (capture disabled, suppress not asserted).
     """
+    if os.environ.get(_SUPPRESS_ENV_VAR, "").lower() in ("true", "1", "yes"):
+        return False
     return os.environ.get(_ENV_VAR, "").lower() in ("true", "1", "yes")
 
 
