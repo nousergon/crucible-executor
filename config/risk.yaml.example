@@ -133,6 +133,21 @@ regime_drawdown_scale: 0.10      # per-σ sensitivity on the threshold magnitude
 regime_drawdown_floor: 0.60      # clamp lower bound (max tightening = 40%)
 regime_drawdown_ceil:  1.40      # clamp upper bound (max loosening = 40%)
 
+# ── Regime-conditional entry score threshold (Stage D' Wire 5, regime-v3-260514) ─
+# Off by default; ships dormant. When ON, ``min_score_to_enter`` is adjusted by
+# ``-intensity_z * regime_min_score_scale`` clamped to
+# ``[-regime_min_score_cap, +regime_min_score_cap]`` then to
+# ``[regime_min_score_floor, regime_min_score_ceil]``. Risk-off regimes
+# (intensity_z < 0) RAISE the threshold → more selective (only the best
+# ideas qualify); risk-on (z > 0) LOWER → more inclusive (don't miss
+# the tailwind). Operator flips ``regime_min_score_enabled: true`` after
+# 4+ weeks of substrate observation alongside Wires 2-4.
+regime_min_score_enabled: false  # gate-off by default; flip after observation window
+regime_min_score_scale: 2.0      # per-σ point shift in score threshold
+regime_min_score_cap: 10.0       # max absolute adjustment in score points
+regime_min_score_floor: 50.0     # clamp lower bound on adjusted threshold
+regime_min_score_ceil:  90.0     # clamp upper bound on adjusted threshold
+
 # ── IBKR connection ─────────────────────────────────────────────────────────
 ibkr_host: "127.0.0.1"
 ibkr_port: 4002                  # 4002 = paper trading, 4001 = live

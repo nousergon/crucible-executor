@@ -36,6 +36,49 @@ def _emit(events: list[dict] | None, event: dict) -> None:
         events.append(event)
 
 
+def regime_conditional_min_score(
+    intensity_z: float | None,
+    *,
+    base_min_score: float,
+    scale: float = 2.0,
+    cap: float = 10.0,
+    floor: float = 50.0,
+    ceil: float = 90.0,
+) -> float:
+    """Stage D' Wire 5 — regime-conditional entry score threshold.
+
+    Adjusts ``min_score_to_enter`` based on the predictor regime substrate's
+    composite intensity_z. Direction: risk-off RAISES the threshold (more
+    selective — only the best ideas survive); risk-on LOWERS the threshold
+    (more inclusive — don't miss the tailwind).
+
+    Why opposite-sign vs Wire 4 (veto)?
+      Both wires gate entries; both go in the same SEMANTIC direction
+      ("tighter in stress, looser in tailwind") — but their underlying
+      thresholds move in opposite directions to achieve that effect.
+      Veto: HIGHER threshold → harder to veto → MORE entries allowed.
+      Entry score: LOWER threshold → easier to qualify → MORE entries.
+
+    Math: ``adjustment = -intensity_z * scale`` clamped to ``[-cap, +cap]``,
+    then ``base + adjustment`` clamped to ``[floor, ceil]``. Defaults
+    (scale=2.0, cap=10.0) give:
+      * z=-2 → adjustment +4.0 (base 70 → 74)
+      * z=-5 → adjustment +10.0 capped (base 70 → 80)
+      * z=0  → adjustment  0.0 (base unchanged)
+      * z=+2 → adjustment -4.0 (base 70 → 66)
+      * z=None → adjustment 0.0 (legacy preserved)
+
+    Floor 50.0 / ceil 90.0 prevent pathological tails from disabling
+    the gate entirely or making it unreachable.
+    """
+    base = float(base_min_score)
+    if intensity_z is None:
+        return base
+    raw_adjustment = -float(intensity_z) * float(scale)
+    capped_adjustment = max(-float(cap), min(float(cap), raw_adjustment))
+    return max(float(floor), min(float(ceil), base + capped_adjustment))
+
+
 def regime_conditional_threshold_scale(
     intensity_z: float | None,
     *,
@@ -345,14 +388,33 @@ def check_order(
 
     # ── ENTER rules ───────────────────────────────────────────────────────────
 
-    # 1. Score minimum
+    # 1. Score minimum (Stage D' Wire 5: optionally regime-conditional)
     score = signal.get("score") or 0
-    min_score = config.get("min_score_to_enter", 70)
+    base_min_score = config.get("min_score_to_enter", 70)
+    if config.get("regime_min_score_enabled", False):
+        min_score = regime_conditional_min_score(
+            regime_intensity_z,
+            base_min_score=base_min_score,
+            scale=config.get("regime_min_score_scale", 2.0),
+            cap=config.get("regime_min_score_cap", 10.0),
+            floor=config.get("regime_min_score_floor", 50.0),
+            ceil=config.get("regime_min_score_ceil", 90.0),
+        )
+    else:
+        min_score = base_min_score
     if score < min_score:
         reason = f"Score {score:.1f} < minimum {min_score}"
         _emit(events, {**base_event_ctx,
             "event_type": "veto", "rule": "min_score",
             "reason": reason, "value": float(score), "threshold": float(min_score),
+            "context": {
+                "base_min_score": float(base_min_score),
+                "regime_intensity_z": (
+                    float(regime_intensity_z)
+                    if regime_intensity_z is not None
+                    else None
+                ),
+            },
         })
         return False, reason
 
