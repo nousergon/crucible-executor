@@ -133,6 +133,23 @@ regime_drawdown_scale: 0.10      # per-σ sensitivity on the threshold magnitude
 regime_drawdown_floor: 0.60      # clamp lower bound (max tightening = 40%)
 regime_drawdown_ceil:  1.40      # clamp upper bound (max loosening = 40%)
 
+# ── Forced-bear circuit-breaker (Stage F2, regime-fast-signal-260515) ──────
+# Off by default; ships dormant + parallel-observe. The daily BOCPD
+# fast signal (s3://.../regime/fast_signal/latest.json, produced by
+# alpha-engine-predictor) latches ``forced_bear`` on a confirmed midweek
+# regime break. When ON, the planner's effective ``market_regime``
+# becomes "bear" for ALL gating reads (sizing Wire 2, drawdown Wire 3,
+# entry-score Wire 5, bear_* risk.yaml overrides) — no separate halt
+# knob, forced_bear == bear. Bear caps are hard ceilings so the
+# most-protective of {continuous wires, bear floor} binds (no
+# double-count). The fast signal is READ every cycle regardless of this
+# flag (parallel-observe); only the regime override is gated. Operator
+# flips ``regime_forced_bear_enabled: true`` after the F1 backfill
+# calibration clears its gate (positive lead vs smoothed-HMM + sane
+# whipsaw) AND the F2 parallel-observe window shows the counterfactual
+# would have helped the skilled-risk basket.
+regime_forced_bear_enabled: false  # gate-off by default; flip after F1+F2 gates
+
 # ── Regime-conditional entry score threshold (Stage D' Wire 5, regime-v3-260514) ─
 # Off by default; ships dormant. When ON, ``min_score_to_enter`` is adjusted by
 # ``-intensity_z * regime_min_score_scale`` clamped to

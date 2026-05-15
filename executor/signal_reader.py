@@ -59,6 +59,42 @@ def extract_intensity_z(substrate: dict | None) -> float | None:
     return None
 
 
+REGIME_FAST_SIGNAL_PREFIX = "regime/fast_signal"
+
+
+def read_fast_signal(s3_bucket: str) -> dict | None:
+    """Read the latest daily fast-signal artifact (Stage F2).
+
+    Mirror of ``read_regime_substrate``. Wraps
+    ``load_latest_eval_artifact`` on ``s3://{bucket}/regime/fast_signal/
+    latest.json`` — the observe-only daily BOCPD circuit-breaker output
+    produced by alpha-engine-predictor's ``regime_fast_signal``
+    inference stage (regime-fast-signal-260515.md). Returns the parsed
+    payload (``forced_bear``, ``intensity_z``, ``change_confidence``,
+    ``warmup``, …) or ``None`` if unavailable. ``None`` ⇒ the executor
+    treats forced_bear as False (legacy behavior preserved).
+    """
+    s3 = boto3.client("s3")
+    return load_latest_eval_artifact(
+        s3, bucket=s3_bucket, prefix=REGIME_FAST_SIGNAL_PREFIX,
+    )
+
+
+def extract_forced_bear(fast_signal: dict | None) -> bool:
+    """Pull the ``forced_bear`` latch out of a fast-signal payload.
+
+    Returns ``False`` when the payload is None, malformed, or still in
+    ``warmup`` (a warming detector must never assert a regime break —
+    the producer already suppresses forced_bear during warmup, this is
+    defence-in-depth against schema drift / a stale artifact).
+    """
+    if not isinstance(fast_signal, dict):
+        return False
+    if fast_signal.get("warmup") is True:
+        return False
+    return fast_signal.get("forced_bear") is True
+
+
 def read_predictions(s3_bucket: str) -> tuple[dict[str, dict], str | None]:
     """
     Read predictor/predictions/latest.json from S3.

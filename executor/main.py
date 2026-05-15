@@ -995,6 +995,53 @@ def run(
                 )
                 regime_intensity_z = None
 
+        # ── 2b''. Resolve daily fast-signal forced-bear latch (F2) ─────────────
+        # regime-fast-signal-260515.md Stage F2. The daily BOCPD
+        # circuit-breaker (alpha-engine-predictor regime_fast_signal
+        # stage) latches forced_bear on a confirmed midweek regime
+        # break. When acting, the planner's EFFECTIVE market_regime
+        # becomes "bear" for ALL gating reads — sizing (Wire 2), drawdown
+        # tiers (Wire 3), entry-score gate, and the existing
+        # ``market_regime == "bear"`` risk.yaml overrides
+        # (bear_max_position_pct etc.). No separate halt knob: forced_bear
+        # == bear, the system already knows what bear means. Bear caps
+        # are hard ceilings so the most-protective of {continuous wires,
+        # bear floor} naturally binds (guardrail 3, no double-count).
+        #
+        # The read is UNGATED (always in non-simulate) so the F2
+        # parallel-observe window has data even with the flag off; the
+        # behavior (regime override) is gated on
+        # ``regime_forced_bear_enabled`` (default false). One S3 GET per
+        # planning cycle — negligible (planner runs ~1×/morning).
+        if not simulate:
+            try:
+                from executor.signal_reader import (
+                    extract_forced_bear,
+                    read_fast_signal,
+                )
+                _fb = extract_forced_bear(read_fast_signal(signals_bucket))
+                if _fb and config.get("regime_forced_bear_enabled", False):
+                    logger.warning(
+                        "FORCED-BEAR active — overriding effective "
+                        "market_regime '%s' → 'bear' for this planning "
+                        "cycle (research regime preserved for audit). "
+                        "Source: daily BOCPD fast signal.",
+                        market_regime,
+                    )
+                    market_regime = "bear"
+                elif _fb:
+                    logger.info(
+                        "regime_forced_bear OBSERVE (flag off): fast "
+                        "signal latched forced_bear=True; would override "
+                        "market_regime '%s' → 'bear'. No behavior change.",
+                        market_regime,
+                    )
+            except Exception as _fb_err:
+                logger.warning(
+                    "fast-signal read failed (%s) — forced-bear not "
+                    "applied; legacy regime behavior preserved.", _fb_err,
+                )
+
         # ── 2c. Compute graduated drawdown multiplier ──────────────────────────
         # Pass an events sink so any halt/throttle event lands in
         # `risk_events` ONCE per planning cycle (the per-ticker check_order
