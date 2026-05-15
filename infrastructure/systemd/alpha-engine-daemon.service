@@ -20,6 +20,15 @@ Environment=PYTHONPATH=/home/ec2-user/alpha-engine
 Environment=AWS_REGION=us-east-1
 Environment=ALPHA_ENGINE_JSON_LOGS=1
 Environment=FLOW_DOCTOR_ENABLED=1
+# Secrets (EMAIL_SENDER, GMAIL_APP_PASSWORD, ANTHROPIC_API_KEY, ...) — the
+# RunDaemon SSM step launches this unit via systemd, which (unlike the SF's
+# RunMorningPlanner command) does not `source` the env file. PR 9g (#182)
+# deleted the ssm_secrets import-time shim that previously populated these
+# for the daemon, so flow-doctor's ${EMAIL_SENDER} resolution crash-looped
+# the daemon (2026-05-15). Mirror the morning-planner path until the
+# .env-deprecation arc's SSM substrate fully covers systemd entrypoints.
+# Leading `-` tolerates the file's eventual removal (no hard failure).
+EnvironmentFile=-/home/ec2-user/.alpha-engine.env
 
 [Install]
 WantedBy=multi-user.target
