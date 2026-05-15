@@ -253,3 +253,48 @@ def test_run_accepts_injected_maps_via_kwargs():
             inspect.Parameter.KEYWORD_ONLY,
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         ), f"{name} must be keyword-callable, got kind={kind}"
+
+
+# ── Macro-symbol exclusion from the ATR set ─────────────────────────────────
+
+
+def test_atr_tickers_excludes_macro_symbols():
+    """The 2026-05-15 weekday SF morning-planner failure: the
+    portfolio-optimizer cutover (2026-05-13) made SPY a held core
+    position, so ``current_positions`` injected SPY into ``atr_tickers``.
+    SPY lives in the Close-only ``macro`` ArcticDB library (no
+    atr_14_pct column) and is absent from ``universe`` →
+    ``load_atr_14_pct`` hard-failed with NoSuchVersionException, taking
+    down the whole planner before the daemon could start.
+
+    Same root-cause family as eod_reconcile #181, but the correct
+    remedy for ATR is *exclusion* (macro lib has no ATR feature), not
+    macro-lib dispatch. Lock the ``- _MACRO_SYMBOLS`` set-difference so
+    a refactor can't silently re-admit SPY/ETFs to the ATR set.
+    """
+    src = _source()
+    assert "_MACRO_SYMBOLS" in src, (
+        "main.py must import _MACRO_SYMBOLS to exclude macro-routed "
+        "held positions (SPY core etc.) from the ATR lookup."
+    )
+    assert "set(atr_tickers) - _MACRO_SYMBOLS" in src, (
+        "atr_tickers must subtract _MACRO_SYMBOLS — without it the "
+        "SPY-as-held-core optimizer cutover re-breaks the morning "
+        "planner via load_atr_14_pct NoSuchVersionException "
+        "(2026-05-15 weekday SF failure)."
+    )
+
+
+def test_main_imports_macro_symbols_from_price_cache():
+    """``_MACRO_SYMBOLS`` is the single source of truth for macro-routed
+    tickers (defined in price_cache.py, also consumed by
+    load_price_histories + eod_reconcile #181). Pin the import so the
+    exclusion set never drifts from the dispatch set.
+    """
+    from executor.price_cache import _MACRO_SYMBOLS
+
+    assert "SPY" in _MACRO_SYMBOLS
+    assert executor_main._MACRO_SYMBOLS is _MACRO_SYMBOLS, (
+        "executor.main must reuse price_cache._MACRO_SYMBOLS, not "
+        "redefine its own macro set (drift risk)."
+    )
