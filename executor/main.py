@@ -1457,6 +1457,53 @@ def run(
             except Exception as e:
                 logger.warning("Failed to write order book: %s", e)
 
+        # ── 6b. Per-ticker order-book rationale artifact ────────────────────────
+        # Audit-stable record answering "why is ticker X in state S
+        # today" for the whole considered universe (incl. excluded /
+        # vetoed). Pure join + serialize over structures already
+        # materialized above — no new instrumentation. Non-blocking:
+        # the planner must never fail over an audit artifact (same
+        # posture as the shadow optimizer + data manifest below).
+        if not simulate and not dry_run and signals_bucket:
+            try:
+                import boto3
+
+                from alpha_engine_lib.dates import now_dual
+                from alpha_engine_lib.eval_artifacts import new_eval_run_id
+                from executor.order_book_rationale import (
+                    build_order_book_rationale,
+                    write_order_book_rationale,
+                )
+
+                _dual = now_dual()
+                _rationale = build_order_book_rationale(
+                    signals=signals,
+                    predictions_by_ticker=predictions_by_ticker,
+                    order_book_data=ob.data,
+                    blocked_entries=blocked_entries,
+                    risk_events=plan_risk_events,
+                    market_regime=market_regime,
+                    run_date=run_date,
+                    signal_date=(
+                        signals_raw.get("date", run_date)
+                        if signals_raw else run_date
+                    ),
+                    prediction_date=predictions_date,
+                    calendar_date=_dual.calendar_date,
+                    trading_day=_dual.trading_day,
+                    run_id=new_eval_run_id(),
+                )
+                write_order_book_rationale(
+                    _rationale,
+                    s3_client=boto3.client("s3"),
+                    bucket=signals_bucket,
+                )
+            except Exception as _rat_err:
+                logger.warning(
+                    "Order-book rationale write failed (non-blocking): %s",
+                    _rat_err,
+                )
+
         # ── 7. Backup and disconnect ─────────────────────────────────────────
         if not dry_run and not simulate:
             backup_to_s3(db_path, run_date, trades_bucket)
