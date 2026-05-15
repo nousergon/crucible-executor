@@ -41,6 +41,7 @@ from executor.signal_reader import get_actionable_signals, read_signals_with_fal
 from executor.strategies.config import load_strategy_config
 from executor.strategies.exit_manager import evaluate_exits, SECTOR_ETF_MAP
 from executor.price_cache import (
+    _MACRO_SYMBOLS,
     load_atr_14_pct,
     load_daily_vwap,
     load_feature_coverage,
@@ -1100,8 +1101,19 @@ def run(
         # missing ticker or stale data — feedback_hard_fail_until_stable.
         # Scope: signal tickers (ENTER) + held positions (for trailing stops).
         #
-        # ETF tickers are intentionally excluded — they're used for sector-relative
-        # exit veto via price_histories, not for ATR-based execution.
+        # Macro-routed tickers (SPY/sector ETFs/VIX/etc., see _MACRO_SYMBOLS)
+        # are intentionally excluded. They're used for sector-relative exit
+        # veto via price_histories, not ATR-based execution, and they live in
+        # the Close-only `macro` ArcticDB library which has no atr_14_pct
+        # feature column. The portfolio-optimizer cutover (2026-05-13) made
+        # SPY a held core position via the enhanced-index design (~63% SPY
+        # core); without this filter `current_positions` injects SPY into the
+        # ATR set and load_atr_14_pct hard-fails with NoSuchVersionException
+        # (universe-only read). Same root-cause family as eod_reconcile #181,
+        # but the right remedy for ATR is exclusion (macro lib has no ATR),
+        # not macro-lib dispatch. The SPY core is rebalanced by the optimizer,
+        # not ATR trailing stops; _write_stops_and_finalize's atr_map.get(t)
+        # already skips-with-warning when a held position has no ATR.
         #
         # ``atr_map`` kwarg mirrors the vwap_map injection pattern — backtester
         # precomputes once per simulate pipeline, skipping millions of
@@ -1109,7 +1121,7 @@ def run(
         # atr_map=None and takes the load_atr_14_pct path unchanged.
         atr_tickers = [s["ticker"] for s in signals.get("enter", [])]
         atr_tickers += list(current_positions.keys())
-        atr_tickers = sorted(set(atr_tickers))
+        atr_tickers = sorted(set(atr_tickers) - _MACRO_SYMBOLS)
         if atr_map is None:
             if atr_tickers:
                 atr_map = load_atr_14_pct(
