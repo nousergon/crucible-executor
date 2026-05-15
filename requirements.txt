@@ -33,7 +33,11 @@ requests~=2.32
 # v0.16.0 adds load_latest_eval_artifact + list_eval_artifacts for the
 # canonical eval-artifact partition shape (YYMMDDHHMM run_id + sidecar);
 # required by signal_reader.read_regime_substrate (Stage D' Wire 2).
-alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.16.0
+# v0.17.0 seeds flow-doctor ${VAR} secrets via get_secret() inside
+# setup_logging()/_attach_flow_doctor() before flow_doctor.init() reads
+# os.environ — closes the PR 9g systemd-entrypoint env gap upstream for
+# all repos (replaces the executor-local secrets_bootstrap.py approach).
+alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.17.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
