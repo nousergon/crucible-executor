@@ -20,9 +20,6 @@ import pandas as pd
 import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from ssm_secrets import load_secrets
-load_secrets()
-
 from executor.eod_emailer import send_eod_email
 from executor.trade_logger import (
     init_db, log_eod, backup_to_s3, get_entry_trade, get_todays_trades,

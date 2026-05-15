@@ -37,9 +37,6 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from ssm_secrets import load_secrets
-load_secrets()
-
 from executor.decision_capture import (
     DecisionCaptureWriteError,
     capture_entry_trigger,

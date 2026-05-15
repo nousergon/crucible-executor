@@ -33,9 +33,6 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from ssm_secrets import load_secrets
-load_secrets()
-
 from executor.ibkr import IBKRClient, SimulatedIBKRClient
 from executor.order_book import OrderBook
 from executor.position_sizer import compute_position_size

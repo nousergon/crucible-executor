@@ -48,10 +48,6 @@ import boto3
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from ssm_secrets import load_secrets
-
-load_secrets()
-
 from executor.config_loader import load_config
 from executor.ibkr import IBKRClient
 
