@@ -149,6 +149,31 @@ def _load_constituents_sector_map(bucket: str) -> dict[str, str]:
         return {}
 
 
+# Broad-market index/ETF core positions are not GICS sector constituents.
+# Since the portfolio-optimizer cutover (use_portfolio_optimizer: true,
+# 2026-05-13) SPY is held as the enhanced-index core position. SPY has no
+# `sector` field in signals.json, no entry_trade.sector, and is not in the
+# S&P 500+400 constituents map, so the normal lookup chain misses it and it
+# renders as a bare "—"/"Unknown" on the public site — reads as missing data
+# rather than "this is the broad-market core." Tag it explicitly so every
+# downstream consumer (public site, private console, sector attribution)
+# inherits a meaningful label. New core ETFs the optimizer may substitute
+# get added to ``_INDEX_ETF_TICKERS``.
+_INDEX_ETF_SECTOR = "Broad Market / Index"
+_INDEX_ETF_TICKERS = frozenset({"SPY", "VOO", "IVV", "SPLG"})
+
+
+def _index_etf_sector(ticker: str) -> str | None:
+    """Return the broad-market sector label for index/ETF core positions.
+
+    Returns ``"Broad Market / Index"`` for known broad-market ETFs held as
+    the enhanced-index core (SPY and S&P 500 trackers the optimizer may
+    substitute), else ``None`` so the caller falls through to the normal
+    signals.json / entry-trade / S&P-constituents lookup chain.
+    """
+    return _INDEX_ETF_SECTOR if ticker in _INDEX_ETF_TICKERS else None
+
+
 def _load_predictions_from_s3(bucket: str) -> tuple[dict, str | None]:
     """Load latest predictions from S3. Returns ({ticker: pred_dict}, warning_msg) on failure."""
     s3 = boto3.client("s3")
@@ -440,6 +465,10 @@ def run(run_date: str | None = None) -> None:
     )
 
     # Enrich positions with sector. Lookup chain:
+    #   0. index/ETF core (SPY etc.) → "Broad Market / Index" — not a GICS
+    #      constituent, so it must short-circuit before the sector lookups
+    #      (an index ETF must never be mislabeled with a sector even if it
+    #      somehow appears in a lookup table).
     #   1. signals.json today (universe + buy_candidates)
     #   2. trades.db entry_trade.sector
     #   3. S&P 500+400 constituents.json (latest weekly snapshot) — catches
@@ -447,7 +476,7 @@ def run(run_date: str | None = None) -> None:
     #      today's research universe (e.g. dividend-reinvestment remnants).
     # A missing sector is an observability failure (blank rows in sector
     # attribution), not a hard error — log loudly and continue with "Unknown"
-    # only when all three sources miss.
+    # only when all sources miss.
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
     try:
         sig_data, _ = _load_signals_from_s3(signals_bucket, run_date)
@@ -459,6 +488,10 @@ def run(run_date: str | None = None) -> None:
         constituents_lookup: dict[str, str] | None = None
         for ticker in positions:
             if positions[ticker].get("sector"):
+                continue
+            etf_sector = _index_etf_sector(ticker)
+            if etf_sector:
+                positions[ticker]["sector"] = etf_sector
                 continue
             if ticker in sector_lookup:
                 positions[ticker]["sector"] = sector_lookup[ticker]
