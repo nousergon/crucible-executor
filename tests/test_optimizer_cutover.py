@@ -2,8 +2,10 @@
 Unit tests for executor/optimizer_cutover.py — PR 5 of portfolio-optimizer arc.
 
 Covers:
-  - is_log_usable: happy + every failure mode (no log, sentinel, infeasible,
-    empty would_be_trades)
+  - is_log_usable: happy + every failure mode (no log, sentinel, infeasible).
+    An optimal/ok solve with EMPTY would_be_trades is a valid HOLD, not a
+    failure — it is usable (apply → safe no-op). Regression lock for the
+    2026-05-19 conflation bug.
   - apply_optimizer_targets_to_orderbook:
       * BUY → entry record with optimizer-derived shares / dollars / triggers
       * SELL @ target=0 → urgent_exit EXIT for full held shares
@@ -67,13 +69,50 @@ def test_is_log_usable_infeasible_diag():
     assert is_log_usable(log) is False
 
 
-def test_is_log_usable_empty_trades():
+def test_is_log_usable_optimal_with_no_trades_is_usable():
+    """2026-05-19 regression: an optimal/ok solve with EMPTY
+    would_be_trades is the optimizer's valid 'current ≈ target, hold'
+    verdict — usable, NOT a failure. Previously conflated with genuine
+    failures, producing a false 'operator must investigate' ERROR."""
     log = {
         "shadow_status": "ok",
-        "diagnostics": {"status": "optimal"},
+        "diagnostics": {"status": "optimal", "turnover_one_way": 0.0017},
         "would_be_trades": [],
     }
-    assert is_log_usable(log) is False
+    assert is_log_usable(log) is True
+
+
+def test_is_log_usable_missing_would_be_trades_key_still_usable():
+    """Absent (not just empty) would_be_trades on a clean solve is also a
+    valid hold — usability depends only on the solve status."""
+    log = {"shadow_status": "ok", "diagnostics": {"status": "optimal"}}
+    assert is_log_usable(log) is True
+
+
+def test_apply_optimizer_empty_trades_is_safe_noop():
+    """The caller path for a hold day: usable log + empty would_be_trades
+    → zero entries/exits, no exception (planner logs INFO, not ERROR)."""
+    ob = OrderBook({"date": "2026-05-19", "entries": [], "urgent_exits": [],
+                     "stops": [], "executed_today": []})
+    entries, exits = apply_optimizer_targets_to_orderbook(
+        log={"shadow_status": "ok",
+             "diagnostics": {"status": "optimal"},
+             "would_be_trades": []},
+        ob=ob,
+        ibkr=MagicMock(),
+        current_positions={},
+        price_histories={},
+        atr_map={},
+        strategy_config={},
+        vwap_map={},
+        signals_raw={"date": "2026-05-19", "signals": {}},
+        predictions_by_ticker={},
+        market_regime="neutral",
+        run_date="2026-05-19",
+        predictions_date="2026-05-19",
+    )
+    assert entries == []
+    assert exits == []
 
 
 # ── apply_optimizer_targets_to_orderbook ───────────────────────────────────────

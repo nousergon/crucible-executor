@@ -1490,6 +1490,18 @@ def run(
                     predictions_date=predictions_date,
                 )
                 n_entered = len(opt_entries)
+                if not opt_entries and not opt_exits:
+                    _diag = (shadow_log or {}).get("diagnostics") or {}
+                    logger.info(
+                        "Optimizer solved %r with no rebalance trades "
+                        "(turnover_one_way=%s below the trade threshold) — "
+                        "the current portfolio already matches target. Order "
+                        "book intentionally carries no optimizer entries/"
+                        "exits today; existing positions are retained with "
+                        "stops. This is a valid HOLD, not a fault.",
+                        _diag.get("status"),
+                        _diag.get("turnover_one_way"),
+                    )
             else:
                 logger.error(
                     "use_portfolio_optimizer=True but optimizer log is not "
