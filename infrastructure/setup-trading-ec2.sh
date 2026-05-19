@@ -68,19 +68,31 @@ fi
 sudo bash "$REPO_DIR/infrastructure/install-boot-pull.sh"
 
 # ── 6. Systemd services ────────────────────────────────────────────────────
-# Only xvfb + ibgateway are autostarted on boot. The morning planner
-# and daemon run exclusively from the weekday Step Function via SSM
-# (RunMorningPlanner + RunDaemon steps). Service unit files for the
-# planner + daemon + safety-net timer are still copied to
-# /etc/systemd/system/ so operators can manually `systemctl start`
-# them for break-glass scenarios, but they are NOT enabled — so a
-# fresh boot does not race the SF for the orderbook (incident:
-# 2026-05-05, daemon ran with stale predictions because boot-systemd
-# fired before MorningEnrich + PredictorInference completed).
+# Only xvfb + ibgateway are autostarted on boot. The morning planner and
+# daemon run EXCLUSIVELY from the weekday Step Function via SSM
+# (RunMorningPlanner + RunDaemon steps) — the SF is the sole authority
+# that starts the daemon, and it only reaches RunDaemon after
+# RunMorningPlanner has written today's order book.
+#
+# NO alpha-engine-daemon.timer. It is deliberately absent from the repo.
+# `boot-pull.sh` force-enables EVERY *.timer present in
+# infrastructure/systemd/ on every boot (the "every shipped timer MUST be
+# enabled" reconciliation). A daemon .timer in the repo therefore can NOT
+# stay disabled — boot-pull re-enables it every boot and it fires on its
+# wall clock regardless of whether the SF ran or succeeded. That is
+# exactly the 2026-05-19 failure: the SF FAILED at MorningEnrich, yet the
+# (boot-pull-re-enabled) daemon.timer started the daemon at 06:29 PT with
+# no order book — and the 2026-05-05 stale-predictions incident before
+# it. The .service unit is still shipped (SF `RunDaemon` does
+# `systemctl restart` on it; services are NOT force-enabled by boot-pull,
+# only timers) but there is no timer and no boot autostart, so the only
+# way the daemon ever starts is the SF. If a daemon.timer ever reappears
+# on an instance, boot-pull's orphan reconciliation (no repo source →
+# `disable --now` + rm) retires it on the next boot.
 SYSTEMD_DIR="$REPO_DIR/infrastructure/systemd"
 
 for unit in xvfb.service ibgateway.service alpha-engine-morning.service \
-            alpha-engine-daemon.service alpha-engine-daemon.timer; do
+            alpha-engine-daemon.service; do
     sudo cp "$SYSTEMD_DIR/$unit" /etc/systemd/system/
 done
 
