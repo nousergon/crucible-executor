@@ -150,6 +150,21 @@ regime_drawdown_ceil:  1.40      # clamp upper bound (max loosening = 40%)
 # would have helped the skilled-risk basket.
 regime_forced_bear_enabled: false  # gate-off by default; flip after F1+F2 gates
 
+# ── Drawdown regime leg (regime-drawdown-hysteresis-260518) ───────────────
+# Off by default; ships dormant + parallel-observe, same discipline as
+# the forced-bear flag above. The deterministic drawdown leg (3rd leg of
+# the regime ensemble; s3://.../regime/drawdown/latest.json, produced by
+# alpha-engine-predictor's daily stage) emits a composed effective
+# regime. When ON, it overrides the planner's effective ``market_regime``
+# by MOST-PROTECTIVE (never a downgrade): drawdown "bear" forces bear,
+# "caution" raises neutral/bull → caution but never lowers an
+# already-bear posture. The leg is READ every cycle regardless of this
+# flag (parallel-observe); only the override is gated. Operator flips
+# ``drawdown_regime_enabled: true`` after the skilled-risk-basket
+# counterfactual clears over the observe window (plan §5, observe→promote
+# — same gate shape as Stage-F F2).
+drawdown_regime_enabled: false  # gate-off by default; flip after observe→promote gate
+
 # ── Regime-conditional entry score threshold (Stage D' Wire 5, regime-v3-260514) ─
 # Off by default; ships dormant. When ON, ``min_score_to_enter`` is adjusted by
 # ``-intensity_z * regime_min_score_scale`` clamped to

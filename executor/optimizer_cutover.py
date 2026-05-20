@@ -41,6 +41,18 @@ def is_log_usable(log: dict | None) -> bool:
     Conservative gate: refuses anything but a clean ``optimal`` /
     ``optimal_inaccurate`` solve. Callers fall back to an empty order
     book on False (safer than wrong trades).
+
+    An ``optimal``/``ok`` solve with an EMPTY ``would_be_trades`` is
+    *usable* — it is the optimizer's legitimate verdict that the current
+    portfolio already matches the target within the turnover threshold
+    ("hold" day). It is NOT a failure. Conflating it with a genuine
+    failure (None / non-ok / non-optimal diag) was a real bug: the
+    2026-05-19 weekday rerun solved ``optimal`` with turnover 0.17%
+    (would_be_trades=[]) yet the planner logged a false
+    ``optimizer log is not usable … Operator must investigate`` ERROR
+    and framed a correct hold as a safety fallback. Emptiness is now the
+    caller's concern (apply → a safe no-op; log INFO, not ERROR), not a
+    usability signal.
     """
     if not log:
         return False
@@ -48,8 +60,6 @@ def is_log_usable(log: dict | None) -> bool:
         return False
     diag = log.get("diagnostics") or {}
     if diag.get("status") not in _OK_DIAG_STATUSES:
-        return False
-    if not log.get("would_be_trades"):
         return False
     return True
 

@@ -95,6 +95,44 @@ def extract_forced_bear(fast_signal: dict | None) -> bool:
     return fast_signal.get("forced_bear") is True
 
 
+REGIME_DRAWDOWN_PREFIX = "regime/drawdown"
+
+
+def read_drawdown_substrate(s3_bucket: str) -> dict | None:
+    """Read the latest daily drawdown-leg artifact (regime ensemble leg 3).
+
+    Mirror of ``read_fast_signal``. Wraps ``load_latest_eval_artifact``
+    on ``s3://{bucket}/regime/drawdown/latest.json`` — the observe-only
+    deterministic drawdown leg produced by alpha-engine-predictor's
+    daily ``regime_fast_signal`` stage (regime-drawdown-hysteresis-
+    260518.md). Returns the parsed payload (``spy``, ``excess``,
+    ``effective_regime``, ``observed``, …) or ``None`` if unavailable.
+    ``None`` ⇒ the executor applies no drawdown override (legacy
+    behavior preserved).
+    """
+    s3 = boto3.client("s3")
+    return load_latest_eval_artifact(
+        s3, bucket=s3_bucket, prefix=REGIME_DRAWDOWN_PREFIX,
+    )
+
+
+def extract_drawdown_effective_regime(payload: dict | None) -> str | None:
+    """Pull the composed ``effective_regime`` string out of a drawdown
+    artifact.
+
+    The daily stage stores ``effective_regime`` as the
+    ``compose_effective_regime`` dict (``{"effective_regime": str,
+    "drivers": {...}}``); a bare string is also tolerated for schema
+    resilience. Returns ``None`` when absent/malformed (⇒ no override).
+    """
+    if not isinstance(payload, dict):
+        return None
+    er = payload.get("effective_regime")
+    if isinstance(er, dict):
+        er = er.get("effective_regime")
+    return er if isinstance(er, str) and er else None
+
+
 def read_predictions(s3_bucket: str) -> tuple[dict[str, dict], str | None]:
     """
     Read predictor/predictions/latest.json from S3.

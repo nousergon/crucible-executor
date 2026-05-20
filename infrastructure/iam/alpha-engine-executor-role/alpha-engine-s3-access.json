@@ -43,7 +43,8 @@
                 "arn:aws:s3:::alpha-engine-research/predictor/predictions/*",
                 "arn:aws:s3:::alpha-engine-research/predictor/price_cache/*",
                 "arn:aws:s3:::alpha-engine-research/predictor/price_cache_slim/*",
-                "arn:aws:s3:::alpha-engine-research/predictor/metrics/*"
+                "arn:aws:s3:::alpha-engine-research/predictor/metrics/*",
+                "arn:aws:s3:::alpha-engine-research/reference/price_cache/*"
             ]
         },
         {

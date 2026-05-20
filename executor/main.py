@@ -1043,6 +1043,55 @@ def run(
                     "applied; legacy regime behavior preserved.", _fb_err,
                 )
 
+        # ── 2b'''. Resolve drawdown-leg posture override ──────────────────────
+        # regime-drawdown-hysteresis-260518.md (regime ensemble leg 3).
+        # The deterministic drawdown leg (alpha-engine-predictor daily
+        # stage) emits a composed effective_regime. When acting, it
+        # overrides the planner's effective market_regime by
+        # MOST-PROTECTIVE (never a downgrade): a drawdown "bear" forces
+        # bear; a drawdown "caution" raises neutral/bull → caution but
+        # never lowers an already-bear posture (e.g. one a forced_bear
+        # override just set). Same UNGATED-read / GATED-behavior +
+        # parallel-observe discipline as the forced-bear block above;
+        # gated on ``drawdown_regime_enabled`` (default false).
+        if not simulate:
+            try:
+                from executor.signal_reader import (
+                    extract_drawdown_effective_regime,
+                    read_drawdown_substrate,
+                )
+                _dd = extract_drawdown_effective_regime(
+                    read_drawdown_substrate(signals_bucket)
+                )
+                _rank = {
+                    "bull": 0, "bullish": 0, "neutral": 1,
+                    "caution": 2, "bear": 3, "bearish": 3,
+                }
+                _cur_rank = _rank.get((market_regime or "").lower(), 1)
+                _dd_rank = _rank.get((_dd or "").lower(), -1)
+                if _dd in ("bear", "caution") and _dd_rank > _cur_rank:
+                    if config.get("drawdown_regime_enabled", False):
+                        logger.warning(
+                            "DRAWDOWN regime active — overriding effective "
+                            "market_regime '%s' → '%s' for this planning "
+                            "cycle (research regime preserved for audit). "
+                            "Source: daily drawdown leg (most-protective).",
+                            market_regime, _dd,
+                        )
+                        market_regime = _dd
+                    else:
+                        logger.info(
+                            "drawdown_regime OBSERVE (flag off): drawdown "
+                            "effective_regime=%s; would override "
+                            "market_regime '%s' → '%s'. No behavior change.",
+                            _dd, market_regime, _dd,
+                        )
+            except Exception as _dd_err:
+                logger.warning(
+                    "drawdown-leg read failed (%s) — drawdown override not "
+                    "applied; legacy regime behavior preserved.", _dd_err,
+                )
+
         # ── 2c. Compute graduated drawdown multiplier ──────────────────────────
         # Pass an events sink so any halt/throttle event lands in
         # `risk_events` ONCE per planning cycle (the per-ticker check_order
@@ -1441,6 +1490,18 @@ def run(
                     predictions_date=predictions_date,
                 )
                 n_entered = len(opt_entries)
+                if not opt_entries and not opt_exits:
+                    _diag = (shadow_log or {}).get("diagnostics") or {}
+                    logger.info(
+                        "Optimizer solved %r with no rebalance trades "
+                        "(turnover_one_way=%s below the trade threshold) — "
+                        "the current portfolio already matches target. Order "
+                        "book intentionally carries no optimizer entries/"
+                        "exits today; existing positions are retained with "
+                        "stops. This is a valid HOLD, not a fault.",
+                        _diag.get("status"),
+                        _diag.get("turnover_one_way"),
+                    )
             else:
                 logger.error(
                     "use_portfolio_optimizer=True but optimizer log is not "
