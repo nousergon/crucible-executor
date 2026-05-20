@@ -18,6 +18,7 @@ from datetime import date, timedelta
 import boto3
 import pandas as pd
 import yaml
+from pydantic import BaseModel, Field, ValidationError
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from executor.eod_emailer import send_eod_email
@@ -257,8 +258,54 @@ def _build_position_contexts(
     return contexts, data_warnings
 
 
+class _Narrative(BaseModel):
+    """One per-position rationale."""
+
+    ticker: str = Field(..., description="Position ticker symbol (e.g. AAPL).")
+    narrative: str = Field(
+        ...,
+        description=(
+            "2-3 sentences explaining why this position is held today, citing the "
+            "research thesis, technical signals, and GBM predictions where relevant. "
+            "If a trade was made today, the narrative also explains why."
+        ),
+    )
+
+
+class _RationalesResponse(BaseModel):
+    """Tool-use payload for the EOD rationale synthesis call. The Anthropic
+    SDK validates this shape at the tool-use layer; Pydantic re-validates it
+    here for type safety + strict-field enforcement. Replaces the legacy
+    "ask for JSON in the prompt and json.loads the text" pattern that L1248
+    / L2669 documented as recurrence-prone (markdown fences, preamble,
+    trailing text — string-pattern whack-a-mole)."""
+
+    narratives: list[_Narrative] = Field(
+        ...,
+        description="One narrative per position in the input list.",
+    )
+
+
+_RATIONALES_TOOL = {
+    "name": "emit_rationales",
+    "description": (
+        "Emit per-position rationales for the EOD report. Call this tool exactly "
+        "once with the full list — one narrative per input position."
+    ),
+    "input_schema": _RationalesResponse.model_json_schema(),
+}
+
+
 def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
-    """Call Haiku to synthesize per-position narratives. Falls back to templates."""
+    """Call Haiku via Anthropic tool-use + Pydantic validation to synthesize
+    per-position narratives. Falls back to templates on any failure.
+
+    L1248 / L2669: previous implementation read Haiku's freeform text and
+    tried to ``json.loads`` it — recurrence-prone (markdown fences /
+    preamble / trailing text). Tool-use makes the parse failure mode
+    structurally impossible: Haiku returns a typed ``tool_use`` block
+    whose ``input`` is schema-validated by the SDK *before* it lands here.
+    """
     if not contexts:
         return {}
 
@@ -272,17 +319,38 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
             "For each position below, write 2-3 sentences explaining why it is held, "
             "focusing on near-term catalysts (research thesis, technical signals, GBM predictions). "
             "If a trade was made today, explain why. Be specific about numbers.\n\n"
-            "Return valid JSON only: {\"narratives\": [{\"ticker\": \"XXX\", \"narrative\": \"...\"}]}\n\n"
+            "Call the emit_rationales tool exactly once with one narrative per position.\n\n"
             f"Positions:\n{json.dumps(contexts, indent=2, default=str)}"
         )
 
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2000,
+            tools=[_RATIONALES_TOOL],
+            tool_choice={"type": "tool", "name": "emit_rationales"},
             messages=[{"role": "user", "content": prompt}],
         )
-        result = json.loads(response.content[0].text)
-        return {n["ticker"]: n["narrative"] for n in result.get("narratives", [])}
+        # tool_choice={"type": "tool", "name": ...} forces Haiku to emit a
+        # tool_use block — but Anthropic still allows additional text blocks
+        # alongside it. Pick the tool_use block explicitly.
+        tool_use = next(
+            (b for b in response.content if getattr(b, "type", None) == "tool_use"),
+            None,
+        )
+        if tool_use is None:
+            raise RuntimeError(
+                "Haiku response missing the forced emit_rationales tool_use block — "
+                f"stop_reason={response.stop_reason!r}"
+            )
+        try:
+            parsed = _RationalesResponse.model_validate(tool_use.input)
+        except ValidationError as e:
+            logger.warning(
+                f"LLM rationale tool_use failed Pydantic validation: {e} — "
+                f"input={tool_use.input!r}"
+            )
+            raise
+        return {n.ticker: n.narrative for n in parsed.narratives}
     except Exception as e:
         logger.warning(f"LLM rationale synthesis failed: {e} — using template fallback")
 

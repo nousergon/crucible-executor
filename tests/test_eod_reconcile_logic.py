@@ -10,6 +10,8 @@ from executor.eod_reconcile import (
     _apply_dividend_delta,
     _compute_unattributed_residual_pct,
     _load_constituents_sector_map,
+    _Narrative,
+    _RationalesResponse,
     _resolve_prior_price,
     _synthesize_rationales,
 )
@@ -191,6 +193,137 @@ class TestSynthesizeRationales:
         assert len(result) == 2
         assert "AAPL" in result
         assert "MSFT" in result
+
+
+class TestRationalesResponsePydantic:
+    """L1248/L2669: Pydantic model that validates the tool-use payload
+    returned by Haiku. Validation here makes the parse-failure-mode that
+    bare json.loads used to hit (markdown fences, preamble, trailing
+    text) structurally impossible — the SDK has already shape-checked
+    the tool_use.input before we see it; this re-validates field types."""
+
+    def test_valid_payload(self):
+        payload = {"narratives": [{"ticker": "AAPL", "narrative": "x" * 50}]}
+        parsed = _RationalesResponse.model_validate(payload)
+        assert len(parsed.narratives) == 1
+        assert parsed.narratives[0].ticker == "AAPL"
+
+    def test_empty_narratives_list_valid(self):
+        # The model permits an empty list — Haiku may emit zero narratives if
+        # the contexts list was empty (the caller short-circuits this earlier,
+        # but the contract should still accept it).
+        parsed = _RationalesResponse.model_validate({"narratives": []})
+        assert parsed.narratives == []
+
+    def test_missing_narratives_field_raises(self):
+        from pydantic import ValidationError as PydValidationError
+        with pytest.raises(PydValidationError):
+            _RationalesResponse.model_validate({})
+
+    def test_narrative_missing_ticker_raises(self):
+        from pydantic import ValidationError as PydValidationError
+        with pytest.raises(PydValidationError):
+            _RationalesResponse.model_validate({"narratives": [{"narrative": "no ticker"}]})
+
+    def test_narrative_missing_narrative_raises(self):
+        from pydantic import ValidationError as PydValidationError
+        with pytest.raises(PydValidationError):
+            _RationalesResponse.model_validate({"narratives": [{"ticker": "AAPL"}]})
+
+    def test_narrative_wrong_type_raises(self):
+        from pydantic import ValidationError as PydValidationError
+        with pytest.raises(PydValidationError):
+            _RationalesResponse.model_validate({"narratives": [{"ticker": 123, "narrative": "x"}]})
+
+
+class TestSynthesizeRationalesToolUse:
+    """End-to-end coverage of the Anthropic tool-use path. The Anthropic
+    client is fully mocked so no real API call happens; the assertions
+    pin (a) the tool/tool_choice wiring (b) Pydantic-validated input
+    flows through to the returned dict (c) malformed / missing tool_use
+    blocks fall back to the template path."""
+
+    def _make_mock_anthropic(self, tool_use_input: dict | None, *, stop_reason: str = "tool_use", include_text_block: bool = False):
+        """Build a MagicMock anthropic module + client + response chain.
+        ``tool_use_input=None`` simulates a response with no tool_use block
+        (degenerate-mode probe). Otherwise the mocked tool_use block carries
+        ``input=tool_use_input``."""
+        mock_anthropic = MagicMock()
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+
+        blocks = []
+        if include_text_block:
+            text_block = MagicMock()
+            text_block.type = "text"
+            text_block.text = "Sure, here are the rationales:"
+            blocks.append(text_block)
+        if tool_use_input is not None:
+            tool_block = MagicMock()
+            tool_block.type = "tool_use"
+            tool_block.input = tool_use_input
+            blocks.append(tool_block)
+
+        mock_response = MagicMock()
+        mock_response.content = blocks
+        mock_response.stop_reason = stop_reason
+        mock_client.messages.create.return_value = mock_response
+        return mock_anthropic, mock_client
+
+    def test_tool_use_happy_path(self):
+        mock_anthropic, mock_client = self._make_mock_anthropic(
+            {"narratives": [
+                {"ticker": "AAPL", "narrative": "Held — research score 82, GBM UP."},
+                {"ticker": "MSFT", "narrative": "Reduced 5 shares today on profit-take."},
+            ]}
+        )
+        contexts = [{"ticker": "AAPL"}, {"ticker": "MSFT"}]
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            result = _synthesize_rationales(contexts)
+        assert result == {
+            "AAPL": "Held — research score 82, GBM UP.",
+            "MSFT": "Reduced 5 shares today on profit-take.",
+        }
+        # Verify the SDK was invoked with the forced tool_choice wiring.
+        call_kwargs = mock_client.messages.create.call_args.kwargs
+        assert call_kwargs["tool_choice"] == {"type": "tool", "name": "emit_rationales"}
+        assert call_kwargs["tools"][0]["name"] == "emit_rationales"
+
+    def test_tool_use_with_preceding_text_block(self):
+        # Anthropic permits a text block before the tool_use block — the
+        # synthesizer must pick the tool_use block, not the first content block.
+        mock_anthropic, _ = self._make_mock_anthropic(
+            {"narratives": [{"ticker": "GOOG", "narrative": "y" * 40}]},
+            include_text_block=True,
+        )
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            result = _synthesize_rationales([{"ticker": "GOOG"}])
+        assert result == {"GOOG": "y" * 40}
+
+    def test_missing_tool_use_falls_back_to_template(self):
+        # Haiku stopped without emitting the forced tool — template fallback.
+        mock_anthropic, _ = self._make_mock_anthropic(None, stop_reason="end_turn", include_text_block=True)
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            result = _synthesize_rationales([{"ticker": "AAPL", "research_score": 82.0, "conviction": "rising"}])
+        # Template fallback populates from the context — research_score should
+        # be in the rendered text.
+        assert "AAPL" in result
+        assert "82" in result["AAPL"]
+        assert "rising" in result["AAPL"]
+
+    def test_malformed_tool_input_falls_back_to_template(self):
+        # tool_use block present but input doesn't match the Pydantic schema.
+        mock_anthropic, _ = self._make_mock_anthropic({"narratives": [{"ticker": "AAPL"}]})  # missing 'narrative'
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            result = _synthesize_rationales([{"ticker": "AAPL", "research_score": 90.0}])
+        # Template fallback fires; AAPL is still rendered from the context.
+        assert "AAPL" in result
+        assert "90" in result["AAPL"]
+
+    def test_empty_contexts_short_circuits(self):
+        # Empty input never calls the SDK — verify by leaving anthropic
+        # unmocked; a real import would still resolve but not be invoked.
+        assert _synthesize_rationales([]) == {}
 
 
 class TestLoadConstituentsSectorMap:
