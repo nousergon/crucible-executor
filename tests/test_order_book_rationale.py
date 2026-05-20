@@ -123,6 +123,10 @@ def scenario():
         calendar_date="2026-05-15",
         trading_day="2026-05-15",
         run_id="2605151400",
+        # KO is the held ticker — must come from portfolio truth, not
+        # the research `hold` bucket (research HOLD on a non-held ticker
+        # is a recommendation that wasn't acted on, not a held state).
+        current_positions={"KO": {"mkt_val": 1000}},
     )
 
 
@@ -429,12 +433,13 @@ class TestOptimizerShadowLogSynthesis:
         assert by_ticker["KO"]["terminal_state"] == STATE_HELD
 
     def test_legacy_path_with_no_shadow_log_unchanged(self, scenario):
-        # Backwards compat: no optimizer_shadow_log → identical output to
-        # pre-L121 behavior.
+        # Backwards compat: omitting optimizer_shadow_log → identical
+        # output to pre-L121 behavior. Both paths still receive the
+        # scenario's `current_positions` (the held-ticker source), so
+        # the diff isolates shadow-log presence only.
         payload_legacy = build_order_book_rationale(**scenario)
-        payload_no_log = build_order_book_rationale(
-            **scenario, optimizer_shadow_log=None, current_positions=None,
-        )
+        scenario_no_log = {**scenario, "optimizer_shadow_log": None}
+        payload_no_log = build_order_book_rationale(**scenario_no_log)
         assert payload_legacy["summary"] == payload_no_log["summary"]
         assert payload_legacy["tickers"] == payload_no_log["tickers"]
 
@@ -475,3 +480,168 @@ class TestOptimizerShadowLogSynthesis:
         assert isinstance(elig, np.ndarray)
         assert elig.tolist() == [True, False, True, True]
         assert reasons == [None, "score_below_min", None, None]
+
+
+# ── held detection sourced from portfolio truth (current_positions) ──
+#
+# Regression coverage for the 2026-05-20 incident: AXP/LMT were held in
+# the IB portfolio with the optimizer maintaining their target weights,
+# but the producer was deriving STATE_HELD from `signals.json["hold"]`
+# (a research recommendation, not portfolio truth) — so AXP/LMT fell
+# through to STATE_NO_ACTION while SYK (research HOLD but cur_w=0)
+# wrongly showed as STATE_HELD. The fix routes the held branch through
+# `current_positions` and surfaces the optimizer's maintain-decision.
+
+
+class TestHeldFromPortfolioTruth:
+    def _empty_books(self) -> dict[str, Any]:
+        return {
+            "date": "2026-05-20",
+            "approved_entries": [],
+            "urgent_exits": [],
+            "active_stops": [],
+            "executed_today": [],
+        }
+
+    def test_held_ticker_with_research_enter_signal_state_held(self):
+        # AXP case: held in portfolio, research signal is ENTER (wants
+        # to add more), optimizer maintains target weight ≈ current
+        # weight, no order_book entry. Must resolve to STATE_HELD.
+        payload = build_order_book_rationale(
+            signals={"enter": [_sig("AXP", "ENTER", score=75.0)],
+                     "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={
+                "AXP": {"predicted_direction": "UP",
+                        "prediction_confidence": 0.33}},
+            order_book_data=self._empty_books(),
+            blocked_entries=[],
+            risk_events=[],
+            market_regime="neutral",
+            run_date="2026-05-20",
+            signal_date="2026-05-20",
+            prediction_date="2026-05-20",
+            calendar_date="2026-05-20",
+            trading_day="2026-05-20",
+            run_id="2605201400",
+            current_positions={"AXP": {"mkt_val": 8000}},
+        )
+        axp = next(r for r in payload["tickers"] if r["ticker"] == "AXP")
+        assert axp["terminal_state"] == STATE_HELD
+        assert axp["held"] is True
+
+    def test_non_held_ticker_with_research_hold_is_no_action(self):
+        # SYK case: research recommends HOLD but the ticker is not in
+        # the portfolio (cur_w=0). Research HOLD on a non-held ticker
+        # is an informational opinion, NOT a held state — resolve to
+        # STATE_NO_ACTION so the table doesn't claim we hold it.
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [], "reduce": [],
+                     "hold": [_sig("SYK", "HOLD")]},
+            predictions_by_ticker={},
+            order_book_data=self._empty_books(),
+            blocked_entries=[],
+            risk_events=[],
+            market_regime="neutral",
+            run_date="2026-05-20",
+            signal_date="2026-05-20",
+            prediction_date="2026-05-20",
+            calendar_date="2026-05-20",
+            trading_day="2026-05-20",
+            run_id="2605201400",
+            current_positions={},
+        )
+        syk = next(r for r in payload["tickers"] if r["ticker"] == "SYK")
+        assert syk["terminal_state"] == STATE_NO_ACTION
+        assert syk["held"] is False
+
+    def test_held_ticker_silent_from_research_appears_in_table(self):
+        # A position the IB portfolio holds but research has no opinion
+        # on this week must STILL appear in the considered universe so
+        # the table can answer "why is X held" for the full portfolio.
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            order_book_data=self._empty_books(),
+            blocked_entries=[],
+            risk_events=[],
+            market_regime="neutral",
+            run_date="2026-05-20",
+            signal_date="2026-05-20",
+            prediction_date="2026-05-20",
+            calendar_date="2026-05-20",
+            trading_day="2026-05-20",
+            run_id="2605201400",
+            current_positions={"LMT": {"mkt_val": 7000}},
+        )
+        tickers = {r["ticker"] for r in payload["tickers"]}
+        assert "LMT" in tickers
+        lmt = next(r for r in payload["tickers"] if r["ticker"] == "LMT")
+        assert lmt["terminal_state"] == STATE_HELD
+        assert lmt["held"] is True
+
+    def test_optimizer_block_populated_from_shadow_log(self):
+        # When the shadow log is present, each record carries the
+        # per-ticker optimizer view (current_weight, target_weight,
+        # alpha_hat, eligible) so the dashboard can render the
+        # maintain/reduce/select decision without re-loading the log.
+        shadow = {
+            "tickers": ["AXP", "MSFT"],
+            "current_weights": [0.08, 0.0],
+            "target_weights": [0.08, 0.0],
+            "alpha_hat": [0.039, -0.02],
+            "eligibility": [True, True],
+        }
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            order_book_data=self._empty_books(),
+            blocked_entries=[],
+            risk_events=[],
+            market_regime="neutral",
+            run_date="2026-05-20",
+            signal_date="2026-05-20",
+            prediction_date="2026-05-20",
+            calendar_date="2026-05-20",
+            trading_day="2026-05-20",
+            run_id="2605201400",
+            optimizer_shadow_log=shadow,
+            current_positions={"AXP": {"mkt_val": 8000}},
+        )
+        axp = next(r for r in payload["tickers"] if r["ticker"] == "AXP")
+        assert axp["optimizer"]["current_weight"] == 0.08
+        assert axp["optimizer"]["target_weight"] == 0.08
+        assert axp["optimizer"]["eligible"] is True
+        # Optimizer maintain-decision is in the chain for held tickers.
+        opt_stage = next(
+            (s for s in axp["decision_chain"] if s["stage"] == "optimizer"),
+            None,
+        )
+        assert opt_stage is not None
+        assert opt_stage["result"] == "maintain"
+        assert "tgt 8.00%" in opt_stage["detail"]
+        assert "cur 8.00%" in opt_stage["detail"]
+
+    def test_legacy_path_records_carry_held_false_and_null_optimizer(self):
+        # No shadow_log + no current_positions → backwards-compat:
+        # `held` is False for every record, `optimizer` is None.
+        payload = build_order_book_rationale(
+            signals={"enter": [_sig("AAPL", "ENTER")],
+                     "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            order_book_data={"date": "2026-05-20",
+                             "approved_entries": [_entry_with_meta("AAPL")],
+                             "urgent_exits": [], "active_stops": [],
+                             "executed_today": []},
+            blocked_entries=[],
+            risk_events=[],
+            market_regime="neutral",
+            run_date="2026-05-20",
+            signal_date="2026-05-20",
+            prediction_date="2026-05-20",
+            calendar_date="2026-05-20",
+            trading_day="2026-05-20",
+            run_id="2605201400",
+        )
+        aapl = next(r for r in payload["tickers"] if r["ticker"] == "AAPL")
+        assert aapl["held"] is False
+        assert aapl["optimizer"] is None

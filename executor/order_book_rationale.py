@@ -265,12 +265,16 @@ def build_order_book_rationale(
             appended to ``blocked_entries`` / ``risk_events`` — the
             legacy lists win on conflicts (legacy path is more
             authoritative when it ran).
-        current_positions: ``{ticker: position_dict}`` of held tickers,
-            used to suppress synthetic rejections for tickers that are
-            already in the portfolio (a "rejection" for a held ticker
-            is a research-EXIT, which the order book carries as
-            ``urgent_exits`` — that branch already paints the right
-            state).
+        current_positions: ``{ticker: position_dict}`` of held tickers
+            from the IB portfolio. This is the **authoritative source**
+            for whether a ticker is currently held — NOT the research
+            ``signals.json["hold"]`` bucket (which is a research
+            recommendation, not portfolio truth). Used to (a) set the
+            ``STATE_HELD`` terminal state and the per-record ``held``
+            boolean, (b) extend the considered universe so held tickers
+            appear in the table even when research is silent on them,
+            and (c) suppress synthetic optimizer rejections for tickers
+            already in the portfolio (those exit via ``urgent_exits``).
 
     Returns:
         Serializable payload dict (canonical eval_artifacts shape).
@@ -314,9 +318,33 @@ def build_order_book_rationale(
         if e.get("ticker") not in _legacy_event_tickers
     ]
     enter = {s.get("ticker"): s for s in signals.get("enter", []) if s.get("ticker")}
-    held = {s.get("ticker"): s for s in signals.get("hold", []) if s.get("ticker")}
+    research_hold = {
+        s.get("ticker"): s for s in signals.get("hold", []) if s.get("ticker")
+    }
     exited = {s.get("ticker"): s for s in signals.get("exit", []) if s.get("ticker")}
     reduced = {s.get("ticker"): s for s in signals.get("reduce", []) if s.get("ticker")}
+
+    # Per-ticker optimizer view, sourced from the shadow log's parallel
+    # lists (tickers / current_weights / target_weights / alpha_hat /
+    # eligibility). Empty dict for legacy non-optimizer runs.
+    optimizer_view: dict[str, dict[str, Any]] = {}
+    if isinstance(optimizer_shadow_log, Mapping):
+        _tks = optimizer_shadow_log.get("tickers") or []
+        _cw = optimizer_shadow_log.get("current_weights") or []
+        _tw = optimizer_shadow_log.get("target_weights") or []
+        _ah = optimizer_shadow_log.get("alpha_hat") or []
+        _el = optimizer_shadow_log.get("eligibility") or []
+        for i, tk in enumerate(_tks):
+            if not tk:
+                continue
+            optimizer_view[tk] = {
+                "current_weight": _cw[i] if i < len(_cw) else None,
+                "target_weight": _tw[i] if i < len(_tw) else None,
+                "alpha_hat": _ah[i] if i < len(_ah) else None,
+                "eligible": (
+                    bool(_el[i]) if i < len(_el) and _el[i] is not None else None
+                ),
+            }
 
     approved = {
         e.get("ticker"): e
@@ -343,20 +371,23 @@ def build_order_book_rationale(
             first_event[t] = ev
 
     considered = (
-        set(enter) | set(held) | set(exited) | set(reduced)
+        set(enter) | set(research_hold) | set(exited) | set(reduced)
         | set(approved) | set(urgent) | set(blocked) | set(first_event)
+        | _held_set
     )
 
     records: list[dict[str, Any]] = []
     for ticker in considered:
         sig = (
-            enter.get(ticker) or held.get(ticker)
+            enter.get(ticker) or research_hold.get(ticker)
             or exited.get(ticker) or reduced.get(ticker)
         )
         pred = predictions_by_ticker.get(ticker)
         ev = first_event.get(ticker)
         ob_entry = approved.get(ticker)
         ob_exit = urgent.get(ticker)
+        is_held = ticker in _held_set
+        opt_view = optimizer_view.get(ticker)
 
         chain: list[dict[str, Any]] = []
         exclusion: dict[str, Any] | None = None
@@ -437,16 +468,32 @@ def build_order_book_rationale(
                 "threshold": exclusion["threshold"],
                 "detail": exclusion["reason"],
             })
-        elif ticker in held:
+        elif is_held:
             state = STATE_HELD
+            # Surface the optimizer's maintain-decision for held tickers
+            # so the chain explains *why* the position is held today
+            # (target weight ≈ current weight, no rebalance trade).
+            if opt_view is not None:
+                _cw = opt_view.get("current_weight")
+                _tw = opt_view.get("target_weight")
+                chain.append({
+                    "stage": "optimizer",
+                    "result": "maintain",
+                    "detail": (
+                        f"tgt {_tw * 100:.2f}% / cur {_cw * 100:.2f}%"
+                        if _cw is not None and _tw is not None else None
+                    ),
+                })
         else:
             state = STATE_NO_ACTION
 
         records.append({
             "ticker": ticker,
             "terminal_state": state,
+            "held": is_held,
             "research": _research_block(sig),
             "predictor": _predictor_block(pred),
+            "optimizer": opt_view,
             "decision_chain": chain,
             "exclusion": exclusion,
             "order_book": ob_entry or ob_exit or None,
