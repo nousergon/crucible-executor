@@ -1553,6 +1553,13 @@ def run(
                     calendar_date=_dual.calendar_date,
                     trading_day=_dual.trading_day,
                     run_id=new_eval_run_id(),
+                    # L121 — when the portfolio optimizer is the
+                    # authoritative entry driver, legacy blocked/
+                    # risk_event lists are empty; the optimizer's
+                    # eligibility mask supplies the per-ticker
+                    # rejection reasons instead.
+                    optimizer_shadow_log=shadow_log,
+                    current_positions=current_positions,
                 )
                 write_order_book_rationale(
                     _rationale,
