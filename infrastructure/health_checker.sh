@@ -41,13 +41,29 @@ declare -A MAX_HOURS=(
 
 send_alert() {
     local msg="$1"
-    if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-        echo "ALERT (no Telegram): $msg"
-        return
+    # Migrated 2026-05-20 (ROADMAP L146) — was an inline `curl` to the
+    # Telegram bot API; now delegates to the canonical
+    # ``alpha_engine_lib.alerts`` primitive (v0.21.0, lib #52) which
+    # fans out to BOTH the SNS ``alpha-engine-alerts`` topic (→ email)
+    # AND ``@nous_ergon_alerts_bot``. The Bash-side contract is
+    # unchanged: ``send_alert "$msg"`` from anywhere in the script.
+    #
+    # Resolve a Python that has alpha_engine_lib installed — prefer the
+    # repo-local venv (matches the dispatcher-cleanup pattern in
+    # alpha-engine-backtester #231), fall back to whichever system
+    # python3 is on PATH. ``|| echo`` is the same graceful-degrade
+    # surface the pre-migration ``no Telegram`` branch provided.
+    local _alert_python
+    if [ -x "$(dirname "$0")/../.venv/bin/python" ]; then
+        _alert_python="$(dirname "$0")/../.venv/bin/python"
+    else
+        _alert_python="$(command -v python3 || command -v python || echo python)"
     fi
-    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d chat_id="${TELEGRAM_CHAT_ID}" \
-        -d text="$msg" > /dev/null 2>&1
+    "$_alert_python" -m alpha_engine_lib.alerts publish \
+        --message "$msg" \
+        --severity error \
+        --source alpha-engine/infrastructure/health_checker.sh \
+        > /dev/null 2>&1 || echo "ALERT (alerts.publish failed): $msg"
 }
 
 alerts=""
