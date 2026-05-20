@@ -310,3 +310,168 @@ def test_round_trip_via_lib_loader(scenario):
     )
     assert loaded["run_id"] == payload["run_id"]
     assert loaded["summary"]["n_considered"] == 7
+
+
+# ── optimizer-aware path (L121) ─────────────────────────────────────────
+
+
+class TestOptimizerShadowLogSynthesis:
+    """When use_portfolio_optimizer: true, the legacy _plan_entries path
+    is bypassed and blocked_entries / risk_events arrive EMPTY. The
+    rationale producer must source per-ticker rejection reasons from
+    the optimizer's shadow log to answer "why didn't ticker X enter?"
+    on the optimizer-driven path (ROADMAP L121)."""
+
+    def _optimizer_scenario(self):
+        """Optimizer-driven run. legacy lists are empty (legacy path skipped).
+        The shadow log carries the eligibility mask + reasons.
+        order_book_data carries the optimizer-translated approved + exits."""
+        signals = {
+            "enter": [
+                _sig("AAPL", "ENTER"),
+                _sig("NVDA", "ENTER", score=40.0),  # below min_score
+                _sig("AMD", "ENTER"),               # gbm_veto
+                _sig("F", "ENTER"),                 # universe but no score
+            ],
+            "exit": [_sig("MSFT", "EXIT")],
+            "reduce": [],
+            "hold": [_sig("KO", "HOLD")],
+        }
+        signals["enter"][3].pop("score", None)  # F has no score
+        predictions = {
+            "AAPL": {"predicted_direction": "UP", "predicted_alpha": 0.03},
+            "AMD": {"predicted_direction": "DOWN", "gbm_veto": True},
+        }
+        # Optimizer-translated order book: AAPL is the lone approved
+        # entry; MSFT comes through urgent_exits from the EXIT signal.
+        order_book = {
+            "date": "2026-05-15",
+            "approved_entries": [_entry_with_meta("AAPL")],
+            "urgent_exits": [
+                {"ticker": "MSFT", "signal": "EXIT", "shares": 50,
+                 "reason": "research_exit"},
+            ],
+            "active_stops": [],
+            "executed_today": [],
+        }
+        # Optimizer-shadow log shape per executor.optimizer_shadow._build_and_solve.
+        shadow_log = {
+            "shadow_status": "ok",
+            "tickers": ["AAPL", "NVDA", "AMD", "F", "MSFT", "KO", "SPY", "CASH"],
+            "eligibility": [True, False, False, False, False, True, True, True],
+            "eligibility_reasons": [
+                None,
+                "score_below_min",
+                "gbm_veto",
+                "no_score",
+                "signal_exit",
+                None,
+                None,
+                None,
+            ],
+            "optimizer_cfg": {"min_score_to_enter": 57.0},
+            "diagnostics": {"status": "optimal"},
+        }
+        return dict(
+            signals=signals,
+            predictions_by_ticker=predictions,
+            order_book_data=order_book,
+            blocked_entries=[],   # legacy path skipped
+            risk_events=[],       # legacy path skipped
+            market_regime="neutral",
+            run_date="2026-05-15",
+            signal_date="2026-05-15",
+            prediction_date="2026-05-15",
+            calendar_date="2026-05-15",
+            trading_day="2026-05-15",
+            run_id="2605151400",
+            optimizer_shadow_log=shadow_log,
+            current_positions={"KO": {"mkt_val": 1000}},
+        )
+
+    def test_optimizer_rejected_tickers_surface_in_rationale(self):
+        scenario = self._optimizer_scenario()
+        payload = build_order_book_rationale(**scenario)
+        by_ticker = {r["ticker"]: r for r in payload["tickers"]}
+        # NVDA: score below min → STATE_RISK_BLOCKED with min_score rule.
+        assert by_ticker["NVDA"]["terminal_state"] == STATE_RISK_BLOCKED
+        assert by_ticker["NVDA"]["exclusion"]["rule"] == "min_score_to_enter"
+        assert by_ticker["NVDA"]["exclusion"]["value"] == 40.0
+        assert by_ticker["NVDA"]["exclusion"]["threshold"] == 57.0
+
+    def test_optimizer_gbm_veto_surfaces_as_predictor_vetoed(self):
+        scenario = self._optimizer_scenario()
+        payload = build_order_book_rationale(**scenario)
+        by_ticker = {r["ticker"]: r for r in payload["tickers"]}
+        # AMD: gbm_veto → STATE_PREDICTOR_VETOED (event_type=override or
+        # rule in _PREDICTOR_RULES).
+        assert by_ticker["AMD"]["terminal_state"] == STATE_PREDICTOR_VETOED
+        assert by_ticker["AMD"]["exclusion"]["rule"] == "gbm_veto"
+
+    def test_optimizer_no_score_surfaces_as_risk_blocked(self):
+        scenario = self._optimizer_scenario()
+        payload = build_order_book_rationale(**scenario)
+        by_ticker = {r["ticker"]: r for r in payload["tickers"]}
+        # F: no score → STATE_RISK_BLOCKED with missing_score rule.
+        assert by_ticker["F"]["terminal_state"] == STATE_RISK_BLOCKED
+        assert by_ticker["F"]["exclusion"]["rule"] == "missing_score"
+
+    def test_optimizer_held_ticker_does_not_get_synthetic_rejection(self):
+        # KO is held (current_positions). Even if it were ineligible, we
+        # should NOT fabricate a "blocked" record — exits go through
+        # urgent_exits. Here KO IS eligible, so this is also a sanity
+        # check that the eligible branch doesn't produce noise.
+        scenario = self._optimizer_scenario()
+        payload = build_order_book_rationale(**scenario)
+        by_ticker = {r["ticker"]: r for r in payload["tickers"]}
+        # KO is held with no rebalance trade → STATE_HELD (research said
+        # HOLD; no order_book record).
+        assert by_ticker["KO"]["terminal_state"] == STATE_HELD
+
+    def test_legacy_path_with_no_shadow_log_unchanged(self, scenario):
+        # Backwards compat: no optimizer_shadow_log → identical output to
+        # pre-L121 behavior.
+        payload_legacy = build_order_book_rationale(**scenario)
+        payload_no_log = build_order_book_rationale(
+            **scenario, optimizer_shadow_log=None, current_positions=None,
+        )
+        assert payload_legacy["summary"] == payload_no_log["summary"]
+        assert payload_legacy["tickers"] == payload_no_log["tickers"]
+
+    def test_legacy_blocked_takes_precedence_over_synth(self):
+        # If both legacy and shadow_log produce rejection records for
+        # the same ticker, the legacy entry wins (it ran, it's
+        # authoritative). Mixed-path defensive case — production never
+        # produces this, but the dedup must be deterministic.
+        scenario = self._optimizer_scenario()
+        scenario["blocked_entries"] = [
+            {"ticker": "NVDA", "block_reason": "LEGACY reason"}
+        ]
+        scenario["risk_events"] = [
+            {"ticker": "NVDA", "event_type": "veto", "rule": "legacy_rule",
+             "value": 1.0, "threshold": 2.0, "reason": "LEGACY reason"}
+        ]
+        payload = build_order_book_rationale(**scenario)
+        nvda = next(r for r in payload["tickers"] if r["ticker"] == "NVDA")
+        # Legacy rule slug survives — synth row was filtered.
+        assert nvda["exclusion"]["rule"] == "legacy_rule"
+
+    def test_optimizer_shadow_eligibility_reasons_field_in_log(self):
+        # Sanity: the field name the producer reads matches what
+        # optimizer_shadow.py emits. Pins the contract between the two
+        # modules so a rename of either side is caught.
+        from executor.optimizer_shadow import _build_eligibility
+        import numpy as np
+        elig, reasons = _build_eligibility(
+            tickers=["AAA", "BBB", "SPY", "CASH"],
+            signals_by_ticker={"AAA": {"score": 80, "signal": "ENTER"},
+                               "BBB": {"score": 30, "signal": "ENTER"}},
+            predictions_by_ticker={},
+            current_positions={},
+            config={"min_score_to_enter": 57},
+            spy_idx=2,
+            cash_idx=3,
+        )
+        assert isinstance(elig, np.ndarray)
+        assert elig.tolist() == [True, False, True, True]
+        assert reasons == [None, "score_below_min", None, None]

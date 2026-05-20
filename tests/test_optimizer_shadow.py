@@ -197,7 +197,7 @@ def test_exit_signal_makes_ticker_ineligible():
     cash_idx = tickers.index("CASH")
     aapl_idx = tickers.index("AAPL")
 
-    eligibility = _build_eligibility(
+    eligibility, _reasons = _build_eligibility(
         tickers, inputs["signals_raw"]["signals"],
         inputs["predictions_by_ticker"], inputs["current_positions"],
         inputs["config"], spy_idx, cash_idx,
@@ -219,7 +219,7 @@ def test_gbm_veto_makes_ticker_ineligible():
     spy_idx = tickers.index("SPY")
     cash_idx = tickers.index("CASH")
 
-    eligibility = _build_eligibility(
+    eligibility, _reasons = _build_eligibility(
         tickers, inputs["signals_raw"]["signals"],
         inputs["predictions_by_ticker"], inputs["current_positions"],
         inputs["config"], spy_idx, cash_idx,

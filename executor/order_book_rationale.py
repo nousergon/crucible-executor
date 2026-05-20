@@ -77,7 +77,109 @@ _STATE_ORDER = {
 # drove the rejection — these map to STATE_PREDICTOR_VETOED so the
 # console can answer "blocked by the ML layer" distinctly from
 # "blocked by a hard risk rule". Sourced from deciders.py emit sites.
-_PREDICTOR_RULES = {"stance_gate", "momentum_gate"}
+_PREDICTOR_RULES = {"stance_gate", "momentum_gate", "gbm_veto"}
+
+# Mapping from optimizer_shadow eligibility-rejection slugs to the
+# (rule, event_type, human_message) tuple used to synthesize
+# risk_events for the optimizer-authoritative path. Maps to the same
+# state vocabulary as the legacy path:
+#   - ``gbm_veto`` → STATE_PREDICTOR_VETOED (predictor-driven)
+#   - everything else → STATE_RISK_BLOCKED (research/score-driven)
+_OPTIMIZER_REJECTION_SLUGS = {
+    "gbm_veto": (
+        "gbm_veto",
+        "override",
+        "Predictor high-confidence DOWN veto fired (gbm_veto=true).",
+    ),
+    "score_below_min": (
+        "min_score_to_enter",
+        "block",
+        "Research composite score below configured min_score_to_enter.",
+    ),
+    "no_score": (
+        "missing_score",
+        "block",
+        "No research score available for this ticker (universe entry but signals "
+        "missing).",
+    ),
+    # ``signal_exit`` is intentionally not surfaced as a block — research-EXIT
+    # tickers flow through urgent_exits in the order book and are handled by
+    # the existing exit_path branch in build_order_book_rationale.
+}
+
+
+def _synthesize_optimizer_rejections(
+    *,
+    shadow_log: Mapping[str, Any] | None,
+    signals_by_ticker: Mapping[str, Mapping[str, Any]],
+    current_positions: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Reconstruct ``blocked_entries`` + ``risk_events`` from the optimizer log.
+
+    When ``use_portfolio_optimizer: true`` the legacy ``_plan_entries``
+    path is bypassed (executor/main.py § "Process ENTER signals"), so
+    ``plan.blocked`` and ``plan.risk_events`` are empty — but the
+    optimizer's eligibility mask still encodes per-ticker rejection
+    reasons. This function projects those reasons into the same dict
+    shape the legacy path produces so
+    ``build_order_book_rationale`` can answer "why didn't ticker X
+    enter?" identically across both code paths.
+
+    Returns (synthetic_blocked_entries, synthetic_risk_events). Both
+    lists are stable-ordered by the optimizer's ``tickers`` order.
+
+    Tickers that are currently held are excluded — a "rejection" for an
+    already-held ticker is structurally a research-EXIT (which the
+    order book carries as ``urgent_exits``), not a missed entry.
+    """
+    if not shadow_log:
+        return [], []
+    tickers = shadow_log.get("tickers") or []
+    eligibility = shadow_log.get("eligibility") or []
+    reasons = shadow_log.get("eligibility_reasons") or []
+    opt_cfg = shadow_log.get("optimizer_cfg") or {}
+    min_score_threshold = opt_cfg.get("min_score_to_enter")
+
+    blocked: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+
+    for i, ticker in enumerate(tickers):
+        if i >= len(eligibility) or eligibility[i]:
+            continue
+        if ticker in current_positions:
+            continue
+        reason = reasons[i] if i < len(reasons) else None
+        mapped = _OPTIMIZER_REJECTION_SLUGS.get(reason or "")
+        if mapped is None:
+            continue
+        rule_slug, event_type, message = mapped
+
+        # Surface threshold + ticker's actual value when meaningful.
+        # score_below_min: threshold = min_score; value = the score.
+        # gbm_veto / no_score / others: best-effort, may be None.
+        sig = signals_by_ticker.get(ticker, {}) or {}
+        value: Any | None = None
+        threshold: Any | None = None
+        if reason == "score_below_min":
+            value = sig.get("score")
+            threshold = min_score_threshold
+        elif reason == "gbm_veto":
+            value = True
+        elif reason == "no_score":
+            value = None
+            threshold = min_score_threshold
+
+        blocked.append({"ticker": ticker, "block_reason": message})
+        events.append({
+            "ticker": ticker,
+            "event_type": event_type,
+            "rule": rule_slug,
+            "value": value,
+            "threshold": threshold,
+            "reason": message,
+        })
+
+    return blocked, events
 
 
 def _research_block(sig: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -123,6 +225,8 @@ def build_order_book_rationale(
     calendar_date: str,
     trading_day: str,
     run_id: str,
+    optimizer_shadow_log: Mapping[str, Any] | None = None,
+    current_positions: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Join the morning-planner decision structures into a per-ticker record.
 
@@ -142,17 +246,73 @@ def build_order_book_rationale(
             incl. ``sizing_factors`` + ``triggers``; ``urgent_exits``
             carry exit/reduce/cover records).
         blocked_entries: ``plan.blocked`` — per-ENTER rejections with a
-            free-text ``block_reason``.
+            free-text ``block_reason``. EMPTY when the portfolio
+            optimizer is the authoritative entry driver (legacy
+            ``_plan_entries`` bypassed); the missing information is
+            then sourced from ``optimizer_shadow_log``.
         risk_events: ``plan.risk_events`` — structured rule log with
             ``event_type`` / ``rule`` / ``value`` / ``threshold``.
+            Same EMPTY-on-optimizer-path caveat as ``blocked_entries``.
         market_regime: effective regime for the run.
         run_date / signal_date / prediction_date: lineage dates.
         calendar_date / trading_day: dual-tracked dates (LdP).
         run_id: ``YYMMDDHHMM`` from ``new_eval_run_id``.
+        optimizer_shadow_log: when present, sources synthetic blocked /
+            risk_event records from ``log["eligibility"]`` +
+            ``log["eligibility_reasons"]`` so the rationale answers
+            "why didn't ticker X enter?" for the optimizer-driven path
+            (``use_portfolio_optimizer: true``). Synthetic records are
+            appended to ``blocked_entries`` / ``risk_events`` — the
+            legacy lists win on conflicts (legacy path is more
+            authoritative when it ran).
+        current_positions: ``{ticker: position_dict}`` of held tickers,
+            used to suppress synthetic rejections for tickers that are
+            already in the portfolio (a "rejection" for a held ticker
+            is a research-EXIT, which the order book carries as
+            ``urgent_exits`` — that branch already paints the right
+            state).
 
     Returns:
         Serializable payload dict (canonical eval_artifacts shape).
     """
+    # Optimizer-aware augmentation — see _synthesize_optimizer_rejections
+    # docstring. Synthesized records extend the legacy lists; existing
+    # legacy entries take precedence (the legacy gate, when it ran, is
+    # the authoritative source).
+    _signals_by_ticker_for_synth: dict[str, dict[str, Any]] = {}
+    for bucket in ("enter", "hold", "exit", "reduce"):
+        for sig in signals.get(bucket, []) or []:
+            t = sig.get("ticker") if isinstance(sig, Mapping) else None
+            if t:
+                _signals_by_ticker_for_synth[t] = dict(sig)
+    _held_set = (
+        {t for t in (current_positions or {}).keys() if t}
+        if current_positions is not None
+        else set()
+    )
+    _legacy_blocked_tickers = {
+        (b.get("ticker") if isinstance(b, Mapping) else None)
+        for b in (blocked_entries or [])
+    }
+    _legacy_event_tickers = {
+        (ev.get("ticker") if isinstance(ev, Mapping) else None)
+        for ev in (risk_events or [])
+    }
+    _synth_blocked, _synth_events = _synthesize_optimizer_rejections(
+        shadow_log=optimizer_shadow_log,
+        signals_by_ticker=_signals_by_ticker_for_synth,
+        current_positions=_held_set,
+    )
+    # De-duplicate against legacy entries by ticker so a ticker the
+    # legacy path already explained doesn't get a second synthetic row.
+    blocked_entries = list(blocked_entries or []) + [
+        b for b in _synth_blocked
+        if b.get("ticker") not in _legacy_blocked_tickers
+    ]
+    risk_events = list(risk_events or []) + [
+        e for e in _synth_events
+        if e.get("ticker") not in _legacy_event_tickers
+    ]
     enter = {s.get("ticker"): s for s in signals.get("enter", []) if s.get("ticker")}
     held = {s.get("ticker"): s for s in signals.get("hold", []) if s.get("ticker")}
     exited = {s.get("ticker"): s for s in signals.get("exit", []) if s.get("ticker")}

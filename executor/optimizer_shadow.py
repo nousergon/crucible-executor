@@ -130,7 +130,7 @@ def _build_and_solve(
         tickers, signals_by_ticker, predictions_by_ticker,
         config, optimizer_cfg, spy_idx, cash_idx,
     )
-    eligibility = _build_eligibility(
+    eligibility, eligibility_reasons = _build_eligibility(
         tickers, signals_by_ticker, predictions_by_ticker,
         current_positions, config, spy_idx, cash_idx,
     )
@@ -163,6 +163,7 @@ def _build_and_solve(
         "current_weights": [float(x) for x in w_prev],
         "alpha_hat": [float(x) for x in alpha_hat],
         "eligibility": [bool(x) for x in eligibility],
+        "eligibility_reasons": list(eligibility_reasons),
         "stance_caps": [float(x) for x in stance_caps],
         "sectors": sectors,
         "would_be_trades": would_be_trades,
@@ -373,9 +374,30 @@ def _build_eligibility(
     config: dict,
     spy_idx: int,
     cash_idx: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, list[str | None]]:
+    """Compute per-ticker eligibility for new entries + the gate that
+    excluded each ineligible ticker.
+
+    Returns (eligibility_mask, reasons). ``reasons[i]`` is None for
+    eligible tickers, otherwise a stable slug naming the gate that
+    excluded the ticker — consumed downstream by
+    ``order_book_rationale.build_order_book_rationale`` to answer
+    "why didn't ticker X enter?" when the portfolio optimizer is the
+    authoritative driver (the legacy ``_plan_entries`` path is bypassed
+    and produces no ``blocked_entries`` / ``risk_events`` itself).
+
+    Reason slugs:
+      * ``"signal_exit"`` — research said EXIT.
+      * ``"gbm_veto"`` — predictor's high-confidence DOWN veto fired.
+      * ``"score_below_min"`` — research composite < ``min_score_to_enter``.
+      * ``"no_score"`` — no research signal / score for this ticker.
+
+    Held tickers stay eligible regardless of score (the optimizer
+    decides whether to reduce them).
+    """
     min_score = float(config.get("min_score_to_enter", 57))
     eligibility = np.ones(len(tickers), dtype=bool)
+    reasons: list[str | None] = [None] * len(tickers)
     for i, t in enumerate(tickers):
         if i in (spy_idx, cash_idx):
             continue
@@ -385,16 +407,22 @@ def _build_eligibility(
 
         if sig.get("signal") == "EXIT":
             eligibility[i] = False
+            reasons[i] = "signal_exit"
             continue
         if pred.get("gbm_veto") is True:
             eligibility[i] = False
+            reasons[i] = "gbm_veto"
             continue
         if is_held:
             continue
         score = sig.get("score")
-        if score is None or float(score) < min_score:
+        if score is None:
             eligibility[i] = False
-    return eligibility
+            reasons[i] = "no_score"
+        elif float(score) < min_score:
+            eligibility[i] = False
+            reasons[i] = "score_below_min"
+    return eligibility, reasons
 
 
 def _compute_trade_deltas(
