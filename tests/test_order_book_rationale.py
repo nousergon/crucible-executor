@@ -645,3 +645,44 @@ class TestHeldFromPortfolioTruth:
         aapl = next(r for r in payload["tickers"] if r["ticker"] == "AAPL")
         assert aapl["held"] is False
         assert aapl["optimizer"] is None
+
+
+# ── L171: OBR write-failure surfaces via alerts.publish ───────────────────
+
+
+def test_obr_write_failure_publishes_alert_not_silent_swallow():
+    """Pin the L171 fix (2026-05-22): an OBR write failure in
+    `executor/main.py` must reach the operator via
+    `alpha_engine_lib.alerts.publish` — silent warning-log only is
+    exactly the [[feedback_no_silent_fails]] failure mode (page 16
+    falls back to yesterday's snapshot with zero signal that today's
+    write never landed).
+
+    Source-inspection regression test (the surrounding `executor/main.py`
+    requires full executor harness to exercise); pin the structural
+    contract so a future refactor that drops the publish call breaks
+    at CI time.
+    """
+    import inspect
+    import executor.main as main_mod
+
+    src = inspect.getsource(main_mod)
+    # Locate the OBR-rationale write block — the WARN log + the
+    # alpha_engine_lib.alerts.publish must BOTH live in the except
+    # handler that wraps write_order_book_rationale.
+    assert "Order-book rationale write failed" in src, (
+        "OBR write-failure WARN log appears to have been refactored — "
+        "re-audit the new except handler for the L171 alert publish "
+        "before merging."
+    )
+    assert "obr_write_failed_" in src, (
+        "OBR write-failure handler must call `alpha_engine_lib.alerts.publish` "
+        "with a `dedup_key` starting `obr_write_failed_` so the failure "
+        "reaches Telegram/SNS rather than silently swallowing "
+        "([[feedback_no_silent_fails]])."
+    )
+    assert "from alpha_engine_lib import alerts" in src, (
+        "OBR write-failure handler must import alpha_engine_lib.alerts "
+        "lazily (inside the except) so a missing lib at boot doesn't "
+        "break the planner cold-start."
+    )

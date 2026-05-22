@@ -678,8 +678,16 @@ def run_daemon(dry_run: bool = False) -> None:
                     held_after = int(_phase0_positions[ticker].get("shares", 0)) - shares
                     _phase0_positions[ticker]["shares"] = held_after
 
+                # L165 (2026-05-22): pass the SEMANTIC action ("EXIT" /
+                # "REDUCE" / "COVER"), not the IB side ("SELL" / "BUY").
+                # The intraday `_execute_exit` path at L1094 already does
+                # this correctly; the prior asymmetric spelling caused
+                # "Telegram shows SELL but page 16 shows REDUCE" for
+                # morning urgent REDUCEs. The action label IS the
+                # alert's semantic payload — losing it silently fails
+                # the alert's purpose ([[feedback_no_silent_fails]]).
                 send_trade_alert(
-                    action=side,
+                    action=action,
                     ticker=ticker,
                     shares=shares,
                     price=fill_price,

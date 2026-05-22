@@ -328,3 +328,46 @@ class TestTriggerEodPipeline:
             _trigger_eod_pipeline({}, "2026-04-29")
             payload = json.loads(sfn.start_execution.call_args.kwargs["input"])
             assert "alpha-engine-alerts" in payload["sns_topic_arn"]
+
+
+# ── L165: urgent-exits action label semantic correctness ─────────────────
+
+
+class TestPhase0UrgentExitsActionLabel:
+    """Pin the L165 fix (2026-05-22): the urgent-exits loop must pass
+    the SEMANTIC action ("EXIT" / "REDUCE" / "COVER") to
+    send_trade_alert, NOT the IB side ("SELL" / "BUY").
+
+    Failure mode this catches: morning urgent REDUCEs surface in
+    Telegram as "SELL" (because the daemon previously passed `side`
+    instead of `action`), while page 16 / OBR shows the real action.
+    Asymmetric with the intraday `_execute_exit` path that already
+    passes `action=action` correctly. Source-inspection pin so a
+    future refactor that drops the fix breaks at CI time, not after
+    the next divergence incident.
+    """
+
+    def test_phase0_urgent_exit_passes_semantic_action_not_side(self):
+        import inspect
+        import executor.daemon as daemon
+
+        src = inspect.getsource(daemon)
+        # The Phase-0 urgent-exits loop must build `send_trade_alert`
+        # with `action=action`, not `action=side`. The exact spelling
+        # is asserted because that's the single-line bug class the L165
+        # fix closes — any future contributor copy-pasting from a
+        # pre-fix snippet falls into this pin.
+        assert "action=side" not in src, (
+            "daemon.py contains `action=side` — the L165 bug class is "
+            "back. Pass the semantic action label ('EXIT'/'REDUCE'/"
+            "'COVER') to send_trade_alert, not the IB side."
+        )
+        # And the urgent-exits loop's call must still use action= keyword.
+        # Pin the specific surrounding context so we'd notice a future
+        # refactor that moves the call to a helper without preserving
+        # the label.
+        assert 'trigger=f"urgent_{reason}"' in src, (
+            "the Phase-0 urgent-exits send_trade_alert call appears "
+            "to have been refactored — re-audit the new call site for "
+            "the L165 action-label correctness before merging."
+        )

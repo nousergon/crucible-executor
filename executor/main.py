@@ -1567,10 +1567,44 @@ def run(
                     bucket=signals_bucket,
                 )
             except Exception as _rat_err:
+                # L171 (2026-05-22) — OBR is observability infra, not
+                # load-bearing, so we don't crash the morning planner on
+                # a rationale-write failure. But the failure MUST reach
+                # the operator: page 16 falling back to yesterday's
+                # snapshot is exactly the silent regression
+                # [[feedback_no_silent_fails]] forbids. WARN-log here
+                # is one recording surface; lib v0.24.0 alerts.publish
+                # is the second (SNS + Telegram). Both best-effort —
+                # alert-publish itself is best-effort per the same
+                # secondary-observability clause as the score_aggregator
+                # pillar-sanity path. dedup_key collapses repeat
+                # failures within the publish window.
                 logger.warning(
                     "Order-book rationale write failed (non-blocking): %s",
                     _rat_err,
                 )
+                try:
+                    from alpha_engine_lib import alerts as _alerts
+                    _alerts.publish(
+                        message=(
+                            f"[executor/main.py] Order-book rationale write "
+                            f"failed for run_date={run_date}: "
+                            f"{type(_rat_err).__name__}: {_rat_err}. "
+                            f"Page 16 will fall back to the prior snapshot "
+                            f"until next morning-planner run."
+                        ),
+                        severity="WARN",
+                        source="alpha-engine/executor/main.py",
+                        sns=True,
+                        telegram=True,
+                        dedup_key=f"obr_write_failed_{run_date}",
+                    )
+                except Exception as _alert_err:  # noqa: BLE001 — secondary observability
+                    logger.warning(
+                        "OBR-failure alert publish itself failed: %s "
+                        "(WARN log above remains the failure surface)",
+                        _alert_err,
+                    )
 
         # ── 7. Backup and disconnect ─────────────────────────────────────────
         if not dry_run and not simulate:
