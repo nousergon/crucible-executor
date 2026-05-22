@@ -50,6 +50,7 @@ from executor.intraday_snapshot import (
     IntradaySnapshotWriter,
     compute_surveillance_universe,
 )
+from executor.daemon_state_logger import get_logger as _get_decision_logger
 from executor.market_hours import is_market_hours
 from executor.notifier import send_daemon_status, send_trade_alert
 from executor.order_book import OrderBook
@@ -737,6 +738,39 @@ def run_daemon(dry_run: bool = False) -> None:
                     source="daemon",
                 )
 
+                # L139(a) — daemon-stage intraday replay capture. The
+                # urgent_exits loop is the morning-planner-to-daemon
+                # handoff; recording it here gives the backtester an
+                # entry point into the intraday decision stream for
+                # eventual gate-enforcement (L139b).
+                _get_decision_logger().record(
+                    decision_type=(
+                        "phase0_auto_cover" if action == "COVER"
+                        else "urgent_exit"
+                    ),
+                    ticker=ticker,
+                    action=action,
+                    trading_day=run_date,
+                    shares=shares,
+                    trigger_reason=reason,
+                    fill_price=fill_price,
+                    ib_order_id=order_result.get("ib_order_id"),
+                    status=order_result.get("status"),
+                    retry_count=order_result.get("retry_count", 0),
+                    attempts=order_result.get("attempts", []),
+                    context={
+                        "exit_detail": urgent.get("detail", ""),
+                        "research_score": urgent.get("research_score"),
+                        "research_conviction": urgent.get("research_conviction"),
+                        "research_rating": urgent.get("research_rating"),
+                        "sector": urgent.get("sector"),
+                        "sector_rating": urgent.get("sector_rating"),
+                        "market_regime": urgent.get("market_regime"),
+                        "predicted_direction": urgent.get("predicted_direction"),
+                        "prediction_confidence": urgent.get("prediction_confidence"),
+                    },
+                )
+
                 trades_executed += 1
                 # COVER trades shouldn't prevent new ENTER for the same ticker
                 if action != "COVER":
@@ -919,6 +953,19 @@ def run_daemon(dry_run: bool = False) -> None:
         send_daemon_status("\u274c *Daemon crashed* — check logs")
         raise
     finally:
+        # ── L139(a) — flush intraday decision capture for replay parity ──
+        # Best-effort; flush failures WARN-log only (the primary trade
+        # path already completed via log_trade / send_trade_alert).
+        # Append semantics handle fix-and-rerun cycles within a single
+        # trading_day.
+        try:
+            _get_decision_logger().flush_to_s3(
+                bucket=config.get("signals_bucket", "alpha-engine-research"),
+                trading_day=run_date,
+            )
+        except Exception:
+            logger.debug("daemon_state flush failed", exc_info=True)
+
         # ── Data manifest ──────────────────────────────────────────────────
         try:
             from executor.health_status import write_data_manifest
@@ -1168,6 +1215,39 @@ def _execute_exit(
         source="daemon",
     )
 
+    # L139(a) — intraday exit decision capture for replay parity.
+    _get_decision_logger().record(
+        decision_type="intraday_exit",
+        ticker=ticker,
+        action=action,
+        trading_day=run_date,
+        shares=shares,
+        trigger_reason=exit_signal.get("reason", ""),
+        trigger_price=current_price,
+        fill_price=fill_price,
+        ib_order_id=order_result.get("ib_order_id"),
+        status=order_result.get("status"),
+        retry_count=order_result.get("retry_count", 0),
+        attempts=order_result.get("attempts", []),
+        entry_trade_id=_entry_id,
+        spy_price_at_order=_spy_now,
+        context={
+            "exit_detail": exit_signal.get("detail"),
+            "exit_gate": exit_signal.get("gate"),
+            "research_score": exit_signal.get("research_score"),
+            "research_conviction": exit_signal.get("research_conviction"),
+            "sector": exit_signal.get("sector"),
+            "market_regime": exit_signal.get("market_regime"),
+            "predicted_direction": exit_signal.get("predicted_direction"),
+            "prediction_confidence": exit_signal.get("prediction_confidence"),
+            "realized_pnl": _rpnl,
+            "realized_return_pct": _rpct,
+            "spy_return_during_hold": _spy_ret,
+            "realized_alpha_pct": _ralpha,
+            "days_held": _dheld,
+        },
+    )
+
 
 def _execute_entry(
     ibkr: IBKRClient,
@@ -1398,6 +1478,38 @@ def _execute_entry(
         price=fill_price,
         trigger=trigger_reason,
         source="daemon",
+    )
+
+    # L139(a) — entry trigger decision capture for replay parity.
+    _get_decision_logger().record(
+        decision_type="entry_trigger",
+        ticker=ticker,
+        action="ENTER",
+        trading_day=run_date,
+        shares=shares,
+        trigger_reason=trigger_reason,
+        signal_price=_signal_price,
+        trigger_price=_trigger_price,
+        fill_price=fill_price,
+        ib_order_id=order_result.get("ib_order_id"),
+        status=order_result.get("status"),
+        retry_count=order_result.get("retry_count", 0),
+        attempts=order_result.get("attempts", []),
+        execution_latency_ms=_latency_ms,
+        spy_price_at_order=_spy_now,
+        context={
+            "predicted_alpha": entry.get("predicted_alpha"),
+            "research_score": entry.get("research_score"),
+            "research_conviction": entry.get("research_conviction"),
+            "research_rating": entry.get("research_rating"),
+            "sector": entry.get("sector"),
+            "sector_rating": entry.get("sector_rating"),
+            "market_regime": entry.get("market_regime"),
+            "predicted_direction": entry.get("predicted_direction"),
+            "prediction_confidence": entry.get("prediction_confidence"),
+            "position_pct": entry.get("position_pct"),
+            "sizing_factors": entry.get("sizing_factors"),
+        },
     )
 
 
