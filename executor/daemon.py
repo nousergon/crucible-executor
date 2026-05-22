@@ -234,12 +234,25 @@ def _place_order_with_retry(
                    fill when the hold releases. Retrying duplicates the order
                    (PFE incident 2026-04-22).
       * Filled / PartialFill → done.
+
+    L133 (2026-05-22): the returned dict carries two new audit-trail
+    fields the caller embeds into ``rationale_json``:
+      * ``retry_count`` (int) — 0 if the first attempt succeeded.
+      * ``attempts`` (list of dict) — per-attempt
+        ``{attempt, status, ib_order_id, retry_reason}`` records.
+    Closes the home-endnote gap that PR #100 had to reword from
+    "every order, fill, retry, and exit decision recorded with
+    rationale" — the retry chain is now persisted alongside the
+    final fill state, not lost on the floor.
     """
     order_result = None
+    attempts: list[dict] = []
     for attempt in range(MAX_ORDER_RETRIES):
+        retry_reason: str | None = None
         if attempt > 0:
             prior_id = order_result.get("ib_order_id") if order_result else None
             prior_status = order_result.get("status") if order_result else None
+            retry_reason = prior_status  # "Timeout" / "Rejected" → why we're retrying
             if prior_status == "Timeout" and prior_id is not None:
                 try:
                     ibkr.cancel_order(prior_id)
@@ -252,8 +265,19 @@ def _place_order_with_retry(
             order_result = place_bracket_with_stop(ibkr, ticker, shares, **bracket_kwargs)
         else:
             order_result = ibkr.place_market_order(ticker, side, shares)
+        attempts.append({
+            "attempt": attempt + 1,
+            "status": order_result.get("status"),
+            "ib_order_id": order_result.get("ib_order_id"),
+            "retry_reason": retry_reason,
+        })
         if order_result["status"] not in ("Rejected", "Timeout"):
             break
+    # Embed the audit trail on the returned dict so log_trade callers
+    # can include it verbatim in rationale_json. Routing decisions
+    # never read these — purely audit.
+    order_result["retry_count"] = len(attempts) - 1
+    order_result["attempts"] = attempts
     return order_result
 
 
@@ -649,6 +673,24 @@ def run_daemon(dry_run: bool = False) -> None:
                         "exit_detail": urgent.get("detail", ""),
                         "source": "intraday_daemon",
                         "phase": "urgent",
+                        # L133 — universal context on every exit, not
+                        # just edge cases. Closes home endnote bullet 3.
+                        "signal_context": {
+                            "research_score": urgent.get("research_score"),
+                            "research_rating": urgent.get("research_rating"),
+                            "research_conviction": urgent.get("research_conviction"),
+                            "sector": urgent.get("sector"),
+                            "sector_rating": urgent.get("sector_rating"),
+                            "market_regime": urgent.get("market_regime"),
+                            "predicted_direction": urgent.get("predicted_direction"),
+                            "prediction_confidence": urgent.get("prediction_confidence"),
+                        },
+                        # L133 — retry chain audit trail from
+                        # _place_order_with_retry. retry_count=0 +
+                        # single-entry attempts list = first-attempt
+                        # success.
+                        "retry_count": order_result.get("retry_count", 0),
+                        "attempts": order_result.get("attempts", []),
                     }),
                     "entry_trade_id": _entry_id,
                     "trigger_price": fill_price,
@@ -1072,6 +1114,24 @@ def _execute_exit(
             "exit_reason": exit_signal.get("reason"),
             "exit_detail": exit_signal.get("detail"),
             "source": "intraday_daemon",
+            # L133 — signal context at exit time + retry chain audit.
+            # ``exit_signal`` carries scores the intraday exit_manager
+            # used to decide (profit-take threshold, time-decay tier,
+            # ATR multiplier, etc.); pass through verbatim so trades.db
+            # records WHY this specific exit fired, not just THAT it did.
+            "signal_context": {
+                "research_score": exit_signal.get("research_score"),
+                "research_rating": exit_signal.get("research_rating"),
+                "research_conviction": exit_signal.get("research_conviction"),
+                "sector": exit_signal.get("sector"),
+                "sector_rating": exit_signal.get("sector_rating"),
+                "market_regime": exit_signal.get("market_regime"),
+                "predicted_direction": exit_signal.get("predicted_direction"),
+                "prediction_confidence": exit_signal.get("prediction_confidence"),
+                "exit_gate": exit_signal.get("gate"),  # e.g. "atr_trail", "time_decay", "profit_take"
+            },
+            "retry_count": order_result.get("retry_count", 0),
+            "attempts": order_result.get("attempts", []),
         }),
         "entry_trade_id": _entry_id,
         "trigger_price": current_price,
@@ -1205,6 +1265,25 @@ def _execute_entry(
             "planned_price": _signal_price,
             "sizing_factors": entry.get("sizing_factors"),
             "predicted_alpha": entry.get("predicted_alpha"),
+            # L133 — full signal context on every ENTER so the
+            # trade-by-trade audit log can answer "why did we enter
+            # AAPL today?" without joining with signals.json + the
+            # predictor archive at review time.
+            "signal_context": {
+                "research_score": entry.get("research_score"),
+                "research_rating": entry.get("research_rating"),
+                "research_conviction": entry.get("research_conviction"),
+                "sector": entry.get("sector"),
+                "sector_rating": entry.get("sector_rating"),
+                "market_regime": entry.get("market_regime"),
+                "price_target_upside": entry.get("price_target_upside"),
+                "predicted_direction": entry.get("predicted_direction"),
+                "prediction_confidence": entry.get("prediction_confidence"),
+                "position_pct": entry.get("position_pct"),
+            },
+            # L133 retry chain audit — see _place_order_with_retry docstring.
+            "retry_count": order_result.get("retry_count", 0),
+            "attempts": order_result.get("attempts", []),
         }),
         "execution_latency_ms": _latency_ms,
         "signal_price": _signal_price,

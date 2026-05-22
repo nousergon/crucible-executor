@@ -371,3 +371,121 @@ class TestPhase0UrgentExitsActionLabel:
             "to have been refactored — re-audit the new call site for "
             "the L165 action-label correctness before merging."
         )
+
+
+# ── L133: retry-tracking audit trail on `_place_order_with_retry` ──────────
+
+
+class TestPlaceOrderWithRetryAttemptsAudit:
+    """Pin the L133 (2026-05-22) addition — `_place_order_with_retry` now
+    returns an `attempts` list + `retry_count` so callers can embed the
+    audit chain in trades.db `rationale_json`. Closes the home-endnote
+    gap PR #100 had to drop the "retry" qualifier from.
+    """
+
+    def test_first_attempt_success_yields_single_entry_zero_retries(self):
+        ibkr = MagicMock()
+        ibkr.place_market_order.return_value = {
+            "status": "Filled", "ib_order_id": 100,
+        }
+        result = _place_order_with_retry(ibkr, "AAPL", "SELL", 10, "exit")
+        assert result["retry_count"] == 0
+        assert len(result["attempts"]) == 1
+        first = result["attempts"][0]
+        assert first["attempt"] == 1
+        assert first["status"] == "Filled"
+        assert first["ib_order_id"] == 100
+        assert first["retry_reason"] is None  # first attempt — no prior to retry
+
+    @patch("executor.daemon._time.sleep")
+    def test_retry_count_and_reasons_captured_for_each_failed_attempt(self, mock_sleep):
+        ibkr = MagicMock()
+        ibkr.place_market_order.side_effect = [
+            {"status": "Timeout", "ib_order_id": 287},
+            {"status": "Rejected", "ib_order_id": 288},
+            {"status": "Filled", "ib_order_id": 289},
+        ]
+        result = _place_order_with_retry(ibkr, "PFE", "SELL", 77, "urgent")
+        assert result["status"] == "Filled"
+        assert result["retry_count"] == 2
+        assert len(result["attempts"]) == 3
+        assert result["attempts"][0]["status"] == "Timeout"
+        assert result["attempts"][0]["retry_reason"] is None
+        assert result["attempts"][1]["status"] == "Rejected"
+        assert result["attempts"][1]["retry_reason"] == "Timeout"  # why we retried
+        assert result["attempts"][2]["status"] == "Filled"
+        assert result["attempts"][2]["retry_reason"] == "Rejected"
+
+    @patch("executor.daemon._time.sleep")
+    def test_all_retries_failed_still_records_full_audit(self, mock_sleep):
+        ibkr = MagicMock()
+        ibkr.place_market_order.return_value = {
+            "status": "Rejected", "ib_order_id": 300,
+        }
+        result = _place_order_with_retry(ibkr, "AAPL", "SELL", 10, "exit")
+        # MAX_ORDER_RETRIES attempts; all failed; result still carries
+        # the full audit trail so trades.db rationale_json captures
+        # "we tried 3 times and IB rejected every one."
+        assert result["status"] == "Rejected"
+        assert result["retry_count"] == MAX_ORDER_RETRIES - 1
+        assert len(result["attempts"]) == MAX_ORDER_RETRIES
+        for entry in result["attempts"]:
+            assert entry["status"] == "Rejected"
+
+    @patch("executor.daemon._time.sleep")
+    def test_working_status_records_single_attempt_no_retry(self, mock_sleep):
+        """Working status holds — we DON'T retry (PFE incident protection).
+        Audit trail captures the single Working attempt.
+        """
+        ibkr = MagicMock()
+        ibkr.place_market_order.return_value = {
+            "status": "Working", "ib_order_id": 400,
+        }
+        result = _place_order_with_retry(ibkr, "AAPL", "SELL", 10, "urgent")
+        assert result["status"] == "Working"
+        assert result["retry_count"] == 0
+        assert len(result["attempts"]) == 1
+        assert result["attempts"][0]["status"] == "Working"
+
+
+class TestRationaleJsonEnrichmentSourceShape:
+    """Source-inspection pin on the L133 enrichment of the 3 daemon
+    log_trade call sites' rationale_json. Each site MUST include the
+    signal_context block + the retry audit. Full-loop tests require IB
+    Gateway harness; this pin guards against a future refactor that
+    drops the enrichment.
+    """
+
+    def test_urgent_exit_rationale_carries_signal_context_and_retry_audit(self):
+        import inspect
+        import executor.daemon as daemon
+
+        src = inspect.getsource(daemon)
+        # The Phase 0 urgent-exits log_trade call.
+        assert '"phase": "urgent"' in src, "Phase-0 urgent-exit rationale shape changed"
+        # signal_context block on the urgent path.
+        assert '"signal_context"' in src, (
+            "L133 enrichment dropped — log_trade rationale_json must "
+            "carry a signal_context block on every trade pathway."
+        )
+        # retry audit on every log_trade rationale.
+        assert '"retry_count":' in src and '"attempts":' in src, (
+            "L133 retry audit dropped — log_trade rationale_json must "
+            "carry retry_count + attempts on every trade pathway."
+        )
+
+    def test_enter_rationale_carries_signal_context_and_retry_audit(self):
+        import inspect
+        import executor.daemon as daemon
+
+        src = inspect.getsource(daemon)
+        # The intraday ENTER log_trade call (PFE incident-class fields:
+        # trigger_reason + sizing_factors + predicted_alpha must remain).
+        assert '"trigger_reason":' in src
+        assert '"sizing_factors":' in src
+        # Pin: the rationale must reference position_pct inside the
+        # signal_context block (not just at the trade dict's top level).
+        assert '"position_pct":' in src, (
+            "L133 ENTER rationale must include position_pct in "
+            "signal_context so the audit log captures the sizing math."
+        )
