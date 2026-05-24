@@ -1,0 +1,22 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "PipelineStatusPageRead",
+            "Effect": "Allow",
+            "Action": [
+                "states:DescribeExecution",
+                "states:GetExecutionHistory",
+                "states:ListExecutions"
+            ],
+            "Resource": [
+                "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline",
+                "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline",
+                "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline",
+                "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-saturday-pipeline:*",
+                "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-weekday-pipeline:*",
+                "arn:aws:states:us-east-1:711398986525:execution:alpha-engine-eod-pipeline:*"
+            ]
+        }
+    ]
+}
