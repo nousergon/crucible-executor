@@ -279,7 +279,10 @@ class TestSynthesizeRationalesToolUse:
         )
         contexts = [{"ticker": "AAPL"}, {"ticker": "MSFT"}]
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
-            result = _synthesize_rationales(contexts)
+            # llm_enabled=True is now opt-in per the standing rule that
+            # LLM calls live in the research module. Default path is
+            # template-only; this test exercises the LLM branch.
+            result = _synthesize_rationales(contexts, llm_enabled=True)
         assert result == {
             "AAPL": "Held — research score 82, GBM UP.",
             "MSFT": "Reduced 5 shares today on profit-take.",
@@ -297,14 +300,17 @@ class TestSynthesizeRationalesToolUse:
             include_text_block=True,
         )
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
-            result = _synthesize_rationales([{"ticker": "GOOG"}])
+            result = _synthesize_rationales([{"ticker": "GOOG"}], llm_enabled=True)
         assert result == {"GOOG": "y" * 40}
 
     def test_missing_tool_use_falls_back_to_template(self):
         # Haiku stopped without emitting the forced tool — template fallback.
         mock_anthropic, _ = self._make_mock_anthropic(None, stop_reason="end_turn", include_text_block=True)
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
-            result = _synthesize_rationales([{"ticker": "AAPL", "research_score": 82.0, "conviction": "rising"}])
+            result = _synthesize_rationales(
+                [{"ticker": "AAPL", "research_score": 82.0, "conviction": "rising"}],
+                llm_enabled=True,
+            )
         # Template fallback populates from the context — research_score should
         # be in the rendered text.
         assert "AAPL" in result
@@ -315,7 +321,10 @@ class TestSynthesizeRationalesToolUse:
         # tool_use block present but input doesn't match the Pydantic schema.
         mock_anthropic, _ = self._make_mock_anthropic({"narratives": [{"ticker": "AAPL"}]})  # missing 'narrative'
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
-            result = _synthesize_rationales([{"ticker": "AAPL", "research_score": 90.0}])
+            result = _synthesize_rationales(
+                [{"ticker": "AAPL", "research_score": 90.0}],
+                llm_enabled=True,
+            )
         # Template fallback fires; AAPL is still rendered from the context.
         assert "AAPL" in result
         assert "90" in result["AAPL"]

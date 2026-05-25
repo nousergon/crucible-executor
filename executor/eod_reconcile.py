@@ -415,27 +415,44 @@ def _record_eod_narrative_cost(response, run_date: str) -> None:
         )
 
 
-def _synthesize_rationales(contexts: list[dict], run_date: str | None = None) -> dict[str, str]:
-    """Call Haiku via Anthropic tool-use + Pydantic validation to synthesize
-    per-position narratives. Falls back to templates on any failure.
+def _synthesize_rationales(
+    contexts: list[dict],
+    run_date: str | None = None,
+    *,
+    llm_enabled: bool = False,
+) -> dict[str, str]:
+    """Synthesize per-position narratives for the EOD report.
 
-    L1248 / L2669: previous implementation read Haiku's freeform text and
-    tried to ``json.loads`` it — recurrence-prone (markdown fences /
-    preamble / trailing text). Tool-use makes the parse failure mode
-    structurally impossible: Haiku returns a typed ``tool_use`` block
-    whose ``input`` is schema-validated by the SDK *before* it lands here.
+    **Default posture: template-only (NO LLM call).** The executor's
+    standing architectural rule is that LLM calls live in the research
+    module; the EOD report's "research thesis + GBM signals + trades"
+    summary is mechanically derivable from the context dict without
+    LLM synthesis. The Haiku path is opt-in via
+    ``config.get("eod_narrative_llm_enabled", False)``.
 
-    ``run_date``: when provided, the response's tokens + tool-fee usage
-    are priced via ``alpha_engine_lib.cost.record_anthropic_call`` and
-    written as one JSONL row to
-    ``s3://alpha-engine-research/decision_artifacts/_cost_raw/{run_date}/{run_date}/executor:eod_narrative.jsonl``.
-    Phase 0.2 wiring of the executor's only LLM call site
-    (previously-untracked ~$10–30/mo cost slice per the
-    ``prompt-caching-investigation-260525.md`` audit). When ``run_date``
-    is None (e.g., tests, ad-hoc invocation), cost telemetry is skipped.
+    When ``llm_enabled=True``: calls Haiku via Anthropic tool-use +
+    Pydantic validation. L1248 / L2669: previous implementation read
+    Haiku's freeform text and tried to ``json.loads`` it —
+    recurrence-prone (markdown fences / preamble / trailing text).
+    Tool-use makes the parse failure mode structurally impossible:
+    Haiku returns a typed ``tool_use`` block whose ``input`` is
+    schema-validated by the SDK *before* it lands here. Falls back to
+    templates on any failure.
+
+    ``run_date``: when provided AND ``llm_enabled=True``, the response's
+    tokens + tool-fee usage are priced via
+    ``alpha_engine_lib.cost.record_anthropic_call`` and written to S3.
+    When LLM is disabled there's no API call → cost telemetry is
+    naturally skipped.
     """
     if not contexts:
         return {}
+
+    if not llm_enabled:
+        # Template-only path — same shape as the LLM branch's fallback.
+        # Operator-preferred default per the no-LLM-outside-research-
+        # module architectural rule (see [[preference_llm_calls_confined_to_research_module]]).
+        return _template_rationales(contexts)
 
     # Try LLM synthesis
     try:
@@ -489,7 +506,17 @@ def _synthesize_rationales(contexts: list[dict], run_date: str | None = None) ->
     except Exception as e:
         logger.warning(f"LLM rationale synthesis failed: {e} — using template fallback")
 
-    # Template fallback
+    return _template_rationales(contexts)
+
+
+def _template_rationales(contexts: list[dict]) -> dict[str, str]:
+    """Build per-position rationales from the context dict — no LLM call.
+
+    Default path when ``eod_narrative_llm_enabled`` is false (the
+    standing-policy default) AND the deterministic fallback when the
+    LLM path raises. Same output shape either way so the EOD emailer
+    consumes one contract.
+    """
     narratives = {}
     for ctx in contexts:
         parts = []
@@ -1032,14 +1059,24 @@ def run(run_date: str | None = None) -> None:
         except Exception as e:
             logger.debug("Log backup failed for %s: %s", log_file, e)
 
-    # Build position rationale narratives
+    # Build position rationale narratives — default = template-only (NO
+    # LLM call). Operators wanting the polished Haiku-synthesized prose
+    # opt in via ``eod_narrative_llm_enabled: true`` in risk.yaml.
+    # See [[preference_llm_calls_confined_to_research_module]] for the
+    # standing architectural rule.
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
+    llm_enabled = bool(config.get("eod_narrative_llm_enabled", False))
     position_narratives = {}
     try:
         if positions:
             contexts, ctx_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date)
-            position_narratives = _synthesize_rationales(contexts, run_date=run_date)
-            logger.info(f"Position narratives generated for {len(position_narratives)} tickers")
+            position_narratives = _synthesize_rationales(
+                contexts, run_date=run_date, llm_enabled=llm_enabled,
+            )
+            logger.info(
+                f"Position narratives generated for {len(position_narratives)} "
+                f"tickers (llm_enabled={llm_enabled})"
+            )
             data_warnings.extend(ctx_warnings)
     except Exception as e:
         logger.warning(f"Position rationale generation failed: {e}")
