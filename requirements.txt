@@ -37,7 +37,16 @@ requests~=2.32
 # setup_logging()/_attach_flow_doctor() before flow_doctor.init() reads
 # os.environ — closes the PR 9g systemd-entrypoint env gap upstream for
 # all repos (replaces the executor-local secrets_bootstrap.py approach).
-alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.21.0
+# v0.30.0 + v0.31.0 add the cost-telemetry SDK adapter
+# (``metadata_from_anthropic_message``) + server-tool fee tracking
+# (``ToolFee`` / ``ToolFeeTable``) — required by Phase 0 of the cost-
+# optimization workstream to wire ``eod_reconcile.py``'s position-
+# narrative LLM calls into the cost-telemetry stream. Predates ``cost.py``
+# entirely (added at v0.22+); 10-version bump validated by smoke-test of
+# all existing imports (secrets/dates/logging/eval_artifacts/alerts/
+# universe/telegram/decision_capture/preflight/trading_calendar) on
+# 2026-05-25 — all additive, no breaking changes to existing surface.
+alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.31.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
