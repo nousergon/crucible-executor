@@ -1058,6 +1058,11 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
                 "sns_topic_arn": sns_topic_arn,
                 "run_date": run_date,
                 "triggered_by": "daemon_shutdown",
+                # pipeline_role tag (Option-D 2026-05-25) — page 25 filters
+                # EOD section to role="eod" by default. Operator-initiated
+                # EOD replays MUST set their own pipeline_role per the
+                # taxonomy in pipeline-reporting-revamp-260524.md §6.
+                "pipeline_role": "eod",
             }),
         )
         logger.info("EOD pipeline triggered: %s", state_machine_arn)
