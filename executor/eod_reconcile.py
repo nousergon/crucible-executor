@@ -18,7 +18,6 @@ from datetime import date, timedelta
 import boto3
 import pandas as pd
 import yaml
-from pydantic import BaseModel, Field, ValidationError
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from executor.eod_emailer import send_eod_email
@@ -258,265 +257,32 @@ def _build_position_contexts(
     return contexts, data_warnings
 
 
-class _Narrative(BaseModel):
-    """One per-position rationale."""
+def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
+    """Build per-position rationales from the context dict for the EOD email.
 
-    ticker: str = Field(..., description="Position ticker symbol (e.g. AAPL).")
-    narrative: str = Field(
-        ...,
-        description=(
-            "2-3 sentences explaining why this position is held today, citing the "
-            "research thesis, technical signals, and GBM predictions where relevant. "
-            "If a trade was made today, the narrative also explains why."
-        ),
-    )
+    **Zero LLM exposure — hard architectural guardrail.** Per
+    ``[[preference_llm_calls_confined_to_research_module]]``, executor
+    never invokes an LLM. Trading execution is the most operationally
+    critical surface; introducing any external-API dependency (even
+    gated) couples trading-day reliability to upstream availability.
+    If a future surface genuinely needs LLM-synthesized prose, the call
+    goes in research and produces a frozen artifact executor reads.
 
+    Output is mechanical synthesis from the context dict: entry / score
+    / GBM prediction / thesis summary / today's actions, joined with
+    spaces. Same dict-shape the EOD emailer has always consumed.
 
-class _RationalesResponse(BaseModel):
-    """Tool-use payload for the EOD rationale synthesis call. The Anthropic
-    SDK validates this shape at the tool-use layer; Pydantic re-validates it
-    here for type safety + strict-field enforcement. Replaces the legacy
-    "ask for JSON in the prompt and json.loads the text" pattern that L1248
-    / L2669 documented as recurrence-prone (markdown fences, preamble,
-    trailing text — string-pattern whack-a-mole)."""
-
-    narratives: list[_Narrative] = Field(
-        ...,
-        description="One narrative per position in the input list.",
-    )
-
-
-_RATIONALES_TOOL = {
-    "name": "emit_rationales",
-    "description": (
-        "Emit per-position rationales for the EOD report. Call this tool exactly "
-        "once with the full list — one narrative per input position."
-    ),
-    "input_schema": _RationalesResponse.model_json_schema(),
-}
-
-
-_COST_TELEMETRY_BUCKET = "alpha-engine-research"
-_COST_TELEMETRY_PREFIX = "decision_artifacts/_cost_raw"
-
-# Phase 4 #1 — cost-budget WARN threshold. Shared env var with
-# alpha-engine-research's ``llm_cost_tracker.RunBudgetExceededError`` +
-# alpha-engine-data's ``_cost_telemetry.CostBudgetExceededError`` so a
-# single operator knob ceilings cost across all SF entry points.
-# Executor's posture is WARN-only (NOT raise) per [[feedback_no_silent_fails]]
-# applied carefully: the EOD report is operator-critical and survives
-# a cost-sink miss; we cannot let a single anomalous narrative call
-# take down the trading-day reconcile. The WARN log + the per-call
-# JSONL row on S3 are the operator-facing signals.
-_COST_BUDGET_ENV_VAR = "ALPHA_ENGINE_RUN_BUDGET_USD"
-_COST_BUDGET_DEFAULT_USD = 100.0
-
-
-def _resolve_cost_budget_ceiling() -> float:
-    """Read ``ALPHA_ENGINE_RUN_BUDGET_USD`` (shared with research + data).
-
-    Returns the positive threshold to WARN above, or 0.0 to disable.
-    Parse failure → disable (don't let a malformed env take down EOD).
-    """
-    import os
-    raw = os.environ.get(_COST_BUDGET_ENV_VAR, "")
-    if not raw:
-        return _COST_BUDGET_DEFAULT_USD
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        logger.warning(
-            "[cost_telemetry] ALPHA_ENGINE_RUN_BUDGET_USD=%r is not a "
-            "number; disabling cost-budget WARN", raw,
-        )
-        return 0.0
-
-# Anthropic snapshot suffix: -YYYYMMDD on family names (e.g.
-# "claude-haiku-4-5-20251001"). Cost-telemetry rate cards are family-
-# keyed, so strip the suffix before pricing lookup. Mirrors the research-
-# side normalization at ``alpha-engine-research/graph/llm_cost_tracker.py``
-# (the 2026-05-02 SF halt that motivated that fix). Lift candidate:
-# both research + executor now do this — when a 3rd consumer adopts the
-# same pin pattern, fold into ``alpha_engine_lib.cost``'s SDK adapter.
-import re as _re
-_SNAPSHOT_SUFFIX_RE = _re.compile(r"-\d{8}$")
-
-
-def _record_eod_narrative_cost(response, run_date: str) -> None:
-    """Price + persist one cost-telemetry JSONL row for the EOD narrative.
-
-    Best-effort: any failure is logged and swallowed so the EOD report
-    (the primary deliverable) survives. The cost-telemetry surface
-    itself fails loud at flush time per
-    ``[[feedback_no_silent_fails]]`` — but since the executor's EOD
-    runs nightly outside the research SF, we cannot let a cost-sink
-    miss take down the trading-day report. The WARN log is the
-    operator-facing signal that the row was lost.
-
-    Writes to the same partition the research-side
-    ``aggregate_costs.py`` already scans, so the daily parquet rolls
-    executor + data + research rows up under one ``by_agent_id``
-    breakdown — single source of truth for the cost dashboard.
-    """
-    try:
-        from alpha_engine_lib.cost import record_anthropic_call
-
-        # Normalize snapshot suffix off the SDK-reported model so the
-        # family-keyed rate card matches (see _SNAPSHOT_SUFFIX_RE above).
-        family_model = _SNAPSHOT_SUFFIX_RE.sub("", getattr(response, "model", ""))
-        record = record_anthropic_call(
-            response,
-            model_name=family_model or None,
-            extra_fields={
-                "run_id": run_date,
-                "agent_id": "executor:eod_narrative",
-            },
-        )
-        key = (
-            f"{_COST_TELEMETRY_PREFIX}/{run_date}/{run_date}/"
-            f"executor:eod_narrative.jsonl"
-        )
-        body = (json.dumps(record, default=str) + "\n").encode("utf-8")
-        boto3.client("s3").put_object(
-            Bucket=_COST_TELEMETRY_BUCKET,
-            Key=key,
-            Body=body,
-            ContentType="application/x-ndjson",
-        )
-        cost_usd = float(record.get("cost_usd", 0))
-        logger.info(
-            "[cost_telemetry] EOD narrative cost recorded: $%.4f → "
-            "s3://%s/%s",
-            cost_usd,
-            _COST_TELEMETRY_BUCKET, key,
-        )
-
-        # Phase 4 #1 — WARN if this single call alone exceeds the run
-        # budget (signal that a narrative prompt expansion or runaway
-        # loop pushed one call into the danger zone). Doesn't raise:
-        # EOD report continues. Operators see the WARN + dashboard's
-        # next refresh shows the spike in the "Recent calls" tab.
-        ceiling = _resolve_cost_budget_ceiling()
-        if ceiling > 0 and cost_usd > ceiling:
-            logger.warning(
-                "[cost_telemetry] EOD narrative single call exceeded "
-                "cost budget: $%.4f > ceiling=$%.4f (env var "
-                "ALPHA_ENGINE_RUN_BUDGET_USD). Investigate the prompt "
-                "or position-count expansion — typical EOD call is "
-                "under $0.01. JSONL row preserved on S3 for diagnosis.",
-                cost_usd, ceiling,
-            )
-    except Exception as exc:
-        # Best-effort. Operator-facing WARN; EOD report continues.
-        logger.warning(
-            "[cost_telemetry] EOD narrative cost record FAILED for "
-            "run_date=%s — cost row LOST: %s",
-            run_date, exc,
-        )
-
-
-def _synthesize_rationales(
-    contexts: list[dict],
-    run_date: str | None = None,
-    *,
-    llm_enabled: bool = False,
-) -> dict[str, str]:
-    """Synthesize per-position narratives for the EOD report.
-
-    **Default posture: template-only (NO LLM call).** The executor's
-    standing architectural rule is that LLM calls live in the research
-    module; the EOD report's "research thesis + GBM signals + trades"
-    summary is mechanically derivable from the context dict without
-    LLM synthesis. The Haiku path is opt-in via
-    ``config.get("eod_narrative_llm_enabled", False)``.
-
-    When ``llm_enabled=True``: calls Haiku via Anthropic tool-use +
-    Pydantic validation. L1248 / L2669: previous implementation read
-    Haiku's freeform text and tried to ``json.loads`` it —
-    recurrence-prone (markdown fences / preamble / trailing text).
-    Tool-use makes the parse failure mode structurally impossible:
-    Haiku returns a typed ``tool_use`` block whose ``input`` is
-    schema-validated by the SDK *before* it lands here. Falls back to
-    templates on any failure.
-
-    ``run_date``: when provided AND ``llm_enabled=True``, the response's
-    tokens + tool-fee usage are priced via
-    ``alpha_engine_lib.cost.record_anthropic_call`` and written to S3.
-    When LLM is disabled there's no API call → cost telemetry is
-    naturally skipped.
+    History: an Anthropic-Haiku-backed synthesis path shipped
+    2026-03-17 (commit 58dcb9b) and ran for ~10 weeks before being
+    nuked outright 2026-05-25 after Brian flagged the unmandated LLM
+    exposure. Cost-telemetry wiring + WARN-above-ceiling instrumentation
+    + an opt-in kill-switch flag (PRs #210/#211/#212 same session) all
+    went with it — the rule is "no LLM in executor, period" rather than
+    "LLM with substrate."
     """
     if not contexts:
         return {}
 
-    if not llm_enabled:
-        # Template-only path — same shape as the LLM branch's fallback.
-        # Operator-preferred default per the no-LLM-outside-research-
-        # module architectural rule (see [[preference_llm_calls_confined_to_research_module]]).
-        return _template_rationales(contexts)
-
-    # Try LLM synthesis
-    try:
-        import anthropic
-        client = anthropic.Anthropic()
-
-        prompt = (
-            "You are a portfolio analyst writing concise position rationales for an end-of-day report.\n"
-            "For each position below, write 2-3 sentences explaining why it is held, "
-            "focusing on near-term catalysts (research thesis, technical signals, GBM predictions). "
-            "If a trade was made today, explain why. Be specific about numbers.\n\n"
-            "Call the emit_rationales tool exactly once with one narrative per position.\n\n"
-            f"Positions:\n{json.dumps(contexts, indent=2, default=str)}"
-        )
-
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=2000,
-            tools=[_RATIONALES_TOOL],
-            tool_choice={"type": "tool", "name": "emit_rationales"},
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        # Phase 0.2 cost telemetry — best-effort capture. Failures here
-        # MUST NOT break narrative synthesis (the primary deliverable);
-        # log + continue. Per [[feedback_no_silent_fails]] we still WARN
-        # loud so missed rows surface in CloudWatch.
-        if run_date is not None:
-            _record_eod_narrative_cost(response, run_date)
-        # tool_choice={"type": "tool", "name": ...} forces Haiku to emit a
-        # tool_use block — but Anthropic still allows additional text blocks
-        # alongside it. Pick the tool_use block explicitly.
-        tool_use = next(
-            (b for b in response.content if getattr(b, "type", None) == "tool_use"),
-            None,
-        )
-        if tool_use is None:
-            raise RuntimeError(
-                "Haiku response missing the forced emit_rationales tool_use block — "
-                f"stop_reason={response.stop_reason!r}"
-            )
-        try:
-            parsed = _RationalesResponse.model_validate(tool_use.input)
-        except ValidationError as e:
-            logger.warning(
-                f"LLM rationale tool_use failed Pydantic validation: {e} — "
-                f"input={tool_use.input!r}"
-            )
-            raise
-        return {n.ticker: n.narrative for n in parsed.narratives}
-    except Exception as e:
-        logger.warning(f"LLM rationale synthesis failed: {e} — using template fallback")
-
-    return _template_rationales(contexts)
-
-
-def _template_rationales(contexts: list[dict]) -> dict[str, str]:
-    """Build per-position rationales from the context dict — no LLM call.
-
-    Default path when ``eod_narrative_llm_enabled`` is false (the
-    standing-policy default) AND the deterministic fallback when the
-    LLM path raises. Same output shape either way so the EOD emailer
-    consumes one contract.
-    """
     narratives = {}
     for ctx in contexts:
         parts = []
@@ -1059,23 +825,17 @@ def run(run_date: str | None = None) -> None:
         except Exception as e:
             logger.debug("Log backup failed for %s: %s", log_file, e)
 
-    # Build position rationale narratives — default = template-only (NO
-    # LLM call). Operators wanting the polished Haiku-synthesized prose
-    # opt in via ``eod_narrative_llm_enabled: true`` in risk.yaml.
-    # See [[preference_llm_calls_confined_to_research_module]] for the
-    # standing architectural rule.
+    # Build position rationale narratives — mechanical synthesis from
+    # the context dict. No LLM exposure in executor per
+    # [[preference_llm_calls_confined_to_research_module]].
     signals_bucket = config.get("signals_bucket", "alpha-engine-research")
-    llm_enabled = bool(config.get("eod_narrative_llm_enabled", False))
     position_narratives = {}
     try:
         if positions:
             contexts, ctx_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date)
-            position_narratives = _synthesize_rationales(
-                contexts, run_date=run_date, llm_enabled=llm_enabled,
-            )
+            position_narratives = _synthesize_rationales(contexts)
             logger.info(
-                f"Position narratives generated for {len(position_narratives)} "
-                f"tickers (llm_enabled={llm_enabled})"
+                f"Position narratives generated for {len(position_narratives)} tickers"
             )
             data_warnings.extend(ctx_warnings)
     except Exception as e:

@@ -12,7 +12,12 @@ pyarrow~=14.0
 # load_atr_14_pct. Version range kept loose to avoid pinning pain with the
 # predictor/backtester venvs which share the same S3-backed store.
 arcticdb~=6.12
-anthropic~=0.40
+# anthropic SDK removed 2026-05-25 — executor has no LLM exposure per
+# [[preference_llm_calls_confined_to_research_module]] hard guardrail.
+# The 10-week EOD-narrative Haiku call site that motivated this dep was
+# deleted outright in the same PR; if a future surface genuinely needs
+# LLM-synthesized output, the call goes in research and produces a
+# frozen artifact executor reads.
 exchange-calendars~=4.5
 requests~=2.32
 # alpha-engine-lib provides setup_logging + BasePreflight. Executor passes
@@ -37,15 +42,12 @@ requests~=2.32
 # setup_logging()/_attach_flow_doctor() before flow_doctor.init() reads
 # os.environ — closes the PR 9g systemd-entrypoint env gap upstream for
 # all repos (replaces the executor-local secrets_bootstrap.py approach).
-# v0.30.0 + v0.31.0 add the cost-telemetry SDK adapter
-# (``metadata_from_anthropic_message``) + server-tool fee tracking
-# (``ToolFee`` / ``ToolFeeTable``) — required by Phase 0 of the cost-
-# optimization workstream to wire ``eod_reconcile.py``'s position-
-# narrative LLM calls into the cost-telemetry stream. Predates ``cost.py``
-# entirely (added at v0.22+); 10-version bump validated by smoke-test of
-# all existing imports (secrets/dates/logging/eval_artifacts/alerts/
-# universe/telegram/decision_capture/preflight/trading_calendar) on
-# 2026-05-25 — all additive, no breaking changes to existing surface.
+# Pinned at v0.33.0 — executor uses setup_logging/secrets/dates/eval_
+# artifacts/alerts/universe/telegram/decision_capture/preflight/trading_
+# calendar surfaces. The cost-telemetry primitives shipped at v0.30+
+# are NOT consumed here (executor has no LLM exposure per
+# [[preference_llm_calls_confined_to_research_module]]) but the
+# transitive lib pin stays current.
 alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.33.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
