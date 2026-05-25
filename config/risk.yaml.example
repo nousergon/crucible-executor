@@ -48,6 +48,15 @@ batch_confidence_tightening_enabled: false
 # new = (old - 0.5) * 2.
 batch_confidence_threshold: 0.30    # if mean batch confidence < this, tighten
 batch_confidence_min_score_bump: 10 # bump min_score_to_enter by this when triggered
+
+# ── EOD report narrative synthesis ───────────────────────────────────────────
+# When true, the EOD reconcile calls Haiku once per weekday to synthesize
+# 2-3 sentence per-position narratives for the daily email. Default false
+# per the standing rule that LLM calls live in the research module —
+# template-derived narratives (entry / score / GBM / thesis / today's
+# actions) cover the same surface mechanically. Flip to true if the
+# polished prose is worth the (small) Anthropic spend.
+eod_narrative_llm_enabled: false
 momentum_gate_enabled: false      # disabled — predictor mean-reversion conflicts with this
 min_conviction_to_enter:         # only these conviction levels allow new entries
   - rising
