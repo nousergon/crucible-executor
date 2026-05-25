@@ -542,3 +542,124 @@ def test_eod_reconcile_uses_macro_aware_dispatch_for_held_positions():
         "to route reads between universe_lib and macro_lib (mirrors "
         "price_cache.load_price_histories:128-145)."
     )
+
+
+# ── Phase 0.2 cost telemetry on EOD narrative LLM call ──────────────────
+
+
+class _FakeServerToolUsage:
+    def __init__(self, *, web_search_requests=0, web_fetch_requests=0):
+        self.web_search_requests = web_search_requests
+        self.web_fetch_requests = web_fetch_requests
+
+
+class _FakeUsage:
+    def __init__(
+        self, *, input_tokens, output_tokens,
+        cache_read_input_tokens=None, cache_creation_input_tokens=None,
+        server_tool_use=None,
+    ):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_read_input_tokens = cache_read_input_tokens
+        self.cache_creation_input_tokens = cache_creation_input_tokens
+        self.server_tool_use = server_tool_use
+
+
+class _FakeAnthropicMessage:
+    """Stand-in for ``anthropic.types.Message`` shaped for the cost lib."""
+
+    def __init__(self, *, model, usage):
+        self.model = model
+        self.usage = usage
+
+
+class TestRecordEodNarrativeCost:
+    """Lock down the Phase 0.2 cost-telemetry wiring on EOD's sole
+    LLM call site (executor/eod_reconcile.py:326).
+
+    Per the audit at alpha-engine-docs/private/prompt-caching-investigation-260525.md
+    §1.1 this was the second-largest previously-untracked LLM cost
+    slice (~$10–30/mo, ~10–30% of monthly spend). Sink mirrors the
+    research-side ``decision_artifacts/_cost_raw/`` partition so the
+    daily aggregator sees executor's rows alongside research's + data's.
+    """
+
+    def test_writes_jsonl_row_to_canonical_s3_key(self, monkeypatch):
+        import boto3 as _boto3
+        from executor import eod_reconcile
+
+        captured = {}
+
+        class _StubS3:
+            def put_object(self, **kwargs):
+                captured.update(kwargs)
+                return {}
+
+        monkeypatch.setattr(_boto3, "client", lambda svc: _StubS3())
+
+        response = _FakeAnthropicMessage(
+            model="claude-haiku-4-5-20251001",
+            usage=_FakeUsage(input_tokens=2000, output_tokens=500),
+        )
+        eod_reconcile._record_eod_narrative_cost(response, "2026-05-25")
+
+        assert captured["Bucket"] == "alpha-engine-research"
+        assert captured["Key"] == (
+            "decision_artifacts/_cost_raw/2026-05-25/2026-05-25/"
+            "executor:eod_narrative.jsonl"
+        )
+        assert captured["ContentType"] == "application/x-ndjson"
+
+        body = captured["Body"].decode("utf-8").strip()
+        import json as _json
+        row = _json.loads(body)
+        assert row["run_id"] == "2026-05-25"
+        assert row["agent_id"] == "executor:eod_narrative"
+        # Snapshot suffix stripped — rate card is family-keyed.
+        assert row["model"] == "claude-haiku-4-5"
+        assert row["input_tokens"] == 2000
+        assert row["output_tokens"] == 500
+        # (2000 * 1.0 + 500 * 5.0) / 1M = 0.0045
+        assert row["cost_usd"] == pytest.approx(0.0045, abs=1e-6)
+
+    def test_failure_swallowed_so_eod_report_survives(self, monkeypatch, caplog):
+        """A cost-telemetry exception must NOT propagate — EOD report
+        is the primary deliverable. The WARN log is operator-facing
+        signal that the row was lost."""
+        import boto3 as _boto3
+        from executor import eod_reconcile
+
+        class _BrokenS3:
+            def put_object(self, **kwargs):
+                raise RuntimeError("AccessDenied")
+
+        monkeypatch.setattr(_boto3, "client", lambda svc: _BrokenS3())
+
+        response = _FakeAnthropicMessage(
+            model="claude-haiku-4-5-20251001",
+            usage=_FakeUsage(input_tokens=10, output_tokens=5),
+        )
+        # Must NOT raise.
+        eod_reconcile._record_eod_narrative_cost(response, "2026-05-25")
+        assert any(
+            "cost record FAILED" in r.message and "AccessDenied" in r.message
+            for r in caplog.records
+        )
+
+    def test_synthesize_rationales_skips_cost_when_run_date_none(self, monkeypatch):
+        """Back-compat — callers passing no run_date (tests, ad-hoc CLI)
+        must not invoke the cost-telemetry path."""
+        from executor import eod_reconcile
+
+        called = {"n": 0}
+
+        def _spy(*args, **kwargs):
+            called["n"] += 1
+
+        monkeypatch.setattr(
+            eod_reconcile, "_record_eod_narrative_cost", _spy,
+        )
+        # Drive the no-context fast path (returns {} without calling LLM).
+        eod_reconcile._synthesize_rationales([])
+        assert called["n"] == 0
