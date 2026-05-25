@@ -296,7 +296,77 @@ _RATIONALES_TOOL = {
 }
 
 
-def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
+_COST_TELEMETRY_BUCKET = "alpha-engine-research"
+_COST_TELEMETRY_PREFIX = "decision_artifacts/_cost_raw"
+
+# Anthropic snapshot suffix: -YYYYMMDD on family names (e.g.
+# "claude-haiku-4-5-20251001"). Cost-telemetry rate cards are family-
+# keyed, so strip the suffix before pricing lookup. Mirrors the research-
+# side normalization at ``alpha-engine-research/graph/llm_cost_tracker.py``
+# (the 2026-05-02 SF halt that motivated that fix). Lift candidate:
+# both research + executor now do this — when a 3rd consumer adopts the
+# same pin pattern, fold into ``alpha_engine_lib.cost``'s SDK adapter.
+import re as _re
+_SNAPSHOT_SUFFIX_RE = _re.compile(r"-\d{8}$")
+
+
+def _record_eod_narrative_cost(response, run_date: str) -> None:
+    """Price + persist one cost-telemetry JSONL row for the EOD narrative.
+
+    Best-effort: any failure is logged and swallowed so the EOD report
+    (the primary deliverable) survives. The cost-telemetry surface
+    itself fails loud at flush time per
+    ``[[feedback_no_silent_fails]]`` — but since the executor's EOD
+    runs nightly outside the research SF, we cannot let a cost-sink
+    miss take down the trading-day report. The WARN log is the
+    operator-facing signal that the row was lost.
+
+    Writes to the same partition the research-side
+    ``aggregate_costs.py`` already scans, so the daily parquet rolls
+    executor + data + research rows up under one ``by_agent_id``
+    breakdown — single source of truth for the cost dashboard.
+    """
+    try:
+        from alpha_engine_lib.cost import record_anthropic_call
+
+        # Normalize snapshot suffix off the SDK-reported model so the
+        # family-keyed rate card matches (see _SNAPSHOT_SUFFIX_RE above).
+        family_model = _SNAPSHOT_SUFFIX_RE.sub("", getattr(response, "model", ""))
+        record = record_anthropic_call(
+            response,
+            model_name=family_model or None,
+            extra_fields={
+                "run_id": run_date,
+                "agent_id": "executor:eod_narrative",
+            },
+        )
+        key = (
+            f"{_COST_TELEMETRY_PREFIX}/{run_date}/{run_date}/"
+            f"executor:eod_narrative.jsonl"
+        )
+        body = (json.dumps(record, default=str) + "\n").encode("utf-8")
+        boto3.client("s3").put_object(
+            Bucket=_COST_TELEMETRY_BUCKET,
+            Key=key,
+            Body=body,
+            ContentType="application/x-ndjson",
+        )
+        logger.info(
+            "[cost_telemetry] EOD narrative cost recorded: $%.4f → "
+            "s3://%s/%s",
+            float(record.get("cost_usd", 0)),
+            _COST_TELEMETRY_BUCKET, key,
+        )
+    except Exception as exc:
+        # Best-effort. Operator-facing WARN; EOD report continues.
+        logger.warning(
+            "[cost_telemetry] EOD narrative cost record FAILED for "
+            "run_date=%s — cost row LOST: %s",
+            run_date, exc,
+        )
+
+
+def _synthesize_rationales(contexts: list[dict], run_date: str | None = None) -> dict[str, str]:
     """Call Haiku via Anthropic tool-use + Pydantic validation to synthesize
     per-position narratives. Falls back to templates on any failure.
 
@@ -305,6 +375,15 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
     preamble / trailing text). Tool-use makes the parse failure mode
     structurally impossible: Haiku returns a typed ``tool_use`` block
     whose ``input`` is schema-validated by the SDK *before* it lands here.
+
+    ``run_date``: when provided, the response's tokens + tool-fee usage
+    are priced via ``alpha_engine_lib.cost.record_anthropic_call`` and
+    written as one JSONL row to
+    ``s3://alpha-engine-research/decision_artifacts/_cost_raw/{run_date}/{run_date}/executor:eod_narrative.jsonl``.
+    Phase 0.2 wiring of the executor's only LLM call site
+    (previously-untracked ~$10–30/mo cost slice per the
+    ``prompt-caching-investigation-260525.md`` audit). When ``run_date``
+    is None (e.g., tests, ad-hoc invocation), cost telemetry is skipped.
     """
     if not contexts:
         return {}
@@ -330,6 +409,13 @@ def _synthesize_rationales(contexts: list[dict]) -> dict[str, str]:
             tool_choice={"type": "tool", "name": "emit_rationales"},
             messages=[{"role": "user", "content": prompt}],
         )
+
+        # Phase 0.2 cost telemetry — best-effort capture. Failures here
+        # MUST NOT break narrative synthesis (the primary deliverable);
+        # log + continue. Per [[feedback_no_silent_fails]] we still WARN
+        # loud so missed rows surface in CloudWatch.
+        if run_date is not None:
+            _record_eod_narrative_cost(response, run_date)
         # tool_choice={"type": "tool", "name": ...} forces Haiku to emit a
         # tool_use block — but Anthropic still allows additional text blocks
         # alongside it. Pick the tool_use block explicitly.
@@ -903,7 +989,7 @@ def run(run_date: str | None = None) -> None:
     try:
         if positions:
             contexts, ctx_warnings = _build_position_contexts(positions, conn, signals_bucket, run_date)
-            position_narratives = _synthesize_rationales(contexts)
+            position_narratives = _synthesize_rationales(contexts, run_date=run_date)
             logger.info(f"Position narratives generated for {len(position_narratives)} tickers")
             data_warnings.extend(ctx_warnings)
     except Exception as e:

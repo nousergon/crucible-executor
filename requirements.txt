@@ -46,7 +46,7 @@ requests~=2.32
 # all existing imports (secrets/dates/logging/eval_artifacts/alerts/
 # universe/telegram/decision_capture/preflight/trading_calendar) on
 # 2026-05-25 — all additive, no breaking changes to existing surface.
-alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.32.0
+alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.33.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
