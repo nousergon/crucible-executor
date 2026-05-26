@@ -325,8 +325,14 @@ portfolio_optimizer:
   # multi-asset / risk-parity layer.
   vol_target_annual: null
   # Covariance estimator. "ledoit_wolf" is the institutional default;
-  # "sample" disables shrinkage (useful only for synthetic-input tests).
+  # "sample" disables shrinkage (test-only); "ewma" enables RiskMetrics 1996
+  # exponentially-weighted dynamic Σ (vol-clustering aware). See
+  # optimizer-sota-upgrades-260526.md §A.2.
   covariance_shrinkage: ledoit_wolf
+  # EWMA decay (only used when covariance_shrinkage="ewma"). 0.94 is the
+  # RiskMetrics canonical (~11d half-life); 0.97 ↔ ~23d half-life (closer to
+  # canonical 21d α̂ horizon). Must be in [0.5, 1.0].
+  ewma_lambda_decay: 0.94
   # Σ horizon in trading days. 1 (default) = legacy daily Σ, bit-identical to
   # pre-260526 behavior. Set to 21 to align Σ with the canonical 21d log-domain
   # α̂; under i.i.d. log-returns Σ_H = H · Σ_daily, with vol-target SOC and

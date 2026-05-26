@@ -183,6 +183,10 @@ OPTIMIZER_CONFIG_DEFAULTS: dict = {
     # (bit-identical to pre-260526 behavior); set to 21 to align Σ with the
     # canonical 21d log-domain α̂. See optimizer-sota-upgrades-260526.md §A.1.
     "sigma_horizon_days": 1,
+    # EWMA decay for ``covariance_shrinkage="ewma"``. RiskMetrics 1996
+    # canonical value 0.94 ↔ ~11d half-life; 0.97 ↔ ~23d half-life (closer
+    # to canonical 21d α̂ horizon). See optimizer-sota-upgrades-260526.md §A.2.
+    "ewma_lambda_decay": 0.94,
 }
 
 
@@ -222,20 +226,57 @@ def _validate_inputs(
         raise ValueError("CASH must be eligible (sleeve pin)")
 
 
+def _ewma_covariance(returns: np.ndarray, lambda_decay: float) -> np.ndarray:
+    """RiskMetrics 1996 EWMA covariance with zero-mean assumption.
+
+    Σ_EWMA = (1−λ) · Σ_{k=0}^{T-1} λ^k · r_{t-k} r_{t-k}ᵀ, normalized so weights
+    sum to 1 over the finite window. The zero-mean simplification is standard
+    for daily equity returns (E[r] ≪ σ); RiskMetrics 1996 §5.3.2.
+
+    With λ=0.94 the effective half-life is log(0.5)/log(0.94) ≈ 11.2 trading days
+    (RiskMetrics canonical); 0.97 → ~22.8 days (closer to 21d α̂ horizon).
+
+    Degenerate at λ=1.0: weights become uniform 1/T → reduces to (unbiased
+    only up to the 1/T vs 1/(T-1) factor) sample covariance. Tested.
+    """
+    if not 0.5 <= lambda_decay <= 1.0:
+        raise ValueError(
+            f"ewma_lambda_decay must be in [0.5, 1.0]; got {lambda_decay}. "
+            f"RiskMetrics 1996 canonical is 0.94 (daily) or 0.97 (monthly)."
+        )
+    T = returns.shape[0]
+    if lambda_decay >= 1.0 - 1e-12:
+        # Uniform weights (degenerate). Treat λ=1 as plain sample-cov-equivalent.
+        return (returns.T @ returns) / T
+    # Newest observation first; row 0 carries the largest weight.
+    R = returns[::-1]
+    weights = (1.0 - lambda_decay) * lambda_decay ** np.arange(T)
+    weights /= weights.sum()  # normalize for finite-window truncation
+    return (R.T * weights) @ R
+
+
 def _estimate_covariance(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
     """Return covariance at horizon ``cfg["sigma_horizon_days"]``.
 
-    Estimates Σ_daily via the configured shrinkage (Ledoit-Wolf default) on the
-    NaN-clean returns panel, then scales by horizon-days under i.i.d. log-return
-    assumption: Σ_H = H · Σ_daily. Default H=1 preserves legacy daily Σ
-    bit-identical (1 × Σ = Σ).
+    Estimates Σ_daily via the configured estimator, then scales by horizon-days
+    under i.i.d. log-return assumption: Σ_H = H · Σ_daily. Default H=1 preserves
+    legacy daily Σ bit-identical (1 × Σ = Σ).
+
+    Estimators (cfg["covariance_shrinkage"]):
+      * "ledoit_wolf" (default): Ledoit-Wolf 2004 constant-correlation shrinkage
+        on equal-weighted samples. Institutional default.
+      * "sample": raw sample covariance, no shrinkage. Test-only.
+      * "ewma": RiskMetrics 1996 EWMA with cfg["ewma_lambda_decay"] (default
+        0.94). Captures vol-clustering; weights recent observations more.
+        See optimizer-sota-upgrades-260526.md §A.2.
     """
     clean = returns_panel[~np.isnan(returns_panel).any(axis=1)]
     if clean.shape[0] < 20:
         raise ValueError(
             f"Need ≥20 clean return rows for covariance; got {clean.shape[0]}"
         )
-    if cfg["covariance_shrinkage"] == "ledoit_wolf":
+    estimator = cfg["covariance_shrinkage"]
+    if estimator == "ledoit_wolf":
         try:
             from sklearn.covariance import LedoitWolf
         except ImportError as e:
@@ -244,12 +285,12 @@ def _estimate_covariance(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
                 "via `pip install 'scikit-learn>=1.3,<1.6'`."
             ) from e
         sigma_daily = LedoitWolf().fit(clean).covariance_
-    elif cfg["covariance_shrinkage"] == "sample":
+    elif estimator == "sample":
         sigma_daily = np.cov(clean, rowvar=False)
+    elif estimator == "ewma":
+        sigma_daily = _ewma_covariance(clean, float(cfg.get("ewma_lambda_decay", 0.94)))
     else:
-        raise ValueError(
-            f"Unknown covariance_shrinkage: {cfg['covariance_shrinkage']}"
-        )
+        raise ValueError(f"Unknown covariance_shrinkage: {estimator}")
 
     horizon = int(cfg.get("sigma_horizon_days", 1))
     if horizon < 1:

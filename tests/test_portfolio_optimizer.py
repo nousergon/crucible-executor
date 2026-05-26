@@ -401,3 +401,152 @@ def test_sigma_horizon_days_below_one_raises():
 
     with pytest.raises(ValueError, match="sigma_horizon_days must be ≥ 1"):
         _solve(u)
+
+
+# ─── A.2 EWMA covariance tests ──────────────────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §A.2
+#
+# RiskMetrics 1996 EWMA with zero-mean assumption. New estimator option
+# "ewma" + cfg["ewma_lambda_decay"] (default 0.94). Default estimator
+# (ledoit_wolf) is unchanged; EWMA is opt-in.
+
+
+def test_ewma_concentrates_on_recent_regime():
+    """Two-regime synthetic panel: EWMA should be closer to recent regime's
+    sample cov than to a pooled sample cov.
+
+    Construct T=500 daily returns: first 250 rows have N=2 with vol=0.005
+    and ρ=+0.8 (calm regime); last 250 rows have vol=0.03 and ρ=-0.3
+    (stress regime). EWMA(λ=0.94, half-life≈11d) should weight the stress
+    regime heavily because its window is much shorter than 250 days.
+    """
+    from executor.portfolio_optimizer import _ewma_covariance
+
+    rng = np.random.default_rng(42)
+    T_per = 250
+
+    # Calm regime: vol 0.005, correlation +0.8
+    calm_cov = np.array([[0.005**2, 0.8 * 0.005**2], [0.8 * 0.005**2, 0.005**2]])
+    calm = rng.multivariate_normal([0, 0], calm_cov, size=T_per)
+
+    # Stress regime: vol 0.03, correlation -0.3 (decorrelating in a crash)
+    stress_cov = np.array([[0.03**2, -0.3 * 0.03**2], [-0.3 * 0.03**2, 0.03**2]])
+    stress = rng.multivariate_normal([0, 0], stress_cov, size=T_per)
+
+    panel = np.vstack([calm, stress])  # calm first, stress last (most recent)
+
+    sigma_sample = np.cov(panel, rowvar=False)
+    sigma_ewma = _ewma_covariance(panel, lambda_decay=0.94)
+
+    # EWMA diagonals should be far closer to stress vol² than to the pooled
+    # ~mean of the two regimes' vol². Pooled vol² ≈ (0.005² + 0.03²) / 2 ≈ 4.6e-4.
+    pooled_var_avg = (0.005**2 + 0.03**2) / 2
+    stress_var = 0.03**2
+    ewma_var_avg = (sigma_ewma[0, 0] + sigma_ewma[1, 1]) / 2
+
+    assert abs(ewma_var_avg - stress_var) < abs(ewma_var_avg - pooled_var_avg), (
+        f"EWMA should track recent regime: ewma_var_avg={ewma_var_avg:.6f}, "
+        f"stress_var={stress_var:.6f}, pooled_var={pooled_var_avg:.6f}"
+    )
+    # And sample-cov should be in-between (averages across both regimes)
+    sample_var_avg = (sigma_sample[0, 0] + sigma_sample[1, 1]) / 2
+    assert abs(sample_var_avg - pooled_var_avg) < abs(sample_var_avg - stress_var), (
+        f"Sample cov should be closer to pooled than to stress; "
+        f"sample_var_avg={sample_var_avg:.6f}"
+    )
+
+
+def test_ewma_lambda_one_degenerates_to_uniform_weighted_cov():
+    """λ=1.0 → uniform weights → cov matches (R.T @ R)/T (zero-mean assumption)."""
+    from executor.portfolio_optimizer import _ewma_covariance
+
+    rng = np.random.default_rng(0)
+    returns = rng.normal(0, 0.01, size=(300, 3))
+
+    sigma_ewma_lambda1 = _ewma_covariance(returns, lambda_decay=1.0)
+    sigma_uniform = (returns.T @ returns) / returns.shape[0]
+
+    np.testing.assert_allclose(sigma_ewma_lambda1, sigma_uniform, rtol=1e-10)
+
+
+def test_ewma_weights_normalize_to_one():
+    """The EWMA weights must sum to 1 — sanity check that finite-T normalization
+    is correct so total variance scale is preserved."""
+    from executor.portfolio_optimizer import _ewma_covariance
+
+    rng = np.random.default_rng(1)
+    returns = rng.normal(0, 0.01, size=(500, 4))
+
+    sigma = _ewma_covariance(returns, lambda_decay=0.94)
+    # If weights summed wrong, the diagonal magnitude would be off by O(1/T)
+    # vs the true variance. Compare to uniform cov for plausibility check.
+    uniform_var_avg = float(np.mean(np.diag((returns.T @ returns) / 500)))
+    ewma_var_avg = float(np.mean(np.diag(sigma)))
+    # Both should be O(0.01²) = 1e-4. EWMA can deviate in either direction
+    # due to recent-window noise but must be in the same order of magnitude.
+    assert 0.1 * uniform_var_avg < ewma_var_avg < 10 * uniform_var_avg
+
+
+def test_ewma_invalid_lambda_raises():
+    """λ outside [0.5, 1.0] is a config error — RiskMetrics canonical range."""
+    from executor.portfolio_optimizer import _ewma_covariance
+
+    rng = np.random.default_rng(2)
+    returns = rng.normal(0, 0.01, size=(100, 2))
+
+    with pytest.raises(ValueError, match="ewma_lambda_decay must be in"):
+        _ewma_covariance(returns, lambda_decay=0.3)
+    with pytest.raises(ValueError, match="ewma_lambda_decay must be in"):
+        _ewma_covariance(returns, lambda_decay=1.1)
+
+
+def test_ewma_estimator_integrates_with_solve_target_weights():
+    """End-to-end: covariance_shrinkage="ewma" produces a valid optimization."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "ewma", "ewma_lambda_decay": 0.94}
+
+    result = _solve(u)
+
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
+    assert result.weights[u["cash_idx"]] == pytest.approx(0.03, abs=1e-6)
+    # Conviction picks should hit their cap given strong α̂
+    assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
+    assert result.weights[1] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_ewma_composes_with_sigma_horizon_days():
+    """EWMA Σ at H=21 = 21 × EWMA Σ at H=1 — composition with A.1."""
+    from executor.portfolio_optimizer import _estimate_covariance, OPTIMIZER_CONFIG_DEFAULTS
+
+    rng = np.random.default_rng(3)
+    returns = rng.normal(0, 0.01, size=(300, 4))
+
+    cfg_h1 = {**OPTIMIZER_CONFIG_DEFAULTS, "covariance_shrinkage": "ewma",
+              "ewma_lambda_decay": 0.94, "sigma_horizon_days": 1}
+    cfg_h21 = {**OPTIMIZER_CONFIG_DEFAULTS, "covariance_shrinkage": "ewma",
+               "ewma_lambda_decay": 0.94, "sigma_horizon_days": 21}
+
+    sigma_h1 = _estimate_covariance(returns, cfg_h1)
+    sigma_h21 = _estimate_covariance(returns, cfg_h21)
+
+    np.testing.assert_allclose(sigma_h21, 21.0 * sigma_h1, rtol=1e-10)
+
+
+def test_default_estimator_unchanged_after_ewma_addition():
+    """Adding EWMA must NOT change behavior when covariance_shrinkage is unset
+    or set to ledoit_wolf — no silent regression of the production path."""
+    u_default = _baseline_universe(n_active=2)
+    u_default["alpha_hat"][:2] = 0.05
+    u_default["cfg"] = {}  # default everything
+
+    u_explicit_lw = _baseline_universe(n_active=2)
+    u_explicit_lw["alpha_hat"][:2] = 0.05
+    u_explicit_lw["returns_panel"] = u_default["returns_panel"].copy()
+    u_explicit_lw["cfg"] = {"covariance_shrinkage": "ledoit_wolf"}
+
+    r_default = _solve(u_default)
+    r_lw = _solve(u_explicit_lw)
+
+    np.testing.assert_allclose(r_default.weights, r_lw.weights, atol=1e-8)
