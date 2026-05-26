@@ -334,6 +334,13 @@ portfolio_optimizer:
   # RiskMetrics canonical (~11d half-life); 0.97 ↔ ~23d half-life (closer to
   # canonical 21d α̂ horizon). Must be in [0.5, 1.0].
   ewma_lambda_decay: 0.94
+  # γ for the Garlappi-Uppal-Wang 2007 α̂-uncertainty penalty term
+  # γ · sum_i(σ_α̂_i² · w_i²). σ_α̂ comes from the predictor's BayesianRidge
+  # posterior (predicted_alpha_std field in predictions JSON, B.1).
+  # 0.0 (default) disables the term and preserves bit-identical legacy MVO.
+  # Backtester-tunable via param sweep; cutover gated by B.5. See
+  # optimizer-sota-upgrades-260526.md §B.3.
+  alpha_uncertainty_penalty: 0.0
   # Σ horizon in trading days. 1 (default) = legacy daily Σ, bit-identical to
   # pre-260526 behavior. Set to 21 to align Σ with the canonical 21d log-domain
   # α̂; under i.i.d. log-returns Σ_H = H · Σ_daily, with vol-target SOC and

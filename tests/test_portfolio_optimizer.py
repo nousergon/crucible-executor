@@ -636,3 +636,227 @@ def test_oas_distinct_from_lw_on_correlated_small_sample():
         "OAS should differ from LW on small T/N correlated data — if these "
         "match, OAS may be silently aliasing to LW"
     )
+
+
+# ─── B.3 α̂-uncertainty penalty tests ────────────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §B.3
+#
+# Adds γ · sum_i(σ_α̂_i² · w_i²) to the MVO objective when γ > 0 and
+# alpha_uncertainty is provided. Garlappi-Uppal-Wang 2007 diagonal-Ω form.
+# Default OFF (γ=0) preserves bit-identical legacy MVO behavior.
+
+
+def test_default_alpha_uncertainty_penalty_is_off_and_bit_identical():
+    """With cfg["alpha_uncertainty_penalty"] unset (default 0.0) AND no
+    alpha_uncertainty arg, behavior must match legacy MVO bit-identical —
+    a silent change to the production path would be the worst-case
+    failure mode of this PR."""
+    u_legacy = _baseline_universe(n_active=2)
+    u_legacy["alpha_hat"][:2] = 0.05
+    u_legacy["cfg"] = {"covariance_shrinkage": "sample"}
+
+    u_b3 = _baseline_universe(n_active=2)
+    u_b3["alpha_hat"][:2] = 0.05
+    u_b3["returns_panel"] = u_legacy["returns_panel"].copy()
+    u_b3["cfg"] = {"covariance_shrinkage": "sample"}  # no alpha_uncertainty_penalty key
+
+    r_legacy = _solve(u_legacy)
+    r_b3 = _solve(u_b3)
+    np.testing.assert_allclose(r_legacy.weights, r_b3.weights, atol=1e-12)
+    assert r_b3.diagnostics["alpha_uncertainty_penalty_used"] is False
+
+
+def test_alpha_uncertainty_penalty_off_when_arg_none_even_if_gamma_positive():
+    """γ > 0 but alpha_uncertainty=None → penalty term skipped (covers the
+    1-week soak window before BR pickle promoted in production)."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 1000.0}
+
+    result = _solve(u)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is False
+    # Same as legacy MVO — both names hit the cap
+    assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
+    assert result.weights[1] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_alpha_uncertainty_penalty_off_when_all_std_zero_or_nan():
+    """alpha_uncertainty provided but ALL entries are NaN (full legacy-Ridge
+    fallback case) → penalty term skipped."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 1000.0}
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    all_nan = np.full(N, np.nan)
+    result = solve_target_weights(**u, alpha_uncertainty=all_nan)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is False
+
+
+def test_high_uncertainty_pick_shrinks_relative_to_confident_pick():
+    """Two equal-α̂ picks: T0 has high σ (0.04), T1 has low σ (0.002).
+    With γ large enough, T0 shrinks below its cap while T1 stays at cap.
+
+    This is the load-bearing property of B.3 — confident picks size up,
+    diffuse picks size down. Per Garlappi-Uppal-Wang 2007 / plan §B.3."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 1000.0}
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[0] = 0.04  # diffuse
+    unc[1] = 0.002  # confident
+
+    result = solve_target_weights(**u, alpha_uncertainty=unc)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
+    assert result.weights[0] < 0.05, (
+        f"High-σ pick should shrink below cap; got {result.weights[0]:.4f}"
+    )
+    assert result.weights[1] == pytest.approx(0.08, abs=1e-3), (
+        f"Low-σ pick should stay at cap; got {result.weights[1]:.4f}"
+    )
+    # And the high-σ pick must shrink BELOW the low-σ pick
+    assert result.weights[0] < result.weights[1]
+
+
+def test_uniform_high_uncertainty_shrinks_all_conviction_picks_proportionally():
+    """All conviction picks have identical high σ → all shrink equally
+    relative to the baseline (no penalty) case. Plan acceptance:
+    'high-uncertainty case shrinks all conviction picks proportionally.'"""
+    u_baseline = _baseline_universe(n_active=3)
+    u_baseline["alpha_hat"][:3] = 0.05
+    u_baseline["cfg"] = {"covariance_shrinkage": "sample"}
+
+    u_high_unc = _baseline_universe(n_active=3)
+    u_high_unc["alpha_hat"][:3] = 0.05
+    u_high_unc["returns_panel"] = u_baseline["returns_panel"].copy()
+    u_high_unc["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 500.0}
+    u_high_unc["stance_caps"][u_high_unc["spy_idx"]] = 1.0
+    u_high_unc["stance_caps"][u_high_unc["cash_idx"]] = 1.0
+
+    r_baseline = _solve(u_baseline)
+    N = len(u_high_unc["tickers"])
+    unc = np.zeros(N)
+    unc[:3] = 0.05  # equal high uncertainty across all 3
+    r_high_unc = solve_target_weights(**u_high_unc, alpha_uncertainty=unc)
+
+    # Baseline: all three at cap
+    assert all(r_baseline.weights[i] == pytest.approx(0.08, abs=1e-3) for i in range(3))
+    # With uniform high σ: all three shrink, all roughly equal to each other
+    assert all(r_high_unc.weights[i] < 0.07 for i in range(3)), (
+        "All conviction picks should shrink when uncertainty is uniformly high"
+    )
+    spread = np.max(r_high_unc.weights[:3]) - np.min(r_high_unc.weights[:3])
+    assert spread < 0.005, (
+        f"Equal-σ picks should shrink to equal weights; spread={spread:.4f}"
+    )
+
+
+def test_nan_entries_treated_as_zero_uncertainty():
+    """Partial-rollout case: one ticker has BR std, the other still on legacy
+    Ridge (std=None → NaN). NaN entries get zero penalty (no info)."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 1000.0}
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.full(N, np.nan)
+    unc[0] = 0.04  # T0 has BR std → penalty applies
+    # T1 stays NaN → no penalty
+
+    result = solve_target_weights(**u, alpha_uncertainty=unc)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
+    # T0 shrinks (penalty applied), T1 stays at cap (no info, no penalty)
+    assert result.weights[0] < 0.05
+    assert result.weights[1] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_negative_alpha_uncertainty_coerced_to_zero_with_warning(caplog):
+    """Negative σ is an upstream contract violation but we don't crash the
+    morning planner over it — log loud, coerce to 0."""
+    import logging
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 1000.0}
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[0] = -0.05  # invalid
+    unc[1] = 0.002
+
+    with caplog.at_level(logging.WARNING):
+        result = solve_target_weights(**u, alpha_uncertainty=unc)
+    assert any("negative entries" in rec.message for rec in caplog.records)
+    # Solve still completes; T0 gets zero penalty (coerced), so it stays at cap
+    assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_alpha_uncertainty_wrong_shape_raises():
+    """Shape mismatch IS a load-bearing programming bug — raise loud."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 1000.0}
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    wrong_shape = np.array([0.01, 0.02])  # N=4 expected
+    with pytest.raises(ValueError, match="alpha_uncertainty shape"):
+        solve_target_weights(**u, alpha_uncertainty=wrong_shape)
+
+
+def test_uncertainty_penalty_diagnostics_populated():
+    """Diagnostics surface mean_alpha_std_active + penalty_contribution
+    for operator readability when penalty is active."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 500.0}
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[:2] = 0.03
+
+    result = solve_target_weights(**u, alpha_uncertainty=unc)
+    diag = result.diagnostics
+    assert diag["alpha_uncertainty_penalty_used"] is True
+    assert "mean_alpha_std_active" in diag
+    assert diag["mean_alpha_std_active"] > 0
+    assert "alpha_uncertainty_penalty_contribution" in diag
+    assert diag["alpha_uncertainty_penalty_contribution"] > 0
+
+
+def test_uncertainty_penalty_composes_with_horizon_and_ewma():
+    """B.3 must compose with A.1 (sigma_horizon_days) and A.2 (EWMA) —
+    the full SOTA stack should work together, not just in isolation."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {
+        "covariance_shrinkage": "ewma",
+        "ewma_lambda_decay": 0.94,
+        "sigma_horizon_days": 21,
+        "risk_aversion": 5.0 / 21.0,  # compensating rescale per A.1
+        "alpha_uncertainty_penalty": 1000.0,
+    }
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[0] = 0.04
+    unc[1] = 0.002
+
+    result = solve_target_weights(**u, alpha_uncertainty=unc)
+    # Solve succeeds AND uncertainty penalty active AND differentiates picks
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
+    assert result.weights[0] < result.weights[1]

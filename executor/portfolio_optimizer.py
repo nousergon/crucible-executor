@@ -7,7 +7,7 @@ no-conviction fill, cash is a pinned operational sleeve, conviction picks
 express deviation from SPY within sector + position + vol-target constraints.
 
 Math:
-    maximize   wᵀα̂  −  λ · wᵀΣ_H w  −  τ · ‖w − w_prev‖₁
+    maximize   wᵀα̂  −  λ · wᵀΣ_H w  −  γ · wᵀΩw  −  τ · ‖w − w_prev‖₁
     s.t.       Σwᵢ = 1                                    (budget)
                w[CASH] = cash_sleeve                       (sleeve pin)
                0 ≤ wᵢ ≤ stance_capᵢ                       (per-name cap)
@@ -20,6 +20,15 @@ Horizon convention: Σ_H is the H-day covariance, where H is set via
 Under i.i.d. log-return assumption, Σ_H = H · Σ_daily — see
 `alpha-engine-docs/private/optimizer-sota-upgrades-260526.md` §A.1 for the
 rationale (align Σ horizon with the canonical 21d log-domain α̂).
+
+α̂-uncertainty term (workstream B.3): Ω = diag(σ_α̂²) penalizes positions
+in proportion to per-name predictor variance — Garlappi-Uppal-Wang 2007
+diagonal-Ω form. γ = cfg["alpha_uncertainty_penalty"] (default 0.0 = OFF,
+preserves bit-identical legacy MVO). σ_α̂ comes from the predictor's
+BayesianRidge posterior (`predicted_alpha_std` in predictions JSON, shipped
+in alpha-engine-predictor B.1 #199). When `alpha_uncertainty=None` or all
+entries are NaN, the term is skipped regardless of γ — covers the 1-week
+soak window before the next training cycle promotes a BayesianRidge model.
 
 This module is a pure function over numpy inputs. It does no I/O, no logging
 config side effects, no S3 calls — easy to unit-test (PR 1) and easy to wire
@@ -57,6 +66,8 @@ def solve_target_weights(
     spy_idx: int,
     cash_idx: int,
     cfg: dict,
+    *,
+    alpha_uncertainty: np.ndarray | None = None,
 ) -> OptimizerResult:
     """
     Solve the constrained MVO and return target weights + diagnostics.
@@ -85,6 +96,16 @@ def solve_target_weights(
             to w_i = 0. SPY and CASH must be eligibility=True.
         spy_idx, cash_idx: positions in tickers list.
         cfg: dict with optimizer parameters. See OPTIMIZER_CONFIG_DEFAULTS.
+        alpha_uncertainty: optional shape (N,) array of σ_α̂ per ticker —
+            the BayesianRidge posterior std emitted by the predictor
+            (predicted_alpha_std field in predictions JSON, B.1). When
+            provided AND cfg["alpha_uncertainty_penalty"] > 0, adds the
+            Garlappi-Uppal-Wang 2007 diagonal-Ω penalty term to the MVO
+            objective so noisy picks size down proportionally. NaN entries
+            are treated as zero uncertainty (no penalty for that name);
+            covers the partial-rollout case during the 1-week soak between
+            B.1 landing and the first BayesianRidge model being promoted
+            in production. None ↔ no penalty regardless of γ.
 
     Returns:
         OptimizerResult with weights (length N, sums to 1, sleeve pinned) and
@@ -102,6 +123,7 @@ def solve_target_weights(
 
     N = len(tickers)
     sigma = _estimate_covariance(returns_panel, cfg)
+    omega_diag, alpha_unc_used = _resolve_alpha_uncertainty(alpha_uncertainty, N, cfg)
 
     try:
         import cvxpy as cp
@@ -114,11 +136,18 @@ def solve_target_weights(
     sigma_psd = cp.psd_wrap(sigma)
     w = cp.Variable(N)
 
-    objective = cp.Maximize(
-        alpha_hat @ w
-        - cfg["risk_aversion"] * cp.quad_form(w, sigma_psd)
-        - (cfg["tcost_bps"] / 1e4) * cp.norm(w - w_prev, 1)
-    )
+    objective_terms = [
+        alpha_hat @ w,
+        - cfg["risk_aversion"] * cp.quad_form(w, sigma_psd),
+        - (cfg["tcost_bps"] / 1e4) * cp.norm(w - w_prev, 1),
+    ]
+    if alpha_unc_used:
+        # γ · sum_i (σ_α̂_i² · w_i²) — diagonal-Ω Garlappi-Uppal-Wang penalty.
+        # cp.square(w) on a Variable is convex; sum with non-negative weights
+        # remains convex; negated in a Maximize is concave (well-formed).
+        gamma = float(cfg["alpha_uncertainty_penalty"])
+        objective_terms.append(- gamma * (omega_diag @ cp.square(w)))
+    objective = cp.Maximize(sum(objective_terms))
 
     eligibility_idx = np.where(~eligibility)[0]
     effective_caps = np.where(eligibility, stance_caps, 0.0)
@@ -150,12 +179,14 @@ def solve_target_weights(
         weights = _fallback_weights(w_prev, cash_idx, cfg["cash_sleeve_pct"])
         diagnostics = _build_diagnostics(
             weights, w_prev, sigma, alpha_hat, spy_idx, "infeasible_fallback", cfg,
+            omega_diag=omega_diag, alpha_unc_used=alpha_unc_used,
         )
         return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
     weights = _clip_and_renormalize(weights, effective_caps, cash_idx, cfg)
     diagnostics = _build_diagnostics(
         weights, w_prev, sigma, alpha_hat, spy_idx, status, cfg,
+        omega_diag=omega_diag, alpha_unc_used=alpha_unc_used,
     )
     return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
@@ -187,7 +218,56 @@ OPTIMIZER_CONFIG_DEFAULTS: dict = {
     # canonical value 0.94 ↔ ~11d half-life; 0.97 ↔ ~23d half-life (closer
     # to canonical 21d α̂ horizon). See optimizer-sota-upgrades-260526.md §A.2.
     "ewma_lambda_decay": 0.94,
+    # γ for the Garlappi-Uppal-Wang 2007 α̂-uncertainty penalty term
+    # γ · sum_i(σ_α̂_i² · w_i²). 0.0 (default) disables the term and
+    # preserves bit-identical legacy MVO behavior. Backtester-tunable.
+    # See optimizer-sota-upgrades-260526.md §B.3.
+    "alpha_uncertainty_penalty": 0.0,
 }
+
+
+def _resolve_alpha_uncertainty(
+    alpha_uncertainty: np.ndarray | None,
+    N: int,
+    cfg: dict,
+) -> tuple[np.ndarray, bool]:
+    """Build omega_diag = σ_α̂² and decide whether the penalty term is
+    active for this solve.
+
+    Returns (omega_diag, used) where ``used`` is True iff γ > 0 AND at
+    least one σ_α̂ entry is finite AND non-zero. On used=False the caller
+    skips the penalty term, preserving bit-identical legacy behavior.
+
+    Negative or non-finite σ_α̂ entries are coerced to 0 (no penalty for
+    that name) so partial-rollout (legacy Ridge std=None → NaN) does not
+    raise. Caller's alpha_uncertainty contract is "predictor posterior
+    std or NaN per ticker"; we enforce the σ ≥ 0 invariant defensively
+    here too — a negative entry IS an upstream bug (BR posterior is
+    always positive), but the optimizer is the wrong place to crash the
+    morning planner over it. Log loud, treat as missing.
+    """
+    gamma = float(cfg.get("alpha_uncertainty_penalty", 0.0))
+    if alpha_uncertainty is None or gamma <= 0.0:
+        return np.zeros(N), False
+    arr = np.asarray(alpha_uncertainty, dtype=np.float64).ravel()
+    if arr.shape != (N,):
+        raise ValueError(
+            f"alpha_uncertainty shape {arr.shape} != ({N},) — must be one entry per ticker"
+        )
+    # Any negative entry is an upstream contract violation. Don't crash the
+    # morning planner — log loud, coerce to 0 (per partial-rollout policy).
+    if np.any(arr[np.isfinite(arr)] < 0.0):
+        n_bad = int(np.sum((arr < 0.0) & np.isfinite(arr)))
+        logger.warning(
+            "alpha_uncertainty has %d negative entries — coercing to 0. "
+            "Predictor BayesianRidge posterior is always positive; investigate "
+            "upstream (B.1 #199 wiring).", n_bad,
+        )
+    # NaN / inf / negative → 0 → no penalty contribution
+    arr = np.where(np.isfinite(arr) & (arr >= 0.0), arr, 0.0)
+    omega = arr ** 2
+    used = bool(np.any(omega > 0.0))
+    return omega, used
 
 
 def _validate_inputs(
@@ -370,6 +450,9 @@ def _build_diagnostics(
     spy_idx: int,
     status: str,
     cfg: dict,
+    *,
+    omega_diag: np.ndarray | None = None,
+    alpha_unc_used: bool = False,
 ) -> dict:
     # sigma is at horizon H per _estimate_covariance. Annualize:
     # Var_ann = Var_H · (252/H) → vol_ann = √(252/H · Var_H). At default
@@ -383,7 +466,7 @@ def _build_diagnostics(
     active_share = float(np.sum(np.abs(weights - spy_only)) / 2)
     n_active = int(np.sum(weights > cfg["min_position_pct"]))
     turnover = float(np.sum(np.abs(weights - w_prev)) / 2)
-    return {
+    out = {
         "status": status,
         "portfolio_vol_ann": vol_ann,
         "active_share_vs_spy": active_share,
@@ -391,7 +474,20 @@ def _build_diagnostics(
         "turnover_one_way": turnover,
         "expected_alpha": float(weights @ alpha_hat),
         "weight_sum": float(weights.sum()),
+        "alpha_uncertainty_penalty_used": alpha_unc_used,
     }
+    # α̂-uncertainty observability (workstream B.3). Mean σ_α̂ across the
+    # active book (omega_diag = σ²) — operator-readable signal for how
+    # confident the predictor is on the names being sized today.
+    if omega_diag is not None and np.any(omega_diag > 0.0):
+        active_mask = weights > cfg["min_position_pct"]
+        active_omega = omega_diag[active_mask]
+        if active_omega.size > 0:
+            out["mean_alpha_std_active"] = float(np.sqrt(active_omega.mean()))
+            out["alpha_uncertainty_penalty_contribution"] = float(
+                cfg.get("alpha_uncertainty_penalty", 0.0) * (omega_diag @ (weights ** 2))
+            )
+    return out
 
 
 def make_cash_sentinel_returns(n_rows: int) -> np.ndarray:
