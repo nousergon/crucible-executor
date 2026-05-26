@@ -265,6 +265,10 @@ def _estimate_covariance(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
     Estimators (cfg["covariance_shrinkage"]):
       * "ledoit_wolf" (default): Ledoit-Wolf 2004 constant-correlation shrinkage
         on equal-weighted samples. Institutional default.
+      * "oas": Chen et al. 2010 Oracle Approximating Shrinkage. Lower-MSE than
+        LW when T/N is small (our universe ~27 × T~252 → T/N≈9 is modestly
+        small-sample). Drop-in alternative; same shrinkage-target family
+        (multiple of identity). See optimizer-sota-upgrades-260526.md §A.3.
       * "sample": raw sample covariance, no shrinkage. Test-only.
       * "ewma": RiskMetrics 1996 EWMA with cfg["ewma_lambda_decay"] (default
         0.94). Captures vol-clustering; weights recent observations more.
@@ -285,6 +289,15 @@ def _estimate_covariance(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
                 "via `pip install 'scikit-learn>=1.3,<1.6'`."
             ) from e
         sigma_daily = LedoitWolf().fit(clean).covariance_
+    elif estimator == "oas":
+        try:
+            from sklearn.covariance import OAS
+        except ImportError as e:
+            raise ImportError(
+                "scikit-learn is required for OAS shrinkage. Install via "
+                "`pip install 'scikit-learn>=1.3,<1.6'`."
+            ) from e
+        sigma_daily = OAS().fit(clean).covariance_
     elif estimator == "sample":
         sigma_daily = np.cov(clean, rowvar=False)
     elif estimator == "ewma":

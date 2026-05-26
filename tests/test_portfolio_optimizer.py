@@ -550,3 +550,89 @@ def test_default_estimator_unchanged_after_ewma_addition():
     r_lw = _solve(u_explicit_lw)
 
     np.testing.assert_allclose(r_default.weights, r_lw.weights, atol=1e-8)
+
+
+# ─── A.3 OAS estimator tests ────────────────────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §A.3
+#
+# Chen et al. 2010 Oracle Approximating Shrinkage. Drop-in alongside LW;
+# sklearn.covariance.OAS shares the .fit().covariance_ interface.
+
+
+def test_oas_estimator_produces_valid_psd_matrix():
+    """OAS Σ must be symmetric PSD; same shape as input."""
+    from executor.portfolio_optimizer import _estimate_covariance, OPTIMIZER_CONFIG_DEFAULTS
+
+    rng = np.random.default_rng(5)
+    returns = rng.normal(0, 0.01, size=(252, 5))
+    cfg = {**OPTIMIZER_CONFIG_DEFAULTS, "covariance_shrinkage": "oas"}
+
+    sigma = _estimate_covariance(returns, cfg)
+
+    assert sigma.shape == (5, 5)
+    np.testing.assert_allclose(sigma, sigma.T, atol=1e-12)
+    eigvals = np.linalg.eigvalsh(sigma)
+    assert eigvals.min() >= -1e-10, f"OAS Σ must be PSD; min eigval={eigvals.min()}"
+
+
+def test_oas_estimator_integrates_with_solve_target_weights():
+    """End-to-end: covariance_shrinkage="oas" produces a valid optimization."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "oas"}
+
+    result = _solve(u)
+
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
+    assert result.weights[u["cash_idx"]] == pytest.approx(0.03, abs=1e-6)
+    assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
+    assert result.weights[1] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_oas_composes_with_sigma_horizon_days():
+    """OAS Σ at H=21 = 21 × OAS Σ at H=1 — composition with A.1."""
+    from executor.portfolio_optimizer import _estimate_covariance, OPTIMIZER_CONFIG_DEFAULTS
+
+    rng = np.random.default_rng(7)
+    returns = rng.normal(0, 0.01, size=(252, 4))
+
+    cfg_h1 = {**OPTIMIZER_CONFIG_DEFAULTS, "covariance_shrinkage": "oas",
+              "sigma_horizon_days": 1}
+    cfg_h21 = {**OPTIMIZER_CONFIG_DEFAULTS, "covariance_shrinkage": "oas",
+               "sigma_horizon_days": 21}
+
+    sigma_h1 = _estimate_covariance(returns, cfg_h1)
+    sigma_h21 = _estimate_covariance(returns, cfg_h21)
+
+    np.testing.assert_allclose(sigma_h21, 21.0 * sigma_h1, rtol=1e-10)
+
+
+def test_oas_distinct_from_lw_on_correlated_small_sample():
+    """OAS and LW should produce different Σ when shrinkage intensity differs.
+
+    With i.i.d. zero-correlation data both estimators correctly shrink fully
+    to scaled-identity. Need data with real correlation structure so the
+    intensity formulas (which differ between LW and OAS) yield distinct Σ.
+    Confirms OAS is actually wired (not silently aliasing to LW)."""
+    from executor.portfolio_optimizer import _estimate_covariance, OPTIMIZER_CONFIG_DEFAULTS
+
+    rng = np.random.default_rng(11)
+    N = 10
+    T = 40  # small T/N where shrinkage intensity matters most
+    # Build a correlated panel: each return = common factor + idiosyncratic noise
+    common_factor = rng.normal(0, 0.01, size=T)
+    idiosyncratic = rng.normal(0, 0.005, size=(T, N))
+    returns = common_factor[:, None] + idiosyncratic  # broadcast; introduces ρ≈0.8
+
+    cfg_lw = {**OPTIMIZER_CONFIG_DEFAULTS, "covariance_shrinkage": "ledoit_wolf"}
+    cfg_oas = {**OPTIMIZER_CONFIG_DEFAULTS, "covariance_shrinkage": "oas"}
+
+    sigma_lw = _estimate_covariance(returns, cfg_lw)
+    sigma_oas = _estimate_covariance(returns, cfg_oas)
+
+    # Distinct: different shrinkage intensities → different off-diagonal magnitudes
+    assert not np.allclose(sigma_lw, sigma_oas, atol=1e-7), (
+        "OAS should differ from LW on small T/N correlated data — if these "
+        "match, OAS may be silently aliasing to LW"
+    )

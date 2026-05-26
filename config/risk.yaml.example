@@ -325,9 +325,10 @@ portfolio_optimizer:
   # multi-asset / risk-parity layer.
   vol_target_annual: null
   # Covariance estimator. "ledoit_wolf" is the institutional default;
-  # "sample" disables shrinkage (test-only); "ewma" enables RiskMetrics 1996
-  # exponentially-weighted dynamic Σ (vol-clustering aware). See
-  # optimizer-sota-upgrades-260526.md §A.2.
+  # "oas" is Chen et al. 2010 Oracle Approximating Shrinkage (lower MSE than
+  # LW when T/N is small); "sample" disables shrinkage (test-only); "ewma"
+  # enables RiskMetrics 1996 exponentially-weighted dynamic Σ (vol-clustering
+  # aware). See optimizer-sota-upgrades-260526.md §A.2 / §A.3.
   covariance_shrinkage: ledoit_wolf
   # EWMA decay (only used when covariance_shrinkage="ewma"). 0.94 is the
   # RiskMetrics canonical (~11d half-life); 0.97 ↔ ~23d half-life (closer to
