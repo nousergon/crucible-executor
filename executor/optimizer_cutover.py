@@ -232,12 +232,21 @@ def _build_entry_record(
         "predicted_direction": pred.get("predicted_direction"),
         "prediction_confidence": pred.get("prediction_confidence"),
         "predicted_alpha": pred.get("predicted_alpha"),
+        # B.4c (optimizer-sota-upgrades-260526.md §B.4c): surface the
+        # BayesianRidge posterior std at the order-record layer so
+        # downstream dashboards / emails / EOD reconciliation can show
+        # operators the predictor's confidence on each sized name.
+        # None when the predictor still emits via legacy Ridge (1-week
+        # soak after B.1 #199); downstream consumers handle None per the
+        # additive-field S3 contract.
+        "predicted_alpha_std": pred.get("predicted_alpha_std"),
         "stance": pred.get("stance"),
         "catalyst_date": pred.get("catalyst_date"),
         "sizing_source": "portfolio_optimizer",
         "sizing_factors": {
             "optimizer_target_weight": target_weight,
             "optimizer_delta_dollars": round(delta_dollars, 2),
+            "alpha_uncertainty": pred.get("predicted_alpha_std"),
         },
     }
 
@@ -300,5 +309,7 @@ def _build_urgent_exit_record(
         "predicted_direction": pred.get("predicted_direction"),
         "prediction_confidence": pred.get("prediction_confidence"),
         "predicted_alpha": pred.get("predicted_alpha"),
+        # B.4c — same surfacing rationale as _build_entry_record above.
+        "predicted_alpha_std": pred.get("predicted_alpha_std"),
         "sizing_source": "portfolio_optimizer",
     }

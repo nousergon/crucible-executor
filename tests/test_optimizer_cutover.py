@@ -365,3 +365,109 @@ def test_research_metadata_propagated_to_entry():
     assert e["sector"] == "Health Care"
     assert e["predicted_direction"] == "UP"
     assert e["stance"] == "quality"
+
+
+# ─── B.4c α̂-uncertainty surfacing in cutover records ───────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §B.4c
+#
+# Pure observability layer. Cutover already consumes uncertainty-shaped
+# target weights (the shadow_log was produced by B.4's run_shadow_optimizer
+# which threads alpha_uncertainty into solve). B.4c surfaces predicted_alpha_std
+# in the per-trade entry/exit records so dashboards / EOD email / SQLite
+# trade audit can show operators the predictor's confidence on each sized
+# name. Additive field — None when predictor emits via legacy Ridge during
+# the 1-week B.1 soak.
+
+
+def test_entry_record_surfaces_predicted_alpha_std():
+    """An entry record must carry the BayesianRidge posterior std field
+    when it's present in predictions_by_ticker. Also appears in the
+    sizing_factors block so the dashboard / email layer can read either."""
+    ob = OrderBook(data={"date": "2026-05-26"})
+    ibkr = _make_ibkr({"AAPL": 200.0})
+    log = {
+        "would_be_trades": [{
+            "ticker": "AAPL",
+            "action": "BUY",
+            "delta_dollars": 50_000.0,
+            "delta_weight": 0.05,
+            "target_weight": 0.05,
+            "current_weight": 0.0,
+        }],
+    }
+    predictions_by_ticker = {
+        "AAPL": {
+            "predicted_alpha": 0.038,
+            "predicted_alpha_std": 0.022,  # B.1 BayesianRidge field
+            "predicted_direction": "UP",
+            "prediction_confidence": 0.74,
+        },
+    }
+    kwargs = _baseline_kwargs(ob, ibkr, atr_map={"AAPL": 0.018})
+    kwargs["predictions_by_ticker"] = predictions_by_ticker
+    entries, _ = apply_optimizer_targets_to_orderbook(log=log, **kwargs)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["predicted_alpha"] == 0.038
+    assert e["predicted_alpha_std"] == 0.022
+    assert e["sizing_factors"]["alpha_uncertainty"] == 0.022
+
+
+def test_entry_record_predicted_alpha_std_is_none_during_legacy_ridge_soak():
+    """During the 1-week soak between B.1 landing and the first BR pickle
+    promoted in production, predicted_alpha_std is absent from predictions
+    JSON. Entry record must show None, not raise."""
+    ob = OrderBook(data={"date": "2026-05-26"})
+    ibkr = _make_ibkr({"MSFT": 400.0})
+    log = {
+        "would_be_trades": [{
+            "ticker": "MSFT",
+            "action": "BUY",
+            "delta_dollars": 40_000.0,
+            "delta_weight": 0.04,
+            "target_weight": 0.04,
+            "current_weight": 0.0,
+        }],
+    }
+    predictions_by_ticker = {
+        "MSFT": {
+            "predicted_alpha": 0.025,
+            # No predicted_alpha_std — legacy Ridge era
+            "predicted_direction": "UP",
+        },
+    }
+    kwargs = _baseline_kwargs(ob, ibkr)
+    kwargs["predictions_by_ticker"] = predictions_by_ticker
+    entries, _ = apply_optimizer_targets_to_orderbook(log=log, **kwargs)
+    e = entries[0]
+    assert e["predicted_alpha_std"] is None
+    assert e["sizing_factors"]["alpha_uncertainty"] is None
+
+
+def test_exit_record_surfaces_predicted_alpha_std():
+    """Exit records mirror the entry record additive field."""
+    ob = OrderBook(data={"date": "2026-05-26"})
+    ibkr = _make_ibkr({"JNJ": 150.0})
+    log = {
+        "would_be_trades": [{
+            "ticker": "JNJ",
+            "action": "SELL",
+            "delta_dollars": -22_500.0,
+            "delta_weight": -0.022,
+            "target_weight": 0.0,
+            "current_weight": 0.022,
+        }],
+    }
+    predictions_by_ticker = {
+        "JNJ": {
+            "predicted_alpha": -0.015,
+            "predicted_alpha_std": 0.030,
+        },
+    }
+    current_positions = {"JNJ": {"shares": 150, "sector": "Health Care"}}
+    kwargs = _baseline_kwargs(ob, ibkr, current_positions=current_positions)
+    kwargs["predictions_by_ticker"] = predictions_by_ticker
+    _, exits = apply_optimizer_targets_to_orderbook(log=log, **kwargs)
+    assert len(exits) == 1
+    x = exits[0]
+    assert x["predicted_alpha_std"] == 0.030
