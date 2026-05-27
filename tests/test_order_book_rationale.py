@@ -18,6 +18,10 @@ from executor.order_book_rationale import (
     STATE_APPROVED_ENTRY,
     STATE_HELD,
     STATE_NO_ACTION,
+    STATE_NO_ACTION_OPTIMIZER_ZERO,
+    STATE_NO_ACTION_RESEARCH_EXIT,
+    STATE_NO_ACTION_RESEARCH_HOLD,
+    STATE_NO_ACTION_UNKNOWN,
     STATE_PREDICTOR_VETOED,
     STATE_REDUCE,
     STATE_RISK_BLOCKED,
@@ -142,7 +146,9 @@ def test_every_terminal_state_resolved(scenario):
     assert by_ticker["NVDA"] == STATE_RISK_BLOCKED
     assert by_ticker["AMD"] == STATE_PREDICTOR_VETOED
     assert by_ticker["KO"] == STATE_HELD
-    assert by_ticker["XOM"] == STATE_NO_ACTION
+    # XOM: research EXIT signal on a non-held ticker → orphan exit
+    # sub-state (1.2.0+). Pre-1.2.0 emitted the bare STATE_NO_ACTION.
+    assert by_ticker["XOM"] == STATE_NO_ACTION_RESEARCH_EXIT
 
 
 def test_considered_universe_is_union_of_all_sources(scenario):
@@ -207,14 +213,18 @@ def test_summary_counts_match_records(scenario):
     assert s[f"n_{STATE_RISK_BLOCKED}"] == 1
     assert s[f"n_{STATE_PREDICTOR_VETOED}"] == 1
     assert s[f"n_{STATE_HELD}"] == 1
-    assert s[f"n_{STATE_NO_ACTION}"] == 1
+    # XOM was the sole no-action ticker; under 1.2.0 it carries the
+    # research_exit sub-state slug, not the bare no_action one.
+    assert s[f"n_{STATE_NO_ACTION_RESEARCH_EXIT}"] == 1
+    assert f"n_{STATE_NO_ACTION}" not in s
 
 
 def test_records_sorted_actioned_first(scenario):
     payload = build_order_book_rationale(**scenario)
     states = [r["terminal_state"] for r in payload["tickers"]]
     assert states[0] == STATE_APPROVED_ENTRY
-    assert states[-1] == STATE_NO_ACTION
+    # Last row is XOM, classified as research_exit under 1.2.0+.
+    assert states[-1] == STATE_NO_ACTION_RESEARCH_EXIT
 
 
 def test_payload_is_audit_stable_and_serializable(scenario):
@@ -592,8 +602,10 @@ class TestHeldFromPortfolioTruth:
     def test_non_held_ticker_with_research_hold_is_no_action(self):
         # SYK case: research recommends HOLD but the ticker is not in
         # the portfolio (cur_w=0). Research HOLD on a non-held ticker
-        # is an informational opinion, NOT a held state — resolve to
-        # STATE_NO_ACTION so the table doesn't claim we hold it.
+        # is an informational opinion, NOT a held state — resolve to a
+        # research_hold sub-state under 1.2.0+ so the table both
+        # (a) does not claim we hold it and (b) explains *why* it
+        # surfaced (research said HOLD but we don't own it).
         payload = build_order_book_rationale(
             signals={"enter": [], "exit": [], "reduce": [],
                      "hold": [_sig("SYK", "HOLD")]},
@@ -611,8 +623,13 @@ class TestHeldFromPortfolioTruth:
             current_positions={},
         )
         syk = next(r for r in payload["tickers"] if r["ticker"] == "SYK")
-        assert syk["terminal_state"] == STATE_NO_ACTION
+        assert syk["terminal_state"] == STATE_NO_ACTION_RESEARCH_HOLD
         assert syk["held"] is False
+        # The decision chain must carry a no_action stage explaining the
+        # fallthrough — operator-readable, not just a slug.
+        na = next(s for s in syk["decision_chain"] if s["stage"] == "no_action")
+        assert na["result"] == STATE_NO_ACTION_RESEARCH_HOLD
+        assert "HOLD" in na["detail"]
 
     def test_held_ticker_silent_from_research_appears_in_table(self):
         # A position the IB portfolio holds but research has no opinion
@@ -746,3 +763,166 @@ def test_obr_write_failure_publishes_alert_not_silent_swallow():
         "lazily (inside the except) so a missing lib at boot doesn't "
         "break the planner cold-start."
     )
+
+
+# ── no-action sub-state classification (schema 1.2.0+) ──────────────────
+#
+# Replaces the bare STATE_NO_ACTION fallthrough with four named sub-states
+# so the per-ticker decision chain answers *why* a ticker landed there.
+# Priority: research HOLD > research EXIT/REDUCE > optimizer zero weight
+# > unknown. STATE_NO_ACTION_UNKNOWN should never appear in a healthy
+# production run; surfacing it as a distinct slug lets the dashboard
+# flag a producer bug (mirrors the [[feedback_no_silent_fails]] norm).
+
+
+class TestNoActionSubStates:
+    def _empty_books(self) -> dict[str, Any]:
+        return {
+            "date": "2026-05-27",
+            "approved_entries": [],
+            "urgent_exits": [],
+            "active_stops": [],
+            "executed_today": [],
+        }
+
+    def _base_kwargs(self) -> dict[str, Any]:
+        return dict(
+            order_book_data=self._empty_books(),
+            blocked_entries=[],
+            risk_events=[],
+            market_regime="neutral",
+            run_date="2026-05-27",
+            signal_date="2026-05-27",
+            prediction_date="2026-05-27",
+            calendar_date="2026-05-27",
+            trading_day="2026-05-27",
+            run_id="2605271400",
+            current_positions={},
+        )
+
+    def test_research_hold_on_non_position_classified_hold(self):
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [], "reduce": [],
+                     "hold": [_sig("SYK", "HOLD")]},
+            predictions_by_ticker={},
+            **self._base_kwargs(),
+        )
+        syk = next(r for r in payload["tickers"] if r["ticker"] == "SYK")
+        assert syk["terminal_state"] == STATE_NO_ACTION_RESEARCH_HOLD
+
+    def test_research_exit_on_non_position_classified_exit(self):
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [_sig("XOM", "EXIT")],
+                     "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            **self._base_kwargs(),
+        )
+        xom = next(r for r in payload["tickers"] if r["ticker"] == "XOM")
+        assert xom["terminal_state"] == STATE_NO_ACTION_RESEARCH_EXIT
+        na = next(s for s in xom["decision_chain"] if s["stage"] == "no_action")
+        assert "EXIT" in na["detail"]
+
+    def test_research_reduce_on_non_position_classified_exit(self):
+        # REDUCE is a "lower exposure" signal — orphan REDUCE on a
+        # ticker we don't hold is operationally the same as orphan EXIT.
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [], "reduce": [_sig("BAC", "REDUCE")],
+                     "hold": []},
+            predictions_by_ticker={},
+            **self._base_kwargs(),
+        )
+        bac = next(r for r in payload["tickers"] if r["ticker"] == "BAC")
+        assert bac["terminal_state"] == STATE_NO_ACTION_RESEARCH_EXIT
+        na = next(s for s in bac["decision_chain"] if s["stage"] == "no_action")
+        assert "REDUCE" in na["detail"]
+
+    def test_research_enter_optimizer_zero_target_classified_optimizer_zero(self):
+        # The load-bearing operator case: research said ENTER, the
+        # optimizer ran, the ticker was eligible, but the optimizer
+        # assigned ~0 target weight → "we looked and chose not to."
+        # Research bucket alone is what surfaces the ticker into the
+        # considered universe; the optimizer view supplies the detail.
+        shadow = {
+            "tickers": ["F"],
+            "current_weights": [0.0],
+            "target_weights": [0.0],
+            "alpha_hat": [0.001],
+            "eligibility": [True],
+            "eligibility_reasons": [None],
+            "optimizer_cfg": {"min_score_to_enter": 55.0},
+        }
+        payload = build_order_book_rationale(
+            signals={"enter": [_sig("F", "ENTER", score=65.0)],
+                     "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            optimizer_shadow_log=shadow,
+            **self._base_kwargs(),
+        )
+        f = next(r for r in payload["tickers"] if r["ticker"] == "F")
+        assert f["terminal_state"] == STATE_NO_ACTION_OPTIMIZER_ZERO
+        na = next(s for s in f["decision_chain"] if s["stage"] == "no_action")
+        assert "optimizer" in na["detail"].lower()
+        # The optimizer view is on the record so the dashboard can
+        # surface the weights inline with the sub-state.
+        assert f["optimizer"]["target_weight"] == 0.0
+        assert f["optimizer"]["eligible"] is True
+
+    def test_priority_research_hold_wins_over_optimizer_zero(self):
+        # When BOTH a research HOLD AND an optimizer-zero view exist,
+        # the research signal takes precedence — it's the more direct
+        # explanation ("research said hold, we don't own it") vs the
+        # downstream optimizer math.
+        shadow = {
+            "tickers": ["SYK"],
+            "current_weights": [0.0],
+            "target_weights": [0.0],
+            "alpha_hat": [0.001],
+            "eligibility": [True],
+            "eligibility_reasons": [None],
+        }
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [], "reduce": [],
+                     "hold": [_sig("SYK", "HOLD")]},
+            predictions_by_ticker={},
+            optimizer_shadow_log=shadow,
+            **self._base_kwargs(),
+        )
+        syk = next(r for r in payload["tickers"] if r["ticker"] == "SYK")
+        assert syk["terminal_state"] == STATE_NO_ACTION_RESEARCH_HOLD
+
+    def test_research_enter_without_optimizer_view_classified_unknown(self):
+        # Defensive — should be rare in production. Research said ENTER,
+        # no optimizer shadow log (legacy non-optimizer run OR shadow
+        # log absent for the ticker), no approved-entry record, no
+        # risk-event. The legacy path would normally produce a
+        # blocked-entry or approved-entry; reaching no-action here means
+        # something upstream silently dropped the signal. Surfacing it
+        # as STATE_NO_ACTION_UNKNOWN gives the dashboard a distinct
+        # row to flag for investigation.
+        payload = build_order_book_rationale(
+            signals={"enter": [_sig("LOST", "ENTER")],
+                     "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            **self._base_kwargs(),
+        )
+        lost = next(r for r in payload["tickers"] if r["ticker"] == "LOST")
+        assert lost["terminal_state"] == STATE_NO_ACTION_UNKNOWN
+        na = next(s for s in lost["decision_chain"] if s["stage"] == "no_action")
+        assert "no" in na["detail"].lower()
+
+    def test_chain_always_carries_no_action_stage_for_subclass_rows(self):
+        # Every sub-state must append a `no_action` chain stage so the
+        # per-ticker drill-down explains the fallthrough — no silent
+        # "state slug only" records.
+        payload = build_order_book_rationale(
+            signals={"enter": [], "exit": [_sig("XOM", "EXIT")],
+                     "reduce": [], "hold": [_sig("SYK", "HOLD")]},
+            predictions_by_ticker={},
+            **self._base_kwargs(),
+        )
+        for ticker in ("XOM", "SYK"):
+            rec = next(r for r in payload["tickers"] if r["ticker"] == ticker)
+            stages = [s["stage"] for s in rec["decision_chain"]]
+            assert "no_action" in stages, (
+                f"{ticker}: no_action stage missing from chain"
+            )
