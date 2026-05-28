@@ -563,12 +563,15 @@ def run(run_date: str | None = None) -> None:
     # Hard-fails on any miss: EOD reconcile must reconcile against an
     # authoritative price source, not IB Gateway's delayed intraday data.
     #
-    # Macro-routed held positions (SPY/sector ETFs/etc.) live in the
-    # `macro` library, NOT `universe`. The portfolio-optimizer cutover
+    # Macro-routed held positions (sector ETFs / VIX / TNX / etc.) live in
+    # the `macro` library, NOT `universe`. The portfolio-optimizer cutover
     # (2026-05-13) made SPY a held core position; its first EOD on
     # 2026-05-14 raised NoSuchVersionException because reconcile was
-    # universe-only. Mirror price_cache.load_price_histories' macro-aware
-    # dispatch (executor/price_cache.py:128-145, _MACRO_SYMBOLS).
+    # universe-only. SPY-as-held is now read from `universe` directly
+    # (alpha-engine-data #245 lifted SPY to a full universe member via
+    # `_UNIVERSE_EXTRA`); only the remaining macro-only-Close symbols still
+    # need the macro-lib dispatch. Mirror `price_cache.load_price_histories`
+    # (executor/price_cache.py, `_MACRO_SYMBOLS`).
     from executor.price_cache import (
         _open_universe_library,
         _open_macro_library,
@@ -579,13 +582,8 @@ def run(run_date: str | None = None) -> None:
     target_ts = pd.Timestamp(run_date).normalize()
     closing_prices: dict[str, float] = {}
     missing: list[str] = []
-    # L1346 (c) second-half routing post-#245: SPY removed from macro-routed
-    # set since universe.SPY now carries full OHLCV. Defensive macro fallback
-    # for SPY preserves backwards compat — mirrors price_cache.py + predictor
-    # #196 pattern.
-    _MACRO_SYMBOLS_NO_OHLCV = _MACRO_SYMBOLS - {"SPY"}
     for ticker in positions.keys():
-        if ticker in _MACRO_SYMBOLS_NO_OHLCV:
+        if ticker in _MACRO_SYMBOLS:
             if macro_lib is None:
                 macro_lib = _open_macro_library(trades_bucket)
             lib = macro_lib
@@ -594,22 +592,8 @@ def run(run_date: str | None = None) -> None:
         try:
             df = lib.read(ticker).data
         except Exception as e:
-            # SPY-specific defensive fallback to macro.SPY if universe.SPY
-            # unreadable. Removed once L1346 (b)+(c) soak clean ≥1 cycle.
-            if ticker == "SPY" and lib is universe_lib:
-                if macro_lib is None:
-                    macro_lib = _open_macro_library(trades_bucket)
-                try:
-                    df = macro_lib.read(ticker).data
-                except Exception as e2:
-                    missing.append(
-                        f"{ticker} (universe={e.__class__.__name__}, "
-                        f"macro={e2.__class__.__name__})"
-                    )
-                    continue
-            else:
-                missing.append(f"{ticker} ({e.__class__.__name__})")
-                continue
+            missing.append(f"{ticker} ({e.__class__.__name__})")
+            continue
         if df.empty or "Close" not in df.columns:
             missing.append(f"{ticker} (no Close column)")
             continue

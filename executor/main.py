@@ -1197,33 +1197,28 @@ def run(
         # missing ticker or stale data — feedback_hard_fail_until_stable.
         # Scope: signal tickers (ENTER) + held positions (for trailing stops).
         #
-        # Macro-routed tickers (sector ETFs/VIX/TNX/etc., see _MACRO_SYMBOLS)
-        # are intentionally excluded. They're used for sector-relative exit
-        # veto via price_histories, not ATR-based execution, and they live in
-        # the Close-only `macro` ArcticDB library which has no atr_14_pct
-        # feature column.
+        # Macro-routed tickers (sector ETFs / VIX / TNX / etc., see
+        # _MACRO_SYMBOLS) are intentionally excluded. They live in the
+        # Close-only `macro` ArcticDB library which has no atr_14_pct
+        # feature column and are used for sector-relative exit veto via
+        # price_histories, not ATR-based execution.
         #
-        # SPY is NO LONGER excluded as of L1346 (c) (2026-05-24): alpha-engine
-        # -data #245 promoted SPY to a full ``universe`` ArcticDB member
-        # (_UNIVERSE_EXTRA = frozenset({"SPY"}), written by both
-        # builders/backfill.py and builders/daily_append.py), so SPY now has
-        # the full OHLCV + atr_14_pct feature column that load_atr_14_pct
-        # needs. The pre-L1346 #185 fix excluded SPY because the macro lib
-        # was Close-only; with universe.SPY now carrying ATR, the exclusion
-        # is dead defense. Gate (a) verified via 2026-05-24 DataPhase1 SSM
-        # log (`Backfill write complete: 904 ok` = 903 constituents + SPY).
-        # _MACRO_SYMBOLS_NO_OHLCV is the post-L1346 subset of macro-only
-        # symbols that still need to be excluded — everything in macro EXCEPT
-        # SPY (which now has full OHLCV via universe write).
+        # SPY is NOT excluded — alpha-engine-data #245 (2026-05-15) lifted
+        # SPY to a full `universe` ArcticDB member (`_UNIVERSE_EXTRA =
+        # frozenset({"SPY"})`, written by both builders/backfill.py and
+        # builders/daily_append.py), so `universe.SPY` carries the full
+        # OHLCV + atr_14_pct feature column that `load_atr_14_pct` needs.
+        # SPY is removed from `_MACRO_SYMBOLS` (price_cache.py) for the
+        # same reason — the executor reads SPY from `universe` like any
+        # other held ticker.
         #
         # ``atr_map`` kwarg mirrors the vwap_map injection pattern — backtester
         # precomputes once per simulate pipeline, skipping millions of
         # per-call universe.read(ticker) round-trips. Live trading passes
         # atr_map=None and takes the load_atr_14_pct path unchanged.
-        _MACRO_SYMBOLS_NO_OHLCV = _MACRO_SYMBOLS - {"SPY"}
         atr_tickers = [s["ticker"] for s in signals.get("enter", [])]
         atr_tickers += list(current_positions.keys())
-        atr_tickers = sorted(set(atr_tickers) - _MACRO_SYMBOLS_NO_OHLCV)
+        atr_tickers = sorted(set(atr_tickers) - _MACRO_SYMBOLS)
         if atr_map is None:
             if atr_tickers:
                 atr_map = load_atr_14_pct(

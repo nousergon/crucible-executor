@@ -39,12 +39,17 @@ logger = logging.getLogger(__name__)
 # predictor's own DailyData dependency expectation.
 _ATR_MAX_STALENESS_TRADING_DAYS = 1
 
-# Symbols that live in the ArcticDB `macro` library rather than `universe`.
-# Mirrors the canonical writer list in alpha-engine-data's
-# ``builders/daily_append.py`` (macro_keys + sector_etfs). Kept in sync
-# manually; any additions there need matching updates here.
+# Symbols the executor reads from the ArcticDB `macro` library (Close-only).
+# Subset of what alpha-engine-data writes to macro — SPY is dual-written
+# there but read from `universe` for full OHLCV + atr_14_pct (L1346 (c)
+# retirement, 2026-05-28; SPY became a full `universe` member via
+# alpha-engine-data #245's `_UNIVERSE_EXTRA = frozenset({"SPY"})` write
+# path on 2026-05-15). VIX/VIX3M/TNX/IRX/GLD/USO + XL* sector ETFs stay
+# macro-routed because they have no `universe` counterpart and their
+# use cases (sector-relative exit veto + macro features) consume Close
+# only.
 _MACRO_SYMBOLS = frozenset({
-    "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
     "XLP", "XLRE", "XLU", "XLV", "XLY",
 })
@@ -131,17 +136,8 @@ def load_price_histories(
     read_errors: list[str] = []
     empty: list[str] = []
 
-    # L1346 (c) second-half routing post-#245:
-    # SPY is no longer in `_MACRO_SYMBOLS_NO_OHLCV` because universe.SPY
-    # now carries full OHLCV (alpha-engine-data #245 _UNIVERSE_EXTRA
-    # write path; gate (a) verified via 5/24 DataPhase1 SSM log).
-    # Defensive fallback to macro.SPY preserves backwards compat during
-    # the cross-repo retirement — mirrors alpha-engine-predictor #196's
-    # universe-preferred + macro-fallback shape. Non-SPY macro symbols
-    # (VIX/TNX/IRX/sector ETFs) remain macro-routed (still Close-only).
-    _MACRO_SYMBOLS_NO_OHLCV = _MACRO_SYMBOLS - {"SPY"}
     for ticker in tickers:
-        if ticker in _MACRO_SYMBOLS_NO_OHLCV:
+        if ticker in _MACRO_SYMBOLS:
             if macro is None:
                 macro = _open_macro_library(signals_bucket)
             lib = macro
@@ -150,24 +146,8 @@ def load_price_histories(
         try:
             df = lib.read(ticker).data
         except Exception as e:
-            # L1346 (c) SPY-specific fallback: if SPY isn't in universe
-            # (e.g. universe.SPY backfill hadn't run yet), fall through
-            # to macro.SPY. Removed once L1346 (b) + (c) soak clean for
-            # ≥1 Saturday cycle on production.
-            if ticker == "SPY" and lib is universe:
-                if macro is None:
-                    macro = _open_macro_library(signals_bucket)
-                try:
-                    df = macro.read(ticker).data
-                except Exception as e2:
-                    read_errors.append(
-                        f"{ticker} (universe={e.__class__.__name__}, "
-                        f"macro={e2.__class__.__name__})"
-                    )
-                    continue
-            else:
-                read_errors.append(f"{ticker} ({e.__class__.__name__})")
-                continue
+            read_errors.append(f"{ticker} ({e.__class__.__name__})")
+            continue
         if df.empty:
             empty.append(ticker)
             continue
