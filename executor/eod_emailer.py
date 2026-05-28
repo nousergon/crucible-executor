@@ -18,18 +18,10 @@ from __future__ import annotations
 
 import logging
 import os
-import smtplib
 import sqlite3
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import boto3
-from botocore.exceptions import ClientError
 
-from alpha_engine_lib.secrets import get_secret
-
-_GMAIL_SMTP_HOST = "smtp.gmail.com"
-_GMAIL_SMTP_PORT = 587
 
 logger = logging.getLogger(__name__)
 
@@ -446,49 +438,12 @@ def send_eod_email(
         except Exception as e:
             logger.warning("EOD email archival failed (non-fatal): %s", e)
 
-    app_password = (get_secret("GMAIL_APP_PASSWORD", required=False, default="") or "").replace(" ", "")
-
-    if app_password:
-        # Gmail SMTP — email originates from Gmail's servers, passes SPF/DKIM
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = ", ".join(recipients)
-        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-        try:
-            with smtplib.SMTP(_GMAIL_SMTP_HOST, _GMAIL_SMTP_PORT) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(sender, app_password)
-                server.sendmail(sender, recipients, msg.as_string())
-            logger.info(f"EOD email sent via Gmail SMTP: '{subject}' → {recipients}")
-        except smtplib.SMTPAuthenticationError as e:
-            logger.error(f"Gmail SMTP auth failed: {e}. Check GMAIL_APP_PASSWORD and 2FA.")
-        except Exception as e:
-            logger.error(f"Gmail SMTP send error: {e}")
-    else:
-        # Fallback: AWS SES (works reliably only with a custom domain sender)
-        logger.warning(
-            "GMAIL_APP_PASSWORD not set — falling back to SES. "
-            "If sender is @gmail.com, email may be silently dropped."
-        )
-        ses = boto3.client("ses", region_name=region)
-        try:
-            ses.send_email(
-                Source=sender,
-                Destination={"ToAddresses": recipients},
-                Message={
-                    "Subject": {"Data": subject, "Charset": "UTF-8"},
-                    "Body": {
-                        "Text": {"Data": plain_body, "Charset": "UTF-8"},
-                        "Html": {"Data": html_body, "Charset": "UTF-8"},
-                    },
-                },
-            )
-            logger.info(f"EOD email sent via SES: '{subject}' → {recipients}")
-        except ClientError as e:
-            logger.error(f"SES send failed: {e.response['Error']['Message']}")
-        except Exception as e:
-            logger.error(f"EOD email error: {e}")
+    # SMTP/SES dispatch via the alpha_engine_lib.email_sender chokepoint
+    # (L4356 — Gmail SMTP primary, SES fallback). Identical semantics to
+    # the pre-consolidation inline path.
+    from alpha_engine_lib.email_sender import send_email as _send_email
+    _send_email(
+        subject, plain_body,
+        recipients=recipients, html=html_body,
+        sender=sender, region=region,
+    )
