@@ -290,10 +290,28 @@ def test_main_imports_macro_symbols_from_price_cache():
     tickers (defined in price_cache.py, also consumed by
     load_price_histories + eod_reconcile #181). Pin the import so the
     exclusion set never drifts from the dispatch set.
+
+    Post-L1346 (c) (2026-05-28): SPY is excluded from `_MACRO_SYMBOLS`
+    because `universe.SPY` now carries full OHLCV + atr_14_pct via
+    alpha-engine-data #245's `_UNIVERSE_EXTRA` write path. SPY is read
+    from `universe` like any other held ticker. VIX/VIX3M/TNX/IRX/GLD/
+    USO + XL* sector ETFs remain macro-routed (no `universe` counterpart;
+    Close-only).
     """
     from executor.price_cache import _MACRO_SYMBOLS
 
-    assert "SPY" in _MACRO_SYMBOLS
+    assert "SPY" not in _MACRO_SYMBOLS, (
+        "SPY must NOT be in _MACRO_SYMBOLS post-L1346 (c) retirement — "
+        "universe.SPY now has full OHLCV (alpha-engine-data #245). "
+        "Re-adding SPY here would re-introduce the dead-defense pattern "
+        "that excluded SPY from ATR computation."
+    )
+    # Sanity: remaining macro-only symbols still routed to macro lib.
+    for sym in ("VIX", "TNX", "IRX", "XLK", "XLF"):
+        assert sym in _MACRO_SYMBOLS, (
+            f"{sym} must remain in _MACRO_SYMBOLS — it lives only in the "
+            f"`macro` ArcticDB library (Close-only)."
+        )
     assert executor_main._MACRO_SYMBOLS is _MACRO_SYMBOLS, (
         "executor.main must reuse price_cache._MACRO_SYMBOLS, not "
         "redefine its own macro set (drift risk)."
