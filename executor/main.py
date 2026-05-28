@@ -1045,47 +1045,65 @@ def run(
 
         # ── 2b'''. Resolve drawdown-leg posture override ──────────────────────
         # regime-drawdown-hysteresis-260518.md (regime ensemble leg 3).
-        # The deterministic drawdown leg (alpha-engine-predictor daily
-        # stage) emits a composed effective_regime. When acting, it
-        # overrides the planner's effective market_regime by
-        # MOST-PROTECTIVE (never a downgrade): a drawdown "bear" forces
-        # bear; a drawdown "caution" raises neutral/bull → caution but
-        # never lowers an already-bear posture (e.g. one a forced_bear
-        # override just set). Same UNGATED-read / GATED-behavior +
-        # parallel-observe discipline as the forced-bear block above;
-        # gated on ``drawdown_regime_enabled`` (default false).
+        #
+        # Type-system separation (v0.42.0 Phase 2B —
+        # caution-regime-retirement-260528.md):
+        # The drawdown leg's protective state is an axis ORTHOGONAL to
+        # macro market_regime. Read the severity ordinal as the
+        # canonical input:
+        #   severity 0 = risk_on (no escalation)
+        #   severity 1 = caution (half-step protection)
+        #   severity 2 = risk_off / alpha_bleed (full protection, same as macro bear)
+        # Only severity 2 overrides macro market_regime to "bear" (its
+        # protective tier IS macro bear). Caution-tier (severity 1)
+        # logs an OBSERVE counterfactual today — the half-step posture
+        # for the executor is a future L924 follow-up (position-sizer
+        # caution multiplier or similar). The macro market_regime
+        # 3-class invariant is preserved.
+        #
+        # Same UNGATED-read / GATED-behavior + parallel-observe
+        # discipline as the forced-bear block above; the bear-tier
+        # override gated on ``drawdown_regime_enabled`` (default false).
         if not simulate:
             try:
                 from executor.signal_reader import (
-                    extract_drawdown_effective_regime,
+                    extract_drawdown_protective_severity,
                     read_drawdown_substrate,
                 )
-                _dd = extract_drawdown_effective_regime(
-                    read_drawdown_substrate(signals_bucket)
-                )
-                _rank = {
-                    "bull": 0, "bullish": 0, "neutral": 1,
-                    "caution": 2, "bear": 3, "bearish": 3,
-                }
-                _cur_rank = _rank.get((market_regime or "").lower(), 1)
-                _dd_rank = _rank.get((_dd or "").lower(), -1)
-                if _dd in ("bear", "caution") and _dd_rank > _cur_rank:
+                _dd_payload = read_drawdown_substrate(signals_bucket)
+                _dd_severity = extract_drawdown_protective_severity(_dd_payload)
+                _macro_rank = {"bull": 0, "neutral": 1, "bear": 2}
+                _cur_rank = _macro_rank.get((market_regime or "").lower(), 1)
+                if _dd_severity >= 2 and _cur_rank < _macro_rank["bear"]:
                     if config.get("drawdown_regime_enabled", False):
                         logger.warning(
-                            "DRAWDOWN regime active — overriding effective "
-                            "market_regime '%s' → '%s' for this planning "
-                            "cycle (research regime preserved for audit). "
-                            "Source: daily drawdown leg (most-protective).",
-                            market_regime, _dd,
+                            "DRAWDOWN regime active (severity=2) — overriding "
+                            "effective market_regime '%s' → 'bear' for this "
+                            "planning cycle (research regime preserved for "
+                            "audit). Source: daily drawdown leg "
+                            "(most-protective).",
+                            market_regime,
                         )
-                        market_regime = _dd
+                        market_regime = "bear"
                     else:
                         logger.info(
                             "drawdown_regime OBSERVE (flag off): drawdown "
-                            "effective_regime=%s; would override "
-                            "market_regime '%s' → '%s'. No behavior change.",
-                            _dd, market_regime, _dd,
+                            "severity=2; would override market_regime '%s' "
+                            "→ 'bear'. No behavior change.",
+                            market_regime,
                         )
+                elif _dd_severity == 1:
+                    # Half-step protection — no macro override (caution
+                    # tier is orthogonal to 3-class macro). Logged for
+                    # OBSERVE-window data + future L924 follow-on
+                    # (position-sizer half-step multiplier).
+                    logger.info(
+                        "drawdown_regime OBSERVE: severity=1 (caution-tier) "
+                        "— no macro override (3-class invariant); half-step "
+                        "protective semantic lives on drawdown axis only. "
+                        "market_regime='%s' unchanged.",
+                        market_regime,
+                    )
             except Exception as _dd_err:
                 logger.warning(
                     "drawdown-leg read failed (%s) — drawdown override not "

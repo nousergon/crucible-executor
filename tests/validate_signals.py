@@ -19,6 +19,11 @@ import sys
 _VALID_SIGNALS = {"ENTER", "EXIT", "REDUCE", "HOLD"}
 _VALID_CONVICTIONS = {"rising", "stable", "declining"}
 _VALID_SECTOR_RATINGS = {"overweight", "market_weight", "underweight"}
+# 3-class Ang-Bekaert taxonomy (v0.42.0 / 2026-05-28 —
+# caution-regime-retirement-260528.md). Legacy "caution" grandfathered
+# on read for historical signals.json artifacts but no longer emitted
+# by the macro agent (whose _validate_regime coerces raw LLM caution
+# → neutral upstream).
 _VALID_REGIMES = {"bull", "neutral", "bear", "caution"}
 
 

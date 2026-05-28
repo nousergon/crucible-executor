@@ -14,6 +14,7 @@ from unittest.mock import patch
 from executor.signal_reader import (
     REGIME_DRAWDOWN_PREFIX,
     extract_drawdown_effective_regime,
+    extract_drawdown_protective_severity,
     read_drawdown_substrate,
 )
 
@@ -54,6 +55,75 @@ class TestExtractDrawdownEffectiveRegime:
         assert extract_drawdown_effective_regime(
             {"effective_regime": {"effective_regime": 3}}
         ) is None
+
+
+class TestExtractDrawdownProtectiveSeverity:
+    """v0.42.0 Phase 2B (caution-regime-retirement-260528.md): canonical
+    drawdown-axis severity ordinal exposed for executor + future
+    half-step protection consumers."""
+
+    def test_canonical_payload_severity_2(self):
+        # New (post-Phase-2A) compose_effective_regime emits the ordinal
+        # in the nested dict alongside effective_regime/drivers.
+        payload = {
+            "effective_regime": {
+                "effective_regime": "bear",
+                "drivers": {"drawdown_spy": "bear"},
+                "drawdown_tier": "risk_off",
+                "drawdown_protective_severity": 2,
+            }
+        }
+        assert extract_drawdown_protective_severity(payload) == 2
+
+    def test_canonical_payload_severity_1(self):
+        payload = {
+            "effective_regime": {
+                "effective_regime": "neutral",
+                "drivers": {"drawdown_spy": None},
+                "drawdown_tier": "caution",
+                "drawdown_protective_severity": 1,
+            }
+        }
+        assert extract_drawdown_protective_severity(payload) == 1
+
+    def test_canonical_payload_severity_0(self):
+        payload = {
+            "effective_regime": {
+                "effective_regime": "neutral",
+                "drivers": {},
+                "drawdown_tier": "risk_on",
+                "drawdown_protective_severity": 0,
+            }
+        }
+        assert extract_drawdown_protective_severity(payload) == 0
+
+    def test_legacy_grandfather_string_bear_derives_severity_2(self):
+        # Pre-Phase-2A payloads carried only the string field. Grandfather:
+        # derive severity from the legacy string for backward-compat.
+        payload = {"effective_regime": "bear"}
+        assert extract_drawdown_protective_severity(payload) == 2
+
+    def test_legacy_grandfather_string_caution_derives_severity_1(self):
+        payload = {"effective_regime": "caution"}
+        assert extract_drawdown_protective_severity(payload) == 1
+
+    def test_legacy_grandfather_string_bull_derives_severity_0(self):
+        payload = {"effective_regime": "bull"}
+        assert extract_drawdown_protective_severity(payload) == 0
+
+    def test_none_or_missing_returns_zero(self):
+        assert extract_drawdown_protective_severity(None) == 0
+        assert extract_drawdown_protective_severity({}) == 0
+        assert extract_drawdown_protective_severity("nope") == 0
+        assert extract_drawdown_protective_severity({"spy": {}}) == 0
+
+    def test_severity_clamped_to_valid_range(self):
+        # Defensive — if a malformed payload had severity > 2 or < 0,
+        # the helper clamps to [0, 2] rather than passing through.
+        payload = {"effective_regime": {"drawdown_protective_severity": 5}}
+        assert extract_drawdown_protective_severity(payload) == 2
+        payload_neg = {"effective_regime": {"drawdown_protective_severity": -1}}
+        assert extract_drawdown_protective_severity(payload_neg) == 0
 
 
 class TestReadDrawdownSubstrate:

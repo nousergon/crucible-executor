@@ -124,6 +124,13 @@ def extract_drawdown_effective_regime(payload: dict | None) -> str | None:
     ``compose_effective_regime`` dict (``{"effective_regime": str,
     "drivers": {...}}``); a bare string is also tolerated for schema
     resilience. Returns ``None`` when absent/malformed (⇒ no override).
+
+    Post-v0.42.0 (caution-regime-retirement-260528.md Phase 2A): the
+    ``effective_regime`` is 3-class macro (bull/neutral/bear) only.
+    The drawdown leg's caution-tier (severity 1) no longer aliases
+    into the macro vocabulary; downstream half-step protective
+    consumers should call ``extract_drawdown_protective_severity``
+    instead to get the orthogonal drawdown-axis ordinal.
     """
     if not isinstance(payload, dict):
         return None
@@ -131,6 +138,35 @@ def extract_drawdown_effective_regime(payload: dict | None) -> str | None:
     if isinstance(er, dict):
         er = er.get("effective_regime")
     return er if isinstance(er, str) and er else None
+
+
+def extract_drawdown_protective_severity(payload: dict | None) -> int:
+    """Pull the drawdown-axis severity ordinal out of a drawdown artifact.
+
+    Post-v0.42.0 (caution-regime-retirement-260528.md Phase 2A): the
+    drawdown leg's protective state is a SEPARATE axis from macro
+    market_regime. Ordinal scale:
+        0 = risk_on / no escalation
+        1 = caution (half-step protection — milder than full bear)
+        2 = risk_off / alpha_bleed (full protection — same severity as macro bear)
+
+    Read this for any half-step protection consumer. Returns 0 when
+    absent / malformed / legacy payload (grandfather safety — old
+    payloads pre-Phase-2A had no severity field; treating absence as
+    0 preserves observe-only behavior).
+    """
+    if not isinstance(payload, dict):
+        return 0
+    er = payload.get("effective_regime")
+    if isinstance(er, dict):
+        sev = er.get("drawdown_protective_severity")
+        if isinstance(sev, int):
+            return max(0, min(2, sev))
+    # Legacy grandfather: derive from the string field if present.
+    legacy = extract_drawdown_effective_regime(payload)
+    if legacy is not None:
+        return {"bear": 2, "caution": 1}.get(legacy.lower(), 0)
+    return 0
 
 
 def read_predictions(s3_bucket: str) -> tuple[dict[str, dict], str | None]:
