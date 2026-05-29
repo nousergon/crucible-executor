@@ -118,6 +118,20 @@ regime_sizing_scale: 0.05        # per-σ sensitivity; +1σ → 1.05× tilt
 regime_sizing_floor: 0.70        # clamp lower bound on the multiplier
 regime_sizing_ceil:  1.30        # clamp upper bound on the multiplier
 
+# ── Barrier-win-probability sizing (Task B2, meta-labeling consumer) ────────
+# Off by default; ships DORMANT. When ON, position_sizer multiplies the raw
+# weight by ``barrier_win_prob_sizing_min + barrier_win_prob_sizing_range *
+# barrier_win_prob`` (clamped: bwp∈[0,1] → adj∈[min, min+range]; bwp=0.5→1.0).
+# ``barrier_win_prob`` = the predictor's calibrated P(profit/upper barrier
+# touched before stop/lower barrier), emitted observe-only in predictions.json
+# (alpha-engine-predictor Task B1). Operator flips
+# ``barrier_win_prob_sizing_enabled: true`` only after the field has soaked
+# ≥1 Saturday cycle AND the backtester sweep (Task B3) justifies the weight.
+# Missing field (pre-B1 predictions) → 1.0× (graceful degrade).
+barrier_win_prob_sizing_enabled: false  # gate-off by default; flip after soak + sweep
+barrier_win_prob_sizing_min:   0.70     # multiplier at bwp=0 (and floor)
+barrier_win_prob_sizing_range: 0.60     # span; bwp=0.5→1.0×, bwp=1.0→1.30×
+
 # ── Regime-aware drawdown tiers (Stage D' Wire 3, regime-v3-260514) ─────────
 # Off by default; ships dormant. When ON, the SOFT graduated-drawdown tier
 # thresholds are scaled by ``1.0 + intensity_z * regime_drawdown_scale``

@@ -96,6 +96,10 @@ _PARAM_MAP = {
     "correlation_block_threshold": ("correlation_block_threshold",),
     "profit_take_pct": ("strategy", "exit_manager", "profit_take_pct"),
     "momentum_exit_threshold": ("strategy", "exit_manager", "momentum_exit_threshold"),
+    # Task B2 (dormant): barrier-win-prob sizing weights. The enable flag
+    # itself is a bool, handled with the other non-numeric special keys below.
+    "barrier_win_prob_sizing_min": ("barrier_win_prob_sizing_min",),
+    "barrier_win_prob_sizing_range": ("barrier_win_prob_sizing_range",),
 }
 
 
@@ -117,6 +121,8 @@ _PARAM_VALIDATORS = {
     "correlation_block_threshold": (float, 0.3,  1.0),
     "profit_take_pct":             (float, 0.05, 1.0),
     "momentum_exit_threshold":     (float, -50,  0),
+    "barrier_win_prob_sizing_min":   (float, 0.3, 1.0),
+    "barrier_win_prob_sizing_range": (float, 0.1, 1.0),
 }
 
 _EXECUTOR_PARAMS_CACHE_PATH = Path(__file__).resolve().parent.parent / "config" / ".executor_params_cache.json"
@@ -143,6 +149,7 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
         # Advisory schema validation (log warnings, never block)
         _unknown_keys = [k for k in data if k not in _PARAM_MAP and k not in (
             "disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend",
+            "barrier_win_prob_sizing_enabled",
             "updated_at", "best_sharpe", "best_alpha", "improvement_pct",
             "n_combos_tested", "manual_override",
         )]
@@ -150,8 +157,13 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
             logger.warning("executor_params.json contains unknown keys: %s", _unknown_keys)
         # Only keep safe-to-override params (numeric) + special non-numeric params
         safe = {k: v for k, v in data.items() if k in _PARAM_MAP}
-        # Phase 4 non-numeric params: disabled_triggers (list), p_up sizing (bool)
-        for special_key in ("disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend"):
+        # Phase 4 non-numeric params: disabled_triggers (list), p_up sizing (bool).
+        # Task B2: barrier_win_prob_sizing_enabled (bool) — the dormant sizing
+        # consumer's master switch, flipped via S3 after soak + backtester sweep.
+        for special_key in (
+            "disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend",
+            "barrier_win_prob_sizing_enabled",
+        ):
             if special_key in data:
                 safe[special_key] = data[special_key]
         if safe:

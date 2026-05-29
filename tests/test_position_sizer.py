@@ -579,3 +579,70 @@ class TestStanceConditionalSizing:
         r_value = self._sizing("value")
         assert r_value["dollar_size"] < r_momentum["dollar_size"]
         assert r_value["dollar_size"] / r_momentum["dollar_size"] == pytest.approx(0.7, rel=1e-3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Barrier-win-probability sizing (Task B2 — meta-labeling consumer, dormant)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestBarrierWinProbSizing:
+
+    def _adj(self, *, enabled, bwp, **cfg_overrides):
+        cfg = _base_config(barrier_win_prob_sizing_enabled=enabled, **cfg_overrides)
+        return compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=[{"ticker": "AAPL"}],
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=cfg,
+            barrier_win_prob=bwp,
+        )["barrier_win_prob_adj"]
+
+    def test_dormant_by_default(self):
+        """Flag absent → no adjustment even when bwp is provided."""
+        assert self._adj(enabled=False, bwp=0.9) == 1.0
+
+    def test_coinflip_is_neutral(self):
+        """bwp=0.5 → 1.0× (min 0.70 + range 0.60 * 0.5)."""
+        assert self._adj(enabled=True, bwp=0.5) == pytest.approx(1.0)
+
+    def test_certain_win_max_multiplier(self):
+        assert self._adj(enabled=True, bwp=1.0) == pytest.approx(1.30)
+
+    def test_certain_loss_min_multiplier(self):
+        assert self._adj(enabled=True, bwp=0.0) == pytest.approx(0.70)
+
+    def test_missing_field_graceful_degrade(self):
+        """Enabled but no bwp on the prediction (pre-B1) → 1.0×."""
+        assert self._adj(enabled=True, bwp=None) == 1.0
+
+    def test_clamps_out_of_range(self):
+        # bwp > 1 clamps to 1 → 1.30; bwp < 0 clamps to 0 → 0.70
+        assert self._adj(enabled=True, bwp=5.0) == pytest.approx(1.30)
+        assert self._adj(enabled=True, bwp=-3.0) == pytest.approx(0.70)
+
+    def test_custom_min_and_range(self):
+        # min=0.5, range=1.0 → bwp=1.0 → 1.5×
+        assert self._adj(
+            enabled=True, bwp=1.0,
+            barrier_win_prob_sizing_min=0.5,
+            barrier_win_prob_sizing_range=1.0,
+        ) == pytest.approx(1.5)
+
+    def test_downsizes_position_when_low_prob(self):
+        """End-to-end: a low-barrier-prob pick sizes smaller than a high one."""
+        enter = [{"ticker": f"T{i}"} for i in range(40)]  # base 0.025 < cap
+
+        def _pp(bwp):
+            return compute_position_size(
+                ticker="AAPL", portfolio_nav=100_000, enter_signals=enter,
+                signal=_base_signal(), sector_rating="market_weight",
+                current_price=150.0,
+                config=_base_config(barrier_win_prob_sizing_enabled=True),
+                barrier_win_prob=bwp,
+            )["position_pct"]
+
+        assert _pp(0.1) < _pp(0.9)

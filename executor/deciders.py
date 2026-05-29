@@ -728,6 +728,11 @@ def decide_entries(
             feature_coverage=coverage_map.get(ticker),
             stance=pred_data.get("stance"),
             regime_intensity_z=regime_intensity_z,
+            # Task B2 (dormant): predictor's observe-only calibrated
+            # P(up barrier before down). Missing on pre-B1 predictions →
+            # None → 1.0× multiplier (graceful degrade); only affects sizing
+            # once ``barrier_win_prob_sizing_enabled`` is flipped on.
+            barrier_win_prob=pred_data.get("barrier_win_prob"),
         )
 
         # Emit executor:position_sizer DecisionArtifact (L2308 PR 2).

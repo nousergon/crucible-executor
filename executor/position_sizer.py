@@ -72,6 +72,7 @@ def compute_position_size(
     feature_coverage: float | None = None,
     stance: str | None = None,
     regime_intensity_z: float | None = None,
+    barrier_win_prob: float | None = None,
 ) -> dict:
     """
     Compute position size for a new ENTER order.
@@ -220,11 +221,34 @@ def compute_position_size(
     else:
         regime_adj = 1.0
 
+    # Barrier-win-probability sizing (Task B2 — meta-labeling consumer).
+    # Reads the predictor's calibrated ``barrier_win_prob`` = P(profit/upper
+    # barrier touched before stop/lower barrier). Linear map centered at the
+    # 0.5 coin-flip → 1.0×, mirroring the p_up precedent above:
+    #   adj = min + range * bwp  →  bwp=0.5→1.0, bwp=0→min, bwp=1→min+range.
+    # Default OFF (ships DORMANT): the predictor emits the field observe-only
+    # (Task B1); the operator flips ``barrier_win_prob_sizing_enabled`` ON only
+    # after the field has soaked ≥1 Saturday cycle AND the backtester sweep
+    # (Task B3) justifies the weight. Composes multiplicatively; clamped so a
+    # bad/extreme probability cannot blow up size (and the final
+    # ``min(raw_weight, max_pct)`` caps it regardless). Falls through to 1.0×
+    # when the field is absent (pre-B1 predictions) — graceful degrade.
+    if (
+        config.get("barrier_win_prob_sizing_enabled", False)
+        and barrier_win_prob is not None
+    ):
+        bwp = max(0.0, min(1.0, barrier_win_prob))
+        bwp_min = config.get("barrier_win_prob_sizing_min", 0.70)
+        bwp_range = config.get("barrier_win_prob_sizing_range", 0.60)
+        barrier_win_prob_adj = bwp_min + bwp_range * bwp
+    else:
+        barrier_win_prob_adj = 1.0
+
     max_pct = config.get("max_position_pct", 0.05)
     raw_weight = (base_weight * sector_adj * conviction_adj * upside_adj
                   * drawdown_multiplier * atr_adj * confidence_adj
                   * staleness_adj * earnings_adj * coverage_adj
-                  * stance_adj * regime_adj)
+                  * stance_adj * regime_adj * barrier_win_prob_adj)
     position_weight = min(raw_weight, max_pct)
 
     # ATR volatility cap: ensure ATR constraint is not overridden by other
@@ -248,6 +272,7 @@ def compute_position_size(
         f"confidence_adj={confidence_adj} staleness_adj={staleness_adj} "
         f"earnings_adj={earnings_adj} coverage_adj={coverage_adj} "
         f"stance_adj={stance_adj} regime_adj={regime_adj} "
+        f"barrier_win_prob_adj={barrier_win_prob_adj} "
         f"→ {position_weight:.3f} NAV = ${dollar_size:.0f} = {shares} shares"
     )
 
@@ -266,4 +291,5 @@ def compute_position_size(
         "coverage_adj": coverage_adj,
         "stance_adj": stance_adj,
         "regime_adj": regime_adj,
+        "barrier_win_prob_adj": barrier_win_prob_adj,
     }
