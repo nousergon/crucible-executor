@@ -46,6 +46,13 @@ from executor.decision_capture import (
 from executor.entry_triggers import EntryTriggerEngine
 from executor.ibkr import IBKRClient
 from executor.intraday_exit_manager import IntradayExitManager
+from executor.intraday_resolve import (
+    available_redeploy_cash,
+    build_redeploy_entry,
+    compute_drawdown_overlay,
+    select_forced_exits,
+    solve_redeploy,
+)
 from executor.intraday_snapshot import (
     IntradaySnapshotWriter,
     compute_surveillance_universe,
@@ -84,6 +91,42 @@ MARKET_OPEN_MINUTE = 30
 # ``_execute_entry`` (decision-capture wiring, L2308) can read it without
 # threading the tz through every call site.
 _ET = pytz.timezone("US/Eastern")
+
+
+def _within_resolve_window(cutoff_et: str) -> bool:
+    """True if the current ET time is before the intraday re-solve cutoff.
+
+    Past the cutoff, freed cash can't reliably fill before the 3:55 PM ET
+    time-expiry, so we stop re-solving and let it carry to tomorrow's planner.
+    """
+    try:
+        hh, mm = (int(x) for x in cutoff_et.split(":"))
+    except (ValueError, AttributeError):
+        hh, mm = 15, 30
+    now = datetime.now(_ET)
+    return (now.hour, now.minute) < (hh, mm)
+
+
+def _load_optimizer_shadow_log(bucket: str) -> dict | None:
+    """Load the morning optimizer shadow log (target weights + cached daily Σ
+    + alpha_hat) for the intraday re-solve. Returns None on ANY failure — the
+    caller treats a missing log as 'cannot redeploy' and leaves cash idle (the
+    re-solve is load-bearing; it never silently no-ops as if it succeeded)."""
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        obj = s3.get_object(
+            Bucket=bucket, Key="predictor/optimizer_shadow/latest.json",
+        )
+        return json.loads(obj["Body"].read())
+    except Exception as e:
+        logger.error(
+            "Could not load optimizer shadow log for intraday re-solve "
+            "(redeploy disabled, freed cash stays idle until next planner): %s",
+            e,
+        )
+        return None
+
 
 # Connection retry limits
 MAX_RECONNECT_BACKOFF_SECS = 300
@@ -363,6 +406,31 @@ def run_daemon(dry_run: bool = False) -> None:
     client_id = strategy_config.get("intraday_client_id", 2)
     poll_interval = strategy_config.get("intraday_poll_interval_sec", 60)
     run_date = date.today().isoformat()
+
+    # ── Intraday reconcile-to-target state (optimizer authority) ─────────────
+    # When the optimizer owns the book, hard-risk exits (catastrophic gap stop,
+    # drawdown forced-exit) free cash intraday with no same-day redeploy path —
+    # the bug that left the book at 22% cash / SPY 0 on 2026-05-29. This state
+    # drives the real-time drawdown overlay + event-driven re-solve that
+    # redeploys freed cash back to the sleeve. See executor/intraday_resolve.py.
+    use_optimizer = bool(config.get("use_portfolio_optimizer", False))
+    _opt_cfg = config.get("portfolio_optimizer", {}) or {}
+    resolve_enabled = use_optimizer and bool(_opt_cfg.get("intraday_resolve_enabled", True))
+    overlay_enabled = bool(_opt_cfg.get("intraday_drawdown_overlay_enabled", True))
+    resolve_min_freed_pct = float(_opt_cfg.get("intraday_resolve_min_freed_cash_pct", 0.01))
+    resolve_cutoff_et = str(_opt_cfg.get("intraday_resolve_cutoff_et", "15:30"))
+    resolve_max_per_day = int(_opt_cfg.get("intraday_resolve_max_per_day", 5))
+    _stopped_out_today: set[str] = set()   # gap-stopped + dd-forced names (no same-day rebuy)
+    _dd_forced_today: set[str] = set()     # subset force-exited by the drawdown overlay
+    _hard_risk_exit_seen = False           # event flag: a hard-risk exit freed cash → re-solve
+    _resolve_count = 0
+    _shadow_log_cache: dict | None = None
+    if resolve_enabled:
+        logger.info(
+            "Intraday reconcile ENABLED — drawdown overlay + event-driven "
+            "re-solve (min_freed=%.1f%% NAV, cutoff=%s ET, max/day=%d)",
+            resolve_min_freed_pct * 100, resolve_cutoff_et, resolve_max_per_day,
+        )
 
     logger.info(
         "Intraday daemon starting | date=%s | dry_run=%s | clientId=%d | poll=%ds",
@@ -891,19 +959,29 @@ def run_daemon(dry_run: bool = False) -> None:
                 if not price_state:
                     continue
 
-                # Check for trail update first
-                trail_update = exit_mgr.should_update_trail(stop, price_state["last"])
-                if trail_update:
-                    new_high, new_stop = trail_update
-                    order_book.update_stop_high_water(ticker, new_high, new_stop)
-                    order_book.save()
-                    logger.debug(
-                        "Trail updated %s: high=$%.2f stop=$%.2f",
-                        ticker, new_high, new_stop,
-                    )
+                # Dispatch on the record's stop_kind (written by the morning
+                # planner). ``catastrophic_gap_only`` (optimizer owns the book)
+                # runs ONLY the hard-risk catastrophic gap stop — the alpha
+                # rules (trailing-stop / profit-take / collapse) and the trail
+                # ratchet are suppressed by construction. ``alpha``/absent runs
+                # the full legacy IntradayExitManager. Carrying the authority
+                # in the data (not a daemon flag) is the hard-to-misuse form.
+                if stop.get("stop_kind") == "catastrophic_gap_only":
+                    exit_signal = exit_mgr.check_catastrophic_gap(stop, price_state)
+                else:
+                    # Check for trail update first
+                    trail_update = exit_mgr.should_update_trail(stop, price_state["last"])
+                    if trail_update:
+                        new_high, new_stop = trail_update
+                        order_book.update_stop_high_water(ticker, new_high, new_stop)
+                        order_book.save()
+                        logger.debug(
+                            "Trail updated %s: high=$%.2f stop=$%.2f",
+                            ticker, new_high, new_stop,
+                        )
 
-                # Check exit rules
-                exit_signal = exit_mgr.evaluate(stop, price_state)
+                    # Check exit rules
+                    exit_signal = exit_mgr.evaluate(stop, price_state)
                 if exit_signal:
                     try:
                         _execute_exit(
@@ -913,6 +991,13 @@ def run_daemon(dry_run: bool = False) -> None:
                         if not dry_run:
                             trades_executed += 1
                             executed_tickers.add(exit_signal.get("ticker"))
+                            # A catastrophic gap stop is a hard-risk exit: the
+                            # name must NOT be re-bought same-day (morning alpha
+                            # is still positive), and the freed cash triggers an
+                            # event-driven re-solve in the reconcile block below.
+                            if exit_signal.get("reason") == "catastrophic_gap_stop":
+                                _stopped_out_today.add(exit_signal.get("ticker"))
+                                _hard_risk_exit_seen = True
                             # Emit executor:exit_rules DecisionArtifact
                             # (L2308 PR 4 — daemon-side intraday exits).
                             # Lands AFTER the fill succeeded (mirrors PR 1
@@ -948,6 +1033,122 @@ def run_daemon(dry_run: bool = False) -> None:
                         logger.warning("Connection lost during exit %s: %s — reconnecting", exit_signal.get("ticker"), e)
                         ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)
                         break
+
+            # ── Intraday reconcile-to-target (optimizer owns the book) ────────
+            # Real-time drawdown overlay (force de-risk + suppress redeploy) and
+            # event-driven re-solve that redeploys cash freed by hard-risk exits
+            # back to the sleeve same-day. Reuses the morning Σ + alpha_hat from
+            # the optimizer shadow log → zero new alpha look-ahead. Guarded so a
+            # reconcile failure never kills the daemon (cash just carries to the
+            # next morning planner); the re-solve itself fails loud (no silent
+            # no-op-as-success). Runs after exits / before entries so freshly
+            # enqueued redeploy buys get a fill attempt this same tick.
+            if resolve_enabled and not dry_run:
+                try:
+                    nav = ibkr.get_portfolio_nav()
+                    try:
+                        peak = ibkr.get_peak_nav(conn) or nav
+                    except Exception:
+                        peak = nav
+                    positions = ibkr.get_positions()
+                    overlay = compute_drawdown_overlay(nav, peak, config, strategy_config)
+                    if not overlay_enabled:
+                        # Overlay off: no intraday forced exits, no drawdown
+                        # redeploy suppression — redeploy purely event-driven.
+                        overlay = {**overlay, "forced_exit_count": 0, "redeploy_suppressed": False}
+
+                    # (a) Drawdown de-risk: force-exit lowest-conviction names.
+                    # Independent of the shadow log so de-risking works even if
+                    # the log is missing. Ranking has no scores here → falls back
+                    # to smallest-position-first (conservative).
+                    if overlay["forced_exit_count"] > 0:
+                        for fx in select_forced_exits(
+                            positions, {}, _stopped_out_today | _dd_forced_today,
+                            overlay["forced_exit_count"],
+                        ):
+                            ps = monitor.get_price(fx["ticker"])
+                            if not ps:
+                                continue
+                            _execute_exit(ibkr, conn, order_book, fx, ps, run_date,
+                                          dry_run, monitor=monitor)
+                            _dd_forced_today.add(fx["ticker"])
+                            _stopped_out_today.add(fx["ticker"])
+                            _hard_risk_exit_seen = True
+                            trades_executed += 1
+                            executed_tickers.add(fx["ticker"])
+                            logger.warning(
+                                "INTRADAY DRAWDOWN FORCED EXIT: %s (%s)",
+                                fx["ticker"], overlay["tier_desc"],
+                            )
+
+                    # (b) Redeploy freed cash — only when NOT de-risking, only in
+                    # response to a hard-risk exit, within the fill window, and
+                    # under the per-day cap.
+                    if (
+                        _hard_risk_exit_seen
+                        and not overlay["redeploy_suppressed"]
+                        and _resolve_count < resolve_max_per_day
+                        and _within_resolve_window(resolve_cutoff_et)
+                    ):
+                        if _shadow_log_cache is None:
+                            _shadow_log_cache = _load_optimizer_shadow_log(config["signals_bucket"])
+                        if _shadow_log_cache is not None:
+                            sleeve = float((_shadow_log_cache.get("optimizer_cfg") or {}).get("cash_sleeve_pct", 0.03))
+                            pending_dollars = sum(
+                                (e.get("dollar_size") or (e.get("shares", 0) * (e.get("current_price") or 0)))
+                                for e in order_book.pending_entries()
+                            )
+                            avail = available_redeploy_cash(
+                                _shadow_log_cache["tickers"], positions, nav,
+                                sleeve, pending_dollars,
+                            )
+                            if avail > resolve_min_freed_pct * nav:
+                                res = solve_redeploy(
+                                    shadow_log=_shadow_log_cache,
+                                    current_positions=positions,
+                                    nav=nav,
+                                    stopped_out=_stopped_out_today,
+                                )
+                                _resolve_count += 1
+                                # Event consumed: only re-solve again when a NEW
+                                # hard-risk exit fires (coalesces same-tick stops,
+                                # prevents per-tick churn).
+                                _hard_risk_exit_seen = False
+                                if res["status"] not in ("optimal", "optimal_inaccurate"):
+                                    logger.error(
+                                        "Intraday re-solve status=%r — NOT redeploying; "
+                                        "~$%.0f freed cash left idle for next planner",
+                                        res["status"], avail,
+                                    )
+                                else:
+                                    n_enq = 0
+                                    for b in res["buys"]:
+                                        if b["ticker"] in _stopped_out_today:
+                                            continue
+                                        ps = monitor.get_price(b["ticker"])
+                                        px = ps.get("last") if ps else None
+                                        if not px or px <= 0:
+                                            continue
+                                        sh = int(b["delta_dollars"] // px)
+                                        if sh <= 0:
+                                            continue
+                                        order_book.add_entry(build_redeploy_entry(
+                                            b["ticker"], sh, px, b["target_weight"], run_date,
+                                            pullback_pct=strategy_config.get("intraday_pullback_pct", 0.02),
+                                        ))
+                                        n_enq += 1
+                                    if n_enq:
+                                        order_book.save()
+                                    logger.info(
+                                        "Intraday re-solve #%d: enqueued %d redeploy buy(s) "
+                                        "for ~$%.0f freed cash (vol_ann=%s)",
+                                        _resolve_count, n_enq, avail, res.get("vol_ann"),
+                                    )
+                except Exception as _rec_err:
+                    logger.error(
+                        "Intraday reconcile error (freed cash may stay idle until "
+                        "the next morning planner): %s", _rec_err, exc_info=True,
+                    )
 
             # ── Check entries ────────────────────────────────────────
             if strategy_config.get("intraday_entry_triggers_enabled", True):

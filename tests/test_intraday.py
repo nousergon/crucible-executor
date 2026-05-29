@@ -230,6 +230,51 @@ class TestIntradayExitManager:
         # Tightened to 1.5x ATR = 7.5, so stop = 155 - 7.5 = 147.5
         assert new_stop == 147.5
 
+    # ── Catastrophic gap stop (optimizer-mode hard-risk override) ────────────
+    def test_catastrophic_gap_fires(self):
+        mgr = self._mgr()  # default pct 0.15
+        result = mgr.check_catastrophic_gap(
+            {"ticker": "AAPL", "gap_reference_price": 200.0, "shares": 10},
+            {"last": 169.0},  # -15.5% from reference
+        )
+        assert result is not None
+        assert result["action"] == "EXIT"
+        assert result["reason"] == "catastrophic_gap_stop"
+        assert result["shares"] == 10
+
+    def test_catastrophic_gap_no_fire_above_threshold(self):
+        mgr = self._mgr()
+        result = mgr.check_catastrophic_gap(
+            {"ticker": "AAPL", "gap_reference_price": 200.0, "shares": 10},
+            {"last": 175.0},  # -12.5% — above the 15% threshold
+        )
+        assert result is None
+
+    def test_catastrophic_gap_falls_back_to_entry_price(self):
+        mgr = self._mgr()
+        result = mgr.check_catastrophic_gap(
+            {"ticker": "AAPL", "entry_price": 100.0, "shares": 10},  # no gap_reference_price
+            {"last": 80.0},  # -20% from entry
+        )
+        assert result is not None
+        assert result["reason"] == "catastrophic_gap_stop"
+
+    def test_catastrophic_gap_disabled(self):
+        mgr = self._mgr(catastrophic_gap_stop_enabled=False)
+        result = mgr.check_catastrophic_gap(
+            {"ticker": "AAPL", "gap_reference_price": 200.0, "shares": 10},
+            {"last": 150.0},  # -25% but disabled
+        )
+        assert result is None
+
+    def test_catastrophic_gap_custom_threshold(self):
+        mgr = self._mgr(catastrophic_gap_stop_pct=0.10)
+        result = mgr.check_catastrophic_gap(
+            {"ticker": "AAPL", "gap_reference_price": 200.0, "shares": 10},
+            {"last": 178.0},  # -11% — fires at 10% threshold
+        )
+        assert result is not None
+
 
 # ---------------------------------------------------------------------------
 # market_hours

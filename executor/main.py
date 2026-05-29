@@ -645,8 +645,17 @@ def _write_stops_and_finalize(
     run_date: str,
     blocked_entries: list[dict] | None = None,
     signals_bucket: str | None = None,
+    use_optimizer: bool = False,
 ) -> None:
-    """Write stop records for held positions, detect shorts, save order book, notify."""
+    """Write stop records for held positions, detect shorts, save order book, notify.
+
+    ``use_optimizer`` controls the ``stop_kind`` written on each stop record.
+    When True (optimizer is the sole portfolio-exit authority), stops are
+    marked ``catastrophic_gap_only`` — the daemon runs ONLY the per-name
+    catastrophic gap stop against them and suppresses the alpha rules
+    (trailing-stop, profit-take, collapse). When False, stops are marked
+    ``alpha`` and the daemon runs the full legacy IntradayExitManager.
+    """
     # ATR previously computed inline via _compute_atr(ticker_hist). Since
     # 2026-04-16 the executor reads atr_14_pct from the feature-store map
     # (load_atr_14_pct in main()) — same definition the predictor and sizing
@@ -678,7 +687,7 @@ def _write_stops_and_finalize(
             continue
         atr_val = ticker_atr_pct * entry_price
         stop_price = round(entry_price - atr_val * atr_mult, 2)
-        ob.add_stop({
+        stop_record = {
             "ticker": t,
             "entry_price": entry_price,
             "current_stop": stop_price,
@@ -687,7 +696,25 @@ def _write_stops_and_finalize(
             "high_water": entry_price,
             "entry_date": (conn and get_entry_dates(conn, [t]).get(t)) or run_date,
             "shares": pos_shares,
-        })
+        }
+        # ``stop_kind`` lets the daemon dispatch which exit checks run against
+        # this record. Under the optimizer, the only intraday exit allowed is
+        # the catastrophic single-name gap stop; alpha rules are suppressed.
+        # ``gap_reference_price`` anchors the gap check on the most recent
+        # close (gap-down detection), falling back to entry_price.
+        if use_optimizer:
+            stop_record["stop_kind"] = "catastrophic_gap_only"
+            gap_ref = entry_price
+            hist = (price_histories or {}).get(t)
+            if hist is not None and len(hist):
+                try:
+                    gap_ref = float(hist["close"].iloc[-1])
+                except (KeyError, IndexError, ValueError, TypeError):
+                    gap_ref = entry_price
+            stop_record["gap_reference_price"] = gap_ref
+        else:
+            stop_record["stop_kind"] = "alpha"
+        ob.add_stop(stop_record)
 
     # Detect short positions and add urgent cover orders
     for t, pos in current_pos.items():
@@ -1267,16 +1294,46 @@ def run(
         if "SPY" in (price_histories or {}):
             sector_etf_histories["SPY"] = price_histories["SPY"]
     
-        strategy_exits = evaluate_exits(
-            current_positions=current_positions,
-            signals_by_ticker=signals_by_ticker,
-            run_date=run_date,
-            price_histories=price_histories or {},
-            ibkr_client=ibkr,
-            strategy_config=strategy_config,
-            sector_etf_histories=sector_etf_histories or None,
-        )
-    
+        # Resolve the optimizer-authority flags once, early. Under
+        # ``use_portfolio_optimizer`` the optimizer is the SOLE authority for
+        # portfolio-level exits — it emits target-0 / scale-down SELLs in
+        # step 5b. ``optimizer_owns_exits`` additionally requires live mode
+        # (not simulate / not dry_run) because the optimizer cutover that
+        # GENERATES those SELLs only runs live (see step 5b gating). Gating
+        # the suppression on the same condition guarantees we never end up in
+        # a state where legacy exits are off AND optimizer exits are not
+        # generated (which would mean no exits at all). In simulate/dry_run
+        # the legacy path is unchanged — preserving backtester parity.
+        #
+        # Legacy "alpha" strategy exits (ATR trailing-stop, fallback_stop,
+        # profit_take, momentum_exit, time_decay_*, catalyst_hard_exit) fight
+        # the optimizer's target book and are suppressed BY CONSTRUCTION —
+        # incident 2026-05-29: the full SPY core was time-decay-exited and
+        # COST/RGEN were stopped/profit-taken while the optimizer wanted to
+        # keep them, dumping ~$196k to idle cash. Only hard-risk overrides
+        # survive: drawdown forced-exit (§2g below) and the daemon's
+        # catastrophic gap stop.
+        use_optimizer = bool(config.get("use_portfolio_optimizer", False))
+        optimizer_owns_exits = use_optimizer and not simulate and not dry_run
+        if optimizer_owns_exits:
+            strategy_exits = []
+            logger.info(
+                "use_portfolio_optimizer=True — suppressing legacy alpha "
+                "strategy exits; optimizer owns portfolio exits (drawdown "
+                "forced-exit + catastrophic gap stop remain as hard-risk "
+                "overrides)"
+            )
+        else:
+            strategy_exits = evaluate_exits(
+                current_positions=current_positions,
+                signals_by_ticker=signals_by_ticker,
+                run_date=run_date,
+                price_histories=price_histories or {},
+                ibkr_client=ibkr,
+                strategy_config=strategy_config,
+                sector_etf_histories=sector_etf_histories or None,
+            )
+
         if strategy_exits:
             logger.info(
                 f"Strategy layer generated {len(strategy_exits)} exit signal(s): "
@@ -1366,10 +1423,11 @@ def run(
         # ── 3. Process ENTER signals ─────────────────────────────────────────────
         # Cutover flag (PR 5 of portfolio-optimizer-260511): when true, the
         # legacy 1/n entry planner is skipped — the optimizer's MVO solution
-        # in step 5b drives the order book directly. Research EXIT / REDUCE
-        # signals + strategy_exits + drawdown forced exits still fire in
-        # step 4–5 below as protective overrides.
-        use_optimizer = bool(config.get("use_portfolio_optimizer", False))
+        # in step 5b drives the order book directly. ``use_optimizer`` /
+        # ``optimizer_owns_exits`` resolved once at §2d above. Under the
+        # optimizer, legacy research EXIT/REDUCE and alpha strategy exits are
+        # suppressed (the optimizer emits target-0/scale-down SELLs instead);
+        # only drawdown forced-exit + the catastrophic gap stop remain.
         if use_optimizer and not simulate and not dry_run:
             logger.info(
                 "use_portfolio_optimizer=True — skipping legacy _plan_entries; "
@@ -1435,8 +1493,17 @@ def run(
                     )
 
         # ── 4–5. Process EXIT and REDUCE signals ────────────────────────────────
+        # Under the optimizer, research EXIT is already handled via eligibility
+        # (signal=="EXIT" → ineligible → optimizer emits a target-0 SELL), and
+        # research REDUCE genuinely CONFLICTS — the optimizer may want to hold
+        # or even add to a name research is trimming. Suppress both legacy
+        # research-driven exit paths; only drawdown_forced_exit (carried in
+        # strategy_exits) and the optimizer's own SELLs remain.
+        exit_signals_in = signals
+        if optimizer_owns_exits:
+            exit_signals_in = {**signals, "exit": [], "reduce": []}
         exit_orders = _plan_exits_and_reduces(
-            signals=signals,
+            signals=exit_signals_in,
             strategy_exits=strategy_exits,
             predictions_by_ticker=predictions_by_ticker,
             current_positions=current_positions,
@@ -1545,7 +1612,7 @@ def run(
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
             try:
-                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket)
+                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer)
             except Exception as e:
                 logger.warning("Failed to write order book: %s", e)
 

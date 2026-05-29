@@ -236,6 +236,13 @@ strategy:
     momentum_exit_threshold: -15.0  # 20d momentum % (backtester-tunable: [-20.0, -15.0, -10.0])
     momentum_exit_rsi: 30           # RSI(14) threshold
 
+    # Catastrophic single-name gap stop — the ONLY intraday exit allowed when
+    # use_portfolio_optimizer=true (optimizer owns the book). A true hard-risk
+    # control; the alpha rules above are suppressed under the optimizer. Fires
+    # on a large drop vs the gap reference price (recent close at planning time).
+    catastrophic_gap_stop_enabled: true
+    catastrophic_gap_stop_pct: 0.15  # 15% drop from reference triggers full exit (backtester-tunable)
+
   graduated_drawdown:
     enabled: true
     tiers:
@@ -365,6 +372,25 @@ portfolio_optimizer:
   # Minimum position pct — weights below this are clipped to 0 (clean output;
   # avoid tiny stub positions like today's UNP 0.1% NAV residual).
   min_position_pct: 0.005
+
+  # ── Intraday reconcile-to-target (daemon real-time risk overlay) ──────────
+  # When the optimizer owns the book, hard-risk exits free cash intraday with
+  # no same-day redeploy path (incident 2026-05-29 → 22% idle cash, SPY 0).
+  # The daemon reuses the morning Σ + alpha_hat (cached in the optimizer shadow
+  # log) to re-solve and redeploy that cash to the sleeve same-day.
+  intraday_resolve_enabled: true
+  # Real-time drawdown overlay: poll live NAV vs peak each tick; force de-risk
+  # exits + suppress redeploy in a drawdown (reuses compute_drawdown_multiplier,
+  # identical to the morning planner). Disable to revert to morning-only DD.
+  intraday_drawdown_overlay_enabled: true
+  # Min freed cash (fraction of NAV, net of pending entries) before a re-solve
+  # fires — avoids churning on trivial deltas.
+  intraday_resolve_min_freed_cash_pct: 0.01
+  # Stop re-solving past this ET time so redeploy buys can still fill before
+  # the 3:55 PM time-expiry; later-freed cash carries to the next planner.
+  intraday_resolve_cutoff_et: "15:30"
+  # Per-day backstop on re-solves (churn guard).
+  intraday_resolve_max_per_day: 5
 
 # ── Paths (adjust to your deployment) ───────────────────────────────────────
 db_path: "/path/to/trades.db"

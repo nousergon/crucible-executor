@@ -58,7 +58,7 @@ class OptimizerResult:
 def solve_target_weights(
     tickers: list[str],
     alpha_hat: np.ndarray,
-    returns_panel: np.ndarray,
+    returns_panel: np.ndarray | None,
     w_prev: np.ndarray,
     sectors: list[str],
     stance_caps: np.ndarray,
@@ -68,6 +68,7 @@ def solve_target_weights(
     cfg: dict,
     *,
     alpha_uncertainty: np.ndarray | None = None,
+    covariance: np.ndarray | None = None,
 ) -> OptimizerResult:
     """
     Solve the constrained MVO and return target weights + diagnostics.
@@ -106,6 +107,16 @@ def solve_target_weights(
             covers the partial-rollout case during the 1-week soak between
             B.1 landing and the first BayesianRidge model being promoted
             in production. None ↔ no penalty regardless of γ.
+        covariance: optional shape (N,N) DAILY covariance matrix Σ_daily
+            (pre-horizon-scaling). When provided, the returns-panel estimator
+            step is skipped and this matrix is used directly (horizon scaling
+            still applied: Σ_H = H · Σ_daily). This is the intraday-re-solve
+            path: the daemon reuses the morning Σ (cached in the optimizer
+            shadow log) so an event-driven re-solve after a hard-risk exit is
+            mechanism-identical to the morning solve and adds zero alpha
+            look-ahead (Σ is daily-stable). ``returns_panel`` may be None when
+            ``covariance`` is provided. None ↔ estimate Σ from returns_panel
+            as before.
 
     Returns:
         OptimizerResult with weights (length N, sums to 1, sleeve pinned) and
@@ -116,13 +127,27 @@ def solve_target_weights(
     absorbing the residual) and diagnostics["status"] = "infeasible_fallback".
     """
     cfg = {**OPTIMIZER_CONFIG_DEFAULTS, **cfg}
+    N = len(tickers)
     _validate_inputs(
         tickers, alpha_hat, returns_panel, w_prev,
         sectors, stance_caps, eligibility, spy_idx, cash_idx,
+        covariance_provided=covariance is not None,
     )
 
-    N = len(tickers)
-    sigma = _estimate_covariance(returns_panel, cfg)
+    if covariance is not None:
+        # Intraday re-solve: reuse the morning DAILY Σ instead of re-estimating.
+        # Apply the SAME horizon scaling the estimator path applies (Σ_H =
+        # H · Σ_daily); persisting/injecting an already-horizon-scaled Σ here
+        # would double-scale and silently corrupt every vol diagnostic + the
+        # vol-target SOC constraint — guarded by _validate_covariance + the
+        # caller's vol-parity assertion.
+        sigma_daily = _validate_covariance(covariance, N)
+        horizon = int(cfg.get("sigma_horizon_days", 1))
+        if horizon < 1:
+            raise ValueError(f"sigma_horizon_days must be ≥ 1; got {horizon}")
+        sigma = horizon * sigma_daily
+    else:
+        sigma = _estimate_covariance(returns_panel, cfg)
     omega_diag, alpha_unc_used = _resolve_alpha_uncertainty(alpha_uncertainty, N, cfg)
 
     try:
@@ -280,6 +305,7 @@ def _validate_inputs(
     eligibility: np.ndarray,
     spy_idx: int,
     cash_idx: int,
+    covariance_provided: bool = False,
 ) -> None:
     N = len(tickers)
     if N == 0:
@@ -292,10 +318,16 @@ def _validate_inputs(
     ):
         if arr.shape != (N,):
             raise ValueError(f"{name} shape {arr.shape} != ({N},)")
-    if returns_panel.ndim != 2 or returns_panel.shape[1] != N:
-        raise ValueError(
-            f"returns_panel shape {returns_panel.shape} incompatible with N={N}"
-        )
+    # ``returns_panel`` is only required when estimating Σ from history. In the
+    # intraday re-solve path the caller supplies a precomputed covariance and
+    # may pass returns_panel=None.
+    if not covariance_provided:
+        if returns_panel is None:
+            raise ValueError("returns_panel is required when covariance is not provided")
+        if returns_panel.ndim != 2 or returns_panel.shape[1] != N:
+            raise ValueError(
+                f"returns_panel shape {returns_panel.shape} incompatible with N={N}"
+            )
     if len(sectors) != N:
         raise ValueError(f"sectors length {len(sectors)} != N={N}")
     if not (0 <= spy_idx < N) or not (0 <= cash_idx < N):
@@ -335,12 +367,35 @@ def _ewma_covariance(returns: np.ndarray, lambda_decay: float) -> np.ndarray:
     return (R.T * weights) @ R
 
 
-def _estimate_covariance(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
-    """Return covariance at horizon ``cfg["sigma_horizon_days"]``.
+def _validate_covariance(cov: np.ndarray, N: int) -> np.ndarray:
+    """Validate + symmetrize a precomputed DAILY covariance for the re-solve.
 
-    Estimates Σ_daily via the configured estimator, then scales by horizon-days
-    under i.i.d. log-return assumption: Σ_H = H · Σ_daily. Default H=1 preserves
-    legacy daily Σ bit-identical (1 × Σ = Σ).
+    JSON round-tripping can introduce tiny asymmetry / non-PSD perturbations.
+    Symmetrize (0.5·(Σ+Σᵀ)) and fail LOUD on shape mismatch, non-finite
+    entries, or a materially negative eigenvalue — a silently mis-shaped Σ
+    would corrupt the entire vol math (vol-target SOC + every vol diagnostic).
+    """
+    cov = np.asarray(cov, dtype=float)
+    if cov.shape != (N, N):
+        raise ValueError(f"covariance shape {cov.shape} != ({N}, {N})")
+    if not np.all(np.isfinite(cov)):
+        raise ValueError("covariance contains non-finite entries")
+    cov = 0.5 * (cov + cov.T)
+    min_eig = float(np.linalg.eigvalsh(cov).min())
+    tol = -1e-8 * max(1.0, float(np.trace(cov)) / N)
+    if min_eig < tol:
+        raise ValueError(
+            f"covariance is not PSD (min eigenvalue {min_eig:.3e} < tol {tol:.3e})"
+        )
+    return cov
+
+
+def _estimate_covariance_daily(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
+    """Estimate the DAILY covariance Σ_daily (pre-horizon-scaling).
+
+    Split out of ``_estimate_covariance`` so the optimizer shadow log can
+    persist Σ_daily for an intraday re-solve (see ``solve_target_weights``'s
+    ``covariance`` argument). Horizon scaling lives in ``_estimate_covariance``.
 
     Estimators (cfg["covariance_shrinkage"]):
       * "ledoit_wolf" (default): Ledoit-Wolf 2004 constant-correlation shrinkage
@@ -385,6 +440,17 @@ def _estimate_covariance(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
     else:
         raise ValueError(f"Unknown covariance_shrinkage: {estimator}")
 
+    return sigma_daily
+
+
+def _estimate_covariance(returns_panel: np.ndarray, cfg: dict) -> np.ndarray:
+    """Return covariance at horizon ``cfg["sigma_horizon_days"]``.
+
+    Estimates Σ_daily via ``_estimate_covariance_daily``, then scales by
+    horizon-days under i.i.d. log-return assumption: Σ_H = H · Σ_daily.
+    Default H=1 preserves legacy daily Σ bit-identical (1 × Σ = Σ).
+    """
+    sigma_daily = _estimate_covariance_daily(returns_panel, cfg)
     horizon = int(cfg.get("sigma_horizon_days", 1))
     if horizon < 1:
         raise ValueError(f"sigma_horizon_days must be ≥ 1; got {horizon}")

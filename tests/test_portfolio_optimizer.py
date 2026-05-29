@@ -860,3 +860,119 @@ def test_uncertainty_penalty_composes_with_horizon_and_ewma():
     assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
     assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
     assert result.weights[0] < result.weights[1]
+
+
+# ── Covariance-injection re-solve path (intraday reconcile) ──────────────────
+# The daemon's intraday re-solve reuses the morning DAILY covariance Σ cached in
+# the optimizer shadow log instead of re-estimating from a returns panel. These
+# tests pin that the injected path is mechanism-identical to the estimated path.
+
+from executor.portfolio_optimizer import (  # noqa: E402
+    _estimate_covariance_daily,
+    _validate_covariance,
+)
+
+
+def _solved_pair(u: dict):
+    """Solve once estimating Σ from the panel, once injecting Σ_daily from the
+    SAME panel. Returns (estimated_result, injected_result)."""
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    cfg_full = {**OPTIMIZER_CONFIG_DEFAULTS, **u["cfg"]}
+    sigma_daily = _estimate_covariance_daily(u["returns_panel"], cfg_full)
+    est = solve_target_weights(**u)
+    inj_kwargs = {**u, "returns_panel": None, "covariance": sigma_daily}
+    inj = solve_target_weights(**inj_kwargs)
+    return est, inj, sigma_daily
+
+
+def test_covariance_injection_matches_estimated_path():
+    """covariance=None vs covariance=Σ_daily (same panel) → identical output."""
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.03
+    u["alpha_hat"][2] = -0.02
+    est, inj, _ = _solved_pair(u)
+    np.testing.assert_allclose(est.weights, inj.weights, atol=1e-9)
+    assert inj.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        est.diagnostics["portfolio_vol_ann"], rel=1e-9,
+    )
+    assert inj.diagnostics["status"] == est.diagnostics["status"]
+
+
+def test_covariance_injection_horizon_aware():
+    """Injected Σ_daily honors sigma_horizon_days exactly like the estimator."""
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.03
+    u["cfg"] = {"sigma_horizon_days": 21}
+    est, inj, _ = _solved_pair(u)
+    np.testing.assert_allclose(est.weights, inj.weights, atol=1e-9)
+    assert inj.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        est.diagnostics["portfolio_vol_ann"], rel=1e-9,
+    )
+
+
+def test_covariance_injection_json_roundtrip():
+    """Σ persisted to JSON (shadow log) and reloaded still re-solves identically."""
+    import json
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.03
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    cfg_full = {**OPTIMIZER_CONFIG_DEFAULTS, **u["cfg"]}
+    sigma_daily = _estimate_covariance_daily(u["returns_panel"], cfg_full)
+
+    in_mem = solve_target_weights(**{**u, "returns_panel": None, "covariance": sigma_daily})
+    serialized = json.loads(json.dumps([[float(x) for x in row] for row in sigma_daily]))
+    reloaded = np.asarray(serialized, dtype=float)
+    round_tripped = solve_target_weights(**{**u, "returns_panel": None, "covariance": reloaded})
+    np.testing.assert_allclose(in_mem.weights, round_tripped.weights, atol=1e-9)
+
+
+def test_validate_covariance_rejects_bad_shape():
+    with pytest.raises(ValueError, match="covariance shape"):
+        _validate_covariance(np.eye(4), 5)
+
+
+def test_validate_covariance_rejects_non_finite():
+    bad = np.eye(3)
+    bad[0, 0] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        _validate_covariance(bad, 3)
+
+
+def test_validate_covariance_rejects_non_psd():
+    # Symmetric but indefinite (negative eigenvalue).
+    bad = np.array([[1.0, 2.0, 0.0], [2.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    with pytest.raises(ValueError, match="not PSD"):
+        _validate_covariance(bad, 3)
+
+
+def test_validate_covariance_symmetrizes_tiny_asymmetry():
+    sym = np.array([[1.0, 0.2, 0.1], [0.2, 1.0, 0.3], [0.1, 0.3, 1.0]])
+    nearly = sym.copy()
+    nearly[0, 1] += 1e-12  # JSON-roundtrip-scale asymmetry
+    out = _validate_covariance(nearly, 3)
+    np.testing.assert_allclose(out, out.T, atol=0.0)  # exactly symmetric
+
+
+def test_covariance_provided_allows_none_returns_panel():
+    """returns_panel=None is valid when covariance is supplied."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][0] = 0.04
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    cfg_full = {**OPTIMIZER_CONFIG_DEFAULTS, **u["cfg"]}
+    sigma_daily = _estimate_covariance_daily(u["returns_panel"], cfg_full)
+    res = solve_target_weights(**{**u, "returns_panel": None, "covariance": sigma_daily})
+    assert res.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+
+
+def test_missing_returns_panel_without_covariance_raises():
+    u = _baseline_universe(n_active=2)
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    with pytest.raises(ValueError, match="returns_panel is required"):
+        solve_target_weights(**{**u, "returns_panel": None})

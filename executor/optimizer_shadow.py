@@ -33,6 +33,7 @@ import pandas as pd
 
 from executor.portfolio_optimizer import (
     OPTIMIZER_CONFIG_DEFAULTS,
+    _estimate_covariance_daily,
     solve_target_weights,
 )
 
@@ -127,6 +128,11 @@ def _build_and_solve(
         tickers, predictions_by_ticker, spy_idx, cash_idx,
     )
     returns_panel = _build_returns_panel(tickers, price_histories, cash_idx)
+    # Σ_daily (pre-horizon) is persisted below for the daemon's intraday
+    # re-solve. Computed deterministically from the SAME panel + cfg the morning
+    # solve uses internally, so the cached matrix is bit-identical to what
+    # solve_target_weights estimates — the re-solve is mechanism-identical.
+    sigma_daily = _estimate_covariance_daily(returns_panel, optimizer_cfg)
     w_prev = _build_w_prev(tickers, current_positions, portfolio_nav, cash_idx, optimizer_cfg)
     sectors = _build_sectors(tickers, signals_by_ticker, spy_idx, cash_idx)
     stance_caps = _build_stance_caps(
@@ -192,6 +198,7 @@ def _build_and_solve(
         "eligibility_reasons": list(eligibility_reasons),
         "stance_caps": [float(x) for x in stance_caps],
         "sectors": sectors,
+        "covariance_daily": [[float(x) for x in row] for row in sigma_daily],
         "would_be_trades": would_be_trades,
         "diagnostics": result.diagnostics,
         "legacy_orders": [_redact_order(o) for o in legacy_orders],

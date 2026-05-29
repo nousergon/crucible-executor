@@ -36,6 +36,13 @@ MOMENTUM_EXIT_RSI = 30           # RSI(14) threshold
 FALLBACK_STOP_ENABLED = True
 FALLBACK_STOP_PCT = 0.10          # 10% loss from entry triggers exit
 
+# Catastrophic single-name gap stop — the ONLY intraday exit allowed when the
+# optimizer owns the book (stop_kind="catastrophic_gap_only"). A true hard-risk
+# control distinct from the retired alpha rules (trailing-stop/profit-take/
+# collapse). Fires on a large drop vs the gap reference price (recent close).
+CATASTROPHIC_GAP_STOP_ENABLED = True
+CATASTROPHIC_GAP_STOP_PCT = 0.15  # 15% drop from reference triggers full exit
+
 # ── Bracket stop defaults ────────────────────────────────────────────────────
 BRACKET_STOP_ENABLED = True
 BRACKET_TRAIL_ATR_MULTIPLE = 2.0   # trailing stop = ATR * this value
@@ -122,6 +129,10 @@ def load_strategy_config(config: dict) -> dict:
         # Fallback stop (when ATR unavailable)
         "fallback_stop_enabled": exit_cfg.get("fallback_stop_enabled", FALLBACK_STOP_ENABLED),
         "fallback_stop_pct": exit_cfg.get("fallback_stop_pct", FALLBACK_STOP_PCT),
+
+        # Catastrophic single-name gap stop (optimizer-mode hard-risk override)
+        "catastrophic_gap_stop_enabled": exit_cfg.get("catastrophic_gap_stop_enabled", CATASTROPHIC_GAP_STOP_ENABLED),
+        "catastrophic_gap_stop_pct": exit_cfg.get("catastrophic_gap_stop_pct", CATASTROPHIC_GAP_STOP_PCT),
 
         # Graduated drawdown
         "graduated_drawdown_enabled": drawdown_cfg.get("enabled", GRADUATED_DRAWDOWN_ENABLED),

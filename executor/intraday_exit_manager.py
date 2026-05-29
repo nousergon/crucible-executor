@@ -99,6 +99,40 @@ class IntradayExitManager:
             return current_price, new_stop
         return None
 
+    def check_catastrophic_gap(self, stop: dict, price_state: dict) -> dict | None:
+        """Hard-risk per-name catastrophic gap stop (full EXIT).
+
+        Fires when price falls at least ``catastrophic_gap_stop_pct`` below the
+        record's ``gap_reference_price`` (most recent close at planning time,
+        falling back to entry_price). This is the ONLY intraday exit allowed
+        when the optimizer owns the book — a true risk control, distinct from
+        the retired alpha rules (trailing-stop / profit-take / collapse). The
+        optimizer otherwise reconciles the book; this catches the acute
+        single-name crater the optimizer can't react to until next morning.
+        """
+        if not self._config.get("catastrophic_gap_stop_enabled", True):
+            return None
+        current_price = price_state.get("last")
+        if not current_price or current_price <= 0:
+            return None
+        ref = stop.get("gap_reference_price") or stop.get("entry_price")
+        if not ref or ref <= 0:
+            return None
+        threshold = self._config.get("catastrophic_gap_stop_pct", 0.15)
+        drop = (ref - current_price) / ref
+        if drop >= threshold:
+            return {
+                "ticker": stop["ticker"],
+                "action": "EXIT",
+                "shares": stop.get("shares", 0),
+                "reason": "catastrophic_gap_stop",
+                "detail": (
+                    f"price ${current_price:.2f} <= {(1 - threshold):.0%} of "
+                    f"reference ${ref:.2f} (drop {drop:.1%} >= {threshold:.1%})"
+                ),
+            }
+        return None
+
     # ── Private rule checks ──────────────────────────────────────────────────
 
     def _check_trailing_stop(self, stop: dict, current_price: float) -> dict | None:
