@@ -5,7 +5,10 @@
       "Sid": "SendCommandRunShellScriptDocument",
       "Effect": "Allow",
       "Action": "ssm:SendCommand",
-      "Resource": "arn:aws:ssm:us-east-1:711398986525:document/AWS-RunShellScript"
+      "Resource": [
+        "arn:aws:ssm:us-east-1::document/AWS-RunShellScript",
+        "arn:aws:ssm:us-east-1:711398986525:document/AWS-RunShellScript"
+      ]
     },
     {
       "Sid": "SendCommandToAlphaEngineTaggedInstances",
