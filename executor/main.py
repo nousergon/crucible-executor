@@ -25,7 +25,7 @@ import logging
 import os
 import sys
 import time as _time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -633,6 +633,41 @@ def _write_order_book_summary(
         logger.info("Order book summary written to s3://%s/%s", signals_bucket, key)
     except Exception as e:
         logger.warning("Failed to write order book summary (non-fatal): %s", e)
+
+
+def _write_hold_book_flag(
+    bucket: str, run_date: str, predictions_date: str | None, gate: dict
+) -> None:
+    """Persist a dashboard-readable record that the hold-book safeguard fired
+    this run (predictor distribution gate flagged "strongly biased" → optimizer
+    rebalance suppressed → current book held). Writes both a dated artifact and
+    a ``latest.json`` pointer under ``executor/hold_book_flags/`` so the console
+    can banner the discrepancy for operator review. Best-effort — the caller
+    swallows failures so an audit-artifact write never blocks the planner.
+    """
+    import boto3 as _boto3
+
+    payload = json.dumps(
+        {
+            "run_date": run_date,
+            "predictions_date": predictions_date,
+            "held": True,
+            "reason": gate.get("reason"),
+            "failed_check": gate.get("failed_check"),
+            "gate_metrics": gate.get("metrics"),
+            "written_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        indent=2,
+    )
+    _s3 = _boto3.client("s3")
+    for _key in (
+        f"executor/hold_book_flags/{run_date}.json",
+        "executor/hold_book_flags/latest.json",
+    ):
+        _s3.put_object(
+            Bucket=bucket, Key=_key, Body=payload.encode(),
+            ContentType="application/json",
+        )
 
 
 def _write_stops_and_finalize(
@@ -1571,7 +1606,35 @@ def run(
                 apply_optimizer_targets_to_orderbook,
                 is_log_usable,
             )
-            if is_log_usable(shadow_log):
+            from executor.signal_reader import read_distribution_gate
+            # ── Hold-book safeguard (2026-06-01 decision) ─────────────────────
+            # If the predictor's output-distribution gate flagged this batch
+            # "strongly biased", DO NOT let the optimizer rotate the book off
+            # it — hold the current positions and surface the discrepancy for
+            # operator review. Stops are still written below; the daemon's
+            # hard-risk overrides (drawdown forced-exit, catastrophic gap stop)
+            # remain active. Fail-open: a missing/None gate proceeds normally;
+            # only an explicit passed=False holds. Origin: the 6/1 8-model
+            # level-biased recalibration (89.7% DOWN-skew) flushed the book to
+            # SPY on its first inference before this safeguard existed.
+            _gate = read_distribution_gate(signals_bucket)
+            _gate_failed = _gate is not None and _gate.get("passed") is False
+            if _gate_failed:
+                logger.warning(
+                    "HOLD-BOOK SAFEGUARD ACTIVE: predictor output_distribution_gate "
+                    "FAILED (check=%s) for predictions %s — suppressing optimizer "
+                    "rebalance; current book retained (stops written; daemon "
+                    "hard-risk overrides remain active). reason=%s",
+                    _gate.get("failed_check"), predictions_date, _gate.get("reason"),
+                )
+                try:
+                    _write_hold_book_flag(signals_bucket, run_date, predictions_date, _gate)
+                except Exception as _hb_err:
+                    logger.warning(
+                        "hold-book flag artifact write failed (non-blocking): %s",
+                        _hb_err,
+                    )
+            elif is_log_usable(shadow_log):
                 opt_entries, opt_exits = apply_optimizer_targets_to_orderbook(
                     log=shadow_log,
                     ob=ob,

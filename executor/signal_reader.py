@@ -208,6 +208,28 @@ def read_predictions(s3_bucket: str) -> tuple[dict[str, dict], str | None]:
         raise
 
 
+def read_distribution_gate(s3_bucket: str) -> dict | None:
+    """Read the predictor ``output_distribution_gate`` block from
+    ``predictor/predictions/latest.json``.
+
+    Returns the gate dict (``passed`` / ``failed_check`` / ``reason`` /
+    ``metrics`` / ...) or ``None`` when absent — older predictions written
+    before the block was surfaced (2026-06-01), or no predictions at all.
+    Callers MUST treat ``None`` as "no gate signal" and proceed normally
+    (fail-open): only an explicit ``passed is False`` triggers the hold-book
+    safeguard, never a missing gate. See the 2026-06-01 hold-book decision.
+    """
+    s3 = boto3.client("s3")
+    try:
+        obj = s3.get_object(Bucket=s3_bucket, Key="predictor/predictions/latest.json")
+        data = json.loads(obj["Body"].read())
+        return data.get("output_distribution_gate")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+
+
 def read_signals(s3_bucket: str, run_date: str | None = None) -> dict:
     """
     Download signals/{date}/signals.json from S3.
