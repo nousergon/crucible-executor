@@ -15,6 +15,48 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
 log "=== boot-pull started ==="
 
+# ── Refresh the GitHub PAT in ~/.netrc from SSM ────────────────────────────
+# alpha-engine-config is the only PRIVATE repo pulled below; git authenticates
+# to it over HTTPS via the fine-grained PAT in ~/.netrc (libcurl reads ~/.netrc
+# by default — see this repo's CLAUDE.md "GitHub access on EC2"). That token
+# used to be hand-copied onto each box, so a PAT rotation silently broke every
+# box's private-repo pull until someone re-pasted it. 2026-06-03 incident: the
+# executor PAT was rotated; the sibling dashboard box's stale ~/.netrc started
+# returning 401 and its boot-pull FAILed on alpha-engine-config.
+#
+# /alpha-engine/GITHUB_TOKEN (SecureString) is now the single source of truth.
+# Hydrating ~/.netrc from it on every run means a future rotation only needs an
+# SSM update — it auto-propagates to every box within one boot cycle. Mirrors
+# the dashboard repo's boot-pull.sh (alpha-engine-dashboard/infrastructure/).
+#
+# Best-effort by design (per ~/Development/CLAUDE.md item 3 — fail-loud): a
+# refresh failure here is WARN-only and MUST NOT clobber a working ~/.netrc,
+# because the on-disk token may still be valid and we only overwrite when SSM
+# hands back a non-empty token (a transient SSM blip can never wipe valid
+# creds). NOTE: this script only WARN-logs a private-repo fetch failure to
+# /var/log/boot-pull.log (no flow-doctor report like the dashboard box has) —
+# tracked as a follow-up to add symmetric failure surfacing.
+GH_USER="cipher813"
+NETRC="/home/ec2-user/.netrc"
+if GH_TOKEN=$(aws ssm get-parameter --name /alpha-engine/GITHUB_TOKEN \
+        --with-decryption --query "Parameter.Value" --output text 2>>"$LOG") \
+        && [ -n "$GH_TOKEN" ] && [ "$GH_TOKEN" != "None" ]; then
+    NEW_NETRC="machine github.com login ${GH_USER} password ${GH_TOKEN}"
+    if [ ! -f "$NETRC" ] || [ "$NEW_NETRC" != "$(cat "$NETRC" 2>/dev/null)" ]; then
+        # umask 077 + atomic tmp→mv so the token never lands in a
+        # world-readable or half-written file.
+        ( umask 077; printf '%s\n' "$NEW_NETRC" > "${NETRC}.tmp.$$" )
+        mv "${NETRC}.tmp.$$" "$NETRC"
+        chmod 600 "$NETRC"
+        log "OK   ~/.netrc refreshed from SSM /alpha-engine/GITHUB_TOKEN"
+    else
+        log "OK   ~/.netrc unchanged from SSM"
+    fi
+    unset GH_TOKEN NEW_NETRC
+else
+    log "WARN ~/.netrc refresh skipped — SSM /alpha-engine/GITHUB_TOKEN unreadable/empty; keeping existing ~/.netrc (private-repo pull will WARN below if the on-disk token is also stale)"
+fi
+
 REPOS=(
     /home/ec2-user/alpha-engine-config
     /home/ec2-user/alpha-engine
