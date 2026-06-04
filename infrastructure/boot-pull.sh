@@ -65,6 +65,16 @@ REPOS=(
     /home/ec2-user/alpha-engine-data
 )
 
+# Accumulate pull/pip failures so we can surface them LOUD at the end (per
+# ~/Development/CLAUDE.md item 3 — fail-loud). Previously this script only
+# WARN-logged a fetch/reset failure to /var/log/boot-pull.log and continued,
+# so a private-repo auth break (e.g. the 2026-06-03 PAT-rotation incident,
+# which silently failed THIS box's alpha-engine-config pull at 12:45 UTC with
+# no badge/email) was invisible. The sibling dashboard box already reported via
+# flow-doctor; this closes the asymmetry (ROADMAP L4490).
+PULL_FAILURES=0
+FAILED_REPOS=()
+
 for repo in "${REPOS[@]}"; do
     if [ ! -d "$repo/.git" ]; then
         log "SKIP $repo (not cloned)"
@@ -98,7 +108,9 @@ for repo in "${REPOS[@]}"; do
             fi
         fi
     else
-        log "WARN $repo — fetch/reset failed (network issue?)"
+        log "FAIL $repo — fetch/reset failed (network or auth — e.g. stale ~/.netrc PAT)"
+        PULL_FAILURES=$((PULL_FAILURES + 1))
+        FAILED_REPOS+=("$repo (git)")
     fi
 
     # Update pip deps if venv + requirements.txt exist.
@@ -111,7 +123,9 @@ for repo in "${REPOS[@]}"; do
         if .venv/bin/pip install --quiet -r requirements.txt >> "$LOG" 2>&1; then
             log "OK   $repo — deps updated"
         else
-            log "WARN $repo — pip install failed"
+            log "FAIL $repo — pip install failed"
+            PULL_FAILURES=$((PULL_FAILURES + 1))
+            FAILED_REPOS+=("$repo (pip)")
         fi
     fi
 done
@@ -239,5 +253,43 @@ fi
 
 # Config files are now in the alpha-engine-config private repo (pulled above).
 # Each module's config loader searches ~/alpha-engine-config/ first.
+
+# ── Report failures to flow-doctor if any occurred ──────────────────────────
+# Mirrors the dashboard box's boot-pull.sh (alpha-engine-dashboard/
+# infrastructure/) — closes ROADMAP L4490, the asymmetry where a private-repo
+# fetch failure on THIS box was WARN-only-in-the-log (invisible) while the
+# dashboard box raised a flow-doctor badge + email. flow-doctor.yaml here is
+# flow_name=executor → reports to cipher813/alpha-engine + emails the owner.
+# Fire-and-forget (`|| true`): if flow-doctor itself is broken, the FAIL lines
+# in /var/log/boot-pull.log are the fallback signal, and we still exit 1.
+if [ "$PULL_FAILURES" -gt 0 ]; then
+    log "=== boot-pull completed with $PULL_FAILURES failure(s): ${FAILED_REPOS[*]} ==="
+    FD_VENV="/home/ec2-user/alpha-engine/.venv/bin/python"
+    FD_CFG="/home/ec2-user/alpha-engine/flow-doctor.yaml"
+    if [ -x "$FD_VENV" ] && [ -f "$FD_CFG" ]; then
+        "$FD_VENV" - <<PYEOF 2>> "$LOG" || true
+import os
+import sys
+sys.path.insert(0, "/home/ec2-user/alpha-engine")
+try:
+    from alpha_engine_lib.secrets import get_secret
+    for _name in ("EMAIL_SENDER", "EMAIL_RECIPIENTS", "GMAIL_APP_PASSWORD", "FLOW_DOCTOR_GITHUB_TOKEN"):
+        _val = get_secret(_name, required=False)
+        if _val is not None and _name not in os.environ:
+            os.environ[_name] = _val
+    import flow_doctor
+    fd = flow_doctor.init(config_path="/home/ec2-user/alpha-engine/flow-doctor.yaml")
+    fd.report(
+        RuntimeError("boot-pull failed: ${FAILED_REPOS[*]}"),
+        severity="error",
+        context={"site": "boot-pull", "host": "trading", "failures": "${FAILED_REPOS[*]}"},
+    )
+except Exception as e:
+    print(f"[boot-pull] flow-doctor report failed: {e}", file=sys.stderr)
+PYEOF
+    fi
+    log "=== boot-pull complete (with failures) ==="
+    exit 1
+fi
 
 log "=== boot-pull complete ==="
