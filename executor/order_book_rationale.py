@@ -65,20 +65,38 @@ STATE_HELD = "held"
 # always emits one of the two sub-states below. Consumers reading
 # pre-1.2.0 artifacts may still encounter the bare slug.
 STATE_NO_ACTION = "no_action"
-# Sub-states (schema 1.2.0+) — the only ways a ticker can land in the
+# Sub-states (schema 1.2.0+) — the ways a ticker can land in the
 # no-action bucket post-filter are:
 #   1. Research ENTER + optimizer eligible + target ≈ 0 → optimizer_zero
-#      (the "we looked and chose not to" case)
-#   2. Anything else → unknown (should be 0; flags a producer bug)
+#      (the "we looked and chose not to allocate" case — benign)
+#   2. Research ENTER + optimizer assigned a NON-ZERO target but NO order
+#      was created (not approved / blocked / held) → optimizer_dropped.
+#      The optimizer WANTED this position and the allocation was lost
+#      downstream (e.g. a price-resolve failure in optimizer_cutover).
+#      This is an ERROR, not a benign no-action — surfaced distinctly so
+#      the console flags it loudly. (2026-06-04: AMD, the optimizer's
+#      10% top pick, was dropped this way on a transient IBKR price miss.)
+#   3. No optimizer view at all (legacy non-optimizer run / signal
+#      silently dropped upstream) → unknown.
 # Research HOLD / EXIT / REDUCE on a non-held ticker is filtered out
 # of the considered universe entirely — those rows are dead signals
 # (no possible order-book interaction) and would only add noise.
 STATE_NO_ACTION_OPTIMIZER_ZERO = "no_action_optimizer_zero_weight"
+STATE_NO_ACTION_OPTIMIZER_DROPPED = "no_action_optimizer_dropped"
 STATE_NO_ACTION_UNKNOWN = "no_action_unknown"
 
 _NO_ACTION_STATES = frozenset({
     STATE_NO_ACTION,
     STATE_NO_ACTION_OPTIMIZER_ZERO,
+    STATE_NO_ACTION_OPTIMIZER_DROPPED,
+    STATE_NO_ACTION_UNKNOWN,
+})
+
+# Error-severity terminal states — an operator MUST look at these. The
+# console renders them as errors (banner + red row) and they sort to the
+# top of the no-action cluster.
+_ERROR_STATES = frozenset({
+    STATE_NO_ACTION_OPTIMIZER_DROPPED,
     STATE_NO_ACTION_UNKNOWN,
 })
 
@@ -89,10 +107,13 @@ _STATE_ORDER = {
     STATE_PREDICTOR_VETOED: 3,
     STATE_RISK_BLOCKED: 4,
     STATE_HELD: 5,
-    STATE_NO_ACTION_OPTIMIZER_ZERO: 6,
+    # Error states sort FIRST within the no-action cluster so the operator
+    # sees the dropped allocation before the benign optimizer-zero rows.
+    STATE_NO_ACTION_OPTIMIZER_DROPPED: 6,
     STATE_NO_ACTION_UNKNOWN: 7,
+    STATE_NO_ACTION_OPTIMIZER_ZERO: 8,
     # Compatibility — legacy aggregate slug sorts with the others.
-    STATE_NO_ACTION: 7,
+    STATE_NO_ACTION: 8,
 }
 
 # risk_events rules emitted when the *predictor* (not research/risk)
@@ -224,9 +245,13 @@ def _classify_no_action(
     optimizer view (when present) supplies the explanation.
 
       - Optimizer view present, target ≈ 0 → optimizer_zero_weight
-        (the "we looked and chose not to allocate" case).
-      - Anything else → unknown — should be 0 in production; surfacing
-        distinctly lets the dashboard flag a producer bug.
+        (the "we looked and chose not to allocate" case — benign).
+      - Optimizer view present, target ≥ ε but no order/block/held →
+        optimizer_dropped — the optimizer WANTED this position and the
+        allocation was lost downstream (price-resolve failure, etc.).
+        An ERROR, surfaced distinctly so the console flags it loudly.
+      - No optimizer view at all → unknown (legacy non-optimizer run or
+        a signal silently dropped upstream).
 
     Returns the sub-state slug + a short human-readable detail string
     appended to the decision chain so the per-ticker drill-down
@@ -234,10 +259,20 @@ def _classify_no_action(
     """
     if isinstance(opt_view, Mapping):
         tgt = opt_view.get("target_weight")
-        if isinstance(tgt, (int, float)) and abs(tgt) < _OPTIMIZER_TARGET_ZERO_EPSILON:
+        if isinstance(tgt, (int, float)):
+            if abs(tgt) < _OPTIMIZER_TARGET_ZERO_EPSILON:
+                return (
+                    STATE_NO_ACTION_OPTIMIZER_ZERO,
+                    "optimizer eligible but assigned ~0 target weight",
+                )
+            # Non-zero target that never became an order — the allocation
+            # was dropped downstream. ERROR. See [[feedback_no_silent_fails]].
             return (
-                STATE_NO_ACTION_OPTIMIZER_ZERO,
-                "optimizer eligible but assigned ~0 target weight",
+                STATE_NO_ACTION_OPTIMIZER_DROPPED,
+                f"ERROR: optimizer targeted {tgt * 100:.2f}% but no order was "
+                f"created (not approved / blocked / held) — allocation dropped "
+                f"downstream; check the AlphaEngine/Executor/"
+                f"optimizer_target_dropped alarm + executor log",
             )
     return (
         STATE_NO_ACTION_UNKNOWN,
@@ -559,6 +594,17 @@ def build_order_book_rationale(
                 })
         else:
             state, _na_detail = _classify_no_action(opt_view=opt_view)
+            if state == STATE_NO_ACTION_OPTIMIZER_DROPPED:
+                # Recording surface #2 (the producer-side CW alarm in
+                # optimizer_cutover is #1): an ERROR in the planner log so
+                # the dropped allocation is never silent. [[feedback_no_silent_fails]]
+                logger.error(
+                    "order_book_rationale: %s — optimizer targeted %s but no "
+                    "order was created (allocation DROPPED). %s",
+                    ticker,
+                    (opt_view or {}).get("target_weight"),
+                    _na_detail,
+                )
             chain.append({
                 "stage": "no_action",
                 "result": state,

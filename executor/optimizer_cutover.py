@@ -125,12 +125,12 @@ def apply_optimizer_targets_to_orderbook(
         if current_price is None:
             # Every price source failed (no live snapshot after retries AND
             # no usable price history). The optimizer's target cannot be
-            # sized, so it is dropped for this run — but LOUDLY. Dropping a
-            # producer's allocation (esp. its largest target) with only a
-            # debug log is the silent-degrade failure this fix exists to
-            # kill (L4500). WARN names the lost allocation; the CW metric +
-            # alarm gives the drop a recording surface the operator can see.
-            logger.warning(
+            # sized, so it is dropped for this run — and this is an ERROR,
+            # not a benign skip: the optimizer's allocation (esp. its
+            # largest target) is LOST. Logged at ERROR + CW alarm + the
+            # OBR surfaces the ticker as no_action_optimizer_dropped (an
+            # error state). Per [[feedback_no_silent_fails]] (L4500/L4501).
+            logger.error(
                 "optimizer_cutover: DROPPING %s %s target_weight=%.4f $%.2f — "
                 "no price after %d ibkr attempts and no usable price_histories "
                 "close. Optimizer allocation LOST for this run; emitting "

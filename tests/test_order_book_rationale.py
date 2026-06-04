@@ -18,6 +18,7 @@ from executor.order_book_rationale import (
     STATE_APPROVED_ENTRY,
     STATE_HELD,
     STATE_NO_ACTION,
+    STATE_NO_ACTION_OPTIMIZER_DROPPED,
     STATE_NO_ACTION_OPTIMIZER_ZERO,
     STATE_NO_ACTION_UNKNOWN,
     STATE_PREDICTOR_VETOED,
@@ -908,6 +909,38 @@ class TestNoActionSubStates:
         # surface the weights inline with the sub-state.
         assert f["optimizer"]["target_weight"] == 0.0
         assert f["optimizer"]["eligible"] is True
+
+    def test_research_enter_nonzero_target_no_order_classified_dropped(self):
+        # The ERROR case (L4501 / the 2026-06-04 AMD incident): research
+        # ENTER, optimizer assigned a NON-ZERO target (10%), eligible —
+        # but no approved-entry / block / held record exists. The
+        # allocation was dropped downstream (price-resolve failure in
+        # optimizer_cutover). Must classify as the distinct ERROR
+        # sub-state, NOT the benign optimizer_zero or generic unknown.
+        shadow = {
+            "tickers": ["AMD"],
+            "current_weights": [0.0],
+            "target_weights": [0.10],
+            "alpha_hat": [0.0316],
+            "eligibility": [True],
+            "eligibility_reasons": [None],
+        }
+        payload = build_order_book_rationale(
+            signals={"enter": [_sig("AMD", "ENTER", score=75.2)],
+                     "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            optimizer_shadow_log=shadow,
+            **self._base_kwargs(),
+        )
+        amd = next(r for r in payload["tickers"] if r["ticker"] == "AMD")
+        assert amd["terminal_state"] == STATE_NO_ACTION_OPTIMIZER_DROPPED
+        na = next(s for s in amd["decision_chain"] if s["stage"] == "no_action")
+        assert "ERROR" in na["detail"]
+        assert "10.00%" in na["detail"]  # the targeted weight is named
+        assert amd["optimizer"]["target_weight"] == 0.10
+        # Counted distinctly in the summary so the console can banner it.
+        assert payload["summary"]["n_no_action_optimizer_dropped"] == 1
+        assert "n_no_action_unknown" not in payload["summary"]
 
     def test_research_enter_without_optimizer_view_classified_unknown(self):
         # Defensive — should be rare in production. Research said ENTER,
