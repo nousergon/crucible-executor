@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Any
 
 import pandas as pd
@@ -33,6 +34,21 @@ logger = logging.getLogger(__name__)
 
 
 _OK_DIAG_STATUSES = ("optimal", "optimal_inaccurate")
+
+# Price-resolution policy for optimizer targets (L4500, 2026-06-04).
+# The paper IBKR feed frequently returns an empty first snapshot for a
+# ticker; a single miss must NOT silently drop the optimizer's target
+# (the 2026-06-04 incident: AMD — the optimizer's LARGEST pick at 10% /
+# $101.5k — was dropped on a transient no-price, leaving the order book
+# 9-of-10 and surfacing as "no action — unknown (investigate)" on the
+# console). We retry the live snapshot with a short backoff, then fall
+# back to the last close from price_histories (the SAME panel the
+# optimizer sized its weights against, so dimensionally identical to the
+# target it produced). Only if every source fails do we drop — and then
+# LOUDLY (WARN + CW metric + alarm), never silently. Per
+# [[feedback_no_silent_fails]] + [[feedback_sota_institutional_default_no_shortcuts]].
+_PRICE_MAX_ATTEMPTS = 3
+_PRICE_RETRY_SLEEP_S = 1.0
 
 
 def is_log_usable(log: dict | None) -> bool:
@@ -95,6 +111,7 @@ def apply_optimizer_targets_to_orderbook(
 
     entries: list[dict] = []
     exits: list[dict] = []
+    dropped: list[dict] = []
 
     for trade in trades:
         ticker = trade.get("ticker")
@@ -104,12 +121,42 @@ def apply_optimizer_targets_to_orderbook(
         target_weight = float(trade.get("target_weight", 0.0))
         delta_dollars = float(trade.get("delta_dollars", 0.0))
 
-        current_price = _get_current_price(ibkr, ticker)
-        if current_price is None or current_price <= 0:
+        current_price, price_source = _resolve_price(ibkr, ticker, price_histories)
+        if current_price is None:
+            # Every price source failed (no live snapshot after retries AND
+            # no usable price history). The optimizer's target cannot be
+            # sized, so it is dropped for this run — but LOUDLY. Dropping a
+            # producer's allocation (esp. its largest target) with only a
+            # debug log is the silent-degrade failure this fix exists to
+            # kill (L4500). WARN names the lost allocation; the CW metric +
+            # alarm gives the drop a recording surface the operator can see.
             logger.warning(
-                "optimizer_cutover: skip %s — no current_price from ibkr", ticker,
+                "optimizer_cutover: DROPPING %s %s target_weight=%.4f $%.2f — "
+                "no price after %d ibkr attempts and no usable price_histories "
+                "close. Optimizer allocation LOST for this run; emitting "
+                "AlphaEngine/Executor/optimizer_target_dropped alarm.",
+                ticker, action, target_weight, delta_dollars, _PRICE_MAX_ATTEMPTS,
             )
+            _emit_target_dropped_metric(ticker, action, reason="no_price_all_sources")
+            dropped.append({
+                "ticker": ticker,
+                "action": action,
+                "reason": "no_price_all_sources",
+                "target_weight": target_weight,
+                "delta_dollars": delta_dollars,
+            })
             continue
+        if price_source != "ibkr":
+            # Sized off the fallback close rather than a live snapshot. The
+            # target survives (the whole point of L4500) but the operator
+            # should know the live feed missed this name today.
+            logger.warning(
+                "optimizer_cutover: %s priced via FALLBACK %s=$%.2f — live "
+                "ibkr snapshot unavailable after %d attempts; sizing on last "
+                "close. Target preserved.",
+                ticker, price_source, current_price, _PRICE_MAX_ATTEMPTS,
+            )
+            _emit_target_dropped_metric(ticker, action, reason="priced_via_fallback")
 
         if action == "BUY":
             record = _build_entry_record(
@@ -154,9 +201,9 @@ def apply_optimizer_targets_to_orderbook(
             )
 
     logger.info(
-        "optimizer_cutover: applied %d entries + %d urgent_exits from "
-        "%d would_be_trades",
-        len(entries), len(exits), len(trades),
+        "optimizer_cutover: applied %d entries + %d urgent_exits "
+        "(%d dropped — no price) from %d would_be_trades",
+        len(entries), len(exits), len(dropped), len(trades),
     )
     return entries, exits
 
@@ -167,6 +214,90 @@ def _get_current_price(ibkr: Any, ticker: str) -> float | None:
     except Exception as e:
         logger.warning("optimizer_cutover: get_current_price(%s) raised: %s", ticker, e)
         return None
+
+
+def _resolve_price(
+    ibkr: Any,
+    ticker: str,
+    price_histories: dict[str, pd.DataFrame] | None,
+) -> tuple[float | None, str | None]:
+    """Resolve a sizing price for an optimizer target — never silently drop.
+
+    Order of sources (L4500):
+      1. Live IBKR snapshot, retried up to ``_PRICE_MAX_ATTEMPTS`` with a
+         ``_PRICE_RETRY_SLEEP_S`` backoff between tries. ``get_current_price``
+         *returns None* (it does not raise) on a transient empty snapshot,
+         so the retry re-requests market data — the common paper-feed miss
+         clears on a later attempt.
+      2. Last close from ``price_histories[ticker]`` — the same panel the
+         optimizer sized its weights against, so a dimensionally-consistent
+         sizing price when the live feed is down.
+
+    Returns ``(price, source)`` where source ∈ {"ibkr", "price_history_close"},
+    or ``(None, None)`` when every source fails (caller drops the target
+    loudly).
+    """
+    for attempt in range(1, _PRICE_MAX_ATTEMPTS + 1):
+        price = _get_current_price(ibkr, ticker)
+        if price is not None and price > 0:
+            return float(price), "ibkr"
+        if attempt < _PRICE_MAX_ATTEMPTS:
+            time.sleep(_PRICE_RETRY_SLEEP_S)
+
+    last_close = _last_close(price_histories, ticker)
+    if last_close is not None:
+        return last_close, "price_history_close"
+
+    return None, None
+
+
+def _last_close(
+    price_histories: dict[str, pd.DataFrame] | None,
+    ticker: str,
+) -> float | None:
+    """Most-recent positive close from ``price_histories`` (lowercase
+    ``close`` column, matching the optimizer_shadow panel schema), or None."""
+    if not price_histories:
+        return None
+    df = price_histories.get(ticker)
+    if df is None or getattr(df, "empty", True) or "close" not in df.columns:
+        return None
+    try:
+        val = float(df["close"].iloc[-1])
+    except (IndexError, ValueError, TypeError):
+        return None
+    return val if math.isfinite(val) and val > 0 else None
+
+
+def _emit_target_dropped_metric(ticker: str, action: str, *, reason: str) -> None:
+    """Emit ``AlphaEngine/Executor/optimizer_target_dropped`` (Count) with a
+    ``reason`` dimension so a dropped / fallback-priced optimizer target is
+    visible on the console + alarmable.
+
+    Best-effort: CloudWatch errors WARN but never fail the planner — the
+    order-book decision is the load-bearing path; this metric is the
+    recording surface that keeps the drop from being silent (mirrors
+    ``signal_reader._emit_admission_refused_metric``)."""
+    try:
+        import boto3
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Executor",
+            MetricData=[{
+                "MetricName": "optimizer_target_dropped",
+                "Value": 1.0,
+                "Unit": "Count",
+                "Dimensions": [
+                    {"Name": "reason", "Value": reason},
+                ],
+            }],
+        )
+    except Exception as exc:
+        logger.warning(
+            "CloudWatch optimizer_target_dropped metric failed (%s %s, %s): %s. "
+            "Not blocking the planner.",
+            ticker, action, reason, exc,
+        )
 
 
 def _build_entry_record(

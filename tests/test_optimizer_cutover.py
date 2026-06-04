@@ -12,7 +12,10 @@ Covers:
       * SELL @ target>0 → urgent_exit REDUCE for partial shares
       * SELL with no current position → skipped
       * BUY where delta_dollars < price → skipped (shares=0)
-      * ibkr returns None → skipped
+      * Price resolution (L4500 — never silently drop a target):
+          - transient ibkr None clears on retry → entry preserved
+          - ibkr down → fall back to price_histories last close
+          - every source fails → dropped LOUDLY + CW alarm emitted
       * Unknown action → skipped
       * OrderBook dedup (already-pending entry / urgent_exit) — handled by OB
 """
@@ -21,6 +24,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 from executor.optimizer_cutover import (
@@ -28,6 +32,19 @@ from executor.optimizer_cutover import (
     is_log_usable,
 )
 from executor.order_book import OrderBook
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep_no_cw(monkeypatch):
+    """Keep price-retry tests fast + offline: no-op the backoff sleep and
+    stub the CloudWatch emitter. Returns the emitter mock so drop/fallback
+    tests can assert the alarm fired (L4500)."""
+    monkeypatch.setattr("executor.optimizer_cutover.time.sleep", lambda *_a, **_k: None)
+    emitter = MagicMock()
+    monkeypatch.setattr(
+        "executor.optimizer_cutover._emit_target_dropped_metric", emitter
+    )
+    return emitter
 
 
 # ── is_log_usable ──────────────────────────────────────────────────────────────
@@ -271,9 +288,11 @@ def test_buy_with_delta_below_price_is_skipped():
     assert exits == []
 
 
-def test_ibkr_returns_none_skips_ticker():
+def test_ibkr_returns_none_drops_loudly_with_no_history(_no_sleep_no_cw):
+    """No live price AND no price_histories → target dropped, but the drop
+    is recorded via the CW alarm (L4500 — no silent degrade)."""
     ob = OrderBook(data={"date": "2026-05-13"})
-    ibkr = _make_ibkr({})  # all prices unknown
+    ibkr = _make_ibkr({})  # all prices unknown, every attempt
     log = {
         "would_be_trades": [
             {"ticker": "FOO", "action": "BUY", "delta_dollars": 1000, "target_weight": 0.01, "current_weight": 0},
@@ -287,6 +306,62 @@ def test_ibkr_returns_none_skips_ticker():
     )
     assert entries == []
     assert exits == []
+    # Both targets dropped → both emit the no_price alarm.
+    assert _no_sleep_no_cw.call_count == 2
+    reasons = {c.kwargs["reason"] for c in _no_sleep_no_cw.call_args_list}
+    assert reasons == {"no_price_all_sources"}
+    # ibkr retried up to the cap per ticker, not a single shot.
+    assert ibkr.get_current_price.call_count == 2 * 3  # 2 tickers × _PRICE_MAX_ATTEMPTS
+
+
+def test_transient_ibkr_none_clears_on_retry(_no_sleep_no_cw):
+    """A first empty snapshot that clears on a later attempt preserves the
+    target — this is the exact AMD failure mode (L4500)."""
+    ob = OrderBook(data={"date": "2026-05-13"})
+    ibkr = MagicMock()
+    # None on attempt 1, real price on attempt 2.
+    ibkr.get_current_price.side_effect = [None, 200.0]
+    log = {
+        "would_be_trades": [{
+            "ticker": "AMD", "action": "BUY",
+            "delta_dollars": 101_511.17, "target_weight": 0.10, "current_weight": 0.0,
+        }],
+    }
+    entries, exits = apply_optimizer_targets_to_orderbook(
+        log=log,
+        **_baseline_kwargs(ob, ibkr),
+    )
+    assert len(entries) == 1
+    assert entries[0]["ticker"] == "AMD"
+    assert entries[0]["current_price"] == 200.0
+    assert entries[0]["shares"] == 507  # floor(101511.17 / 200)
+    assert ibkr.get_current_price.call_count == 2  # stopped retrying once priced
+    _no_sleep_no_cw.assert_not_called()  # live snapshot won → no alarm
+
+
+def test_falls_back_to_price_history_close_when_ibkr_down(_no_sleep_no_cw):
+    """ibkr down for the whole window → size on last close from the same
+    panel the optimizer used; target preserved + fallback alarm emitted."""
+    ob = OrderBook(data={"date": "2026-05-13"})
+    ibkr = _make_ibkr({})  # never returns a price
+    price_histories = {
+        "AMD": pd.DataFrame({"close": [195.0, 205.0, 210.0]}),
+    }
+    log = {
+        "would_be_trades": [{
+            "ticker": "AMD", "action": "BUY",
+            "delta_dollars": 101_511.17, "target_weight": 0.10, "current_weight": 0.0,
+        }],
+    }
+    entries, exits = apply_optimizer_targets_to_orderbook(
+        log=log,
+        **_baseline_kwargs(ob, ibkr, price_histories=price_histories),
+    )
+    assert len(entries) == 1
+    assert entries[0]["current_price"] == 210.0  # last close
+    assert entries[0]["shares"] == 483  # floor(101511.17 / 210)
+    _no_sleep_no_cw.assert_called_once()
+    assert _no_sleep_no_cw.call_args.kwargs["reason"] == "priced_via_fallback"
 
 
 def test_unknown_action_is_skipped():
