@@ -209,10 +209,12 @@ def solve_target_weights(
         return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
     weights = _clip_and_renormalize(weights, effective_caps, cash_idx, cfg)
+    weights, governor = _apply_turnover_governor(weights, w_prev, cfg)
     diagnostics = _build_diagnostics(
         weights, w_prev, sigma, alpha_hat, spy_idx, status, cfg,
         omega_diag=omega_diag, alpha_unc_used=alpha_unc_used,
     )
+    diagnostics.update(governor)
     return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
 
@@ -248,6 +250,25 @@ OPTIMIZER_CONFIG_DEFAULTS: dict = {
     # preserves bit-identical legacy MVO behavior. Backtester-tunable.
     # See optimizer-sota-upgrades-260526.md §B.3.
     "alpha_uncertainty_penalty": 0.0,
+    # ── Turnover governor (gradual-rebalance guardrail) ──────────────────
+    # SAFETY guardrail — NOT an alpha knob, NOT backtester-tuned. Caps the
+    # one-way turnover the book may execute in a single day by scaling the
+    # step from w_prev toward the optimizer's target, so the portfolio WALKS
+    # to the target over several daily re-solves instead of jumping in one
+    # session. Institutional books rebalance gradually; a large single-day
+    # reallocation is the rare exception that should be operator-reviewed,
+    # not the default. Defaults ON (unlike the optional α̂-uncertainty term)
+    # because it's a fail-safe — a too-tight cap only slows rebalancing, it
+    # can never produce a worse trade.
+    #   max_daily_turnover: one-way turnover cap/day (None → governor OFF,
+    #     bit-identical legacy behavior).
+    #   large_move_turnover_flag: when REQUESTED (uncapped) one-way turnover
+    #     exceeds this, the solve sets large_move_flagged so the planner
+    #     alerts for approval. The move is STILL executed gradually under the
+    #     cap — flagging never bypasses the cap, and the cap never waits on
+    #     the flag.
+    "max_daily_turnover": 0.20,
+    "large_move_turnover_flag": 0.35,
 }
 
 
@@ -506,6 +527,58 @@ def _clip_and_renormalize(
     if total > 0:
         weights = weights / total
     return weights
+
+
+def _apply_turnover_governor(
+    weights: np.ndarray, w_prev: np.ndarray, cfg: dict
+) -> tuple[np.ndarray, dict]:
+    """Cap one-way daily turnover by scaling the step ``w_prev → weights``.
+
+    Gradual-rebalance guardrail: institutional books walk to the target over
+    several days rather than jumping. When the optimizer's target implies a
+    one-way turnover above ``max_daily_turnover``, take a PARTIAL step toward
+    it — ``w_exec = w_prev + (w_target - w_prev) · (cap / requested)`` — which
+    bounds executed one-way turnover to the cap while preserving direction.
+    The scaled vector is a convex combination of two cap-feasible points
+    (``w_prev`` and the clipped ``weights``), so it stays within all linear
+    constraints (Σw=1, sector caps, per-name caps). The book converges to the
+    target over subsequent daily re-solves.
+
+    A REQUESTED (pre-cap) turnover above ``large_move_turnover_flag`` sets
+    ``large_move_flagged`` so the planner alerts for operator approval — the
+    move is never executed in one jump regardless, only surfaced.
+
+    Returns ``(possibly-scaled weights, governor diagnostics)``. With
+    ``max_daily_turnover=None`` the step is returned unchanged (legacy).
+    """
+    requested = float(np.sum(np.abs(weights - w_prev)) / 2)
+    cap = cfg.get("max_daily_turnover")
+    flag = cfg.get("large_move_turnover_flag")
+    gov: dict = {
+        "requested_turnover_one_way": requested,
+        "turnover_capped": False,
+        "large_move_flagged": bool(flag is not None and requested > flag),
+    }
+    if cap is not None and cap > 0 and requested > cap:
+        # The scaling (a convex combination of w_prev and the target) only
+        # preserves Σw=1 when w_prev is itself a normalized portfolio. In
+        # production w_prev = positions/NAV + cash sentinel and always sums to
+        # 1; if it doesn't, scaling would silently de-normalize the book, so
+        # leave the step ungoverned and surface the anomaly rather than corrupt
+        # the weights. See [[feedback_no_silent_fails]].
+        if abs(float(w_prev.sum()) - 1.0) > 1e-6:
+            logger.warning(
+                "turnover governor SKIPPED: w_prev sums to %.4f (≠ 1) — cannot "
+                "scale without de-normalizing; executing the full target step "
+                "(requested one-way turnover %.3f).",
+                float(w_prev.sum()), requested,
+            )
+        else:
+            scale = cap / requested
+            weights = w_prev + (weights - w_prev) * scale
+            gov["turnover_capped"] = True
+            gov["turnover_scale_applied"] = float(scale)
+    return weights, gov
 
 
 def _build_diagnostics(

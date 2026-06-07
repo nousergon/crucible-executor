@@ -158,6 +158,46 @@ def _build_and_solve(
         alpha_uncertainty=alpha_uncertainty,
     )
 
+    # Turnover-governor large-move flag: the optimizer requested a one-way
+    # rebalance above large_move_turnover_flag. It is ALREADY executed
+    # gradually under the max_daily_turnover cap (the primary guardrail);
+    # this alert surfaces the aggressive request for operator approval to
+    # accelerate. Alert-publish is best-effort secondary observability — the
+    # cap already protected the book, so a publish failure must never block
+    # the planner. See [[feedback_no_silent_fails]] (recording surface = the
+    # WARN log + the shadow-log governor fields below).
+    if result.diagnostics.get("large_move_flagged"):
+        _req = result.diagnostics.get("requested_turnover_one_way", 0.0)
+        _cap = optimizer_cfg.get("max_daily_turnover")
+        _flag = optimizer_cfg.get("large_move_turnover_flag")
+        logger.warning(
+            "Optimizer large-move flag: requested one-way turnover %.1f%% "
+            "> flag %.0f%% — executing gradually under the %.0f%%/day cap "
+            "(run_date=%s)",
+            _req * 100, (_flag or 0) * 100, (_cap or 0) * 100, run_date,
+        )
+        try:
+            from alpha_engine_lib import alerts as _alerts
+            _alerts.publish(
+                message=(
+                    f"[executor] Optimizer requested a large rebalance: "
+                    f"one-way turnover {_req:.1%} exceeds the {_flag:.0%} flag "
+                    f"(run_date={run_date}). The book is being moved GRADUALLY "
+                    f"under the {_cap:.0%}/day cap — no single-day jump. Review "
+                    f"and approve acceleration if the reallocation is intended."
+                ),
+                severity="WARN",
+                source="alpha-engine/executor/optimizer_shadow.py",
+                sns=True,
+                telegram=True,
+                dedup_key=f"optimizer_large_move_{run_date}",
+            )
+        except Exception as _alert_err:  # noqa: BLE001 — secondary observability
+            logger.warning(
+                "large-move alert publish failed (non-fatal, cap already "
+                "applied): %s", _alert_err,
+            )
+
     would_be_trades = _compute_trade_deltas(
         tickers, result.weights, w_prev, portfolio_nav, optimizer_cfg,
     )

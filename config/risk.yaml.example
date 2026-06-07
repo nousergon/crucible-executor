@@ -362,6 +362,19 @@ portfolio_optimizer:
   # Backtester-tunable via param sweep; cutover gated by B.5. See
   # optimizer-sota-upgrades-260526.md §B.3.
   alpha_uncertainty_penalty: 0.0
+  # ── Turnover governor (gradual-rebalance guardrail) ───────────────────
+  # SAFETY guardrail, NOT backtester-tuned. The book WALKS to the optimizer's
+  # target over several days rather than jumping in one session: when a
+  # single-day target implies one-way turnover above max_daily_turnover, the
+  # step from current weights toward target is scaled down so executed
+  # turnover == the cap (the remaining distance closes over subsequent daily
+  # re-solves). Defaults ON (fail-safe — a tighter cap only slows rebalancing,
+  # never worsens a trade). Set max_daily_turnover: null to disable.
+  max_daily_turnover: 0.20          # ≤20% one-way turnover executed per day
+  # When the REQUESTED (uncapped) one-way turnover exceeds this, the planner
+  # emits a WARN + SNS/Telegram alert for operator approval to accelerate —
+  # the move is still executed gradually under the cap regardless.
+  large_move_turnover_flag: 0.35
   # Σ horizon in trading days. 1 (default) = legacy daily Σ, bit-identical to
   # pre-260526 behavior. Set to 21 to align Σ with the canonical 21d log-domain
   # α̂; under i.i.d. log-returns Σ_H = H · Σ_daily, with vol-target SOC and

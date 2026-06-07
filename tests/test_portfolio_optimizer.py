@@ -62,7 +62,11 @@ def _baseline_universe(
         "eligibility": np.ones(N, dtype=bool),
         "spy_idx": spy_idx,
         "cash_idx": cash_idx,
-        "cfg": {},
+        # These fixtures test the MVO TARGET (w_prev=zeros → full target).
+        # Disable the turnover governor (a separate concern — it caps the
+        # STEP toward the target) so target assertions stay bit-identical;
+        # the governor is exercised directly in TestTurnoverGovernor.
+        "cfg": {"max_daily_turnover": None},
     }
 
 
@@ -976,3 +980,81 @@ def test_missing_returns_panel_without_covariance_raises():
     u["stance_caps"][u["cash_idx"]] = 1.0
     with pytest.raises(ValueError, match="returns_panel is required"):
         solve_target_weights(**{**u, "returns_panel": None})
+
+
+class TestTurnoverGovernor:
+    """Gradual-rebalance guardrail: the book walks to the optimizer's target
+    over several days; a single-day target above the cap is scaled down, and a
+    large REQUESTED move is flagged for operator approval (still executed
+    gradually). See executor/portfolio_optimizer.py::_apply_turnover_governor.
+    """
+
+    def _solve_from_prev(self, prev_active=0.0, cap=0.20, flag=0.35):
+        # One active name with strong α̂ so the MVO wants a large allocation.
+        # w_prev sums to 1 (the production invariant: positions/NAV + cash
+        # sentinel) — prev_active in the name, the rest in cash. From all-cash
+        # (prev_active=0) the MVO target is a ~0.97 one-way jump.
+        u = _baseline_universe(n_active=1)
+        u["alpha_hat"][0] = 0.08
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[0] = prev_active
+        w_prev[u["cash_idx"]] = 1.0 - prev_active
+        u["w_prev"] = w_prev
+        u["cfg"] = {"max_daily_turnover": cap, "large_move_turnover_flag": flag}
+        return _solve(u)
+
+    def test_small_move_below_cap_is_not_governed(self):
+        # Already near target → requested turnover < cap → untouched + no flag.
+        u = _baseline_universe(n_active=1)
+        u["alpha_hat"][0] = 0.08
+        # Seed w_prev close to the expected target (0.08 / 0.89 SPY / 0.03 cash).
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[0] = 0.075
+        w_prev[u["spy_idx"]] = 0.895
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["cfg"] = {"max_daily_turnover": 0.20, "large_move_turnover_flag": 0.35}
+        result = _solve(u)
+        assert result.diagnostics["turnover_capped"] is False
+        assert result.diagnostics["large_move_flagged"] is False
+        assert result.diagnostics["turnover_one_way"] < 0.20
+
+    def test_large_target_is_capped_to_max_daily_turnover(self):
+        # From all-cash (w_prev=0) the MVO target is a ~0.5 turnover jump;
+        # the governor must scale executed one-way turnover down to the cap.
+        N = 3  # T0, SPY, CASH
+        result = self._solve_from_prev(cap=0.20)
+        d = result.diagnostics
+        assert d["turnover_capped"] is True
+        assert d["requested_turnover_one_way"] > 0.20
+        # executed turnover lands at the cap (within solver/clip tolerance)
+        assert d["turnover_one_way"] == pytest.approx(0.20, abs=1e-3)
+
+    def test_capped_weights_stay_feasible(self):
+        # Scaled step = convex combo of two feasible points → Σw=1 preserved.
+        N = 3
+        result = self._solve_from_prev(cap=0.20)
+        assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
+        assert np.all(result.weights >= -1e-9)
+
+    def test_large_requested_move_sets_flag(self):
+        # Requested turnover ~0.5 > 0.35 flag → flagged (but still capped).
+        N = 3
+        result = self._solve_from_prev(cap=0.20, flag=0.35)
+        assert result.diagnostics["large_move_flagged"] is True
+        assert result.diagnostics["turnover_capped"] is True  # cap independent of flag
+
+    def test_flag_without_cap_does_not_scale(self):
+        # flag set, cap disabled → flagged but weights untouched (cap is the
+        # only thing that scales; flagging never bypasses or replaces it).
+        N = 3
+        result = self._solve_from_prev(cap=None, flag=0.35)
+        assert result.diagnostics["large_move_flagged"] is True
+        assert result.diagnostics["turnover_capped"] is False
+
+    def test_governor_disabled_is_bit_identical(self):
+        # max_daily_turnover=None → no governor; turnover_capped False, no scale.
+        N = 3
+        result = self._solve_from_prev(cap=None, flag=None)
+        assert result.diagnostics["turnover_capped"] is False
+        assert result.diagnostics["large_move_flagged"] is False
