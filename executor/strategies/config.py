@@ -43,6 +43,18 @@ FALLBACK_STOP_PCT = 0.10          # 10% loss from entry triggers exit
 CATASTROPHIC_GAP_STOP_ENABLED = True
 CATASTROPHIC_GAP_STOP_PCT = 0.15  # 15% drop from reference triggers full exit
 
+# Position loss floor (MAE stop) — hard-risk, STANCE-AGNOSTIC maximum-adverse-
+# excursion floor. Full EXIT when a held position's loss from avg cost breaches
+# the floor, regardless of stance / catalyst / Research signal. The cumulative-
+# drawdown sibling of the single-move catastrophic gap stop. Closes the falling-
+# knife gap (L4549a) where a value-stance name (COIN) bled -19% un-cut because
+# the value gate skips the momentum veto AND the value exit overrides loosen ATR
+# to 4.5x / time-decay to 30d. Cold-start -0.15 cuts the COIN-class knife now;
+# the backtester tunes it within a protective band thereafter. MUST stay out of
+# STANCE_EXIT_OVERRIDES — a risk floor the value loosening cannot subordinate.
+POSITION_LOSS_FLOOR_ENABLED = True
+POSITION_LOSS_FLOOR_PCT = -0.15  # loss from avg cost (<= this, a negative decimal) → full EXIT
+
 # ── Bracket stop defaults ────────────────────────────────────────────────────
 BRACKET_STOP_ENABLED = True
 BRACKET_TRAIL_ATR_MULTIPLE = 2.0   # trailing stop = ATR * this value
@@ -133,6 +145,10 @@ def load_strategy_config(config: dict) -> dict:
         # Catastrophic single-name gap stop (optimizer-mode hard-risk override)
         "catastrophic_gap_stop_enabled": exit_cfg.get("catastrophic_gap_stop_enabled", CATASTROPHIC_GAP_STOP_ENABLED),
         "catastrophic_gap_stop_pct": exit_cfg.get("catastrophic_gap_stop_pct", CATASTROPHIC_GAP_STOP_PCT),
+
+        # Position loss floor / MAE stop (stance-agnostic hard-risk override)
+        "position_loss_floor_enabled": exit_cfg.get("position_loss_floor_enabled", POSITION_LOSS_FLOOR_ENABLED),
+        "position_loss_floor_pct": exit_cfg.get("position_loss_floor_pct", POSITION_LOSS_FLOOR_PCT),
 
         # Graduated drawdown
         "graduated_drawdown_enabled": drawdown_cfg.get("enabled", GRADUATED_DRAWDOWN_ENABLED),

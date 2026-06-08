@@ -368,3 +368,87 @@ class TestSectorRelativeVeto:
             strategy_config=_strategy_config(sector_relative_veto_enabled=False),
         )
         assert vetoed is False
+
+
+# ── Position loss floor (MAE stop) — L4549a ──────────────────────────────────
+
+from executor.strategies.exit_manager import (  # noqa: E402
+    check_position_loss_floor,
+    _evaluate_single_position,
+)
+from executor.strategies.exit_manager import STANCE_EXIT_OVERRIDES  # noqa: E402
+
+
+class TestPositionLossFloor:
+    """MAE / position loss floor — hard-risk stance-agnostic exit (L4549a)."""
+
+    _CFG = {"position_loss_floor_enabled": True, "position_loss_floor_pct": -0.15}
+
+    def test_trips_when_loss_breaches_floor(self):
+        # COIN-shape: avg 187, px 152 → -18.7% <= -15% → EXIT
+        sig = check_position_loss_floor("COIN", 152.0, 187.0, self._CFG)
+        assert sig is not None
+        assert sig["action"] == "EXIT"
+        assert sig["reason"] == "position_loss_floor"
+        assert "COIN" == sig["ticker"]
+
+    def test_trips_exactly_at_floor(self):
+        sig = check_position_loss_floor("X", 85.0, 100.0, self._CFG)  # -15.0%
+        assert sig is not None and sig["action"] == "EXIT"
+
+    def test_no_trip_above_floor(self):
+        # -5% loss, inside the floor → hold
+        assert check_position_loss_floor("AMD", 95.0, 100.0, self._CFG) is None
+
+    def test_no_trip_when_in_profit(self):
+        assert check_position_loss_floor("BRO", 110.0, 100.0, self._CFG) is None
+
+    def test_disabled_returns_none(self):
+        cfg = {"position_loss_floor_enabled": False, "position_loss_floor_pct": -0.15}
+        assert check_position_loss_floor("COIN", 152.0, 187.0, cfg) is None
+
+    def test_missing_inputs_return_none(self):
+        assert check_position_loss_floor("X", None, 100.0, self._CFG) is None
+        assert check_position_loss_floor("X", 50.0, None, self._CFG) is None
+        assert check_position_loss_floor("X", 50.0, 0.0, self._CFG) is None
+
+    def test_floor_pct_absent_defaults_active(self):
+        # No key in config → default -0.15 applies (active on merge w/o risk.yaml edit)
+        sig = check_position_loss_floor("COIN", 152.0, 187.0, {})
+        assert sig is not None and sig["action"] == "EXIT"
+
+    def test_floor_pct_none_in_config_returns_none(self):
+        cfg = {"position_loss_floor_enabled": True, "position_loss_floor_pct": None}
+        assert check_position_loss_floor("COIN", 152.0, 187.0, cfg) is None
+
+    def test_floor_is_not_a_stance_override(self):
+        # INVARIANT: the floor must never be loosened per-stance — a hard-risk
+        # backstop the value stance's loosened ATR/time-decay cannot subordinate.
+        for stance, overrides in STANCE_EXIT_OVERRIDES.items():
+            assert "position_loss_floor_pct" not in overrides, stance
+            assert "position_loss_floor_enabled" not in overrides, stance
+
+    def test_floor_supersedes_value_stance_in_single_position_eval(self):
+        # A value-stance position down past the floor exits via the loss floor
+        # FIRST, even though value loosens ATR (4.5x) / time-decay (30d).
+        cfg = {
+            "position_loss_floor_enabled": True,
+            "position_loss_floor_pct": -0.15,
+            "atr_trailing_enabled": True,
+            "fallback_stop_enabled": False,
+        }
+        sig, rule = _evaluate_single_position(
+            ticker="COIN",
+            pos={"avg_cost": 187.0, "stance": "value", "shares": 100},
+            research_action="HOLD",
+            current_price=152.0,
+            history=None,
+            sector_etf_histories=None,
+            stance_config=cfg,
+            catalyst_date=None,
+            entry_date="2026-05-26",
+            run_date="2026-06-08",
+            feature_lookup=None,
+        )
+        assert rule == "position_loss_floor"
+        assert sig is not None and sig["action"] == "EXIT"

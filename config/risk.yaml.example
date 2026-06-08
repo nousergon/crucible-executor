@@ -243,6 +243,17 @@ strategy:
     catastrophic_gap_stop_enabled: true
     catastrophic_gap_stop_pct: 0.15  # 15% drop from reference triggers full exit (backtester-tunable)
 
+    # Position loss floor (MAE stop) — STANCE-AGNOSTIC hard-risk override that
+    # survives the optimizer (like catastrophic_gap above). Full EXIT when a
+    # held position's loss from avg cost breaches the floor, regardless of
+    # stance / catalyst / Research signal. The cumulative-drawdown sibling of
+    # the single-move catastrophic gap stop. Closes the value-stance falling-
+    # knife gap (L4549a). Cold-start -0.15 cuts the COIN-class knife; the
+    # backtester tunes it within a protective band (loose end is the safeguard).
+    # NOTE: never add position_loss_floor_pct to the per-stance exit overrides.
+    position_loss_floor_enabled: true
+    position_loss_floor_pct: -0.15  # loss from avg cost (<= this negative decimal) → full EXIT (backtester-tunable)
+
   graduated_drawdown:
     enabled: true
     tiers:

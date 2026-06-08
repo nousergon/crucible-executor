@@ -543,6 +543,59 @@ def check_momentum_exit(
     return None
 
 
+def check_position_loss_floor(
+    ticker: str,
+    current_price: float | None,
+    avg_cost: float | None,
+    strategy_config: dict,
+) -> dict | None:
+    """Hard-risk maximum-adverse-excursion (MAE) floor — full EXIT.
+
+    Fires when a held position's loss from average cost breaches
+    ``position_loss_floor_pct`` (a negative decimal, e.g. -0.15). This is
+    the cumulative-drawdown sibling of the intraday ``catastrophic_gap_stop``
+    (single-move): it cuts a falling-knife position whose thesis has been
+    wrong by too much, regardless of stance / catalyst / Research signal.
+
+    STANCE-AGNOSTIC AND HARD: ``position_loss_floor_pct`` must NEVER be added
+    to ``STANCE_EXIT_OVERRIDES`` — the floor is a risk backstop the value
+    stance's loosened ATR (4.5x) / time-decay (30d) must not be able to
+    suppress (the gap that let COIN bleed -19% un-cut while ranked #1,
+    L4549a). Backtester-tuned within a protective band thereafter; the band's
+    loose end is the real safeguard.
+    """
+    if not strategy_config.get("position_loss_floor_enabled", True):
+        return None
+    # Inline default mirrors strategies.config.POSITION_LOSS_FLOOR_PCT so the
+    # floor is active even on a partial config (active on merge with no
+    # risk.yaml edit). An explicit ``None`` still disables it.
+    floor = strategy_config.get("position_loss_floor_pct", -0.15)
+    if (
+        floor is None
+        or avg_cost is None
+        or current_price is None
+        or float(avg_cost) <= 0
+    ):
+        return None
+    loss = float(current_price) / float(avg_cost) - 1.0
+    if loss <= float(floor):
+        logger.info(
+            f"POSITION LOSS FLOOR EXIT {ticker}: loss={loss * 100:.1f}% "
+            f"<= floor={float(floor) * 100:.1f}% "
+            f"(avg_cost={float(avg_cost):.2f}, px={float(current_price):.2f})"
+        )
+        return {
+            "ticker": ticker,
+            "action": "EXIT",
+            "reason": "position_loss_floor",
+            "detail": (
+                f"MAE floor breached: {loss * 100:.1f}% from avg cost "
+                f"(floor {float(floor) * 100:.1f}%)"
+            ),
+        }
+    return None
+
+
 def _evaluate_single_position(
     *,
     ticker: str,
@@ -574,7 +627,22 @@ def _evaluate_single_position(
     sector-relative veto suppressed it (load-bearing for grading the
     sector-veto decision separately from the ATR-fire decision).
     """
-    # 0. Catalyst hard exit — runs FIRST so the deadline supersedes
+    # 0. Position loss floor (MAE) — hard-risk, stance-agnostic, runs
+    # FIRST. A position down past the floor is cut regardless of stance,
+    # catalyst, or price-based checks (the falling-knife backstop, L4549a).
+    # ``position_loss_floor_pct`` is intentionally NOT in STANCE_EXIT_OVERRIDES,
+    # so ``stance_config`` carries its base value here — the value stance's
+    # loosened ATR/time-decay cannot subordinate this floor.
+    loss_floor_exit = check_position_loss_floor(
+        ticker=ticker,
+        current_price=current_price,
+        avg_cost=pos.get("avg_cost"),
+        strategy_config=stance_config,
+    )
+    if loss_floor_exit:
+        return loss_floor_exit, "position_loss_floor"
+
+    # 0b. Catalyst hard exit — runs next so the deadline supersedes
     # price-based checks (the thesis is mechanically expired).
     catalyst_exit = check_catalyst_hard_exit(
         ticker=ticker,

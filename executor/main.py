@@ -39,7 +39,11 @@ from executor.position_sizer import compute_position_size
 from executor.risk_guard import check_order, compute_drawdown_multiplier
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
 from executor.strategies.config import load_strategy_config
-from executor.strategies.exit_manager import evaluate_exits, SECTOR_ETF_MAP
+from executor.strategies.exit_manager import (
+    evaluate_exits,
+    check_position_loss_floor,
+    SECTOR_ETF_MAP,
+)
 from executor.price_cache import (
     _MACRO_SYMBOLS,
     load_atr_14_pct,
@@ -1374,7 +1378,46 @@ def run(
                 f"Strategy layer generated {len(strategy_exits)} exit signal(s): "
                 + ", ".join(f"{s['ticker']}({s['action']}: {s['reason']})" for s in strategy_exits)
             )
-    
+
+        # ── 2f'. Position loss-floor (MAE) hard-risk exits ────────────────────
+        # Stance-agnostic maximum-adverse-excursion floor: cut any held
+        # position whose loss from avg cost breaches position_loss_floor_pct.
+        # Runs UNCONDITIONALLY — like drawdown forced-exit (§2g) and the
+        # catastrophic gap stop, this is a hard-risk override that survives the
+        # optimizer (``optimizer_owns_exits`` suppresses *alpha* strategy exits,
+        # NOT risk floors). Closes the falling-knife gap that let COIN bleed
+        # -19% un-cut while ranked #1 (L4549a). The non-optimizer path already
+        # evaluates the floor inside evaluate_exits; the dedup below prevents a
+        # double-add there. Price falls back to last mark (market_value/shares)
+        # when live pricing is unavailable pre-open, so the floor still fires.
+        if strategy_config.get("position_loss_floor_enabled", True) and current_positions:
+            floor_existing_exits = (
+                {s["ticker"] for s in signals.get("exit", [])}
+                | {s["ticker"] for s in strategy_exits if s["action"] == "EXIT"}
+            )
+            for t, pos in current_positions.items():
+                if t in floor_existing_exits:
+                    continue
+                if int(pos.get("shares", 0)) <= 0:
+                    continue
+                px = ibkr.get_current_price(t)
+                if px is None:
+                    shares = pos.get("shares") or 0
+                    mv = pos.get("market_value")
+                    px = (mv / shares) if (mv and shares) else None
+                floor_exit = check_position_loss_floor(
+                    ticker=t,
+                    current_price=px,
+                    avg_cost=pos.get("avg_cost"),
+                    strategy_config=strategy_config,
+                )
+                if floor_exit:
+                    strategy_exits.append(floor_exit)
+                    logger.info(
+                        f"POSITION LOSS FLOOR EXIT (hard-risk override): {t} — "
+                        f"{floor_exit['detail']}"
+                    )
+
         enter_signals = signals["enter"]
 
         # Initialize order book for the day (daemon reads this after main.py completes).
