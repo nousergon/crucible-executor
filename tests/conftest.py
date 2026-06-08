@@ -7,6 +7,7 @@ never the real SSM Parameter Store.
 """
 import sys
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -30,3 +31,29 @@ def _isolate_secrets_from_ssm(monkeypatch):
     clear_cache()
     yield
     clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _block_real_alert_publish(monkeypatch):
+    """Stub ``alpha_engine_lib.alerts.publish`` so NO test fans out a real
+    SNS / Telegram operator alert.
+
+    Without this, any test exercising a code path that calls
+    ``alerts.publish(..., sns=True, telegram=True)`` pages the operator for
+    real. Concretely: ``test_optimizer_shadow.py``'s baseline fixture (a
+    near-all-cash book) trips the turnover-governor large-move flag added in
+    #237, which fired a live WARN to Telegram + SNS on every suite run
+    (``run_date=2026-05-11``, observed 2026-06-07). Tests assert on the call
+    inputs, not on real delivery. ``optimizer_shadow`` imports the symbol
+    lazily as ``from alpha_engine_lib import alerts as _alerts`` and calls
+    ``_alerts.publish`` at runtime, so patching the module attribute here
+    intercepts it. See ROADMAP L4566; mirrored by a cross-repo guard in
+    ``alpha_engine_lib.alerts.publish`` (PYTEST_CURRENT_TEST).
+    """
+    try:
+        from alpha_engine_lib import alerts
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(alerts, "publish", MagicMock(name="alerts.publish"))
+    yield
