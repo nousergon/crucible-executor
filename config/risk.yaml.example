@@ -53,9 +53,19 @@ min_conviction_to_enter:         # only these conviction levels allow new entrie
   - rising
   - stable
 
-# Momentum confirmation gate — skip entries with weak momentum
+# Momentum confirmation gate — skip entries with weak momentum.
+# DE-STANCED 2026-06-07 (L4565): this veto now applies UNIFORMLY to every
+# stance (the value-invert / quality-relax bypasses are retired). catalyst
+# stays exempt (event-driven). "Don't treat value differently."
 momentum_gate_enabled: true
 momentum_gate_threshold: -5.0   # min 20d momentum % (backtester-tunable: [-10.0, -5.0, -2.0])
+
+# Reversal-confirmation gate (L4565) — "don't buy a cheap name until momentum
+# stops deteriorating." Blocks entry while the predictor's momentum_confirmation
+# (the momentum L1 score) is below the threshold. Uniform across stances;
+# catalyst exempt. DEFAULT-ON in code (active on merge); backtester-tunable.
+reversal_confirmation_enabled: true
+reversal_confirmation_threshold: 0.0   # require momentum_confirmation >= this (backtester-tunable: [-0.05, 0.0, 0.05])
 
 # Cross-ticker correlation blocking — prevent correlated entries
 correlation_block_enabled: true

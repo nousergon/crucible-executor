@@ -532,76 +532,25 @@ def decide_entries(
             predictor_momentum_veto = pred_data_for_veto.get("momentum_veto")
             predictor_momentum_20d = pred_data_for_veto.get("momentum_20d")
             stance = pred_data_for_veto.get("stance")  # may be None (legacy)
-            value_drawdown_min = config.get("value_stance_drawdown_min", -0.05)
-            quality_threshold_pct = config.get(
-                "quality_stance_momentum_threshold", -15.0
-            )
-            quality_threshold_decimal = float(quality_threshold_pct) / 100.0
+            # NOTE (L4565): value_stance_drawdown_min / quality_stance_momentum_threshold
+            # are retired — the momentum veto is now uniform across stances.
 
             momentum_20d_decimal: float | None = None
             if isinstance(predictor_momentum_20d, (int, float)):
                 momentum_20d_decimal = float(predictor_momentum_20d)
 
-            # ── Value stance: require drawdown to qualify ───────────────
-            # A value pick must actually be oversold — that's the entry
-            # premise. If the ticker isn't down, the stance label is
-            # mis-applied (or the underlying feature has noise) and the
-            # pick doesn't fit its declared strategy. Block.
-            if stance == "value":
-                if (
-                    momentum_20d_decimal is not None
-                    and momentum_20d_decimal > value_drawdown_min
-                ):
-                    reason = (
-                        f"value stance gate: 20d="
-                        f"{momentum_20d_decimal * 100:.1f}% > drawdown min "
-                        f"{value_drawdown_min * 100:.1f}% "
-                        "(value picks require actual drawdown)"
-                    )
-                    logger.info(f"SKIP ENTER {ticker} — {reason}")
-                    plan.blocked.append({**_shadow_base, "block_reason": reason})
-                    plan.risk_events.append({**_event_base,
-                        "event_type": "veto",
-                        "rule": "stance_gate",
-                        "stance": "value",
-                        "reason": reason,
-                        "value": momentum_20d_decimal,
-                        "threshold": value_drawdown_min,
-                    })
-                    continue
-                # Else: drawdown qualifies. Skip the standard momentum
-                # gate (the predictor's veto is for trend-following,
-                # inappropriate for value picks).
-                logger.debug(
-                    f"PASS value gate {ticker} — 20d="
-                    f"{momentum_20d_decimal * 100 if momentum_20d_decimal is not None else '?':.1f}%"
-                )
-
-            # ── Quality stance: relaxed threshold ───────────────────────
-            # Defensive names (low vol, low debt) can absorb deeper
-            # drawdowns before we abandon them. Default -15% vs the
-            # standard -5%. Backtester-tunable.
-            elif stance == "quality":
-                if (
-                    momentum_20d_decimal is not None
-                    and momentum_20d_decimal < quality_threshold_decimal
-                ):
-                    reason = (
-                        f"quality stance gate (relaxed): 20d="
-                        f"{momentum_20d_decimal * 100:.1f}% < "
-                        f"{quality_threshold_pct}%"
-                    )
-                    logger.info(f"SKIP ENTER {ticker} — {reason}")
-                    plan.blocked.append({**_shadow_base, "block_reason": reason})
-                    plan.risk_events.append({**_event_base,
-                        "event_type": "veto",
-                        "rule": "stance_gate",
-                        "stance": "quality",
-                        "reason": reason,
-                        "value": momentum_20d_decimal,
-                        "threshold": quality_threshold_decimal,
-                    })
-                    continue
+            # ── Uniform momentum gating (de-stanced — L4565) ─────────────
+            # SOTA combine-not-route (Asness-Moskowitz-Pedersen 2013;
+            # Barra/Axioma z-score+sum): value & momentum combine at the
+            # signal level, so we do NOT treat "value" specially (Brian
+            # 2026-06-07: "I don't like falling knives, I don't think we
+            # should treat value differently"). The predictor's momentum_veto
+            # now applies UNIFORMLY to every stance — the prior value-invert
+            # (skip-veto, the gap that let COIN re-qualify as it fell) and
+            # quality-relax branches are RETIRED. ``catalyst`` stays the one
+            # exception: an event-driven thesis with a catalyst_date exit
+            # boundary may legitimately trade against trend (flagged for
+            # review in the de-stance arc).
 
             # ── Catalyst stance: skip momentum, require catalyst_date ──
             # Event-driven thesis trumps momentum considerations.
@@ -609,7 +558,7 @@ def decide_entries(
             # the executor's catalyst gate (future PR) hard-exits at
             # catalyst_date + 3 trading days — that contract requires
             # the date.
-            elif stance == "catalyst":
+            if stance == "catalyst":
                 catalyst_date = pred_data_for_veto.get("catalyst_date")
                 if not catalyst_date:
                     reason = (
@@ -632,7 +581,7 @@ def decide_entries(
                     f"PASS catalyst gate {ticker} — catalyst_date={catalyst_date}"
                 )
 
-            # ── Default (momentum / None): existing momentum_veto ────────
+            # ── Uniform momentum veto (all non-catalyst stances) ─────────
             elif predictor_momentum_veto is not None:
                 # Predictor-side veto is authoritative. ``momentum_20d``
                 # in the prediction is a decimal (matches feature
@@ -687,6 +636,42 @@ def decide_entries(
                             "veto_source": "executor_fallback",
                         })
                         continue
+
+            # ── Reversal-confirmation gate (uniform — L4565) ─────────────
+            # "Don't buy a cheap name until momentum stops deteriorating."
+            # Keys off the predictor's ``momentum_confirmation`` (the momentum
+            # L1 score): block entry while momentum is still bearish — catches
+            # a falling knife the 20d veto alone may miss. Uniform across
+            # stances; ``catalyst`` is exempt (event-driven). Default-on per
+            # the de-stance decision (Brian 2026-06-07); flip
+            # ``reversal_confirmation_enabled: false`` to disable.
+            if (
+                stance != "catalyst"
+                and config.get("reversal_confirmation_enabled", True)
+            ):
+                momentum_confirmation = pred_data_for_veto.get(
+                    "momentum_confirmation"
+                )
+                rc_threshold = config.get("reversal_confirmation_threshold", 0.0)
+                if (
+                    isinstance(momentum_confirmation, (int, float))
+                    and float(momentum_confirmation) < rc_threshold
+                ):
+                    reason = (
+                        f"reversal-confirmation gate: momentum_confirmation="
+                        f"{float(momentum_confirmation):.3f} < {rc_threshold} "
+                        f"(momentum still deteriorating — wait for reversal)"
+                    )
+                    logger.info(f"SKIP ENTER {ticker} — {reason}")
+                    plan.blocked.append({**_shadow_base, "block_reason": reason})
+                    plan.risk_events.append({**_event_base,
+                        "event_type": "veto",
+                        "rule": "reversal_confirmation",
+                        "reason": reason,
+                        "value": float(momentum_confirmation),
+                        "threshold": rc_threshold,
+                    })
+                    continue
 
         # Earnings proximity warning (logs only)
         earnings_warning_days = config.get("earnings_proximity_warning_days", 2)

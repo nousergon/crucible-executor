@@ -46,26 +46,20 @@ SECTOR_ETF_MAP = {
 # disable the corresponding rule outright. Falls through to baseline
 # config when stance is None / unknown (legacy entries, ML drift, etc.).
 #
-# Defaults below are the cold-start values; backtester adds them to the
-# parameter search space in a follow-up PR.
+# DE-STANCED 2026-06-07 (L4565): the value (4.5× ATR / 30-day) and quality
+# (time-decay disabled) LOOSENINGS are RETIRED — risk is now UNIFORM across
+# stances (Brian: "I don't like falling knives, I don't think we should treat
+# value differently"). The value loosening was the exit-side half of the
+# COIN falling-knife trap; it was an unvalidated cold-start ("backtester adds
+# in a follow-up PR" that never shipped), so removal reverts to the baseline.
+# ``catalyst`` keeps its time-decay disable: that's tied to the catalyst_date
+# hard-exit being the canonical event boundary (a different exit MECHANISM,
+# not a "give it more rope" risk loosening), and catalyst is the documented
+# exception in the entry gate too.
 STANCE_EXIT_OVERRIDES: dict[str, dict] = {
-    "momentum": {
-        # Baseline — no overrides. Pinned explicitly so future readers see
-        # the contrast with the other stances; the dict is otherwise
-        # empty for performance + clarity.
-    },
-    "value": {
-        # Contrarian thesis needs room to play out. Wider stop +
-        # extended hold:
-        "atr_multiplier": 4.5,           # vs default 3.0 — give bounce more room
-        "time_decay_reduce_days": 20,    # vs default 5
-        "time_decay_exit_days": 30,      # vs default 10 — full 30d window for mean reversion
-    },
-    "quality": {
-        # Defensive: long hold, time decay disabled. ATR untouched
-        # (rare exit on the trailing stop is still appropriate).
-        "time_decay_enabled": False,
-    },
+    "momentum": {},   # baseline
+    "value": {},      # de-stanced (L4565) — uniform stops
+    "quality": {},    # de-stanced (L4565) — uniform stops
     "catalyst": {
         # Event-driven: standard checks PLUS the hard catalyst-date
         # exit (see check_catalyst_hard_exit). Time decay disabled

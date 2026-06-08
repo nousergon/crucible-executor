@@ -62,22 +62,22 @@ class TestResolveStanceConfig:
         # No overrides → identity-return for efficiency
         assert out is base
 
-    def test_value_stance_widens_atr_and_extends_time_decay(self):
+    def test_value_stance_now_uniform_baseline(self):
+        """DE-STANCED (L4565): value no longer widens ATR / extends time
+        decay — uniform risk. Empty overrides → baseline identity."""
         base = self._base()
         out = _resolve_strategy_config_for_stance(base, "value")
-        assert out["atr_multiplier"] == STANCE_EXIT_OVERRIDES["value"]["atr_multiplier"]
-        assert out["time_decay_reduce_days"] == STANCE_EXIT_OVERRIDES["value"]["time_decay_reduce_days"]
-        assert out["time_decay_exit_days"] == STANCE_EXIT_OVERRIDES["value"]["time_decay_exit_days"]
-        # Base config preserved — caller can re-use for other stances
-        assert base["atr_multiplier"] == 3.0
-        assert base["time_decay_exit_days"] == 10
+        assert out is base
+        assert out["atr_multiplier"] == 3.0
+        assert out["time_decay_exit_days"] == 10
 
-    def test_quality_stance_disables_time_decay(self):
+    def test_quality_stance_now_uniform_baseline(self):
+        """DE-STANCED (L4565): quality no longer disables time decay —
+        uniform risk."""
         base = self._base()
         out = _resolve_strategy_config_for_stance(base, "quality")
-        assert out["time_decay_enabled"] is False
-        # ATR multiplier untouched — quality keeps standard trailing stop
-        assert out["atr_multiplier"] == 3.0
+        assert out is base
+        assert out["time_decay_enabled"] is True
 
     def test_catalyst_stance_disables_time_decay(self):
         """catalyst-stance positions exit at catalyst_date+N via
@@ -88,11 +88,15 @@ class TestResolveStanceConfig:
         out = _resolve_strategy_config_for_stance(base, "catalyst")
         assert out["time_decay_enabled"] is False
 
-    def test_thesis_ordering_pinned_on_atr_multiplier(self):
-        """value's wider ATR than momentum baseline is institutional
-        discipline. Pin the direction so a future hand-edit can't
-        accidentally tighten value's stop."""
-        assert STANCE_EXIT_OVERRIDES["value"]["atr_multiplier"] > 3.0
+    def test_value_quality_overrides_retired_uniform_risk(self):
+        """DE-STANCED (L4565): value + quality exit-loosenings are RETIRED —
+        risk is uniform across stances. Pin the invariant so a future
+        hand-edit can't re-introduce a value/quality bypass. catalyst keeps
+        its event-boundary time-decay disable (a mechanism, not a loosening)."""
+        assert STANCE_EXIT_OVERRIDES["value"] == {}
+        assert STANCE_EXIT_OVERRIDES["quality"] == {}
+        assert STANCE_EXIT_OVERRIDES["momentum"] == {}
+        assert STANCE_EXIT_OVERRIDES["catalyst"].get("time_decay_enabled") is False
 
 
 # ── check_catalyst_hard_exit ──────────────────────────────────────────────
@@ -203,46 +207,45 @@ def _ibkr_mock(price: float):
     return m
 
 
-def test_evaluate_exits_value_stance_widens_atr_stop():
-    """A value-stance position with -10% drawdown should NOT trigger
-    ATR exit at the wider multiplier (4.5×) when it WOULD at the
-    baseline (3.0×). The wider stop is the stance's room-to-play-out
-    semantic."""
+def test_evaluate_exits_value_stance_now_uniform():
+    """DE-STANCED (L4565): a value-stance position is treated IDENTICALLY
+    to a baseline/momentum position — no wider ATR, no extended hold.
+    "Don't treat value differently." """
     history = _history_with_drawdown(
         "2026-05-01", "2026-05-20", peak=100.0, trough=88.0,
     )
-    positions = {
-        "WING": {
-            "shares": 100,
-            "avg_cost": 100.0,
-            "entry_date": "2026-05-01",
-            "sector": "Consumer Discretionary",
-            "stance": "value",
-        },
-    }
-    signals = MagicMock()
-    signals_by_ticker = {}
-    cfg = _strategy_cfg()
-    # Run at the trough — 12% drawdown from peak
-    exits = evaluate_exits(
-        current_positions=positions,
-        signals_by_ticker=signals_by_ticker,
-        run_date="2026-05-20",
-        price_histories={"WING": history},
-        ibkr_client=_ibkr_mock(88.0),
-        strategy_config=cfg,
-    )
-    # value's wider 4.5× multiplier should NOT fire on this size of drawdown
-    atr_exits = [e for e in exits if e.get("reason") == "atr_trailing_stop"]
-    assert atr_exits == [], (
-        f"value stance's wider ATR should not exit on -12% drawdown; got "
-        f"{atr_exits}"
+
+    def _exits_for(stance):
+        positions = {
+            "WING": {
+                "shares": 100,
+                "avg_cost": 100.0,
+                "entry_date": "2026-05-01",
+                "sector": "Consumer Discretionary",
+                "stance": stance,
+            },
+        }
+        return evaluate_exits(
+            current_positions=positions,
+            signals_by_ticker={},
+            run_date="2026-05-20",
+            price_histories={"WING": history},
+            ibkr_client=_ibkr_mock(88.0),
+            strategy_config=_strategy_cfg(),
+        )
+
+    value_reasons = sorted(e.get("reason") for e in _exits_for("value"))
+    momentum_reasons = sorted(e.get("reason") for e in _exits_for("momentum"))
+    assert value_reasons == momentum_reasons, (
+        f"value must now exit identically to momentum (uniform risk); "
+        f"value={value_reasons} momentum={momentum_reasons}"
     )
 
 
-def test_evaluate_exits_quality_stance_skips_time_decay():
-    """quality-stance positions held >10 days with HOLD signal should
-    NOT trip time decay (disabled via STANCE_EXIT_OVERRIDES)."""
+def test_evaluate_exits_quality_stance_now_uniform():
+    """DE-STANCED (L4565): quality no longer disables time decay — a
+    quality position held past the exit threshold time-decays like any
+    other stance."""
     history = _history_with_drawdown(
         "2026-04-01", "2026-05-01", peak=100.0, trough=100.0,
     )
@@ -265,8 +268,8 @@ def test_evaluate_exits_quality_stance_skips_time_decay():
         strategy_config=cfg,
     )
     time_decays = [e for e in exits if "time_decay" in e.get("reason", "")]
-    assert time_decays == [], (
-        f"quality stance should disable time decay; got {time_decays}"
+    assert time_decays != [], (
+        "quality stance should now time-decay uniformly (L4565 de-stancing)"
     )
 
 
