@@ -389,3 +389,42 @@ class TestDecideExitsAndReducesParity:
         assert ue["ticker"] == "AAPL"
         assert ue["signal"] == "EXIT"
         assert ue["reason"] == "research_signal"
+
+    def test_position_loss_floor_strategy_exit_produces_coin_sell(self):
+        """L4549a Monday-path proof: a position_loss_floor EXIT carried in
+        strategy_exits (the hard-risk override appended by main.py §2f',
+        which survives the optimizer the same way drawdown_forced_exit does)
+        flows through the decider to an executable EXIT order + an order-book
+        urgent exit. This is the exact path that exits COIN at Monday open."""
+        positions = {
+            "COIN": {"shares": 454, "avg_cost": 187.38, "market_value": 69189.6,
+                     "sector": "Financials"},
+        }
+        # Research says nothing / HOLD — COIN is exited purely by the floor.
+        signals = {"exit": [], "reduce": [], "enter": [], "hold": [], "universe": []}
+        strategy_exits = [{
+            "ticker": "COIN", "action": "EXIT", "reason": "position_loss_floor",
+            "detail": "MAE floor breached: -18.7% from avg cost (floor -15.0%)",
+        }]
+        prices_now = {"COIN": 152.40}
+
+        plan = decide_exits_and_reduces(
+            signals=signals,
+            strategy_exits=strategy_exits,
+            current_positions=positions,
+            prices_now=prices_now,
+            predictions_by_ticker={},
+            config={"reduce_fraction": 0.50},
+            market_regime="neutral",
+            portfolio_nav=1_000_000.0,
+            run_date="2026-06-08",
+        )
+
+        coin_orders = [o for o in plan.orders if o["ticker"] == "COIN"]
+        assert len(coin_orders) == 1
+        assert coin_orders[0]["action"] == "EXIT"
+        assert coin_orders[0]["shares"] == 454
+        coin_urgent = [u for u in plan.urgent_exits_with_meta if u["ticker"] == "COIN"]
+        assert len(coin_urgent) == 1
+        assert coin_urgent[0]["signal"] == "EXIT"
+        assert coin_urgent[0]["reason"] == "position_loss_floor"
