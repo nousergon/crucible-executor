@@ -1,0 +1,91 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ListResearchBucket",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::alpha-engine-research"
+        },
+        {
+            "Sid": "ReadResearchSignals",
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::alpha-engine-research/signals/*"
+        },
+        {
+            "Sid": "ReadResearchDb",
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::alpha-engine-research/research.db"
+        },
+        {
+            "Sid": "ReadPrices",
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::alpha-engine-research/prices/*"
+        },
+        {
+            "Sid": "ReadPopulation",
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::alpha-engine-research/population/*"
+        },
+        {
+            "Sid": "ReadWritePredictorData",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::alpha-engine-research/predictor/weights/*",
+                "arn:aws:s3:::alpha-engine-research/predictor/predictions/*",
+                "arn:aws:s3:::alpha-engine-research/predictor/price_cache/*",
+                "arn:aws:s3:::alpha-engine-research/predictor/price_cache_slim/*",
+                "arn:aws:s3:::alpha-engine-research/predictor/metrics/*",
+                "arn:aws:s3:::alpha-engine-research/reference/price_cache/*"
+            ]
+        },
+        {
+            "Sid": "ReadWriteBacktestResults",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+            ],
+            "Resource": "arn:aws:s3:::alpha-engine-research/backtest/*"
+        },
+        {
+            "Sid": "ReadWriteAutoConfig",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+            ],
+            "Resource": "arn:aws:s3:::alpha-engine-research/config/*"
+        },
+        {
+            "Sid": "ReadWriteExecutorBucket",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::alpha-engine-executor",
+                "arn:aws:s3:::alpha-engine-executor/*"
+            ]
+        },
+        {
+            "Sid": "ReadWriteHealth",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+            ],
+            "Resource": "arn:aws:s3:::alpha-engine-research/health/*"
+        }
+    ]
+}

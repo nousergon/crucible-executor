@@ -19,20 +19,37 @@ infrastructure/iam/
 ```
 
 The directory name is the IAM role name; each JSON filename (minus `.json`)
-is the inline policy name on that role.
+is the inline policy name on that role — EXCEPT two reserved filenames per
+role dir, which extend coverage to non-inline axes:
+
+- `trust-policy.json` — the role's assume-role (trust) policy document
+- `managed-policies.json` — a JSON array of attached managed-policy ARNs
+
+Both are opt-in per role (codify the file to start enforcing that axis;
+absent ⇒ that axis is skipped for that role).
 
 ## Roles managed here
 
-- **`alpha-engine-executor-role`** — assumed by the trading EC2 instance
-  (`ae-trading`) and any executor processes assuming it. 8 inline policies
-  as of 2026-04-27 (was 9 — `alpha-engine-ssm-access` consolidated into
-  `alpha-engine-ssm-read`, which already had the superset of actions).
-  Trust policy + role creation are NOT managed here (out of scope for the
-  flat-file approach).
+- **`alpha-engine-executor-role`** — assumed by the **trading** EC2 instance
+  (`ae-trading`) only. 9 inline policies (trading-scoped: S3, SES, SNS,
+  CloudWatch, SSM read/send, EC2 spot, EOD Step Function). Trust policy
+  (`ec2.amazonaws.com`) and managed attachment (`AmazonSSMManagedInstanceCore`)
+  are codified via the reserved files. Until 2026-06-09 this role was also the
+  instance profile for the dashboard box and carried dashboard/cyphering/mnemon
+  grants — those were split out to `alpha-engine-dashboard-role` (see
+  "Per-box role split" below).
+- **`alpha-engine-dashboard-role`** — assumed by the **dashboard/monitoring**
+  EC2 box (`i-09b539c844515d549`, `console`/`live` Streamlit + cyphering
+  signal site + box-health watchdog). 8 inline policies (read-leaning: S3,
+  SSM read, SFN read, SNS, CloudWatch, cyphering SSM read, mnemon S3) + trust
+  (`ec2`) + `AmazonSSMManagedInstanceCore`. Created 2026-06-09 to isolate the
+  low-trust monitoring/cyphering workload from the high-trust trading role.
 - **`github-actions-iam-drift-check`** — assumed by GitHub Actions via
   OIDC for the daily IAM-drift-check workflow. Single inline policy
-  granting `iam:ListRolePolicies` + `iam:GetRolePolicy` scoped to every
-  codified role across alpha-engine + alpha-engine-data + alpha-engine-predictor.
+  granting `iam:ListRolePolicies` + `iam:GetRolePolicy` + `iam:GetRole` +
+  `iam:ListAttachedRolePolicies` (the last two added 2026-06-09 for the
+  trust/managed coverage axes) scoped to every codified role across
+  alpha-engine + alpha-engine-data + alpha-engine-predictor.
   Trust policy: `repo:cipher813/alpha-engine` + `repo:cipher813/alpha-engine-data`
   (main + pull_request); widened 2026-05-06 to support alpha-engine-data's
   drift-check workflow when the cross-cutting orchestration roles moved
@@ -53,13 +70,42 @@ in this directory scans every sibling repo for codified-role writes
 that bypass the home repo's `apply.sh`, regardless of where the role
 is codified.
 
-## Out of scope (not codified here)
+## Coverage (what's codified + checked)
 
-- Trust policies (`AssumeRolePolicyDocument`) — those are role creation,
-  managed manually
-- Managed policies (e.g. `AmazonSSMManagedInstanceCore` is attached to
-  `alpha-engine-executor-role`) — managed manually via attach commands
-- Role creation itself — pre-existing, managed manually
+`apply.sh` and `check-drift.py` cover three axes per role:
+
+1. **Inline policies** — every `<role>/<name>.json` (except the reserved
+   filenames) ⇄ the role's inline policies.
+2. **Trust policy** — `<role>/trust-policy.json` ⇄ `AssumeRolePolicyDocument`
+   (opt-in; codified 2026-06-09 for all roles here).
+3. **Managed attachments** — `<role>/managed-policies.json` (array of ARNs)
+   ⇄ attached managed policies (opt-in; additive on apply — `apply.sh` WARNs
+   on attached-but-uncodified ARNs and never auto-detaches).
+
+Still out of scope: role **creation** (bootstrapped once via
+`migrate-dashboard-role.sh` or by hand; thereafter `apply.sh` manages the
+existing role's policies/trust/attachments).
+
+## Per-box role split (2026-06-09)
+
+The two EC2 boxes used to share ONE instance profile
+(`alpha-engine-executor-profile` → `alpha-engine-executor-role`), making that
+role a catch-all spanning four projects (executor + dashboard + cyphering +
+mnemon). `migrate-dashboard-role.sh` splits them so the high-trust trading
+role is isolated from the low-trust monitoring/cyphering workload:
+
+```bash
+./infrastructure/iam/migrate-dashboard-role.sh status         # show current state
+./infrastructure/iam/migrate-dashboard-role.sh create         # additive: new role+profile+policies
+./infrastructure/iam/migrate-dashboard-role.sh swap           # repoint the live dashboard box
+#   ... verify dashboard + cyphering site + box-health alerts ...
+./infrastructure/iam/migrate-dashboard-role.sh trim-executor  # drop dashboard-only grants from trading role
+./infrastructure/iam/migrate-dashboard-role.sh rollback       # repoint box back (if swap misbehaves)
+```
+
+Each step accepts `--dry-run`. Deferred (P2): right-size `alpha-engine-dashboard-role`
+further (drop the broad `research-bucket-write` for a scoped `_alerts`/`health`
+write policy) via IAM Access Analyzer least-privilege generation after a soak.
 
 ## Usage
 
@@ -86,11 +132,13 @@ wiping policies whose JSON file was deleted in a stale checkout).
 ## Drift detection (codified vs live AWS)
 
 `check-drift.py` diffs the codified state against AWS for every role
-directory under `infrastructure/iam/`. It checks both:
+directory under `infrastructure/iam/`, across all three coverage axes:
 
-- **Set drift**: every `.json` file matches an inline policy on the role,
-  and vice versa.
+- **Set drift**: every inline `.json` file matches an inline policy on the
+  role, and vice versa.
 - **Content drift**: per-policy document equality after JSON normalization.
+- **Trust drift**: `trust-policy.json` ⇄ live `AssumeRolePolicyDocument`.
+- **Managed drift**: `managed-policies.json` ⇄ live attached managed ARNs.
 
 ```bash
 # Local
@@ -138,8 +186,8 @@ Triggers: every PR touching `infrastructure/iam/**`, daily at 09:30 UTC,
 manual `workflow_dispatch`.
 
 Auth (drift-check only): OIDC via the `github-actions-iam-drift-check`
-role (read-only: `iam:ListRolePolicies` + `iam:GetRolePolicy` on the
-codified roles).
+role (read-only: `iam:ListRolePolicies` + `iam:GetRolePolicy` + `iam:GetRole`
++ `iam:ListAttachedRolePolicies` on the codified roles).
 
 ## When you add a new inline policy
 
@@ -153,8 +201,11 @@ codified roles).
 2. Run `aws iam delete-role-policy --role-name <role> --policy-name <policy>`
 3. Commit the deletion
 
-The flat-file approach is intentionally low-ceremony — if the blast radius
+The flat-file approach is intentionally low-ceremony. If the blast radius
 grows (cross-account, multiple roles per service, complex trust-policy
-state), migrate to CloudFormation/Terraform.
+state) and declarative IaC becomes worth it, fold IAM into the **existing
+CloudFormation** (`alpha-engine-orchestration` stack) rather than introducing
+Terraform — adding a third IaC tool alongside CFN + this flat-file layer
+would create drift between tools, not reduce it.
 
 <!-- ci-trigger after alpha-engine-data#172 merged -->

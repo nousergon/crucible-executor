@@ -1,0 +1,3 @@
+[
+    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+]
