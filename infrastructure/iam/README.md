@@ -39,11 +39,24 @@ absent ⇒ that axis is skipped for that role).
   grants — those were split out to `alpha-engine-dashboard-role` (see
   "Per-box role split" below).
 - **`alpha-engine-dashboard-role`** — assumed by the **dashboard/monitoring**
-  EC2 box (`i-09b539c844515d549`, `console`/`live` Streamlit + cyphering
-  signal site + box-health watchdog). 8 inline policies (read-leaning: S3,
-  SSM read, SFN read, SNS, CloudWatch, cyphering SSM read, mnemon S3) + trust
-  (`ec2`) + `AmazonSSMManagedInstanceCore`. Created 2026-06-09 to isolate the
-  low-trust monitoring/cyphering workload from the high-trust trading role.
+  EC2 box (`i-09b539c844515d549`). Created 2026-06-09 to isolate the low-trust
+  monitoring workload from the high-trust trading role. Shared by all four
+  single-operator monitoring surfaces on the box: alpha-engine `console`/`live`
+  Streamlit, the cyphering signal site, the box-health watchdog, and
+  **robodashboard** (`portfolio.nousergon.ai`). robodashboard is an
+  **intentional co-tenant** — it stays a separate repo (per the 2026-06-03
+  keep-separate-product decision) but is treated as part of the nous-ergon
+  single-operator trust domain, so it shares this role rather than getting its
+  own. ⚠️ **Commercialization gate:** the moment robodashboard serves its first
+  *external* customer (multi-tenant, others' brokerage data) it becomes a
+  separate trust domain and MUST move to dedicated compute + its own role +
+  its own bucket (ideally its own AWS account) — do NOT ship multi-tenant on
+  this shared monitoring role. Policies: `alpha-engine-research-access`
+  (read-all on `alpha-engine-research` + `PutObject` scoped to `dashboard/*`,
+  `decision_artifacts/_calibration/*`, `decision_artifacts/_spotcheck/*`,
+  `_alerts/*`, `robodashboard/*` — no Delete, no full-bucket write; right-sized
+  2026-06-09), SSM read, SFN read, SNS, CloudWatch, cyphering SSM read,
+  mnemon S3, trust (`ec2`), `AmazonSSMManagedInstanceCore`.
 - **`github-actions-iam-drift-check`** — assumed by GitHub Actions via
   OIDC for the daily IAM-drift-check workflow. Single inline policy
   granting `iam:ListRolePolicies` + `iam:GetRolePolicy` + `iam:GetRole` +
