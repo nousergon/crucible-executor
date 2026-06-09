@@ -61,7 +61,7 @@ from executor.open_orders_artifact import OpenOrdersSnapshotWriter
 from executor.daemon_state_logger import get_logger as _get_decision_logger
 from executor.market_hours import is_market_hours
 from executor.notifier import send_daemon_status, send_trade_alert
-from executor.order_book import OrderBook
+from executor.order_book import OrderBook, build_stop_record
 from executor.price_monitor import PriceMonitor
 from executor.strategies.config import load_strategy_config
 from executor.trade_logger import init_db, log_trade, get_unmatched_entry
@@ -959,14 +959,26 @@ def run_daemon(dry_run: bool = False) -> None:
                 if not price_state:
                     continue
 
-                # Dispatch on the record's stop_kind (written by the morning
-                # planner). ``catastrophic_gap_only`` (optimizer owns the book)
-                # runs ONLY the hard-risk catastrophic gap stop — the alpha
-                # rules (trailing-stop / profit-take / collapse) and the trail
-                # ratchet are suppressed by construction. ``alpha``/absent runs
-                # the full legacy IntradayExitManager. Carrying the authority
-                # in the data (not a daemon flag) is the hard-to-misuse form.
-                if stop.get("stop_kind") == "catastrophic_gap_only":
+                # Dispatch on book authority. Under the optimizer the alpha
+                # rules (trailing-stop / profit-take / 5% collapse) and the
+                # trail ratchet are retired — ONLY the hard-risk catastrophic
+                # gap stop runs. The authority is the RUN-level ``use_optimizer``
+                # flag (belt); ``build_stop_record`` also stamps each record's
+                # ``stop_kind`` (suspenders). Keying the dispatch off the run
+                # config means an un-stamped record from a forgotten/new
+                # producer can NEVER reintroduce same-day churn — it fails SAFE
+                # toward no-churn. (WDAY 2026-06-05: a daemon-entered stop
+                # lacked stop_kind, fell through here, and the collapse rule
+                # force-sold it the same day.)
+                stop_kind = stop.get("stop_kind")
+                if use_optimizer or stop_kind == "catastrophic_gap_only":
+                    if use_optimizer and stop_kind != "catastrophic_gap_only":
+                        logger.warning(
+                            "stop_kind=%r under optimizer authority for %s — "
+                            "forcing catastrophic_gap_only (producer did not "
+                            "stamp the record; failing safe toward no-churn)",
+                            stop_kind, ticker,
+                        )
                     exit_signal = exit_mgr.check_catastrophic_gap(stop, price_state)
                 else:
                     # Check for trail update first
@@ -1164,6 +1176,7 @@ def run_daemon(dry_run: bool = False) -> None:
                             _execute_entry(
                                 ibkr, conn, order_book, entry, price_state, reason,
                                 run_date, strategy_config, dry_run, monitor=monitor,
+                                use_optimizer=use_optimizer,
                             )
                             if not dry_run:
                                 trades_executed += 1
@@ -1493,8 +1506,16 @@ def _execute_entry(
     strategy_config: dict,
     dry_run: bool,
     monitor: "PriceMonitor | None" = None,
+    use_optimizer: bool = False,
 ) -> None:
-    """Execute an intraday entry (BUY) with bracket stop."""
+    """Execute an intraday entry (BUY) with bracket stop.
+
+    ``use_optimizer`` carries the book authority into the stop record so a
+    daemon-entered position gets the SAME ``stop_kind`` the morning planner
+    stamps on held positions. Without it, intraday entries silently defaulted
+    to the alpha exit rules and were churned same-day by the 5% intraday
+    collapse rule (WDAY 2026-06-05) — see order_book.build_stop_record.
+    """
     ticker = entry["ticker"]
     shares = entry.get("shares", 0)
     current_price = price_state.get("last", 0)
@@ -1669,17 +1690,18 @@ def _execute_entry(
     atr_mult = strategy_config.get("intraday_trailing_stop_atr_multiple", 2.0)
     if trail_atr and trail_atr > 0:
         stop_price = round(fill_price - trail_atr * atr_mult, 2)
-        order_book.add_stop({
-            "ticker": ticker,
-            "entry_price": fill_price,
-            "current_stop": stop_price,
-            "trail_atr": trail_atr,
-            "atr_multiple": atr_mult,
-            "high_water": fill_price,
-            "entry_date": run_date,
-            "shares": actual_shares,
-            "entry_trade_id": trade_id,
-        })
+        order_book.add_stop(build_stop_record(
+            ticker=ticker,
+            entry_price=fill_price,
+            current_stop=stop_price,
+            trail_atr=trail_atr,
+            atr_multiple=atr_mult,
+            high_water=fill_price,
+            entry_date=run_date,
+            shares=actual_shares,
+            use_optimizer=use_optimizer,
+            entry_trade_id=trade_id,
+        ))
     else:
         fallback_enabled = strategy_config.get("fallback_stop_enabled", True)
         fallback_pct = strategy_config.get("fallback_stop_pct", 0.10)
@@ -1689,17 +1711,18 @@ def _execute_entry(
                 "No ATR for %s — using %.0f%% fallback stop at $%.2f",
                 ticker, fallback_pct * 100, stop_price,
             )
-            order_book.add_stop({
-                "ticker": ticker,
-                "entry_price": fill_price,
-                "current_stop": stop_price,
-                "trail_atr": 0,
-                "atr_multiple": 0,
-                "high_water": fill_price,
-                "entry_date": run_date,
-                "shares": actual_shares,
-                "entry_trade_id": trade_id,
-            })
+            order_book.add_stop(build_stop_record(
+                ticker=ticker,
+                entry_price=fill_price,
+                current_stop=stop_price,
+                trail_atr=0,
+                atr_multiple=0,
+                high_water=fill_price,
+                entry_date=run_date,
+                shares=actual_shares,
+                use_optimizer=use_optimizer,
+                entry_trade_id=trade_id,
+            ))
         else:
             logger.warning("No ATR for %s — fallback stop disabled, position has no stop", ticker)
     order_book.save()

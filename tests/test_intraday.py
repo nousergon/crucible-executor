@@ -13,6 +13,7 @@ import pytest
 from executor.entry_triggers import EntryTriggerEngine
 from executor.intraday_exit_manager import IntradayExitManager
 from executor.market_hours import is_market_hours, is_trading_day
+from executor.order_book import build_stop_record
 from executor.notifier import send_daemon_status, send_trade_alert
 from executor.retry import retry
 
@@ -274,6 +275,84 @@ class TestIntradayExitManager:
             {"last": 178.0},  # -11% — fires at 10% threshold
         )
         assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# build_stop_record — book-authority chokepoint (WDAY 2026-06-05 regression)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildStopRecord:
+    """The single chokepoint that stamps stop_kind from the book authority.
+
+    Both producers (morning planner + intraday daemon) route through this, so
+    a daemon-entered position can no longer silently omit stop_kind and inherit
+    the alpha exit rules (the WDAY 2026-06-05 same-day-churn bug).
+    """
+
+    def _kwargs(self, **overrides):
+        base = dict(
+            ticker="WDAY", entry_price=146.48, current_stop=132.0,
+            trail_atr=4.0, atr_multiple=2.0, high_water=146.48,
+            entry_date="2026-06-05", shares=306,
+        )
+        base.update(overrides)
+        return base
+
+    def test_optimizer_stamps_catastrophic_gap_only(self):
+        rec = build_stop_record(use_optimizer=True, **self._kwargs())
+        assert rec["stop_kind"] == "catastrophic_gap_only"
+        # No explicit reference → anchors on entry_price (no overnight gap for a
+        # same-day entry; the gap stop guards a 15% crater from the fill).
+        assert rec["gap_reference_price"] == 146.48
+
+    def test_optimizer_uses_explicit_gap_reference(self):
+        rec = build_stop_record(
+            use_optimizer=True, gap_reference_price=150.0, **self._kwargs()
+        )
+        assert rec["gap_reference_price"] == 150.0
+
+    def test_non_optimizer_stamps_alpha(self):
+        rec = build_stop_record(use_optimizer=False, **self._kwargs())
+        assert rec["stop_kind"] == "alpha"
+        assert "gap_reference_price" not in rec
+
+    def test_use_optimizer_is_required(self):
+        # Forgetting the authority is a TypeError at construction (fail-loud),
+        # never a silent default to the wrong (alpha) behavior.
+        with pytest.raises(TypeError):
+            build_stop_record(**self._kwargs())
+
+    def test_extra_fields_passthrough(self):
+        rec = build_stop_record(
+            use_optimizer=True, entry_trade_id="abc-123", **self._kwargs()
+        )
+        assert rec["entry_trade_id"] == "abc-123"
+
+    def test_wday_scenario_no_intraday_collapse_under_optimizer(self):
+        """The exact WDAY 2026-06-05 churn must not recur.
+
+        Bought $146.48; the day's HIGH was $151.50 (set before the entry); the
+        price fell to $143.92 — 5.0% below the high but only ~1.7% below entry.
+        Under optimizer authority the daemon runs ONLY the catastrophic gap
+        stop, which must NOT fire (a true risk control sees a 1.7% drift, not a
+        crater). The retired 5% collapse rule WOULD have force-sold it.
+        """
+        mgr = IntradayExitManager({"catastrophic_gap_stop_pct": 0.15})
+        rec = build_stop_record(use_optimizer=True, **self._kwargs())
+        price_state = {"last": 143.92, "high": 151.50}
+
+        # Production path under the optimizer: gap stop only — no exit.
+        assert mgr.check_catastrophic_gap(rec, price_state) is None
+
+        # Document the retired behavior: the alpha collapse rule WOULD fire on
+        # the 5%-from-high drop. This is what the fix suppresses.
+        legacy = mgr.evaluate(rec, price_state)
+        assert legacy is not None and legacy["reason"] == "intraday_collapse"
+
+        # And a genuine 15% crater from the fill still trips the gap stop.
+        crater = mgr.check_catastrophic_gap(rec, {"last": 124.0, "high": 151.50})
+        assert crater is not None and crater["reason"] == "catastrophic_gap_stop"
 
 
 # ---------------------------------------------------------------------------
