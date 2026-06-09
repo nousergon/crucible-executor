@@ -1,0 +1,29 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ReadAllResearchBucket",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::alpha-engine-research",
+                "arn:aws:s3:::alpha-engine-research/*"
+            ]
+        },
+        {
+            "Sid": "WriteMonitoringArtifactsOnly",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": [
+                "arn:aws:s3:::alpha-engine-research/dashboard/*",
+                "arn:aws:s3:::alpha-engine-research/decision_artifacts/_calibration/*",
+                "arn:aws:s3:::alpha-engine-research/decision_artifacts/_spotcheck/*",
+                "arn:aws:s3:::alpha-engine-research/_alerts/*",
+                "arn:aws:s3:::alpha-engine-research/robodashboard/*"
+            ]
+        }
+    ]
+}
