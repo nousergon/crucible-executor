@@ -34,7 +34,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from executor.ibkr import IBKRClient, SimulatedIBKRClient
-from executor.order_book import OrderBook
+from executor.order_book import OrderBook, build_stop_record
 from executor.position_sizer import compute_position_size
 from executor.risk_guard import check_order, compute_drawdown_multiplier
 from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
@@ -726,34 +726,32 @@ def _write_stops_and_finalize(
             continue
         atr_val = ticker_atr_pct * entry_price
         stop_price = round(entry_price - atr_val * atr_mult, 2)
-        stop_record = {
-            "ticker": t,
-            "entry_price": entry_price,
-            "current_stop": stop_price,
-            "trail_atr": atr_val or 0,
-            "atr_multiple": atr_mult,
-            "high_water": entry_price,
-            "entry_date": (conn and get_entry_dates(conn, [t]).get(t)) or run_date,
-            "shares": pos_shares,
-        }
-        # ``stop_kind`` lets the daemon dispatch which exit checks run against
-        # this record. Under the optimizer, the only intraday exit allowed is
-        # the catastrophic single-name gap stop; alpha rules are suppressed.
-        # ``gap_reference_price`` anchors the gap check on the most recent
-        # close (gap-down detection), falling back to entry_price.
+        # ``gap_reference_price`` anchors the optimizer-mode gap check on the
+        # most recent close (gap-down detection). For a position held into the
+        # planning run we have its history, so use that; build_stop_record
+        # falls back to entry_price if it's missing.
+        gap_ref = None
         if use_optimizer:
-            stop_record["stop_kind"] = "catastrophic_gap_only"
-            gap_ref = entry_price
             hist = (price_histories or {}).get(t)
             if hist is not None and len(hist):
                 try:
                     gap_ref = float(hist["close"].iloc[-1])
                 except (KeyError, IndexError, ValueError, TypeError):
-                    gap_ref = entry_price
-            stop_record["gap_reference_price"] = gap_ref
-        else:
-            stop_record["stop_kind"] = "alpha"
-        ob.add_stop(stop_record)
+                    gap_ref = None
+        # Single chokepoint stamps stop_kind (+ gap_reference_price) from the
+        # book authority — see order_book.build_stop_record.
+        ob.add_stop(build_stop_record(
+            ticker=t,
+            entry_price=entry_price,
+            current_stop=stop_price,
+            trail_atr=atr_val or 0,
+            atr_multiple=atr_mult,
+            high_water=entry_price,
+            entry_date=(conn and get_entry_dates(conn, [t]).get(t)) or run_date,
+            shares=pos_shares,
+            use_optimizer=use_optimizer,
+            gap_reference_price=gap_ref,
+        ))
 
     # Detect short positions and add urgent cover orders
     for t, pos in current_pos.items():

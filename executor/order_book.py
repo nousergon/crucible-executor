@@ -29,6 +29,62 @@ def _default_book(run_date: str | None = None) -> dict:
     }
 
 
+def build_stop_record(
+    *,
+    ticker: str,
+    entry_price: float,
+    current_stop: float,
+    trail_atr: float,
+    atr_multiple: float,
+    high_water: float,
+    entry_date: str,
+    shares: int,
+    use_optimizer: bool,
+    gap_reference_price: float | None = None,
+    **extra,
+) -> dict:
+    """Construct an active-stop record with book-authority semantics stamped.
+
+    Single chokepoint for stop creation across BOTH producers — the morning
+    planner (``main.py::_write_stops_and_finalize``) and the intraday daemon
+    (``daemon.py::_execute_entry``). ``use_optimizer`` is a REQUIRED keyword:
+    forgetting it raises ``TypeError`` at construction (fail-loud) rather than
+    silently defaulting to the wrong behavior.
+
+    When the portfolio optimizer owns the book (``use_optimizer=True``) every
+    stop is ``catastrophic_gap_only`` — the daemon runs ONLY the hard-risk
+    per-name catastrophic gap stop and the alpha rules (trailing-stop /
+    profit-take / 5% intraday-collapse) are retired. ``gap_reference_price``
+    anchors that gap check; for a same-day daemon entry there is no overnight
+    gap to catch, so it falls back to ``entry_price`` (a 15% crater from where
+    we actually filled). When the optimizer is off, the record is ``alpha`` and
+    the daemon runs the full legacy ``IntradayExitManager``.
+
+    Centralizing this prevents the producer-divergence bug where daemon-entered
+    positions silently omitted ``stop_kind``, defaulted to the alpha rules, and
+    were churned same-day by the 5%-from-intraday-high collapse rule
+    (WDAY 2026-06-05: bought $146.48, force-sold $143.92 on a 5.0% drop from a
+    pre-entry high of $151.50 — a peak the position never held through).
+    """
+    record = {
+        "ticker": ticker,
+        "entry_price": entry_price,
+        "current_stop": current_stop,
+        "trail_atr": trail_atr,
+        "atr_multiple": atr_multiple,
+        "high_water": high_water,
+        "entry_date": entry_date,
+        "shares": shares,
+    }
+    if use_optimizer:
+        record["stop_kind"] = "catastrophic_gap_only"
+        record["gap_reference_price"] = gap_reference_price or entry_price
+    else:
+        record["stop_kind"] = "alpha"
+    record.update(extra)
+    return record
+
+
 class OrderBook:
     """Manages the intraday order book (JSON on disk)."""
 
