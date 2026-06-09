@@ -60,7 +60,7 @@ from executor.trade_logger import (
     log_trade,
 )
 
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, guard_entrypoint
 # Suppress benign IB Error codes that don't represent real failures:
 #   10197 — "No market data during competing live session". The daemon
 #     keeps receiving delayed ticks via the delayedLast fallback in
@@ -1941,4 +1941,9 @@ if __name__ == "__main__":
         else:
             logger.info("No simulated orders generated")
     else:
-        run(dry_run=args.dry_run)
+        # guard_entrypoint captures an uncaught crash (bare raise) and reports
+        # it to flow-doctor before re-raising — the log handler only sees
+        # logger.error/exception, not a propagating exception. No-ops when
+        # flow-doctor is inactive (e.g. local dev).
+        with guard_entrypoint():
+            run(dry_run=args.dry_run)

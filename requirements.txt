@@ -48,7 +48,7 @@ requests~=2.32
 # are NOT consumed here (executor has no LLM exposure per
 # [[preference_llm_calls_confined_to_research_module]]) but the
 # transitive lib pin stays current.
-alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.42.0
+alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.58.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at

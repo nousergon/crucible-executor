@@ -20,6 +20,7 @@ Environment=PYTHONPATH=/home/ec2-user/alpha-engine
 Environment=AWS_REGION=us-east-1
 Environment=ALPHA_ENGINE_JSON_LOGS=1
 Environment=FLOW_DOCTOR_ENABLED=1
+Environment=ALPHA_ENGINE_DEPLOYED=1
 # Secrets (EMAIL_SENDER, GMAIL_APP_PASSWORD, ANTHROPIC_API_KEY, ...) — the
 # RunDaemon SSM step launches this unit via systemd, which (unlike the SF's
 # RunMorningPlanner command) does not `source` the env file. PR 9g (#182)

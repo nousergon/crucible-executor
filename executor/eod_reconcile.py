@@ -26,7 +26,7 @@ from executor.trade_logger import (
 )
 
 from alpha_engine_lib.dates import now_dual
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, guard_entrypoint
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
@@ -1003,4 +1003,7 @@ if __name__ == "__main__":
         help="YYYY-MM-DD; must equal today's trading_day or the run aborts.",
     )
     args = parser.parse_args()
-    run(run_date=args.date)
+    # Capture an uncaught crash via flow-doctor before re-raising
+    # (no-ops when flow-doctor is inactive).
+    with guard_entrypoint():
+        run(run_date=args.date)

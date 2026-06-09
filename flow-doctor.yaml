@@ -11,6 +11,12 @@ notify:
   - type: github
     repo: cipher813/alpha-engine
     token: ${FLOW_DOCTOR_GITHUB_TOKEN}
+  # Telegram fires on the same error report as the GitHub issue (the issue
+  # and the alert land together). Creds resolve from the ae-trading box's
+  # ~/.alpha-engine.env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).
+  - type: telegram
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
   - type: s3
     bucket: alpha-engine-research
     subsystem: executor

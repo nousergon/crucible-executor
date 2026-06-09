@@ -66,7 +66,7 @@ from executor.price_monitor import PriceMonitor
 from executor.strategies.config import load_strategy_config
 from executor.trade_logger import init_db, log_trade, get_unmatched_entry
 
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, guard_entrypoint
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
@@ -1773,4 +1773,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Alpha Engine Intraday Daemon")
     parser.add_argument("--dry-run", action="store_true", help="Log triggers without placing orders")
     args = parser.parse_args()
-    run_daemon(dry_run=args.dry_run)
+    # Capture an uncaught daemon crash via flow-doctor before re-raising
+    # (no-ops when flow-doctor is inactive).
+    with guard_entrypoint():
+        run_daemon(dry_run=args.dry_run)
