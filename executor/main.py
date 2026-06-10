@@ -131,6 +131,32 @@ _PARAM_VALIDATORS = {
 
 _EXECUTOR_PARAMS_CACHE_PATH = Path(__file__).resolve().parent.parent / "config" / ".executor_params_cache.json"
 
+# Non-numeric S3-delivered params the loader passes through to the applied
+# set (master switches / lists — not range-validated like _PARAM_MAP values).
+# Contract: PIPELINE_CONTRACT.yaml executor_params "applied special" section +
+# tests/test_executor_params_consumer_contract.py (L4520).
+_EXECUTOR_PARAMS_SPECIAL_KEYS = (
+    "disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend",
+    "barrier_win_prob_sizing_enabled",
+)
+
+# Producer provenance/metadata keys — KNOWN (no unknown-key WARN) but never
+# applied. Keeping this list complete keeps the WARN signal: an unknown key
+# always means genuine producer/consumer contract drift, not noise.
+# NOTE deliberately ABSENT: stance_size_* (the stance overlay is emitted by
+# the backtester's stance_sizing_optimizer but its application is NOT wired
+# here — its first live arrival must WARN; see the named gap in
+# PIPELINE_CONTRACT.yaml + the ROADMAP follow-up).
+_EXECUTOR_PARAMS_KNOWN_METADATA_KEYS = (
+    "updated_at", "assembled_by", "fit_target",
+    "best_sharpe", "best_alpha", "best_sortino",
+    "improvement_pct", "n_combos_tested", "manual_override",
+    "disabled_triggers_updated_at",
+    "barrier_win_prob_sizing_updated_at", "barrier_win_prob_sizing_ic",
+    "p_up_sizing_updated_at", "p_up_sizing_ic",
+    "stance_sizing_updated_at", "stance_sizing_alpha_spread",
+)
+
 
 def _load_executor_params_from_s3(bucket: str) -> dict | None:
     """Read config/executor_params.json from S3. Cache per cold-start.
@@ -151,12 +177,12 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
         obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
         data = json.loads(obj["Body"].read())
         # Advisory schema validation (log warnings, never block)
-        _unknown_keys = [k for k in data if k not in _PARAM_MAP and k not in (
-            "disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend",
-            "barrier_win_prob_sizing_enabled",
-            "updated_at", "best_sharpe", "best_alpha", "improvement_pct",
-            "n_combos_tested", "manual_override",
-        )]
+        _unknown_keys = [
+            k for k in data
+            if k not in _PARAM_MAP
+            and k not in _EXECUTOR_PARAMS_SPECIAL_KEYS
+            and k not in _EXECUTOR_PARAMS_KNOWN_METADATA_KEYS
+        ]
         if _unknown_keys:
             logger.warning("executor_params.json contains unknown keys: %s", _unknown_keys)
         # Only keep safe-to-override params (numeric) + special non-numeric params
@@ -164,10 +190,7 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
         # Phase 4 non-numeric params: disabled_triggers (list), p_up sizing (bool).
         # Task B2: barrier_win_prob_sizing_enabled (bool) — the dormant sizing
         # consumer's master switch, flipped via S3 after soak + backtester sweep.
-        for special_key in (
-            "disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend",
-            "barrier_win_prob_sizing_enabled",
-        ):
+        for special_key in _EXECUTOR_PARAMS_SPECIAL_KEYS:
             if special_key in data:
                 safe[special_key] = data[special_key]
         if safe:
