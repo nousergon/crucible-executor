@@ -51,15 +51,15 @@ def _complete_signals() -> dict:
         "signals": {},
         "population": ["AAA", "BBB", "CCC"],
         "universe": [
-            {"ticker": "AAA", "signal": "ENTER", "score": 80, "conviction": "rising",
+            {"ticker": "AAA", "signal": "ENTER", "score": 80, "rating": "BUY", "conviction": "rising",
              "sector": "Technology", "sector_rating": "overweight", "price_target_upside": 0.2},
-            {"ticker": "BBB", "signal": "HOLD", "score": 60, "conviction": "stable",
+            {"ticker": "BBB", "signal": "HOLD", "score": 60, "rating": "HOLD", "conviction": "stable",
              "sector": "Technology", "sector_rating": "market_weight", "price_target_upside": 0.0},
-            {"ticker": "CCC", "signal": "EXIT", "score": 30, "conviction": "declining",
+            {"ticker": "CCC", "signal": "EXIT", "score": 30, "rating": "SELL", "conviction": "declining",
              "sector": "Technology", "sector_rating": "underweight", "price_target_upside": 0.0},
         ],
         "buy_candidates": [
-            {"ticker": "AAA", "signal": "ENTER", "score": 80, "conviction": "rising",
+            {"ticker": "AAA", "signal": "ENTER", "score": 80, "rating": "BUY", "conviction": "rising",
              "sector": "Technology", "sector_rating": "overweight", "price_target_upside": 0.2},
         ],
     }
