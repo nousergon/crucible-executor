@@ -22,7 +22,8 @@
                 "arn:aws:s3:::alpha-engine-research/decision_artifacts/_calibration/*",
                 "arn:aws:s3:::alpha-engine-research/decision_artifacts/_spotcheck/*",
                 "arn:aws:s3:::alpha-engine-research/_alerts/*",
-                "arn:aws:s3:::alpha-engine-research/robodashboard/*"
+                "arn:aws:s3:::alpha-engine-research/robodashboard/*",
+                "arn:aws:s3:::alpha-engine-research/metron/*"
             ]
         }
     ]
