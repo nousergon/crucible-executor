@@ -263,6 +263,13 @@ def check_time_decay(
     if signal_action in ("ENTER", "EXIT", "REDUCE"):
         return None
 
+    # entry_date guard: the planner skips entry-date-less positions upstream,
+    # but the Slot S contract (strategies/contract.py, config#990) requires
+    # every rule to decline — not raise — on data-gap inputs, since external
+    # orchestrators don't carry the caller-side guard.
+    if not entry_date:
+        return None
+
     reduce_days = strategy_config.get("time_decay_reduce_days", 5)
     exit_days = strategy_config.get("time_decay_exit_days", 10)
 
@@ -391,7 +398,11 @@ def check_profit_take(
     if not strategy_config.get("profit_take_enabled", True):
         return None
 
-    if avg_cost is None or avg_cost <= 0:
+    # current_price guard: the planner skips price-less positions upstream,
+    # but the Slot S contract (strategies/contract.py, config#990) requires
+    # every rule to decline — not raise — on data-gap inputs, since external
+    # orchestrators don't carry the caller-side guard.
+    if avg_cost is None or avg_cost <= 0 or current_price is None:
         return None
 
     unrealized_gain = (current_price - avg_cost) / avg_cost
