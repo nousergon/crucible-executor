@@ -46,7 +46,7 @@ absent ⇒ that axis is skipped for that role).
   **robodashboard** (`portfolio.nousergon.ai`). robodashboard is an
   **intentional co-tenant** — it stays a separate repo (per the 2026-06-03
   keep-separate-product decision) but is treated as part of the nous-ergon
-  single-operator trust domain, so it shares this role rather than getting its
+  shared nous-ergon trust domain, so it shares this role rather than getting its
   own. ⚠️ **Commercialization gate:** the moment robodashboard serves its first
   *external* customer (multi-tenant, others' brokerage data) it becomes a
   separate trust domain and MUST move to dedicated compute + its own role +
