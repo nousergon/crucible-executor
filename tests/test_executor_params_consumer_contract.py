@@ -18,8 +18,7 @@ from executor import main
 
 
 # Params the producer (backtester optimizer assembler) can emit for the
-# executor to APPLY — PIPELINE_CONTRACT.yaml "applied" sections, minus the
-# stance_size_* overlay (deliberately NOT consumer-accepted yet — see below).
+# executor to APPLY — PIPELINE_CONTRACT.yaml "applied" sections.
 PRODUCER_APPLIED_PARAMS = {
     "atr_multiplier", "time_decay_reduce_days", "time_decay_exit_days",
     "min_score", "max_position_pct", "reduce_fraction",
@@ -29,6 +28,11 @@ PRODUCER_APPLIED_PARAMS = {
     "momentum_gate_threshold", "correlation_block_threshold",
     "profit_take_pct", "momentum_exit_threshold",
     "barrier_win_prob_sizing_min", "barrier_win_prob_sizing_range",
+    # L4598 (config#697): stance overlay application wired 2026-06-12 —
+    # the silent-drop gap is closed; keys remain triple-gated upstream
+    # (rank-IC promotion gate → assembler cutover → soak).
+    "stance_size_momentum", "stance_size_value", "stance_size_quality",
+    "stance_size_catalyst",
 }
 PRODUCER_SPECIAL_KEYS = {
     "disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend",
@@ -43,12 +47,7 @@ PRODUCER_METADATA_KEYS = {
     "barrier_win_prob_sizing_ic", "p_up_sizing_updated_at", "p_up_sizing_ic",
     "stance_sizing_updated_at", "stance_sizing_alpha_spread",
 }
-# Emitted by stance_sizing_optimizer but NOT applied by the executor — the
-# named gap in PIPELINE_CONTRACT.yaml. These must stay OUT of both the applied
-# map and the advisory known-keys list so their first live arrival logs an
-# unknown-key WARN (the only signal until application is wired or the overlay
-# is retired — ROADMAP follow-up filed with the boundary).
-STANCE_OVERLAY_NOT_APPLIED = {
+STANCE_OVERLAY_KEYS = {
     "stance_size_momentum", "stance_size_value", "stance_size_quality",
     "stance_size_catalyst",
 }
@@ -89,11 +88,20 @@ def test_special_keys_accepted():
     assert PRODUCER_SPECIAL_KEYS == set(main._EXECUTOR_PARAMS_SPECIAL_KEYS)
 
 
-def test_stance_overlay_deliberately_unknown():
-    # Inverse pin: the stance overlay must NOT be silently known/applied until
-    # its application is actually wired (or the overlay retired).
-    assert not STANCE_OVERLAY_NOT_APPLIED & set(main._PARAM_MAP)
-    assert not STANCE_OVERLAY_NOT_APPLIED & set(main._EXECUTOR_PARAMS_SPECIAL_KEYS)
-    assert not STANCE_OVERLAY_NOT_APPLIED & set(
-        main._EXECUTOR_PARAMS_KNOWN_METADATA_KEYS
-    )
+def test_stance_overlay_wired_and_bounded():
+    # L4598 (config#697): the stance overlay is APPLIED — every key maps to the
+    # flat top-level config path position_sizer reads, and the validator bounds
+    # mirror the producer's emit bounds (stance_sizing_optimizer
+    # _SIZE_FLOOR=0.4 / _SIZE_CAP=1.1) so a widened producer emission is
+    # rejected loudly (WARN + skip), never applied unchecked.
+    for key in STANCE_OVERLAY_KEYS:
+        assert main._PARAM_MAP.get(key) == (key,), (
+            f"{key} must map to the flat top-level config key position_sizer "
+            f"reads (config.get('{key}'))"
+        )
+        assert main._PARAM_VALIDATORS.get(key) == (float, 0.4, 1.1), (
+            f"{key} validator must mirror the producer emit bounds [0.4, 1.1]"
+        )
+    # Applied params are not metadata — keys must not be double-declared.
+    assert not STANCE_OVERLAY_KEYS & set(main._EXECUTOR_PARAMS_KNOWN_METADATA_KEYS)
+    assert not STANCE_OVERLAY_KEYS & set(main._EXECUTOR_PARAMS_SPECIAL_KEYS)
