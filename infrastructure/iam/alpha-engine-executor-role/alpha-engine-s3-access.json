@@ -66,19 +66,6 @@
             "Resource": "arn:aws:s3:::alpha-engine-research/config/*"
         },
         {
-            "Sid": "ReadWriteExecutorBucket",
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject",
-                "s3:PutObject",
-                "s3:ListBucket"
-            ],
-            "Resource": [
-                "arn:aws:s3:::alpha-engine-executor",
-                "arn:aws:s3:::alpha-engine-executor/*"
-            ]
-        },
-        {
             "Sid": "ReadWriteHealth",
             "Effect": "Allow",
             "Action": [
