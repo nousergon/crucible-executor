@@ -104,6 +104,14 @@ _PARAM_MAP = {
     # itself is a bool, handled with the other non-numeric special keys below.
     "barrier_win_prob_sizing_min": ("barrier_win_prob_sizing_min",),
     "barrier_win_prob_sizing_range": ("barrier_win_prob_sizing_range",),
+    # L4598 (config#697): stance-conditional sizing multipliers tuned by the
+    # backtester's stance_sizing_optimizer (field_overlay via the assembler).
+    # Consumed by position_sizer's stance_adj; gated upstream by the optimizer's
+    # rank-IC promotion gate — no key reaches the live artifact until it clears.
+    "stance_size_momentum": ("stance_size_momentum",),
+    "stance_size_value": ("stance_size_value",),
+    "stance_size_quality": ("stance_size_quality",),
+    "stance_size_catalyst": ("stance_size_catalyst",),
 }
 
 
@@ -127,6 +135,12 @@ _PARAM_VALIDATORS = {
     "momentum_exit_threshold":     (float, -50,  0),
     "barrier_win_prob_sizing_min":   (float, 0.3, 1.0),
     "barrier_win_prob_sizing_range": (float, 0.1, 1.0),
+    # Bounds mirror stance_sizing_optimizer._SIZE_FLOOR/_SIZE_CAP — a producer
+    # emission widened past these is rejected loudly here (WARN + skip).
+    "stance_size_momentum":          (float, 0.4, 1.1),
+    "stance_size_value":             (float, 0.4, 1.1),
+    "stance_size_quality":           (float, 0.4, 1.1),
+    "stance_size_catalyst":          (float, 0.4, 1.1),
 }
 
 _EXECUTOR_PARAMS_CACHE_PATH = Path(__file__).resolve().parent.parent / "config" / ".executor_params_cache.json"
@@ -143,10 +157,6 @@ _EXECUTOR_PARAMS_SPECIAL_KEYS = (
 # Producer provenance/metadata keys — KNOWN (no unknown-key WARN) but never
 # applied. Keeping this list complete keeps the WARN signal: an unknown key
 # always means genuine producer/consumer contract drift, not noise.
-# NOTE deliberately ABSENT: stance_size_* (the stance overlay is emitted by
-# the backtester's stance_sizing_optimizer but its application is NOT wired
-# here — its first live arrival must WARN; see the named gap in
-# PIPELINE_CONTRACT.yaml + the ROADMAP follow-up).
 _EXECUTOR_PARAMS_KNOWN_METADATA_KEYS = (
     "updated_at", "assembled_by", "fit_target",
     "best_sharpe", "best_alpha", "best_sortino",
