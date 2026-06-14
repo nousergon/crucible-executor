@@ -473,3 +473,55 @@ class TestShadowWiringAndAblation:
                 assert abs(entry["delta"]) >= 1e-4
             # n_names_moved must equal length of the list
             assert ab["n_names_moved"] == len(ab["per_ticker_delta"])
+
+
+# ── _load_auto_tuned_optimizer_cfg (config#1057 inc 2) ───────────────────────
+
+
+def _s3_returning(payload):
+    s3 = MagicMock()
+    s3.get_object.return_value = {"Body": MagicMock(read=lambda: json.dumps(payload).encode())}
+    return s3
+
+
+class TestLoadAutoTunedOptimizerCfg:
+    def _cfg(self, **po):
+        return {"signals_bucket": "bkt", "portfolio_optimizer": po}
+
+    def test_loads_allowlisted_and_clamps(self):
+        from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+        s3 = _s3_returning({"risk_aversion": 4.0, "tcost_bps": 3.0,
+                            "max_sector_pct": 0.99, "updated_at": "2026-06-14"})
+        out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
+        # only the two writable knobs survive
+        assert out == {"risk_aversion": 4.0, "tcost_bps": 3.0}
+
+    def test_out_of_band_value_is_reclamped(self):
+        from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg, _AUTO_TUNED_BOUNDS
+        s3 = _s3_returning({"risk_aversion": 999.0, "tcost_bps": -5.0})
+        out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
+        assert out["risk_aversion"] == _AUTO_TUNED_BOUNDS["risk_aversion"][1]  # hi
+        assert out["tcost_bps"] == _AUTO_TUNED_BOUNDS["tcost_bps"][0]          # lo
+
+    def test_kill_switch_disables_consumption(self):
+        from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+        s3 = _s3_returning({"risk_aversion": 4.0})
+        out = _load_auto_tuned_optimizer_cfg(self._cfg(consume_auto_tuned=False), s3_client=s3)
+        assert out == {}
+        s3.get_object.assert_not_called()
+
+    def test_failsafe_on_s3_error_returns_empty(self):
+        from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+        s3 = MagicMock()
+        s3.get_object.side_effect = RuntimeError("NoSuchKey")
+        assert _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3) == {}
+
+    def test_no_bucket_returns_empty(self):
+        from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+        assert _load_auto_tuned_optimizer_cfg({"portfolio_optimizer": {}}, s3_client=MagicMock()) == {}
+
+    def test_non_numeric_value_ignored(self):
+        from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+        s3 = _s3_returning({"risk_aversion": "oops", "tcost_bps": 3.0})
+        out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
+        assert out == {"tcost_bps": 3.0}

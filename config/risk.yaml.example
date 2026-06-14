@@ -346,7 +346,14 @@ shadow_portfolio_optimizer: false
 use_portfolio_optimizer: false
 
 portfolio_optimizer:
+  # config#1057 inc 2: consume the backtester's auto-tuned risk_aversion ×
+  # tcost_bps from config/portfolio_optimizer.json (S3). The executor allowlists
+  # ONLY those two knobs and re-clamps them (defense in depth), and falls back to
+  # the YAML values below on absence/error. Set false = executor's independent
+  # kill-switch (ignore the auto-tuned file, use the YAML values here).
+  consume_auto_tuned: true
   # Risk aversion λ in the MVO objective. Higher = stronger Σ penalty.
+  # (Static fallback / starting point — auto-tuned value wins when present.)
   risk_aversion: 5.0
   # Transaction cost penalty (bps per dollar traded) used in the L1 turnover
   # term. 5 bps is conservative for liquid US large-caps; backtester tunes.

@@ -47,6 +47,64 @@ _CASH_ALPHA_HINT = -1e-6
 _RETURNS_LOOKBACK_DAYS = 252
 _MIN_RETURNS_FOR_COV = 60
 
+# config#1057 inc 2: the backtester auto-tunes the MVO optimizer's OWN params
+# and writes them to config/portfolio_optimizer.json. Mirror the WRITER's
+# writable-set + bounds here as DEFENSE IN DEPTH — the executor never trusts the
+# written value: it consumes ONLY these two knobs and re-clamps them, so even a
+# corrupt/out-of-band file can't move the live solver outside a sane band.
+_AUTO_TUNED_WRITABLE = ("risk_aversion", "tcost_bps")
+_AUTO_TUNED_BOUNDS = {
+    "risk_aversion": (3.0, 10.0),
+    "tcost_bps": (1.0, 20.0),
+}
+
+
+def _load_auto_tuned_optimizer_cfg(config: dict, s3_client=None) -> dict:
+    """Read the backtester's auto-tuned MVO params (risk_aversion × tcost_bps)
+    from ``config/portfolio_optimizer.json`` and return them ALLOWLISTED +
+    CLAMPED (config#1057 inc 2).
+
+    Fail-safe: any absence / read error / parse error returns ``{}`` so the
+    solver falls back to the YAML/defaults — the auto-tuner is never a hard
+    dependency. Gated by ``portfolio_optimizer.consume_auto_tuned`` (default
+    True), the executor's independent kill-switch (separate from the
+    backtester's apply flag)."""
+    po_cfg = config.get("portfolio_optimizer", {}) or {}
+    if not po_cfg.get("consume_auto_tuned", True):
+        return {}
+    bucket = config.get("signals_bucket")
+    if not bucket:
+        return {}
+    try:
+        import json
+
+        s3 = s3_client or boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key="config/portfolio_optimizer.json")
+        data = json.loads(obj["Body"].read())
+    except Exception as e:  # noqa: BLE001 — absence/error → fall back to defaults
+        logger.debug("no auto-tuned optimizer params (%s) — using YAML/defaults", e)
+        return {}
+
+    out: dict = {}
+    for k in _AUTO_TUNED_WRITABLE:
+        if k not in data:
+            continue
+        try:
+            v = float(data[k])
+        except (TypeError, ValueError):
+            logger.warning("auto-tuned %s=%r non-numeric — ignored", k, data.get(k))
+            continue
+        lo, hi = _AUTO_TUNED_BOUNDS[k]
+        cv = min(max(v, lo), hi)
+        if cv != v:
+            logger.warning(
+                "auto-tuned %s=%s clamped to %s (band [%s, %s])", k, v, cv, lo, hi,
+            )
+        out[k] = cv
+    if out:
+        logger.info("Consuming auto-tuned optimizer params from S3: %s", out)
+    return out
+
 
 def run_shadow_optimizer(
     signals_raw: dict,
@@ -125,6 +183,10 @@ def _build_and_solve(
     optimizer_cfg = {
         **OPTIMIZER_CONFIG_DEFAULTS,
         **config.get("portfolio_optimizer", {}),
+        # config#1057 inc 2: the backtester's auto-tuned risk_aversion × tcost_bps
+        # win over the static YAML (allowlisted + re-clamped; empty on absence so
+        # the solver is unchanged until a tuned config exists).
+        **_load_auto_tuned_optimizer_cfg(config),
     }
     tickers = _build_universe(
         signals_raw, predictions_by_ticker, current_positions, price_histories,
