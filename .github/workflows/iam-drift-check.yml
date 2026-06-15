@@ -58,9 +58,9 @@ jobs:
       - name: Checkout sibling repos
         run: |
           set -e
-          for repo in alpha-engine-data alpha-engine-research alpha-engine-predictor \
-                      alpha-engine-backtester alpha-engine-dashboard alpha-engine-lib; do
-            git clone --depth=1 https://github.com/cipher813/${repo}.git ${repo} || \
+          for repo in nousergon-data crucible-research crucible-predictor \
+                      crucible-backtester crucible-dashboard nousergon-lib; do
+            git clone --depth=1 https://github.com/nousergon/${repo}.git ${repo} || \
               echo "WARN: ${repo} not cloneable (private/archived?) — skipping"
           done
 
@@ -68,4 +68,4 @@ jobs:
         run: |
           cd alpha-engine
           python3 infrastructure/iam/check-no-foreign-writers.py \
-            $(for d in ../alpha-engine*; do [ -d "$d" ] && echo --repo "$d"; done)
+            $(for d in ../crucible-* ../nousergon-*; do [ -d "$d" ] && echo --repo "$d"; done)

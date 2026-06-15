@@ -1,5 +1,5 @@
 flow_name: executor
-repo: cipher813/alpha-engine
+repo: nousergon/crucible-executor
 owner: "@brianmcmahon"
 notify:
   - type: email
@@ -9,7 +9,7 @@ notify:
     smtp_port: 587
     smtp_password: ${GMAIL_APP_PASSWORD}
   - type: github
-    repo: cipher813/alpha-engine
+    repo: nousergon/crucible-executor
     token: ${FLOW_DOCTOR_GITHUB_TOKEN}
   # Telegram fires on the same error report as the GitHub issue (the issue
   # and the alert land together). Creds resolve from the ae-trading box's

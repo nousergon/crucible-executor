@@ -259,7 +259,7 @@ fi
 # infrastructure/) — closes ROADMAP L4490, the asymmetry where a private-repo
 # fetch failure on THIS box was WARN-only-in-the-log (invisible) while the
 # dashboard box raised a flow-doctor badge + email. flow-doctor.yaml here is
-# flow_name=executor → reports to cipher813/alpha-engine + emails the owner.
+# flow_name=executor → reports to nousergon/crucible-executor + emails the owner.
 # Fire-and-forget (`|| true`): if flow-doctor itself is broken, the FAIL lines
 # in /var/log/boot-pull.log are the fallback signal, and we still exit 1.
 if [ "$PULL_FAILURES" -gt 0 ]; then

@@ -63,7 +63,7 @@ absent ⇒ that axis is skipped for that role).
   `iam:ListAttachedRolePolicies` (the last two added 2026-06-09 for the
   trust/managed coverage axes) scoped to every codified role across
   alpha-engine + alpha-engine-data + alpha-engine-predictor.
-  Trust policy: `repo:cipher813/alpha-engine` + `repo:cipher813/alpha-engine-data`
+  Trust policy: `repo:nousergon/crucible-executor` + `repo:nousergon/nousergon-data`
   (main + pull_request); widened 2026-05-06 to support alpha-engine-data's
   drift-check workflow when the cross-cutting orchestration roles moved
   to that repo.

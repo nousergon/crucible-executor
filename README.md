@@ -7,11 +7,11 @@
 [![Interactive Brokers](https://img.shields.io/badge/IBKR-1a73e8?style=flat-square)](https://www.interactivebrokers.com/)
 [![ArcticDB](https://img.shields.io/badge/ArcticDB-0e1117?style=flat-square)](https://docs.arcticdb.io/)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-yellow?style=flat-square)](LICENSE)
-[![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/cipher813/alpha-engine-docs#phase-trajectory)
+[![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/nousergon/nousergon-docs#phase-trajectory)
 
 Risk-gated trade executor. Reads research signals + predictor verdicts from S3, applies hard risk rules, sizes positions, and routes orders through IB Gateway. The morning planner writes the order book; an intraday daemon is the sole order executor.
 
-> System overview, Step Function orchestration, and module relationships live in [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs). Code index lives in [`OVERVIEW.md`](OVERVIEW.md).
+> System overview, Step Function orchestration, and module relationships live in [`alpha-engine-docs`](https://github.com/nousergon/nousergon-docs). Code index lives in [`OVERVIEW.md`](OVERVIEW.md).
 
 ## What this does
 
@@ -41,19 +41,19 @@ The daemon is the sole order executor — main.py never places orders, only writ
 
 ## Configuration
 
-This repo is **public**. `config/risk.yaml` is gitignored locally; real risk thresholds, sizing parameters, and IB credentials live in the private [`alpha-engine-config`](https://github.com/cipher813/alpha-engine-config) repo. Tunable safe-to-tune params auto-applied weekly by the Backtester via `s3://alpha-engine-research/config/executor_params.json`. Architecture and approach are public; specific values are private.
+This repo is **public**. `config/risk.yaml` is gitignored locally; real risk thresholds, sizing parameters, and IB credentials live in the private [`alpha-engine-config`](https://github.com/nousergon/alpha-engine-config) repo. Tunable safe-to-tune params auto-applied weekly by the Backtester via `s3://alpha-engine-research/config/executor_params.json`. Architecture and approach are public; specific values are private.
 
 ## Sister repos
 
 | Module | Repo |
 |---|---|
-| Data | [`alpha-engine-data`](https://github.com/cipher813/alpha-engine-data) |
-| Research | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) |
-| Predictor | [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) |
-| Backtester | [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) |
-| Dashboard | [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) |
-| Library | [`alpha-engine-lib`](https://github.com/cipher813/alpha-engine-lib) |
-| Docs | [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs) |
+| Data | [`alpha-engine-data`](https://github.com/nousergon/nousergon-data) |
+| Research | [`alpha-engine-research`](https://github.com/nousergon/crucible-research) |
+| Predictor | [`alpha-engine-predictor`](https://github.com/nousergon/crucible-predictor) |
+| Backtester | [`alpha-engine-backtester`](https://github.com/nousergon/crucible-backtester) |
+| Dashboard | [`alpha-engine-dashboard`](https://github.com/nousergon/crucible-dashboard) |
+| Library | [`alpha-engine-lib`](https://github.com/nousergon/nousergon-lib) |
+| Docs | [`alpha-engine-docs`](https://github.com/nousergon/nousergon-docs) |
 
 ## License
 
