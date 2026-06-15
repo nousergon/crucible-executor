@@ -352,9 +352,14 @@ portfolio_optimizer:
   # the YAML values below on absence/error. Set false = executor's independent
   # kill-switch (ignore the auto-tuned file, use the YAML values here).
   consume_auto_tuned: true
-  # Risk aversion λ in the MVO objective. Higher = stronger Σ penalty.
-  # (Static fallback / starting point — auto-tuned value wins when present.)
-  risk_aversion: 5.0
+  # Risk aversion λ in the MVO objective. Higher = stronger Σ penalty; lower =
+  # more aggressive / higher-vol book. (Static fallback / starting point —
+  # auto-tuned value from config/portfolio_optimizer.json wins when present.)
+  # Baseline lowered 5.0→3.0 (2026-06-15, Brian) for a more aggressive posture;
+  # the tuner may promote lower (floor 1.0). NOTE: the LIVE value lives in the
+  # box's gitignored config/risk.yaml (or the S3 auto-tuned file) — editing this
+  # example does not change production.
+  risk_aversion: 3.0
   # Transaction cost penalty (bps per dollar traded) used in the L1 turnover
   # term. 5 bps is conservative for liquid US large-caps; backtester tunes.
   tcost_bps: 5.0

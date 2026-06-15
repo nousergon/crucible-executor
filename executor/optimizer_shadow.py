@@ -53,8 +53,13 @@ _MIN_RETURNS_FOR_COV = 60
 # written value: it consumes ONLY these two knobs and re-clamps them, so even a
 # corrupt/out-of-band file can't move the live solver outside a sane band.
 _AUTO_TUNED_WRITABLE = ("risk_aversion", "tcost_bps")
+# Read-side re-clamp band (defense in depth). risk_aversion floor lowered
+# 3.0→1.0 (2026-06-15, Brian) to admit a more aggressive auto-tuned book. MUST
+# stay in lockstep with the tuner's write-side bound
+# alpha-engine-backtester/optimizer/portfolio_optimizer_optimizer.py::PARAM_BOUNDS
+# — a mismatch would silently re-clamp a valid tuner value back up on read.
 _AUTO_TUNED_BOUNDS = {
-    "risk_aversion": (3.0, 10.0),
+    "risk_aversion": (1.0, 10.0),
     "tcost_bps": (1.0, 20.0),
 }
 
