@@ -13,8 +13,8 @@
                 },
                 "StringLike": {
                     "token.actions.githubusercontent.com:sub": [
-                        "repo:cipher813/alpha-engine:*",
-                        "repo:cipher813/alpha-engine-data:*"
+                        "repo:nousergon/alpha-engine:*",
+                        "repo:nousergon/alpha-engine-data:*"
                     ]
                 }
             }
