@@ -13,8 +13,8 @@
                 },
                 "StringLike": {
                     "token.actions.githubusercontent.com:sub": [
-                        "repo:nousergon/alpha-engine:*",
-                        "repo:nousergon/alpha-engine-data:*"
+                        "repo:nousergon/crucible-executor:*",
+                        "repo:nousergon/nousergon-data:*"
                     ]
                 }
             }
