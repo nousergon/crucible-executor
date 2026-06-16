@@ -53,13 +53,16 @@ _MIN_RETURNS_FOR_COV = 60
 # written value: it consumes ONLY these two knobs and re-clamps them, so even a
 # corrupt/out-of-band file can't move the live solver outside a sane band.
 _AUTO_TUNED_WRITABLE = ("risk_aversion", "tcost_bps")
-# Read-side re-clamp band (defense in depth). risk_aversion floor lowered
-# 3.0→1.0 (2026-06-15, Brian) to admit a more aggressive auto-tuned book. MUST
-# stay in lockstep with the tuner's write-side bound
-# alpha-engine-backtester/optimizer/portfolio_optimizer_optimizer.py::PARAM_BOUNDS
-# — a mismatch would silently re-clamp a valid tuner value back up on read.
+# Read-side re-clamp band (defense in depth). Generic public default floor (3.0)
+# only — the OPERATING risk_aversion floor is a private risk-policy variable,
+# overridden via the gitignored config/risk.yaml
+# (`portfolio_optimizer.tuner_risk_aversion_floor`) so an aggressive floor (e.g.
+# 1.0) never ships in this public repo (divergence policy: alpha-bearing values
+# stay private). MUST stay in lockstep with the tuner write-side override
+# alpha-engine-backtester/optimizer/portfolio_optimizer_optimizer.py
+# (portfolio_optimizer_tuner.risk_aversion_floor).
 _AUTO_TUNED_BOUNDS = {
-    "risk_aversion": (1.0, 10.0),
+    "risk_aversion": (3.0, 10.0),
     "tcost_bps": (1.0, 20.0),
 }
 
@@ -100,6 +103,12 @@ def _load_auto_tuned_optimizer_cfg(config: dict, s3_client=None) -> dict:
             logger.warning("auto-tuned %s=%r non-numeric — ignored", k, data.get(k))
             continue
         lo, hi = _AUTO_TUNED_BOUNDS[k]
+        # Private risk-policy override: the operating risk_aversion floor lives in
+        # the gitignored risk.yaml, not this public default (divergence policy).
+        if k == "risk_aversion":
+            _floor_override = po_cfg.get("tuner_risk_aversion_floor")
+            if _floor_override is not None:
+                lo = float(_floor_override)
         cv = min(max(v, lo), hi)
         if cv != v:
             logger.warning(

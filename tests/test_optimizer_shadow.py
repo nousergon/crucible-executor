@@ -503,6 +503,20 @@ class TestLoadAutoTunedOptimizerCfg:
         assert out["risk_aversion"] == _AUTO_TUNED_BOUNDS["risk_aversion"][1]  # hi
         assert out["tcost_bps"] == _AUTO_TUNED_BOUNDS["tcost_bps"][0]          # lo
 
+    def test_private_floor_override_admits_aggressive_lambda(self):
+        # Public default floor is 3.0 → λ=2.0 clamps up to 3.0 ...
+        from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+        s3 = _s3_returning({"risk_aversion": 2.0})
+        out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
+        assert out["risk_aversion"] == 3.0
+        # ... but the PRIVATE risk.yaml override (floor 1.0) lets λ=2.0 through,
+        # so a more aggressive auto-tuned book is admitted without shipping the
+        # aggressive floor in the public default.
+        s3b = _s3_returning({"risk_aversion": 2.0})
+        out2 = _load_auto_tuned_optimizer_cfg(
+            self._cfg(tuner_risk_aversion_floor=1.0), s3_client=s3b)
+        assert out2["risk_aversion"] == 2.0
+
     def test_kill_switch_disables_consumption(self):
         from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
         s3 = _s3_returning({"risk_aversion": 4.0})
