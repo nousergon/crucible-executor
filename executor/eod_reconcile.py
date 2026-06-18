@@ -20,6 +20,7 @@ import pandas as pd
 import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from executor import reference_rate
 from executor.eod_emailer import send_eod_email
 from executor.trade_logger import (
     init_db, log_eod, backup_to_s3, get_entry_trade, get_todays_trades,
@@ -835,6 +836,22 @@ def run(run_date: str | None = None) -> None:
             logger.info(f"Exported {key} ({len(df)} rows) to s3://{trades_bucket}/{key}")
         except Exception as e:
             logger.warning(f"S3 CSV export failed for {key}: {e}")
+
+    # ── Reference-rate showcase artifact (metron/reference_rate.json) ─────────
+    # Publish the illustrative-only Reference Rate contract artifact Metron renders
+    # as a demo portfolio. Best-effort: it is secondary observability hung off the
+    # already-committed eod_pnl + S3 CSV exports (recording surface = this WARN), so
+    # a publish failure must never override the EOD run's primary deliverables.
+    try:
+        ref_payload = reference_rate.build_payload(
+            positions=positions,
+            nav=nav,
+            nav_history=reference_rate.nav_history_from_eod_df(eod_df),
+            run_date=run_date,
+        )
+        reference_rate.publish(s3, trades_bucket, ref_payload)
+    except Exception as e:  # noqa: BLE001 — best-effort secondary path; never fatal
+        logger.warning("Reference-rate artifact publish failed (non-fatal): %s", e)
 
     backup_to_s3(db_path, run_date, trades_bucket)
 
