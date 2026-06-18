@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 LATEST_PRICES_KEY = "intraday/latest_prices.json"
 HEARTBEAT_KEY = "intraday/heartbeat.json"
 NAV_KEY = "intraday/nav.json"
+NAV_SERIES_PREFIX = "intraday/nav_series/"
+
+# Defensive cap on per-day series length. At a 60s poll the daemon writes
+# ~390 points across a session; 2000 leaves generous headroom for a faster
+# poll interval while bounding the read-modify-write object size.
+_MAX_SERIES_POINTS = 2000
 
 
 def _put_json_to_s3(s3: Any, bucket: str, key: str, payload: dict) -> bool:
@@ -70,6 +76,32 @@ def _put_json_to_s3(s3: Any, bucket: str, key: str, payload: dict) -> bool:
             bucket, key, type(e).__name__,
         )
         return False
+
+
+def _get_json_from_s3(s3: Any, bucket: str, key: str) -> tuple[dict | None, str]:
+    """GET + parse a JSON object. Returns ``(payload, status)``.
+
+    ``status`` is one of:
+    - ``"ok"`` — parsed dict returned;
+    - ``"missing"`` — object absent (NoSuchKey/404), an expected state
+      (e.g. the first tick of a trading day);
+    - ``"error"`` — a transient failure; callers doing read-modify-write
+      MUST NOT treat this as "empty" and clobber the existing object.
+    """
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(resp["Body"].read()), "ok"
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return None, "missing"
+        logger.warning("intraday read s3://%s/%s failed (%s)", bucket, key, code)
+        return None, "error"
+    except (BotoCoreError, ValueError) as e:
+        logger.warning(
+            "intraday read s3://%s/%s failed (%s)", bucket, key, type(e).__name__
+        )
+        return None, "error"
 
 
 def compute_surveillance_universe(
@@ -260,3 +292,83 @@ class IntradayNavWriter:
             "spy_last": spy_last,
         }
         return _put_json_to_s3(self._s3, self._bucket, NAV_KEY, payload)
+
+
+class IntradayNavSeriesWriter:
+    """Appends a per-tick (NAV, SPY) point to a per-day intraday series.
+
+    Powers the intraday portfolio-vs-SPY curve on live.nousergon.ai. Unlike
+    ``IntradayNavWriter`` (a single overwritten snapshot for the live
+    header numbers), this accumulates the day's points into
+    ``intraday/nav_series/{trading_day}.json`` so the consumer can draw a
+    line, not just a number.
+
+    **Single-writer read-modify-write.** The daemon is the only writer of
+    this object and its poll loop is single-threaded, so RMW is race-free.
+    A transient READ error skips the append rather than clobbering the
+    day's history with a fresh list; a missing object (first tick of the
+    day) starts a new series. Fire-and-forget on write like the other
+    intraday writers — a failed point is a dropped chart sample, never an
+    interruption to the order loop.
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        s3_client: Any | None = None,
+        max_points: int = _MAX_SERIES_POINTS,
+    ) -> None:
+        self._bucket = bucket
+        self._s3 = s3_client if s3_client is not None else boto3.client("s3")
+        self._max_points = max_points
+
+    @staticmethod
+    def key_for(trading_day: str) -> str:
+        return f"{NAV_SERIES_PREFIX}{trading_day}.json"
+
+    def write(
+        self,
+        trading_day: str,
+        account_snapshot: dict,
+        *,
+        spy_last: float | None,
+    ) -> bool:
+        """Append today's current (NAV, SPY) point to the per-day series.
+
+        :param trading_day: The series key date (the daemon's run_date).
+        :param account_snapshot: ``ibkr.get_account_snapshot()`` — only
+            ``net_liquidation`` is charted; a point with no NAV is skipped.
+        :param spy_last: SPY mark from the price monitor (may be ``None``
+            before SPY has a live tick; stored as-is for the consumer).
+        :returns: ``True`` on a successful append+write, ``False`` if the
+            point was skipped (no NAV / transient read error) or the write
+            failed.
+        """
+        nav = account_snapshot.get("net_liquidation")
+        if nav is None:
+            return False
+
+        key = self.key_for(trading_day)
+        existing, status = _get_json_from_s3(self._s3, self._bucket, key)
+        if status == "error":
+            # Don't clobber the day's history on a transient read failure.
+            return False
+
+        points: list = []
+        if status == "ok" and isinstance(existing, dict):
+            prior = existing.get("points")
+            if isinstance(prior, list):
+                points = prior
+
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        points.append({"t": now_iso, "nav": nav, "spy": spy_last})
+        if len(points) > self._max_points:
+            points = points[-self._max_points:]
+
+        payload = {
+            "trading_day": trading_day,
+            "updated_at": now_iso,
+            "points": points,
+        }
+        return _put_json_to_s3(self._s3, self._bucket, key, payload)

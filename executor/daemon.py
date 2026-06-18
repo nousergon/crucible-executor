@@ -54,6 +54,7 @@ from executor.intraday_resolve import (
     solve_redeploy,
 )
 from executor.intraday_snapshot import (
+    IntradayNavSeriesWriter,
     IntradayNavWriter,
     IntradaySnapshotWriter,
     compute_surveillance_universe,
@@ -604,6 +605,11 @@ def run_daemon(dry_run: bool = False) -> None:
     # Same fire-and-forget contract as the writers above.
     nav_writer = IntradayNavWriter(bucket=config["signals_bucket"])
 
+    # Per-day NAV series writer — appends each tick's (NAV, SPY) point to
+    # intraday/nav_series/{run_date}.json so the live site can draw an
+    # intraday portfolio-vs-SPY curve, not just the latest number.
+    nav_series_writer = IntradayNavSeriesWriter(bucket=config["signals_bucket"])
+
     n_urgent = len(order_book.pending_urgent_exits())
     send_daemon_status(
         f"\u2705 *Daemon started*\n"
@@ -914,18 +920,25 @@ def run_daemon(dry_run: bool = False) -> None:
                 # exception from the writer leaks into the trade loop.
                 logger.warning("intraday snapshot writer raised: %s", _snap_err)
 
-            # ── Live-NAV snapshot ────────────────────────────────────
-            # Publish intraday/nav.json (IB NetLiquidation + SPY mark) so
-            # live.nousergon.ai renders a live intraday header. Only when
-            # connected — a NAV read off a dead session is meaningless.
-            # Fire-and-forget; same defensive belt as the writers above.
+            # ── Live-NAV snapshot + series ───────────────────────────
+            # Publish intraday/nav.json (latest NetLiquidation + SPY mark)
+            # for the live header, and append the same point to the per-day
+            # nav_series for the intraday curve. Only when connected — a NAV
+            # read off a dead session is meaningless. One get_account_snapshot
+            # call feeds both writers. Fire-and-forget; same defensive belt.
             try:
                 if ibkr.ib.isConnected():
-                    spy_state = monitor.prices.get("SPY") or {}
+                    spy_last = (monitor.prices.get("SPY") or {}).get("last")
+                    account_snapshot = ibkr.get_account_snapshot()
                     nav_writer.write(
-                        ibkr.get_account_snapshot(),
-                        spy_last=spy_state.get("last"),
+                        account_snapshot,
+                        spy_last=spy_last,
                         ib_connected=True,
+                    )
+                    nav_series_writer.write(
+                        run_date,
+                        account_snapshot,
+                        spy_last=spy_last,
                     )
             except Exception as _nav_err:  # noqa: BLE001
                 logger.warning("nav snapshot writer raised: %s", _nav_err)

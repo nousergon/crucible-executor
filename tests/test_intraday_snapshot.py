@@ -16,6 +16,8 @@ from executor.intraday_snapshot import (
     HEARTBEAT_KEY,
     LATEST_PRICES_KEY,
     NAV_KEY,
+    NAV_SERIES_PREFIX,
+    IntradayNavSeriesWriter,
     IntradayNavWriter,
     IntradaySnapshotWriter,
     compute_surveillance_universe,
@@ -284,3 +286,112 @@ class TestIntradayNavWriterFailureSwallowing:
         )
         writer = IntradayNavWriter(bucket="test-bucket", s3_client=mock_s3)
         assert writer.write(_ACCT, spy_last=740.96, ib_connected=True) is False
+
+
+# ── IntradayNavSeriesWriter ─────────────────────────────────────────────────
+
+
+def _get_body(payload: dict) -> dict:
+    """Build a mock get_object response wrapping ``payload`` as JSON bytes."""
+    body = MagicMock()
+    body.read.return_value = json.dumps(payload).encode("utf-8")
+    return {"Body": body}
+
+
+def _no_such_key():
+    return ClientError(
+        error_response={"Error": {"Code": "NoSuchKey", "Message": "absent"}},
+        operation_name="GetObject",
+    )
+
+
+def _written_payload(mock_s3) -> dict:
+    return json.loads(mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+
+
+@pytest.fixture
+def series_writer(mock_s3):
+    return IntradayNavSeriesWriter(bucket="test-bucket", s3_client=mock_s3)
+
+
+class TestIntradayNavSeriesWriter:
+    def test_key_format(self):
+        assert IntradayNavSeriesWriter.key_for("2026-06-18") == (
+            NAV_SERIES_PREFIX + "2026-06-18.json"
+        )
+
+    def test_first_tick_starts_new_series(self, series_writer, mock_s3):
+        mock_s3.get_object.side_effect = _no_such_key()
+        ok = series_writer.write("2026-06-18", _ACCT, spy_last=740.96)
+        assert ok is True
+        call = mock_s3.put_object.call_args
+        assert call.kwargs["Key"] == NAV_SERIES_PREFIX + "2026-06-18.json"
+        body = _written_payload(mock_s3)
+        assert body["trading_day"] == "2026-06-18"
+        assert len(body["points"]) == 1
+        p = body["points"][0]
+        assert p["nav"] == _ACCT["net_liquidation"]
+        assert p["spy"] == 740.96
+        assert "t" in p
+
+    def test_appends_to_existing_series(self, series_writer, mock_s3):
+        prior = {
+            "trading_day": "2026-06-18",
+            "points": [{"t": "2026-06-18T13:45:00Z", "nav": 999_000.0, "spy": 739.0}],
+        }
+        mock_s3.get_object.return_value = _get_body(prior)
+        series_writer.write("2026-06-18", _ACCT, spy_last=740.96)
+        body = _written_payload(mock_s3)
+        assert len(body["points"]) == 2
+        assert body["points"][0]["nav"] == 999_000.0  # prior preserved
+        assert body["points"][1]["nav"] == _ACCT["net_liquidation"]  # new appended
+
+    def test_no_nav_skips_write(self, series_writer, mock_s3):
+        ok = series_writer.write("2026-06-18", {}, spy_last=740.96)
+        assert ok is False
+        mock_s3.get_object.assert_not_called()
+        mock_s3.put_object.assert_not_called()
+
+    def test_transient_read_error_does_not_clobber(self, series_writer, mock_s3):
+        mock_s3.get_object.side_effect = ClientError(
+            error_response={"Error": {"Code": "ServiceUnavailable"}},
+            operation_name="GetObject",
+        )
+        ok = series_writer.write("2026-06-18", _ACCT, spy_last=740.96)
+        assert ok is False
+        # Critically: no PUT — we must not overwrite the day's history with a
+        # fresh single-point list on a transient read failure.
+        mock_s3.put_object.assert_not_called()
+
+    def test_max_points_trims_oldest(self, mock_s3):
+        writer = IntradayNavSeriesWriter(
+            bucket="test-bucket", s3_client=mock_s3, max_points=3
+        )
+        prior = {
+            "trading_day": "2026-06-18",
+            "points": [
+                {"t": "t1", "nav": 1.0, "spy": 1.0},
+                {"t": "t2", "nav": 2.0, "spy": 2.0},
+                {"t": "t3", "nav": 3.0, "spy": 3.0},
+            ],
+        }
+        mock_s3.get_object.return_value = _get_body(prior)
+        writer.write("2026-06-18", _ACCT, spy_last=740.96)
+        body = _written_payload(mock_s3)
+        assert len(body["points"]) == 3
+        assert body["points"][0]["nav"] == 2.0  # oldest (t1) dropped
+        assert body["points"][-1]["nav"] == _ACCT["net_liquidation"]
+
+    def test_spy_none_stored(self, series_writer, mock_s3):
+        mock_s3.get_object.side_effect = _no_such_key()
+        series_writer.write("2026-06-18", _ACCT, spy_last=None)
+        body = _written_payload(mock_s3)
+        assert body["points"][0]["spy"] is None
+
+    def test_put_failure_returns_false(self, series_writer, mock_s3):
+        mock_s3.get_object.side_effect = _no_such_key()
+        mock_s3.put_object.side_effect = ClientError(
+            error_response={"Error": {"Code": "AccessDenied"}},
+            operation_name="PutObject",
+        )
+        assert series_writer.write("2026-06-18", _ACCT, spy_last=740.96) is False
