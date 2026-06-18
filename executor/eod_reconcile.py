@@ -723,6 +723,47 @@ def run(run_date: str | None = None) -> None:
             logger.warning(msg)
             data_warnings.append(msg)
 
+    # ── Daemon-vs-IB reconciliation-integrity audit (config#859) ──
+    # Secondary observability hung off the primary EOD path: a failure here
+    # must NOT abort EOD reconcile (the NAV log + email are the primary
+    # deliverable), and the failure IS recorded — (a) swallowed: audit
+    # build/write error; (c) recording surface: the WARN below + the
+    # report-card reconciliation_integrity component shows N/A when the
+    # artifact is absent. Per the feedback_no_silent_fails secondary-
+    # observability carve-out.
+    try:
+        from executor.reconciliation_audit import (
+            build_reconciliation_audit,
+            write_reconciliation_audit,
+        )
+
+        _recon_audit = build_reconciliation_audit(
+            conn,
+            today_positions=positions,
+            prior_positions=prior_positions,
+            run_date=run_date,
+            ib_nav=nav,
+        )
+        _recon_key = write_reconciliation_audit(
+            _recon_audit,
+            bucket=trades_bucket,
+            run_date=run_date,
+            region=config.get("aws_region", "us-east-1"),
+        )
+        logger.info(
+            "[reconciliation_audit] match_rate=%.3f status=%s positions=%d "
+            "mismatched=%d -> s3://%s/%s",
+            _recon_audit["reconciliation_match_rate"], _recon_audit["status"],
+            _recon_audit["n_positions"], _recon_audit["n_mismatched"],
+            trades_bucket, _recon_key,
+        )
+    except Exception as _recon_err:  # noqa: BLE001 — secondary observability (see comment above)
+        logger.warning(
+            "[reconciliation_audit] FAILED to build/write reconciliation "
+            "audit for run_date=%s: %s (report card reconciliation_integrity "
+            "shows N/A this cycle)", run_date, _recon_err,
+        )
+
     # Persist EOD snapshot AFTER positions are enriched with closing prices,
     # accrued dividends, and per-position returns. Yesterday's reconcile now
     # reads this snapshot via closing_price (same source as today's
