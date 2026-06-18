@@ -42,13 +42,15 @@ requests~=2.32
 # setup_logging()/_attach_flow_doctor() before flow_doctor.init() reads
 # os.environ — closes the PR 9g systemd-entrypoint env gap upstream for
 # all repos (replaces the executor-local secrets_bootstrap.py approach).
-# Pinned at v0.33.0 — executor uses setup_logging/secrets/dates/eval_
-# artifacts/alerts/universe/telegram/decision_capture/preflight/trading_
-# calendar surfaces. The cost-telemetry primitives shipped at v0.30+
-# are NOT consumed here (executor has no LLM exposure per
-# [[preference_llm_calls_confined_to_research_module]]) but the
-# transitive lib pin stays current.
-alpha-engine-lib[flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.59.1
+# Executor uses setup_logging/secrets/dates/eval_artifacts/alerts/universe/
+# telegram/decision_capture/preflight/trading_calendar surfaces. The
+# cost-telemetry primitives are NOT consumed here (executor has no LLM
+# exposure per [[preference_llm_calls_confined_to_research_module]]) but the
+# lib pin stays current.
+# v0.60.2 (2026-06-18): SSM-authoritative seed + alpha_engine_lib alias resource-loading shim fix; earlier v0.60.1 flow-doctor secret seed when deployed
+# — overwrites a stale sourced FLOW_DOCTOR_GITHUB_TOKEN with the live SSM value
+# so the github_issue notifier stops 403ing on the EOD/executor path (config#1148).
+nousergon-lib[flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.60.2
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
