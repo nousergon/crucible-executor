@@ -15,6 +15,8 @@ from botocore.exceptions import ClientError
 from executor.intraday_snapshot import (
     HEARTBEAT_KEY,
     LATEST_PRICES_KEY,
+    NAV_KEY,
+    IntradayNavWriter,
     IntradaySnapshotWriter,
     compute_surveillance_universe,
 )
@@ -216,3 +218,69 @@ class TestDaemonPidDefault:
         # Just confirm it's an int — actual value is the test runner's pid.
         assert isinstance(body["daemon_pid"], int)
         assert body["daemon_pid"] > 0
+
+
+# ── IntradayNavWriter ───────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def nav_writer(mock_s3):
+    return IntradayNavWriter(bucket="test-bucket", s3_client=mock_s3)
+
+
+_ACCT = {
+    "net_liquidation": 1_000_564.85,
+    "total_cash": 28_634.48,
+    "gross_position_value": 971_930.37,
+    "unrealized_pnl": -10_465.16,
+    "settled_cash": 28_634.48,  # extra field the writer should ignore
+}
+
+
+class TestIntradayNavWriterHappyPath:
+    def test_returns_true_and_writes_one_object(self, nav_writer, mock_s3):
+        ok = nav_writer.write(_ACCT, spy_last=740.96, ib_connected=True)
+        assert ok is True
+        assert mock_s3.put_object.call_count == 1
+
+    def test_correct_key_and_bucket(self, nav_writer, mock_s3):
+        nav_writer.write(_ACCT, spy_last=740.96, ib_connected=True)
+        call = mock_s3.put_object.call_args
+        assert call.kwargs["Key"] == NAV_KEY
+        assert call.kwargs["Bucket"] == "test-bucket"
+        assert call.kwargs["ContentType"] == "application/json"
+
+    def test_payload_shape(self, nav_writer, mock_s3):
+        nav_writer.write(_ACCT, spy_last=740.96, ib_connected=True)
+        body = json.loads(mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+        assert body["net_liquidation"] == 1_000_564.85
+        assert body["total_cash"] == 28_634.48
+        assert body["gross_position_value"] == 971_930.37
+        assert body["unrealized_pnl"] == -10_465.16
+        assert body["spy_last"] == 740.96
+        assert body["ib_connected"] is True
+        assert "timestamp" in body
+        # Raw marks only — no derived return/alpha leaks into the producer.
+        assert "settled_cash" not in body
+        assert "daily_return" not in body and "alpha" not in body
+
+    def test_missing_account_fields_become_null(self, nav_writer, mock_s3):
+        nav_writer.write({}, spy_last=None, ib_connected=True)
+        body = json.loads(mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+        assert body["net_liquidation"] is None
+        assert body["spy_last"] is None
+
+    def test_disconnected_flag_stamped(self, nav_writer, mock_s3):
+        nav_writer.write(_ACCT, spy_last=740.96, ib_connected=False)
+        body = json.loads(mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8"))
+        assert body["ib_connected"] is False
+
+
+class TestIntradayNavWriterFailureSwallowing:
+    def test_s3_error_returns_false_no_raise(self, mock_s3):
+        mock_s3.put_object.side_effect = ClientError(
+            error_response={"Error": {"Code": "AccessDenied", "Message": "nope"}},
+            operation_name="PutObject",
+        )
+        writer = IntradayNavWriter(bucket="test-bucket", s3_client=mock_s3)
+        assert writer.write(_ACCT, spy_last=740.96, ib_connected=True) is False

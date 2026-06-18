@@ -43,6 +43,33 @@ logger = logging.getLogger(__name__)
 
 LATEST_PRICES_KEY = "intraday/latest_prices.json"
 HEARTBEAT_KEY = "intraday/heartbeat.json"
+NAV_KEY = "intraday/nav.json"
+
+
+def _put_json_to_s3(s3: Any, bucket: str, key: str, payload: dict) -> bool:
+    """Write a JSON dict to S3 as a single object. Fire-and-forget.
+
+    Shared by all intraday writers: S3 errors are logged at WARNING and
+    swallowed (return ``False``) so a failed observability write never
+    interrupts the daemon's order-execution loop. The recording surface
+    for a sustained failure is heartbeat-timestamp staleness, which the
+    surveillance Lambda treats as a first-class daemon-down alert.
+    """
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(payload, default=str).encode("utf-8"),
+            ContentType="application/json",
+        )
+        return True
+    except (ClientError, BotoCoreError) as e:
+        logger.warning(
+            "intraday write to s3://%s/%s failed (%s) — surveillance Lambda "
+            "will see heartbeat staleness",
+            bucket, key, type(e).__name__,
+        )
+        return False
 
 
 def compute_surveillance_universe(
@@ -163,18 +190,73 @@ class IntradaySnapshotWriter:
 
     def _put_json(self, key: str, payload: dict) -> bool:
         """Write a JSON dict to S3 as a single object. Fire-and-forget."""
-        try:
-            self._s3.put_object(
-                Bucket=self._bucket,
-                Key=key,
-                Body=json.dumps(payload, default=str).encode("utf-8"),
-                ContentType="application/json",
-            )
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.warning(
-                "intraday snapshot write to s3://%s/%s failed (%s) — "
-                "surveillance Lambda will see heartbeat staleness",
-                self._bucket, key, type(e).__name__,
-            )
-            return False
+        return _put_json_to_s3(self._s3, self._bucket, key, payload)
+
+
+class IntradayNavWriter:
+    """Publishes a live portfolio NAV snapshot to ``intraday/nav.json``.
+
+    Powers the live.nousergon.ai intraday header (current NAV, today's
+    return, today's alpha vs SPY). The daemon already holds an IB
+    account-summary subscription, so ``NetLiquidation`` is IB's own
+    real-time, fill-inclusive ground truth — more accurate than marking
+    a stale position list dashboard-side.
+
+    Producer publishes RAW marks only (NAV, cash, SPY last); the consumer
+    derives today's return/alpha against the prior EOD baseline it already
+    loads from ``eod_pnl.csv``. Keeping the math consumer-side means the
+    display convention can change without redeploying the trading box.
+
+    Fire-and-forget — S3 failures are logged at WARNING and never raise.
+    A failed NAV write must never interrupt the order-execution loop;
+    sustained failure surfaces via heartbeat staleness like the price
+    writer.
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        s3_client: Any | None = None,
+    ) -> None:
+        """:param bucket: S3 bucket to write under (the daemon's
+            ``signals_bucket``).
+        :param s3_client: Inject a pre-built boto3 client (tests). Defaults
+            to a freshly-constructed ``boto3.client("s3")``.
+        """
+        self._bucket = bucket
+        self._s3 = s3_client if s3_client is not None else boto3.client("s3")
+
+    def write(
+        self,
+        account_snapshot: dict,
+        *,
+        spy_last: float | None,
+        ib_connected: bool,
+    ) -> bool:
+        """Publish the NAV snapshot artifact to S3.
+
+        :param account_snapshot: The dict returned by
+            ``ibkr.get_account_snapshot()`` (``net_liquidation``,
+            ``total_cash``, ``gross_position_value``, ``unrealized_pnl``,
+            etc.). Missing fields are tolerated — published as ``None``.
+        :param spy_last: Current SPY last price from the daemon's price
+            monitor (``monitor.prices["SPY"]["last"]``), or ``None`` if SPY
+            has no live tick yet. The consumer needs it to compute today's
+            alpha vs SPY.
+        :param ib_connected: ``ibkr.ib.isConnected()`` — stamped so the
+            consumer can distinguish a fresh-but-disconnected snapshot from
+            a stale one.
+        :returns: ``True`` on successful write, ``False`` otherwise
+            (logged).
+        """
+        payload = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "ib_connected": ib_connected,
+            "net_liquidation": account_snapshot.get("net_liquidation"),
+            "total_cash": account_snapshot.get("total_cash"),
+            "gross_position_value": account_snapshot.get("gross_position_value"),
+            "unrealized_pnl": account_snapshot.get("unrealized_pnl"),
+            "spy_last": spy_last,
+        }
+        return _put_json_to_s3(self._s3, self._bucket, NAV_KEY, payload)

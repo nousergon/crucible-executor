@@ -54,6 +54,7 @@ from executor.intraday_resolve import (
     solve_redeploy,
 )
 from executor.intraday_snapshot import (
+    IntradayNavWriter,
     IntradaySnapshotWriter,
     compute_surveillance_universe,
 )
@@ -597,6 +598,12 @@ def run_daemon(dry_run: bool = False) -> None:
         daemon_pid=os.getpid(),
     )
 
+    # Live-NAV snapshot writer — publishes intraday/nav.json each tick so
+    # live.nousergon.ai can render a live intraday header (current NAV,
+    # today's return + alpha vs SPY) instead of only the last EOD close.
+    # Same fire-and-forget contract as the writers above.
+    nav_writer = IntradayNavWriter(bucket=config["signals_bucket"])
+
     n_urgent = len(order_book.pending_urgent_exits())
     send_daemon_status(
         f"\u2705 *Daemon started*\n"
@@ -906,6 +913,22 @@ def run_daemon(dry_run: bool = False) -> None:
                 # swallow S3 errors. This catch ensures no unexpected
                 # exception from the writer leaks into the trade loop.
                 logger.warning("intraday snapshot writer raised: %s", _snap_err)
+
+            # ── Live-NAV snapshot ────────────────────────────────────
+            # Publish intraday/nav.json (IB NetLiquidation + SPY mark) so
+            # live.nousergon.ai renders a live intraday header. Only when
+            # connected — a NAV read off a dead session is meaningless.
+            # Fire-and-forget; same defensive belt as the writers above.
+            try:
+                if ibkr.ib.isConnected():
+                    spy_state = monitor.prices.get("SPY") or {}
+                    nav_writer.write(
+                        ibkr.get_account_snapshot(),
+                        spy_last=spy_state.get("last"),
+                        ib_connected=True,
+                    )
+            except Exception as _nav_err:  # noqa: BLE001
+                logger.warning("nav snapshot writer raised: %s", _nav_err)
 
             # ── Open-IB-orders snapshot ──────────────────────────────
             # Refresh trades/open_orders/latest.json each tick so the
