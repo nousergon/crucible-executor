@@ -1,11 +1,33 @@
 """Tests for executor.config_loader — risk.yaml resolution with no silent fallback."""
 
+import importlib
 import os
 
 import pytest
 import yaml
 
 from executor import config_loader
+
+
+def test_search_paths_experiment_package_first(monkeypatch):
+    """Experiment-package risk.yaml resolves ahead of the legacy top-level path (config#1042)."""
+    monkeypatch.setenv("ALPHA_ENGINE_EXPERIMENT_ID", "myexp")
+    paths = config_loader._build_search_paths()
+    # First candidate must be the experiment-package copy for the selected slot.
+    assert paths[0].endswith(os.path.join("experiments", "myexp", "executor", "risk.yaml"))
+    # The legacy top-level config-repo path must still be present, AFTER all package paths.
+    legacy_idx = next(i for i, p in enumerate(paths) if p.endswith(os.path.join("alpha-engine-config", "executor", "risk.yaml")))
+    pkg_idx = next(i for i, p in enumerate(paths) if "myexp" in p)
+    assert pkg_idx < legacy_idx
+    # The repo-local legacy fallback remains last.
+    assert paths[-1].endswith(os.path.join("config", "risk.yaml"))
+
+
+def test_search_paths_default_experiment_is_reference(monkeypatch):
+    """With no ALPHA_ENGINE_EXPERIMENT_ID set, the default experiment is `reference`."""
+    monkeypatch.delenv("ALPHA_ENGINE_EXPERIMENT_ID", raising=False)
+    paths = config_loader._build_search_paths()
+    assert paths[0].endswith(os.path.join("experiments", "reference", "executor", "risk.yaml"))
 
 
 def test_get_config_path_returns_first_match(tmp_path, monkeypatch):
