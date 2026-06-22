@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from executor import reference_rate
 from executor.eod_emailer import send_eod_email
+from executor.eod_report import build_eod_report, write_eod_report
 from executor.trade_logger import (
     init_db, log_eod, backup_to_s3, get_entry_trade, get_todays_trades,
 )
@@ -956,6 +957,46 @@ def run(run_date: str | None = None) -> None:
     except Exception as e:
         logger.warning("Execution quality query failed: %s", e)
 
+    # ── Build + write the structured EOD report artifact ──────────────────
+    # consolidated/{date}/eod_report.json is the single source of truth for
+    # the console EOD Report page. The alpha attribution here is the
+    # prior-NAV-basis decomposition that ties to the headline alpha exactly
+    # (executor/eod_report.py) — it replaces the old emailer's sign-flipping
+    # "α % of Total" column and the positions-table total that never
+    # reconciled with the NAV-based headline.
+    try:
+        report = build_eod_report(
+            run_date=run_date,
+            nav=nav,
+            prior_nav=prior_nav,
+            daily_return=daily_return,
+            spy_return=spy_return,
+            alpha=alpha,
+            positions=positions,
+            prior_positions=prior_positions,
+            conn=conn,
+            account_snapshot=account,
+            nav_reconciliation=nav_reconciliation,
+            position_narratives=position_narratives,
+            sector_attribution=sector_attribution,
+            roundtrip_stats=roundtrip_stats,
+            data_warnings=data_warnings,
+            generated_at=snapshot.get("captured_at"),
+        )
+        attribution = report.get("alpha_attribution")
+        if attribution is not None and not attribution.get("ties_to_headline"):
+            logger.warning(
+                "EOD alpha attribution did not tie to headline (residual=$%.2f) "
+                "on %s — investigate before trusting per-position contributions.",
+                attribution.get("residual_usd", 0.0), run_date,
+            )
+        write_eod_report(report, trades_bucket=trades_bucket, run_date=run_date)
+    except Exception as e:
+        logger.error("EOD report artifact build/write failed: %s", e)
+        if fd:
+            fd.report(e, severity="error", context={
+                "site": "eod_report_artifact", "run_date": run_date})
+
     try:
         send_eod_email(
             run_date=run_date,
@@ -963,17 +1004,11 @@ def run(run_date: str | None = None) -> None:
             daily_return=daily_return,
             spy_return=spy_return,
             alpha=alpha,
-            positions=positions,
-            conn=conn,
             sender=config["email_sender"],
             recipients=config["email_recipients"],
-            position_narratives=position_narratives,
-            sector_attribution=sector_attribution,
-            data_warnings=data_warnings,
-            roundtrip_stats=roundtrip_stats,
-            trades_bucket=trades_bucket,
             account_snapshot=account,
-            nav_reconciliation=nav_reconciliation,
+            data_warnings=data_warnings,
+            console_base_url=config.get("console_base_url"),
         )
     except Exception as e:
         logger.error(f"EOD email failed: {e}")
