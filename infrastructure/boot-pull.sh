@@ -115,7 +115,7 @@ for repo in "${REPOS[@]}"; do
 
     # Update pip deps if venv + requirements.txt exist.
     # flow-doctor is now pulled in transitively via
-    # alpha-engine-lib[flow_doctor]; the previous bundled editable
+    # nousergon-lib[flow-doctor]; the previous bundled editable
     # install (pip install -e /home/ec2-user/flow-doctor) has been
     # removed so boot doesn't silently overwrite the lib-provided copy
     # with a local dev branch.

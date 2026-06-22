@@ -50,7 +50,12 @@ requests~=2.32
 # v0.60.2 (2026-06-18): SSM-authoritative seed + alpha_engine_lib alias resource-loading shim fix; earlier v0.60.1 flow-doctor secret seed when deployed
 # — overwrites a stale sourced FLOW_DOCTOR_GITHUB_TOKEN with the live SSM value
 # so the github_issue notifier stops 403ing on the EOD/executor path (config#1148).
-nousergon-lib[flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.60.2
+# NOTE: the flow-doctor extra MUST be hyphenated — setuptools normalizes
+# pyproject's `flow_doctor` to `Provides-Extra: flow-doctor`, and older pip
+# does NOT normalize underscore->hyphen, so `[flow_doctor]` silently drops the
+# extra (leaving flow-doctor stale/absent). `[flow-doctor]` is the PEP 685
+# canonical form and resolves on every pip version (config#1178).
+nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.60.2
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
