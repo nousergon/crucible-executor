@@ -856,9 +856,23 @@ def run(
     All other behaviour (risk guard, position sizer, trade logger) is unchanged.
     """
     orders = []
-    run_date = str(date.today())
+    # Trading-day axis (issue config#1016): run_date keys every trade artifact
+    # this module produces — order_books/{run_date}/, hold_book_flags/{run_date}.json,
+    # trades/order_book/{run_date}.json, the order book's `date` field, and the
+    # trades.date column via downstream log_trade. Those are all session-keyed
+    # artifacts, so run_date must attribute to the last *closed* NYSE session
+    # (now_dual().trading_day), not the raw calendar date. On a trading day after
+    # the open this equals date.today(); on weekends/holidays/pre-open it walks
+    # back to the prior session — which is the correct key for an operator run.
+    # calendar_date is retained for the audit log line (when the process ran).
+    from nousergon_lib.dates import now_dual
+    _dual = now_dual()
+    run_date = _dual.trading_day
     _health_start = _time.time()
-    logger.info(f"Executor starting | date={run_date} | dry_run={dry_run} | simulate={simulate}")
+    logger.info(
+        "Executor starting | trading_day=%s calendar_date=%s | dry_run=%s | simulate=%s",
+        run_date, _dual.calendar_date, dry_run, simulate,
+    )
 
     config = load_config()
     if config_override:

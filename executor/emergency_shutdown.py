@@ -17,7 +17,7 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 import yaml
 
@@ -36,7 +36,21 @@ from executor.config_loader import load_config as _load_config
 
 def emergency_shutdown(execute: bool, stop_instance: bool) -> None:
     config = _load_config()
-    run_date = date.today().isoformat()
+    # Trading-day axis (issue config#1016). This is a live trading-safety tool an
+    # operator may run on a weekend/holiday. Under the dual-tracking convention
+    # the artifact KEY (the trades.db S3 backup, trades_{trading_day}.db) belongs
+    # on the last closed NYSE session, while the trades.date column keeps its
+    # calendar-audit semantic (when the op ran). now_dual() gives us both; we
+    # pass trading_day explicitly into log_trade so the session attribution is
+    # authoritative rather than relying on log_trade's now_dual fallback. This
+    # ONLY changes how dates are recorded/keyed — it does not alter what gets
+    # cancelled, sold, stopped, or in what order.
+    from nousergon_lib.dates import now_dual
+    _dual = now_dual()
+    calendar_date = _dual.calendar_date
+    trading_day = _dual.trading_day
+    # Preserve the prior key used for the S3 backup path (was date.today()).
+    run_date = trading_day
 
     # ── Connect to IB Gateway ──────────────────────────────────────────
     client = IBKRClient(
@@ -93,7 +107,8 @@ def emergency_shutdown(execute: bool, stop_instance: bool) -> None:
         try:
             result = client.place_market_order(ticker, "SELL", shares)
             log_trade(conn, {
-                "date": run_date,
+                "date": calendar_date,
+                "trading_day": trading_day,
                 "ticker": ticker,
                 "action": "EMERGENCY_SELL",
                 "shares": shares,

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -19,9 +19,25 @@ _ORDER_BOOK_DIR = Path(__file__).resolve().parent.parent / "data"
 _ORDER_BOOK_PATH = _ORDER_BOOK_DIR / "order_book.json"
 
 
+def _current_trading_day() -> str:
+    """Last closed NYSE session as an ISO string (the order book's session axis).
+
+    Issue config#1016: the order book's ``date`` field and its load-time
+    freshness check key on the *trading day*, not the raw calendar date, so
+    that the morning batch (main.py) and the daemon (daemon.py) — which both
+    derive run_date from ``now_dual().trading_day`` — agree on which book is
+    "today's". A pre-open weekday read still resolves to the prior session
+    until the open, matching the run_date the producers wrote with. On a
+    trading day after the close this equals ``date.today()``.
+    """
+    from nousergon_lib.dates import now_dual
+
+    return now_dual().trading_day
+
+
 def _default_book(run_date: str | None = None) -> dict:
     return {
-        "date": run_date or date.today().isoformat(),
+        "date": run_date or _current_trading_day(),
         "approved_entries": [],
         "urgent_exits": [],
         "active_stops": [],
@@ -106,8 +122,10 @@ class OrderBook:
                         data = json.loads(path.read_text())
                     finally:
                         fcntl.flock(lock_f, fcntl.LOCK_UN)
-                # Discard stale book from a previous day
-                if data.get("date") != date.today().isoformat():
+                # Discard stale book from a previous trading session. Compare on
+                # the trading-day axis (config#1016) so the daemon doesn't treat
+                # the morning batch's book as stale on a pre-open weekday read.
+                if data.get("date") != _current_trading_day():
                     logger.info("Order book is from %s — starting fresh", data.get("date"))
                     data = _default_book()
                 return cls(data, path)

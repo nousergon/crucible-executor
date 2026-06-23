@@ -1,6 +1,7 @@
 """Tests for executor.emergency_shutdown — paper-account-only halt + liquidate + notify."""
 
 import sys
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -259,6 +260,46 @@ def test_execute_stop_instance_failure_swallowed(stub_config, stub_db, monkeypat
             mod.emergency_shutdown(execute=True, stop_instance=True)
 
     assert any("EC2 stop failed" in r.message for r in caplog.records)
+
+
+# ── Trading-day axis (issue config#1016) ────────────────────────────────────
+
+
+def test_execute_on_weekend_keys_trades_on_prior_trading_day(stub_config, stub_db, monkeypatch):
+    """An emergency shutdown run on a Saturday must key its trade artifacts on
+    the prior NYSE session, not the weekend calendar date:
+
+      * log_trade receives trading_day = the prior session (2026-04-24),
+      * the trades.date column keeps its calendar-audit semantic (2026-04-25),
+      * the S3 backup is keyed on the trading day (the artifact key).
+
+    Mirrors the now_dual() weekend contract in nousergon_lib.dates."""
+    import nousergon_lib.dates as dates_mod
+    from nousergon_lib.dates import now_dual
+
+    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)  # 8 AM ET Sat
+    monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=saturday))
+
+    client = _mock_client(positions={"AAPL": {"shares": 10, "market_value": 1500.0}})
+    monkeypatch.setattr(mod, "IBKRClient", MagicMock(return_value=client))
+    monkeypatch.setattr(mod, "subprocess", MagicMock())
+    monkeypatch.setitem(sys.modules, "boto3", MagicMock())
+
+    mod.emergency_shutdown(execute=True, stop_instance=False)
+
+    # log_trade keyed on the dual axis.
+    logged = mod.log_trade.call_args_list  # type: ignore[attr-defined]
+    assert logged, "expected at least one logged trade"
+    trade = logged[0].args[1]
+    assert trade["trading_day"] == "2026-04-24"  # prior session, NOT Saturday
+    assert trade["date"] == "2026-04-25"  # calendar-audit column unchanged
+
+    # S3 backup keyed on the trading day (artifact key).
+    backup_args = mod.backup_to_s3.call_args  # type: ignore[attr-defined]
+    assert backup_args.args[1] == "2026-04-24"
+
+    # Behavior unchanged: the position was still sold.
+    client.place_market_order.assert_called_once()
 
 
 def test_execute_stop_instance_calls_ec2_stop(stub_config, stub_db, monkeypatch):

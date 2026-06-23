@@ -407,7 +407,16 @@ def run_daemon(dry_run: bool = False) -> None:
 
     client_id = strategy_config.get("intraday_client_id", 2)
     poll_interval = strategy_config.get("intraday_poll_interval_sec", 60)
-    run_date = date.today().isoformat()
+    # Trading-day axis (issue config#1016): run_date keys the daemon's trade
+    # artifacts and is the trading_day passed into log_trade for every fill,
+    # so it must attribute to the last closed NYSE session via now_dual().
+    # It must use the SAME axis as main.py's order-book `date` field, otherwise
+    # the order-book freshness match (order_book.py) would treat the
+    # morning-batch book as stale pre-open on a session whose date.today()
+    # already advanced. On a trading day after the open trading_day == today.
+    from nousergon_lib.dates import now_dual
+    _dual = now_dual()
+    run_date = _dual.trading_day
 
     # ── Intraday reconcile-to-target state (optimizer authority) ─────────────
     # When the optimizer owns the book, hard-risk exits (catastrophic gap stop,

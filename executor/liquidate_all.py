@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import date, datetime, timezone
 
 import yaml
 
@@ -87,7 +86,18 @@ def liquidate(execute: bool, skip_confirm: bool) -> None:
         print()
 
         # ── Place orders ──────────────────────────────────────────────────────
-        run_date = str(date.today())
+        # Trading-day axis (issue config#1016). Operator reset tool that may run
+        # on a weekend/holiday; under the dual-tracking convention the S3 backup
+        # key (trades_{trading_day}.db) belongs on the last closed NYSE session
+        # while the trades.date column keeps its calendar-audit semantic. We pass
+        # trading_day explicitly into log_trade so the session attribution is
+        # authoritative rather than left to log_trade's now_dual fallback. This
+        # ONLY changes date recording/keying — not which positions get sold.
+        from nousergon_lib.dates import now_dual
+        _dual = now_dual()
+        calendar_date = _dual.calendar_date
+        trading_day = _dual.trading_day
+        run_date = trading_day  # S3 backup key (was date.today())
         db_conn = init_db(config.get("db_path", "trades.db"))
 
         for ticker, pos in sorted(positions.items()):
@@ -104,7 +114,8 @@ def liquidate(execute: bool, skip_confirm: bool) -> None:
             log_trade(
                 db_conn,
                 {
-                    "date": run_date,
+                    "date": calendar_date,
+                    "trading_day": trading_day,
                     "ticker": ticker,
                     "action": "LIQUIDATION_SELL",
                     "shares": shares,

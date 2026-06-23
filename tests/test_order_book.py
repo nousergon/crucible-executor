@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from executor.order_book import OrderBook, _default_book
+from executor.order_book import OrderBook, _current_trading_day, _default_book
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -280,3 +280,81 @@ def test_save_atomic_no_tmp(tmp_path):
 
     assert path.exists()
     assert not path.with_suffix(".tmp").exists()
+
+
+# ── 19. trading-day axis (issue config#1016) ─────────────────────────────
+#
+# The order book keys its `date` field and its load-time freshness check on
+# the last *closed* NYSE session (now_dual().trading_day), not the raw
+# calendar date, so the morning batch (main.py) and the daemon (daemon.py) —
+# which both derive run_date from now_dual().trading_day — agree on which
+# book is "today's" even when read pre-open or on a non-session calendar day.
+
+
+def test_current_trading_day_resolves_to_prior_session_on_weekend(monkeypatch):
+    """On a Saturday, _current_trading_day() walks back to the prior Friday
+    session — NOT date.today(). Mirrors the now_dual() contract in
+    nousergon_lib.dates (Sat 2026-04-25 → trading_day 2026-04-24)."""
+    from nousergon_lib.dates import now_dual
+
+    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)  # 8 AM ET Sat
+    # _current_trading_day imports now_dual lazily from nousergon_lib.dates,
+    # so patch that source symbol.
+    import nousergon_lib.dates as dates_mod
+    monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=saturday))
+
+    assert _current_trading_day() == "2026-04-24"
+    # And it is NOT the raw calendar date.
+    assert _current_trading_day() != saturday.date().isoformat()
+
+
+def test_default_book_keys_on_trading_day_when_offsession(monkeypatch):
+    """A fresh book built on a weekend keys `date` to the prior session."""
+    import nousergon_lib.dates as dates_mod
+    from nousergon_lib.dates import now_dual
+
+    sunday = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=sunday))
+
+    book = _default_book()
+    assert book["date"] == "2026-04-24"  # Friday session, not Sunday calendar
+
+
+def test_load_keeps_book_written_on_prior_calendar_day_same_session(monkeypatch, tmp_path):
+    """The exact bug config#1016 guards: a book the morning batch wrote keyed
+    to the trading session must NOT be discarded as 'stale' on a pre-open read
+    whose calendar date has advanced but whose session has not.
+
+    Saturday read of a book keyed to Friday's session (2026-04-24) keeps it,
+    because Saturday's trading_day is still Friday."""
+    import nousergon_lib.dates as dates_mod
+    from nousergon_lib.dates import now_dual
+
+    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=saturday))
+
+    book_data = _default_book(run_date="2026-04-24")  # Friday session key
+    book_data["approved_entries"].append({"ticker": "AAPL", "status": "pending"})
+    path = _make_book(tmp_path, book_data)
+
+    loaded = OrderBook.load(path)
+    # Same trading session → book preserved, entries intact.
+    assert loaded.data["date"] == "2026-04-24"
+    assert loaded.data["approved_entries"][0]["ticker"] == "AAPL"
+
+
+def test_load_discards_book_from_prior_session(monkeypatch, tmp_path):
+    """A book from a genuinely earlier session is still discarded."""
+    import nousergon_lib.dates as dates_mod
+    from nousergon_lib.dates import now_dual
+
+    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)  # session = Fri 4/24
+    monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=saturday))
+
+    stale = _default_book(run_date="2026-04-23")  # Thursday session — older
+    stale["approved_entries"].append({"ticker": "AAPL", "status": "pending"})
+    path = _make_book(tmp_path, stale)
+
+    loaded = OrderBook.load(path)
+    assert loaded.data["date"] == "2026-04-24"  # rebuilt on current session
+    assert loaded.data["approved_entries"] == []
