@@ -354,14 +354,16 @@ portfolio_optimizer:
   consume_auto_tuned: true
   # Risk aversion λ in the MVO objective. Higher = stronger Σ penalty.
   # (Static fallback / starting point — auto-tuned value wins when present.)
-  # Generic reference value only — the LIVE/tuned value is private (box's
-  # gitignored config/risk.yaml or the S3 auto-tuned file); never publish the
-  # operating value here (divergence policy: alpha-bearing values stay private).
+  # Generic reference value only — the LIVE/tuned value is private (the
+  # config-repo alpha-engine-config/executor/risk.yaml or the S3 auto-tuned
+  # file); never publish the operating value here (divergence policy:
+  # alpha-bearing values stay private).
   risk_aversion: 5.0
   # Lower bound the executor will honor for the auto-tuned risk_aversion (the
   # read-side re-clamp floor; ceiling stays the public default 10.0). OPTIONAL +
   # PRIVATE: omit here (public default floor 3.0) and set the operating value in
-  # the box's gitignored risk.yaml to let the tuner run a more aggressive book.
+  # the config-repo alpha-engine-config/executor/risk.yaml to let the tuner run
+  # a more aggressive book.
   # tuner_risk_aversion_floor: 3.0
   # Transaction cost penalty (bps per dollar traded) used in the L1 turnover
   # term. 5 bps is conservative for liquid US large-caps; backtester tunes.

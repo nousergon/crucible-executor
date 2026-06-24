@@ -55,8 +55,10 @@ _MIN_RETURNS_FOR_COV = 60
 _AUTO_TUNED_WRITABLE = ("risk_aversion", "tcost_bps")
 # Read-side re-clamp band (defense in depth). Generic public default floor (3.0)
 # only — the OPERATING risk_aversion floor is a private risk-policy variable,
-# overridden via the gitignored config/risk.yaml
-# (`portfolio_optimizer.tuner_risk_aversion_floor`) so an aggressive floor (e.g.
+# overridden via the private config repo
+# (alpha-engine-config/executor/risk.yaml, key
+# `portfolio_optimizer.tuner_risk_aversion_floor`; resolved by
+# config_loader.py — see its search order) so an aggressive floor (e.g.
 # 1.0) never ships in this public repo (divergence policy: alpha-bearing values
 # stay private). MUST stay in lockstep with the tuner write-side override
 # alpha-engine-backtester/optimizer/portfolio_optimizer_optimizer.py
@@ -104,7 +106,8 @@ def _load_auto_tuned_optimizer_cfg(config: dict, s3_client=None) -> dict:
             continue
         lo, hi = _AUTO_TUNED_BOUNDS[k]
         # Private risk-policy override: the operating risk_aversion floor lives in
-        # the gitignored risk.yaml, not this public default (divergence policy).
+        # the config-repo risk.yaml (alpha-engine-config/executor/risk.yaml),
+        # not this public default (divergence policy).
         if k == "risk_aversion":
             _floor_override = po_cfg.get("tuner_risk_aversion_floor")
             if _floor_override is not None:
