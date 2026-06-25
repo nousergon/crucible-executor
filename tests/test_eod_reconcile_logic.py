@@ -2,17 +2,97 @@
 
 import io
 import json
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from executor.eod_reconcile import (
     _apply_dividend_delta,
+    _compute_daily_return,
     _compute_unattributed_residual_pct,
     _load_constituents_sector_map,
     _resolve_prior_price,
     _synthesize_rationales,
 )
+
+
+class TestComputeDailyReturn:
+    """Gap-aware per-position daily return (config#1228).
+
+    The held-through baseline is the previous TRADING day's ArcticDB close,
+    not a possibly-stale snapshot — so a skipped weekday/EOD SF can no longer
+    inflate a multi-session move into a one-day return.
+    """
+
+    PREV_TD = date(2026, 6, 24)  # the trading day before run_date 2026-06-25
+
+    def test_held_through_uses_prev_trading_day_close(self):
+        # Held yesterday; ArcticDB prior row IS the previous trading day.
+        pct, usd, prior_price, na = _compute_daily_return(
+            "AAA", {"avg_cost": 90.0}, prior_pos={"shares": 10},
+            current_price=110.0, shares=10,
+            prior_close=100.0, prior_close_date=self.PREV_TD,
+            expected_prev_td=self.PREV_TD,
+        )
+        assert pct == pytest.approx(10.0)       # 110/100 - 1
+        assert usd == pytest.approx(100.0)      # (110-100)*10
+        assert prior_price == pytest.approx(100.0)
+        assert na is None
+
+    def test_rgen_regression_healed_gap_is_not_inflated(self):
+        # RGEN: held through; once 06-24 ($145.41) is healed into ArcticDB,
+        # the 06-25 close ($145.23) is ~flat — NOT the +14.92% the stale
+        # 06-23 close ($126.37) produced.
+        pct, usd, prior_price, na = _compute_daily_return(
+            "RGEN", {"avg_cost": 129.43}, prior_pos={"shares": 607},
+            current_price=145.23, shares=715,
+            prior_close=145.41, prior_close_date=self.PREV_TD,
+            expected_prev_td=self.PREV_TD,
+        )
+        assert na is None
+        assert pct == pytest.approx((145.23 / 145.41 - 1) * 100)
+        assert abs(pct) < 1.0  # ~flat, decisively not +14.92%
+
+    def test_unhealed_gap_marks_na_not_a_stale_number(self):
+        # ArcticDB's latest prior row (06-23) predates the previous trading
+        # day (06-24) — gap not healed. Refuse to compute against the stale
+        # baseline; return an explicit N/A with a reason.
+        pct, usd, prior_price, na = _compute_daily_return(
+            "RGEN", {"avg_cost": 129.43}, prior_pos={"shares": 607},
+            current_price=145.23, shares=715,
+            prior_close=126.37, prior_close_date=date(2026, 6, 23),
+            expected_prev_td=self.PREV_TD,
+        )
+        assert (pct, usd, prior_price) == (0.0, 0.0, None)
+        assert na is not None and "RGEN" in na
+        # The bogus +14.92% must never be produced.
+        assert pct != pytest.approx(14.92, abs=0.5)
+
+    def test_opened_today_prices_against_avg_cost(self):
+        # No prior snapshot entry → opened today; baseline is entry avg_cost.
+        pct, usd, prior_price, na = _compute_daily_return(
+            "BBB", {"avg_cost": 50.0}, prior_pos=None,
+            current_price=55.0, shares=4,
+            prior_close=48.0, prior_close_date=self.PREV_TD,
+            expected_prev_td=self.PREV_TD,
+        )
+        assert pct == pytest.approx(10.0)       # 55/50 - 1, uses avg_cost
+        assert prior_price == pytest.approx(50.0)
+        assert na is None
+
+    def test_held_through_no_arctic_prior_falls_back(self):
+        # Held yesterday but no ArcticDB prior close (e.g. brand-new listing)
+        # → legacy snapshot/avg_cost resolution.
+        pct, usd, prior_price, na = _compute_daily_return(
+            "CCC", {"avg_cost": 20.0}, prior_pos={"closing_price": 25.0},
+            current_price=30.0, shares=2,
+            prior_close=None, prior_close_date=None,
+            expected_prev_td=self.PREV_TD,
+        )
+        assert prior_price == pytest.approx(25.0)  # snapshot closing_price
+        assert pct == pytest.approx((30.0 / 25.0 - 1) * 100)
+        assert na is None
 
 
 class TestComputeUnattributedResidualPct:
