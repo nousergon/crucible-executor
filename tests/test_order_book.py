@@ -13,12 +13,23 @@ from executor.order_book import OrderBook, _current_trading_day, _default_book
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
-def _today() -> str:
-    return date.today().isoformat()
+# A fresh order book stamps its date with the current *trading day*
+# (``now_dual().trading_day``), not the calendar day — see
+# ``order_book._current_trading_day`` (config#1016). Asserting against
+# ``date.today()`` is wrong before the close on a trading day (the trading day
+# is still the prior session) and made these tests fail in any CI run that
+# happened pre-close. Pin both the "current" and "stale" dates to the same
+# trading-day axis the production code uses so the assertions are
+# time-of-day-independent.
 
 
-def _yesterday() -> str:
-    return (date.today() - timedelta(days=1)).isoformat()
+def _current_book_date() -> str:
+    return _current_trading_day()
+
+
+def _stale_book_date() -> str:
+    """A date strictly before the current trading day — guaranteed stale."""
+    return (date.fromisoformat(_current_trading_day()) - timedelta(days=1)).isoformat()
 
 
 def _make_book(tmp_path, data: dict | None = None):
@@ -34,7 +45,7 @@ def _make_book(tmp_path, data: dict | None = None):
 def test_load_fresh_no_file(tmp_path):
     path = tmp_path / "order_book.json"
     book = OrderBook.load(path)
-    assert book.data["date"] == _today()
+    assert book.data["date"] == _current_book_date()
     assert book.data["approved_entries"] == []
     assert book.data["urgent_exits"] == []
     assert book.data["active_stops"] == []
@@ -45,12 +56,12 @@ def test_load_fresh_no_file(tmp_path):
 
 
 def test_load_discards_stale_date(tmp_path):
-    stale = _default_book(run_date=_yesterday())
+    stale = _default_book(run_date=_stale_book_date())
     stale["approved_entries"].append({"ticker": "AAPL", "status": "pending"})
     path = _make_book(tmp_path, stale)
 
     book = OrderBook.load(path)
-    assert book.data["date"] == _today()
+    assert book.data["date"] == _current_book_date()
     assert book.data["approved_entries"] == []
 
 
@@ -62,7 +73,7 @@ def test_load_recovers_from_corrupt_json(tmp_path):
     path.write_text("{not valid json!!!")
 
     book = OrderBook.load(path)
-    assert book.data["date"] == _today()
+    assert book.data["date"] == _current_book_date()
     assert book.data["approved_entries"] == []
 
 
