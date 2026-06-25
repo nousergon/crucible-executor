@@ -28,6 +28,7 @@ from executor.trade_logger import (
 )
 
 from nousergon_lib.dates import now_dual
+from nousergon_lib.trading_calendar import previous_trading_day
 from nousergon_lib.logging import setup_logging, guard_entrypoint
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
@@ -344,6 +345,81 @@ def _resolve_prior_price(
     return pos.get("avg_cost", current_price)
 
 
+def _compute_daily_return(
+    ticker: str,
+    pos: dict,
+    prior_pos: dict | None,
+    current_price: float,
+    shares: float,
+    prior_close: float | None,
+    prior_close_date: "date | None",
+    expected_prev_td: "date",
+) -> tuple[float, float, float | None, str | None]:
+    """Gap-aware per-position daily return.
+
+    The prior-day baseline for a position HELD on the previous trading day
+    must be the close on that previous trading day, read authoritatively
+    from ArcticDB (``prior_close`` at ``prior_close_date``) — NOT the stored
+    snapshot's ``closing_price``, which can be days stale whenever a
+    weekday/EOD Step Function was skipped. In the normal case the two are
+    identical (the snapshot persists the same daily_closes-sourced close),
+    so behavior is unchanged; the difference only bites across a gap.
+
+    Concrete bug this closes: the 2026-06-24 SF halt left no 06-24
+    snapshot, so the 06-25 reconcile picked the 06-23 snapshot as
+    "yesterday" and reported RGEN at ``145.23/126.37-1 = +14.92%`` — a
+    two-session move mislabeled as one day, which drove the entire
+    headline (config#1228).
+
+    Returns ``(daily_return_pct, daily_return_usd, prior_price, na_reason)``:
+      * held-through, ArcticDB's prior row IS the previous trading day →
+        true one-session return; ``na_reason`` is None.
+      * held-through but ArcticDB's latest prior row predates the previous
+        trading day (market-data gap not yet healed) → ``(0.0, 0.0, None,
+        reason)``: we refuse to compute a return against a stale baseline,
+        flag it N/A, and let the position's P&L surface in the NAV
+        unattributed bucket rather than fabricate an inflated number.
+      * opened since the prior trading day (absent from the prior snapshot)
+        → return vs entry ``avg_cost`` (unchanged legacy behavior).
+    """
+    held_through = prior_pos is not None
+    if not held_through:
+        # Opened today / during a gap — baseline is the entry price.
+        prior_price = pos.get("avg_cost", current_price)
+    elif prior_close is not None and prior_close_date == expected_prev_td:
+        # Authoritative: the previous trading day's close from ArcticDB.
+        prior_price = float(prior_close)
+    elif (
+        prior_close is not None
+        and prior_close_date is not None
+        and prior_close_date < expected_prev_td
+    ):
+        # ArcticDB's latest prior row predates the previous trading day — a
+        # weekday/EOD SF was skipped and the market-data gap is not yet
+        # healed. Do NOT report a multi-session move as a one-day return.
+        reason = (
+            f"{ticker}: previous-trading-day ({expected_prev_td}) close unavailable "
+            f"in ArcticDB (latest prior row = {prior_close_date}). Daily return marked "
+            f"N/A rather than computed against a stale baseline; the position's P&L "
+            f"surfaces in the NAV unattributed bucket. Heal the market-data gap "
+            f"(config#1228)."
+        )
+        return 0.0, 0.0, None, reason
+    else:
+        # No ArcticDB prior close at all (e.g. brand-new listing) — fall back
+        # to the legacy snapshot/avg_cost resolution.
+        prior_price = _resolve_prior_price(prior_pos, pos, current_price)
+
+    if prior_price and prior_price > 0:
+        return (
+            (current_price / prior_price - 1) * 100,
+            (current_price - prior_price) * shares,
+            prior_price,
+            None,
+        )
+    return 0.0, 0.0, None, None
+
+
 def _apply_dividend_delta(
     pos: dict,
     prior_pos: dict | None,
@@ -385,6 +461,12 @@ def run(run_date: str | None = None) -> None:
         )
     else:
         logger.info("EOD reconciliation | date=%s (explicit)", run_date)
+    # Previous NYSE trading day — the baseline every "daily" figure must be
+    # measured against. Used to detect skipped-SF gaps (config#1228).
+    expected_prev_td = previous_trading_day(date.fromisoformat(run_date))
+    # data_warnings is populated through the run (gap flags, NAV residual)
+    # and surfaced in the EOD email + report artifact.
+    data_warnings: list[str] = []
     _health_start = _time.time()
 
     config = load_config()
@@ -512,18 +594,39 @@ def run(run_date: str | None = None) -> None:
     except Exception as e:
         logger.error(f"Sector enrichment failed: {e}")
 
-    # Prior day's NAV (to compute daily return)
+    # Prior day's NAV (to compute daily return). Also capture its DATE so we
+    # can detect when it is not the previous trading day — i.e. an eod_pnl row
+    # is missing because a weekday/EOD SF was skipped, which makes the
+    # headline NAV daily return span multiple sessions.
     prior_row = conn.execute(
-        "SELECT portfolio_nav FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
+        "SELECT date, portfolio_nav FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
         (run_date,),
     ).fetchone()
-    prior_nav = prior_row[0] if prior_row else None
+    prior_eod_date = (
+        date.fromisoformat(prior_row[0]) if prior_row and prior_row[0] else None
+    )
+    prior_nav = prior_row[1] if prior_row else None
 
     if prior_nav is None:
         logger.info("First trading day — no prior NAV, daily return unavailable")
         daily_return = None
     else:
         daily_return = ((nav - prior_nav) / prior_nav * 100)
+
+    # Headline gap guard: if the prior eod_pnl row is not the previous trading
+    # day, the NAV-level daily return / alpha span more than one session. Per-
+    # position returns are gap-corrected from ArcticDB, but the NAV baseline
+    # stays stale until the missing row is backfilled (config#1229 / Phase 2).
+    if prior_nav is not None and prior_eod_date is not None and prior_eod_date != expected_prev_td:
+        hdr_warn = (
+            f"Headline daily return/alpha span multiple sessions: prior eod_pnl row is "
+            f"{prior_eod_date} but the previous trading day is {expected_prev_td} (an "
+            f"eod_pnl row is missing — a weekday/EOD SF was skipped). Per-position "
+            f"returns are gap-corrected from ArcticDB; the NAV-level baseline is stale "
+            f"until the missing row is backfilled (config#1229)."
+        )
+        logger.warning(hdr_warn)
+        data_warnings.append(hdr_warn)
 
     # SPY return for the day
     spy_price = _spy_close(run_date, config)
@@ -583,6 +686,11 @@ def run(run_date: str | None = None) -> None:
     macro_lib = None  # lazy-open only if a macro-routed held ticker appears
     target_ts = pd.Timestamp(run_date).normalize()
     closing_prices: dict[str, float] = {}
+    # Authoritative prior-day baseline: the last ArcticDB row strictly before
+    # run_date, with its date, so daily returns are measured against the real
+    # previous trading day rather than a possibly-stale snapshot (config#1228).
+    prior_closes: dict[str, float] = {}
+    prior_close_dates: dict[str, date] = {}
     missing: list[str] = []
     for ticker in positions.keys():
         if ticker in _MACRO_SYMBOLS:
@@ -605,6 +713,15 @@ def run(run_date: str | None = None) -> None:
             missing.append(f"{ticker} (no row for {run_date})")
             continue
         closing_prices[ticker] = float(match["Close"].iloc[-1])
+        # Capture the previous available close (last row strictly before
+        # run_date) + its date — the gap-aware daily-return baseline.
+        prior_mask = idx < target_ts
+        if prior_mask.any():
+            prior_rows = df[prior_mask]
+            prior_closes[ticker] = float(prior_rows["Close"].iloc[-1])
+            prior_close_dates[ticker] = (
+                pd.Timestamp(prior_rows.index[-1]).normalize().date()
+            )
     if missing:
         raise RuntimeError(
             f"ArcticDB closing-price lookup failed for {len(missing)} "
@@ -643,22 +760,32 @@ def run(run_date: str | None = None) -> None:
         # source for prior_price (not derived from possibly-stale IB MV).
         pos["closing_price"] = current_price
 
-        # Daily return: today's price vs yesterday's price (or entry price if new today)
+        # Daily return — gap-aware. Held-through positions price against the
+        # previous TRADING day's ArcticDB close (config#1228); a stale
+        # snapshot baseline previously inflated returns across a skipped-SF
+        # gap (RGEN +14.92% on 2026-06-25 vs the 06-23, not 06-24, close).
         prior_pos = prior_positions.get(ticker)
-        prior_price = _resolve_prior_price(prior_pos, pos, current_price)
-
-        if prior_price and prior_price > 0:
-            pos["daily_return_pct"] = (current_price / prior_price - 1) * 100
-            pos["daily_return_usd"] = (current_price - prior_price) * shares
-        else:
-            pos["daily_return_pct"] = 0.0
-            pos["daily_return_usd"] = 0.0
+        daily_pct, daily_usd, prior_price, na_reason = _compute_daily_return(
+            ticker, pos, prior_pos, current_price, shares,
+            prior_closes.get(ticker), prior_close_dates.get(ticker),
+            expected_prev_td,
+        )
+        pos["daily_return_pct"] = daily_pct
+        pos["daily_return_usd"] = daily_usd
+        if na_reason:
+            # Fail loud: the figure is an explicit N/A, not a silent zero.
+            pos["daily_return_na"] = True
+            pos["daily_return_na_reason"] = na_reason
+            logger.warning("Daily-return N/A | %s", na_reason)
+            data_warnings.append(na_reason)
 
         # Dividend attribution: today's accrued dividend for this ticker vs
         # yesterday's snapshot. Delta is the day's dividend income (or its
         # reversal when paid to cash). Flows into position α instead of
-        # leaking into the cash residual.
-        _apply_dividend_delta(pos, prior_pos, prior_price, shares)
+        # leaking into the cash residual. Skipped when the baseline is N/A
+        # (no valid prior price to express the accrual against).
+        if prior_price is not None:
+            _apply_dividend_delta(pos, prior_pos, prior_price, shares)
 
         # Alpha contribution: (weight * position_return) - (weight * SPY_return)
         weight = mv / nav if nav else 0
@@ -666,8 +793,9 @@ def run(run_date: str | None = None) -> None:
         pos["alpha_contribution_pct"] = weight * (pos["daily_return_pct"] - pos_spy)
         pos["alpha_contribution_usd"] = pos["alpha_contribution_pct"] / 100 * nav if nav else 0
 
-    # data_warnings is appended to here (NAV gap) and by _build_position_contexts
-    data_warnings: list[str] = []
+    # data_warnings was initialized at the top of run() and accumulates gap
+    # flags (per-position N/A, headline multi-session) plus the NAV residual
+    # appended below; it is also extended by _build_position_contexts.
 
     # ── NAV change reconciliation ───────────────────────────────────────────
     # Every dollar of NAV change must be attributable to a source: position
