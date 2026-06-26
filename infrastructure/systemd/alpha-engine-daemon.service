@@ -21,15 +21,23 @@ Environment=AWS_REGION=us-east-1
 Environment=ALPHA_ENGINE_JSON_LOGS=1
 Environment=FLOW_DOCTOR_ENABLED=1
 Environment=ALPHA_ENGINE_DEPLOYED=1
-# Secrets (EMAIL_SENDER, GMAIL_APP_PASSWORD, ANTHROPIC_API_KEY, ...) — the
-# RunDaemon SSM step launches this unit via systemd, which (unlike the SF's
-# RunMorningPlanner command) does not `source` the env file. PR 9g (#182)
-# deleted the ssm_secrets import-time shim that previously populated these
-# for the daemon, so flow-doctor's ${EMAIL_SENDER} resolution crash-looped
-# the daemon (2026-05-15). Mirror the morning-planner path until the
-# .env-deprecation arc's SSM substrate fully covers systemd entrypoints.
-# Leading `-` tolerates the file's eventual removal (no hard failure).
-EnvironmentFile=-/home/ec2-user/.alpha-engine.env
+# Secrets — NO EnvironmentFile (.env deprecated, #890). Every secret the
+# daemon and its transitive imports touch is now obtained at runtime via
+# nousergon_lib.secrets.get_secret() (SSM-backed, lib v0.62.0):
+#   - EMAIL_SENDER / EMAIL_RECIPIENTS / GMAIL_APP_PASSWORD → email_sender.py
+#   - TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID → telegram.py
+#   - flow-doctor's ${EMAIL_*}/${GMAIL_APP_PASSWORD}/${TELEGRAM_*}/
+#     ${FLOW_DOCTOR_GITHUB_TOKEN} → seeded into env from get_secret() by
+#     logging.py::_seed_flow_doctor_secrets() at setup_logging() import time,
+#     which is authoritative under ALPHA_ENGINE_DEPLOYED=1 (set above).
+#   - ANTHROPIC_API_KEY → no longer referenced (executor LLM path removed
+#     2026-05-25; "no LLM in executor, period").
+# This mirrors alpha-engine-morning.service, which already runs the same
+# executor codebase via systemd with no EnvironmentFile. The
+# tests/test_no_secret_environ_reads.py regression guard fails CI if any of
+# these are re-introduced as os.environ reads. The historical 2026-05-15
+# crash-loop (flow-doctor ${EMAIL_SENDER} unresolved after the ssm_secrets
+# import shim was deleted in #182) is resolved by the get_secret() seeding.
 
 [Install]
 WantedBy=multi-user.target
