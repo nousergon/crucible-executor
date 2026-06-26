@@ -305,7 +305,10 @@ def backfill(run_date: str, *, dry_run: bool = False, force: bool = False) -> di
     # re-prices from ArcticDB, recomputes the NAV reconciliation, and writes
     # the eod_pnl row + CSVs exactly as a normal EOD would.
     from executor.eod_reconcile import run as eod_run
-    eod_run(run_date)
+    # A backfill is a post-hoc recovery of a PAST day: never resend that day's
+    # EOD email, and never trigger the trailing reconcile_audit self-heal from
+    # inside a correction (the audit pass is what may have called us — config#1276).
+    eod_run(run_date, send_email=False, run_audit=False)
     summary["reconcile"] = "ran"
     return summary
 
