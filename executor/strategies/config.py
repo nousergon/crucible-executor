@@ -154,10 +154,26 @@ def load_strategy_config(config: dict) -> dict:
         "graduated_drawdown_enabled": drawdown_cfg.get("enabled", GRADUATED_DRAWDOWN_ENABLED),
         "drawdown_tiers": drawdown_cfg.get("tiers", DRAWDOWN_TIERS),
 
-        # Drawdown forced exits
-        "drawdown_forced_exit_enabled": drawdown_cfg.get("drawdown_forced_exit_enabled", DRAWDOWN_FORCED_EXIT_ENABLED),
-        "drawdown_forced_exit_tier2_count": drawdown_cfg.get("drawdown_forced_exit_tier2_count", DRAWDOWN_FORCED_EXIT_TIER2_COUNT),
-        "drawdown_forced_exit_tier3_count": drawdown_cfg.get("drawdown_forced_exit_tier3_count", DRAWDOWN_FORCED_EXIT_TIER3_COUNT),
+        # Drawdown forced exits.
+        # These three keys live at the TOP level under `strategy:` (siblings of
+        # `graduated_drawdown:` / `bracket:`), per the documented contract in
+        # config/risk.yaml.example. Read them from `strategy` so the documented
+        # YAML override actually takes effect (config#845). A nested fallback on
+        # `drawdown_cfg` (the old, broken read path) is kept so any config that
+        # accidentally nested them inside `graduated_drawdown:` during the bug
+        # window still resolves — top-level always wins.
+        "drawdown_forced_exit_enabled": strategy.get(
+            "drawdown_forced_exit_enabled",
+            drawdown_cfg.get("drawdown_forced_exit_enabled", DRAWDOWN_FORCED_EXIT_ENABLED),
+        ),
+        "drawdown_forced_exit_tier2_count": strategy.get(
+            "drawdown_forced_exit_tier2_count",
+            drawdown_cfg.get("drawdown_forced_exit_tier2_count", DRAWDOWN_FORCED_EXIT_TIER2_COUNT),
+        ),
+        "drawdown_forced_exit_tier3_count": strategy.get(
+            "drawdown_forced_exit_tier3_count",
+            drawdown_cfg.get("drawdown_forced_exit_tier3_count", DRAWDOWN_FORCED_EXIT_TIER3_COUNT),
+        ),
 
         # Bracket stop
         "bracket_stop_enabled": bracket_cfg.get("enabled", BRACKET_STOP_ENABLED),
