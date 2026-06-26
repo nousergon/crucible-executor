@@ -17,12 +17,64 @@ from executor.portfolio_optimizer import (
 )
 from executor.intraday_resolve import (
     available_redeploy_cash,
+    build_conviction_map,
     build_redeploy_entry,
     compute_drawdown_overlay,
     select_forced_exits,
     solve_redeploy,
     w_prev_from_live,
 )
+
+
+def test_build_conviction_map_flattens_universe_and_buy_candidates():
+    # config#844: the daemon builds its forced-exit conviction map from the
+    # signals.json payload (universe + buy_candidates lists), keyed by ticker.
+    payload = {
+        "universe": [{"ticker": "AAA", "score": 80}, {"ticker": "BBB", "score": 40}],
+        "buy_candidates": [{"ticker": "CCC", "score": 90}, {"ticker": "AAA", "score": 5}],
+    }
+    m = build_conviction_map(payload)
+    assert set(m) == {"AAA", "BBB", "CCC"}
+    assert m["AAA"]["score"] == 80  # first record wins on duplicate
+    assert m["BBB"]["score"] == 40 and m["CCC"]["score"] == 90
+
+
+def test_build_conviction_map_degrades_on_missing_or_malformed():
+    assert build_conviction_map(None) == {}
+    assert build_conviction_map({}) == {}
+    # malformed records / missing ticker are skipped, not raised
+    assert build_conviction_map({"universe": ["NOTADICT", {"score": 1}]}) == {}
+
+
+def test_conviction_map_feeds_lowest_conviction_first_ranking():
+    # End-to-end of the config#844 fix: a real signals payload → conviction map
+    # → select_forced_exits ranks lowest-score-first (NOT smallest-position).
+    payload = {"universe": [
+        {"ticker": "HIGH", "score": 90},
+        {"ticker": "LOW", "score": 20},
+        {"ticker": "MID", "score": 55},
+    ]}
+    # LOW has the LARGEST position — smallest-position-first would spare it, but
+    # conviction ranking must exit it first.
+    positions = {
+        "HIGH": {"shares": 10, "market_value": 1_000},
+        "LOW": {"shares": 10, "market_value": 9_000},
+        "MID": {"shares": 10, "market_value": 5_000},
+    }
+    m = build_conviction_map(payload)
+    out = select_forced_exits(positions, m, set(), target_count=1)
+    assert [o["ticker"] for o in out] == ["LOW"]
+
+
+def test_empty_conviction_map_falls_back_to_smallest_position_first():
+    # When signals are unreadable (empty map), ranking degrades to
+    # smallest-position-first — the prior conservative behavior is preserved.
+    positions = {
+        "BIG": {"shares": 10, "market_value": 9_000},
+        "SMALL": {"shares": 10, "market_value": 1_000},
+    }
+    out = select_forced_exits(positions, build_conviction_map(None), set(), target_count=1)
+    assert [o["ticker"] for o in out] == ["SMALL"]
 
 
 # ── Drawdown overlay ─────────────────────────────────────────────────────────

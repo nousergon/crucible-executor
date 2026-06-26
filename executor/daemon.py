@@ -48,6 +48,7 @@ from executor.ibkr import IBKRClient
 from executor.intraday_exit_manager import IntradayExitManager
 from executor.intraday_resolve import (
     available_redeploy_cash,
+    build_conviction_map,
     build_redeploy_entry,
     compute_drawdown_overlay,
     select_forced_exits,
@@ -592,6 +593,13 @@ def run_daemon(dry_run: bool = False) -> None:
     )
     monitor.subscribe(tickers)
 
+    # Research-conviction map for intraday drawdown forced-exit ranking
+    # (config#844). Built once from the already-loaded signals payload so
+    # select_forced_exits ranks lowest-conviction-first instead of degrading
+    # to smallest-position-first. Empty map (the prior fallback) if signals
+    # were unreadable, so de-risking still works without it.
+    forced_exit_signals_by_ticker = build_conviction_map(signals_for_surveillance)
+
     # S3 snapshot writer — publishes latest_prices + heartbeat at every poll
     # tick. Surveillance Lambda treats heartbeat staleness as daemon-down.
     snapshot_writer = IntradaySnapshotWriter(
@@ -1116,11 +1124,15 @@ def run_daemon(dry_run: bool = False) -> None:
 
                     # (a) Drawdown de-risk: force-exit lowest-conviction names.
                     # Independent of the shadow log so de-risking works even if
-                    # the log is missing. Ranking has no scores here → falls back
-                    # to smallest-position-first (conservative).
+                    # the log is missing. Ranked by research conviction
+                    # (forced_exit_signals_by_ticker, built once at startup from
+                    # the signals payload, config#844); if signals were
+                    # unreadable the map is empty and ranking falls back to
+                    # smallest-position-first (the prior conservative behavior).
                     if overlay["forced_exit_count"] > 0:
                         for fx in select_forced_exits(
-                            positions, {}, _stopped_out_today | _dd_forced_today,
+                            positions, forced_exit_signals_by_ticker,
+                            _stopped_out_today | _dd_forced_today,
                             overlay["forced_exit_count"],
                         ):
                             ps = monitor.get_price(fx["ticker"])
