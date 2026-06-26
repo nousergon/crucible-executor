@@ -96,25 +96,48 @@ class TestAuditWindow:
         assert res["corrected"] == []
         run_mock.assert_not_called()
 
-    def test_missing_row_triggers_backfill(self, tmp_path):
+    def test_missing_row_flagged_as_gap_not_backfilled(self, tmp_path):
+        # A missing row must be FLAGGED, never auto-synthesized — ledger-replay
+        # backfill can fabricate a wrong NAV (the 06-24 / 20-position incident).
         db = str(tmp_path / "t.db")
         _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])  # 06-24 absent → gap
         settled = {"2026-06-24": 733.24}
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch("executor.backfill_eod_pnl.backfill") as bf_mock, \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
+        bf_mock.assert_not_called()
+        run_mock.assert_not_called()
+        assert res["corrected"] == []
+        assert res["gaps"] and res["gaps"][0]["date"] == "2026-06-24"
 
-        def fake_backfill(d):
+    def test_cascade_stale_return_triggers_reconcile(self, tmp_path):
+        # 06-26's OWN close is correct, but its stored spy_return was computed
+        # against the OLD 06-25 prior before 06-25's close was corrected. The
+        # own-close check alone would miss it; the recomputed-return check catches
+        # the cascade and re-reconciles.
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-25", 734.30, 0.1446, 1.41),
+                       ("2026-06-26", 728.99, -0.6149, 0.22)])  # -0.6149 = STALE return
+        settled = {"2026-06-25": 734.30, "2026-06-26": 728.99}
+        calls = []
+
+        def fake_run(d, *, send_email, run_audit):
+            assert send_email is False and run_audit is False
+            calls.append(d)
             conn = init_db(db)
-            conn.execute("INSERT OR REPLACE INTO eod_pnl (date, portfolio_nav, spy_close, created_at) "
-                         "VALUES (?,?,?,?)", (d, 1_000_000.0, 733.24, f"{d}T20:00:00"))
+            conn.execute("UPDATE eod_pnl SET spy_return_pct=? WHERE date=?", (-0.7231, d))
             conn.commit(); conn.close()
 
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
-             patch("executor.backfill_eod_pnl.backfill", side_effect=fake_backfill) as bf_mock, \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
              patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
              patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
-            res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
-        bf_mock.assert_called_once_with("2026-06-24")
+            res = audit_window(start="2026-06-26", end="2026-06-26", config=_cfg(db))
+        assert calls == ["2026-06-26"]  # only the cascaded day re-reconciled
         assert len(res["corrected"]) == 1
-        assert res["corrected"][0]["reason"] == "missing_row"
+        assert res["corrected"][0]["reason"] == "stale_return"
 
     def test_dry_run_changes_nothing(self, tmp_path):
         db = str(tmp_path / "t.db")

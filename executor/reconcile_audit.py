@@ -8,26 +8,29 @@ human uses for financial decisions stays silently wrong (config#1276: 2026-06-25
 SPY stored 733.50 vs settled 734.30, corrupting daily alpha on 06-25 AND 06-26).
 
 This pass closes that gap institutionally. For a trailing window of trading
-days it compares each stored ``eod_pnl.spy_close`` against the CURRENT settled
-ArcticDB close. Any date that diverged beyond tolerance — or is missing
-entirely (a skipped session) — is corrected by re-running the canonical path
-(``eod_reconcile.run`` for an existing row, ``backfill_eod_pnl.backfill`` for a
-missing row), which re-prices everything from settled ArcticDB and re-emits the
-report artifact. Each correction writes an audit record and pages flow-doctor.
+days it re-reconciles (``eod_reconcile.run``, re-pricing from settled ArcticDB
+and re-emitting the artifact) any day whose stored ``spy_close`` diverged from
+the current settled close OR whose stored ``spy_return`` no longer matches the
+value recomputed from settled closes (the cascade case). Each correction writes
+an audit record and pages flow-doctor.
+
+It does NOT synthesize a NAV for a missing row. Ledger-replay backfill
+(``backfill_eod_pnl``) reconstructs positions from the full trades ledger, which
+can drift from the broker's actual book and fabricate a wrong NAV (config#1276
+follow-up: an auto-backfilled 2026-06-24 produced 20 positions / +51% NAV vs the
+real 7). Gaps are FLAGGED for manual, position-verified backfill instead.
 
 Design notes:
   * The check is CHEAP in the common case — a handful of ArcticDB reads; a
     re-reconcile only fires when a date actually diverged. A clean window is a
     no-op beyond the reads.
   * Corrections run OLDEST→NEWEST so a corrected close propagates into the next
-    day's spy_return denominator (and a backfilled gap row becomes the next
-    day's prior-NAV baseline) within a single pass.
+    day's spy_return denominator within a single pass (the cascade detector
+    then re-reconciles that next day off the now-corrected prior).
   * Re-reconciles run with ``send_email=False`` (never resend an old day's
     email) and ``run_audit=False`` (never recurse into this pass).
-  * Comparison is stored-frozen vs current-ArcticDB — the SAME source the
-    original write read. So any non-trivial divergence means ArcticDB CHANGED
-    since the freeze (a settlement correction), which is exactly what we want
-    to re-pick-up; the tolerance only filters float noise, not real moves.
+  * Both legs of the recomputed spy_return come from settled ArcticDB; the
+    tolerance only filters float noise, not real moves.
 
 Usage:
     python -m executor.reconcile_audit                       # trailing 5 trading days
@@ -156,6 +159,7 @@ def audit_window(
 
     corrected: list[dict] = []
     skipped: list[dict] = []
+    gaps: list[dict] = []
     checked = 0
 
     for d in dates:  # oldest → newest so corrections propagate forward in one pass
@@ -170,26 +174,66 @@ def audit_window(
             (d,),
         ).fetchone()
 
-        # ── Case A: missing row (a skipped session) → ledger-synthesis backfill.
+        # ── Missing row (a skipped session). reconcile_audit does NOT synthesize
+        # a NAV here. Ledger-replay backfill (backfill_eod_pnl) reconstructs
+        # positions from the full trades ledger, which can drift from the
+        # broker's actual book and fabricate a wrong NAV (config#1276 follow-up:
+        # an auto-backfilled 06-24 produced 20 positions / +51% NAV vs the real
+        # 7). A gap is FLAGGED for manual, position-verified backfill — never
+        # auto-synthesized by this (close-staleness) pass.
         if row is None:
-            before = None
-            divergence_bps = None
-            reason = "missing_row"
-        else:
-            stored_close = row[0]
-            if stored_close is None:
-                divergence_bps = float("inf")
-            else:
-                divergence_bps = abs(settled / float(stored_close) - 1.0) * 1e4
-            if divergence_bps <= tolerance_bps:
-                continue  # clean — stored close matches settled within tolerance
-            before = {"spy_close": stored_close, "spy_return_pct": row[1], "daily_alpha_pct": row[2]}
-            reason = "stale_close"
+            logger.warning(
+                "[reconcile_audit] %s has NO eod_pnl row (skipped session) — flagging "
+                "gap for MANUAL backfill; not auto-synthesizing a NAV.", d)
+            gaps.append({"date": d, "settled_spy_close": settled})
+            if fd:
+                fd.report(
+                    RuntimeError(
+                        f"eod_pnl gap at {d}: no row (skipped session). Manually run "
+                        f"`backfill_eod_pnl --date {d}` after verifying held positions."),
+                    severity="warning",
+                    context={"site": "reconcile_audit_gap", "run_date": d})
+            continue
+
+        stored_close, stored_spy_return = row[0], row[1]
+
+        # Detector: re-reconcile if the day's OWN close diverged from settled, OR
+        # if its stored spy_return no longer matches the value recomputed from
+        # settled closes. The second clause catches the CASCADE — a prior day's
+        # close was corrected, so THIS day's spy_return denominator is stale even
+        # though its own close is fine (the 06-26-after-06-25 case). Without it,
+        # an own-close-only detector would never self-heal a cascaded return.
+        own_close_div_bps = (
+            float("inf") if stored_close is None
+            else abs(settled / float(stored_close) - 1.0) * 1e4)
+
+        prior_row = conn.execute(
+            "SELECT date FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1", (d,)
+        ).fetchone()
+        settled_prior = _settled_close(prior_row[0], config) if prior_row else None
+        expected_spy_return = (
+            (settled / settled_prior - 1.0) * 100.0 if settled_prior else None)
+        return_div_bps = (
+            None if (expected_spy_return is None or stored_spy_return is None)
+            else abs(expected_spy_return - float(stored_spy_return)) * 100.0)  # 1% = 100bp
+
+        own_stale = own_close_div_bps > tolerance_bps
+        return_stale = (
+            (stored_spy_return is None and expected_spy_return is not None)
+            or (return_div_bps is not None and return_div_bps > tolerance_bps))
+        if not own_stale and not return_stale:
+            continue  # clean — own close and recomputed spy_return both match
+
+        reason = "stale_close" if own_stale else "stale_return"
+        before = {"spy_close": stored_close, "spy_return_pct": stored_spy_return,
+                  "daily_alpha_pct": row[2]}
+        divergence_bps = own_close_div_bps if own_stale else return_div_bps
 
         logger.warning(
-            "[reconcile_audit] %s needs correction (%s): stored=%s settled=%.2f div=%s bps%s",
-            d, reason, (before or {}).get("spy_close") if before else "—", settled,
-            (f"{divergence_bps:.2f}" if divergence_bps not in (None, float("inf")) else str(divergence_bps)),
+            "[reconcile_audit] %s needs correction (%s): stored_close=%s settled=%.2f "
+            "own_div=%s return_div=%s%s", d, reason, stored_close, settled,
+            (f"{own_close_div_bps:.2f}bp" if own_close_div_bps != float("inf") else "inf"),
+            (f"{return_div_bps:.2f}bp" if return_div_bps is not None else "n/a"),
             " [dry-run]" if dry_run else "",
         )
 
@@ -198,13 +242,9 @@ def audit_window(
                               "before": before, "settled_spy_close": settled, "applied": False})
             continue
 
-        # ── Apply the canonical correction.
+        # ── Apply the canonical correction (re-price + re-emit from settled data).
         try:
-            if reason == "missing_row":
-                from executor.backfill_eod_pnl import backfill
-                backfill(d)  # synthesizes the snapshot + runs eod_run (no email, no audit)
-            else:
-                eod_run(d, send_email=send_email, run_audit=False)
+            eod_run(d, send_email=send_email, run_audit=False)
         except Exception as e:  # noqa: BLE001 — per-date isolation: one bad day must not abort the sweep
             logger.error("[reconcile_audit] correction FAILED for %s: %s", d, e)
             if fd:
@@ -248,12 +288,13 @@ def audit_window(
         "checked": checked,
         "corrected": corrected,
         "skipped": skipped,
+        "gaps": gaps,
         "tolerance_bps": tolerance_bps,
         "dry_run": dry_run,
         "window": dates,
     }
-    logger.info("[reconcile_audit] done: checked=%d corrected=%d skipped=%d dry_run=%s",
-                checked, len(corrected), len(skipped), dry_run)
+    logger.info("[reconcile_audit] done: checked=%d corrected=%d gaps=%d skipped=%d dry_run=%s",
+                checked, len(corrected), len(gaps), len(skipped), dry_run)
     return summary
 
 
