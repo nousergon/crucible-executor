@@ -72,6 +72,29 @@ def compute_drawdown_overlay(
     }
 
 
+def build_conviction_map(signals_payload: dict | None) -> dict[str, dict]:
+    """Flatten a ``signals.json`` payload into a ``{ticker: record}`` map for
+    forced-exit conviction ranking (config#844).
+
+    Records are drawn from the ``universe`` + ``buy_candidates`` lists (mirroring
+    main.py §2d's ``signals_by_ticker`` construction); the first record wins on a
+    duplicate ticker. Returns an empty map for a missing/empty/malformed payload
+    so callers degrade to the smallest-position-first fallback in
+    :func:`select_forced_exits` rather than raising.
+    """
+    out: dict[str, dict] = {}
+    if not signals_payload:
+        return out
+    records = (signals_payload.get("universe") or []) + (signals_payload.get("buy_candidates") or [])
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        ticker = rec.get("ticker")
+        if ticker and ticker not in out:
+            out[ticker] = rec
+    return out
+
+
 def select_forced_exits(
     current_positions: dict[str, dict],
     signals_by_ticker: dict[str, dict],
