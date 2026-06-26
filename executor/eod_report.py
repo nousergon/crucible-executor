@@ -180,8 +180,17 @@ def build_eod_report(
     roundtrip_stats: dict | None = None,
     data_warnings: list[str] | None = None,
     generated_at: str | None = None,
+    spy_close_provisional: bool = False,
 ) -> dict:
-    """Assemble the structured EOD report payload (the ``eod_report.json`` artifact)."""
+    """Assemble the structured EOD report payload (the ``eod_report.json`` artifact).
+
+    ``spy_close_provisional`` marks the day's SPY close (and therefore the
+    headline ``spy_return_pct``/``daily_alpha_pct``) as not-yet-settled. The
+    same-day EOD run reads SPY from ArcticDB at ~4:20pm ET, which can still be
+    a pre-settlement value (config#1276); the T+1 ``reconcile_audit`` pass
+    re-derives it from the settled close and re-emits with the flag cleared.
+    The console surfaces this so a human knows when a number is provisional.
+    """
     acct = account_snapshot or {}
     recon = nav_reconciliation or {}
     narratives = position_narratives or {}
@@ -242,6 +251,7 @@ def build_eod_report(
             "daily_return_pct": daily_return,
             "spy_return_pct": spy_return,
             "daily_alpha_pct": alpha,
+            "spy_close_provisional": bool(spy_close_provisional),
             "dollar_alpha": attribution["dollar_alpha"] if attribution else None,
             "cash": acct.get("total_cash"),
             "positions_mv": acct.get("gross_position_value"),

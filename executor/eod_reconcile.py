@@ -472,9 +472,26 @@ def _apply_dividend_delta(
         pos["dividend_paid_usd"] = -div_delta
 
 
-def run(run_date: str | None = None) -> None:
+def run(
+    run_date: str | None = None,
+    *,
+    send_email: bool = True,
+    run_audit: bool = True,
+) -> None:
+    """Reconcile EOD P&L for ``run_date`` against the settled ArcticDB closes.
+
+    ``send_email``: when False, the outbound EOD email is suppressed. A
+    re-reconcile / correction pass (``reconcile_audit``) re-runs this for a
+    PAST date to fix a value frozen pre-settlement — it must re-emit the
+    ``eod_report.json`` artifact (kept) but must NOT resend that day's email.
+
+    ``run_audit``: when True (the live daily run), the trailing-window
+    ``reconcile_audit`` self-heal pass fires at the end. The audit pass itself
+    calls ``run(..., run_audit=False)`` so the re-reconcile can't recurse.
+    """
+    today_trading_day = now_dual().trading_day
     if run_date is None:
-        run_date = now_dual().trading_day
+        run_date = today_trading_day
         logger.info(
             "EOD reconciliation | date=%s (resolved from now_dual().trading_day)",
             run_date,
@@ -648,34 +665,42 @@ def run(run_date: str | None = None) -> None:
         logger.warning(hdr_warn)
         data_warnings.append(hdr_warn)
 
-    # SPY return for the day
+    # SPY return for the day.
+    #
+    # Both legs are read from the SETTLED ArcticDB macro source — the prior
+    # leg is NOT taken from the stored ``eod_pnl.spy_close`` (config#1276).
+    # Freezing the prior close meant that any day whose stored close was a
+    # pre-settlement value (captured at same-day ~4:20pm ET, before the
+    # official close lands in ArcticDB) silently corrupted the NEXT day's
+    # spy_return as the denominator — and never self-healed when ArcticDB
+    # later corrected. Windowing stays gap-consistent: we still span to the
+    # prior *eod_pnl* DATE (the same baseline ``prior_nav`` uses, so SPY and
+    # the portfolio measure the same interval across a skipped session), but
+    # the close VALUE is always the authoritative settled close for that date.
     spy_price = _spy_close(run_date, config)
     spy_return = None
     if spy_price:
-        # Try cached prior SPY close from eod_pnl first
-        spy_prior_row = conn.execute(
-            "SELECT spy_close FROM eod_pnl WHERE spy_close IS NOT NULL AND date < ? ORDER BY date DESC LIMIT 1",
+        prior_date_row = conn.execute(
+            "SELECT date FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
             (run_date,),
         ).fetchone()
-        if spy_prior_row and spy_prior_row[0]:
-            spy_return = (spy_price / spy_prior_row[0] - 1) * 100
-        else:
-            # Fallback: fetch SPY close for the actual prior eod_pnl date
-            # (avoids period="2d" which only gets 1 day regardless of gaps)
-            prior_date_row = conn.execute(
-                "SELECT date FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
-                (run_date,),
-            ).fetchone()
-            if prior_date_row:
-                prior_spy = _spy_close(prior_date_row[0])
-                if prior_spy:
-                    spy_return = (spy_price / prior_spy - 1) * 100
-                else:
-                    logger.warning("Could not fetch SPY close for prior date %s", prior_date_row[0])
+        if prior_date_row:
+            prior_spy = _spy_close(prior_date_row[0], config)
+            if prior_spy:
+                spy_return = (spy_price / prior_spy - 1) * 100
             else:
-                logger.warning("No prior eod_pnl row — cannot compute SPY return")
+                logger.warning("Could not fetch settled SPY close for prior date %s", prior_date_row[0])
+        else:
+            logger.warning("No prior eod_pnl row — cannot compute SPY return")
 
     alpha = (daily_return - spy_return) if (daily_return is not None and spy_return is not None) else None
+
+    # Same-day EOD reads run_date's SPY close from ArcticDB at ~4:20pm ET,
+    # which can still be pre-settlement. Mark the artifact provisional so the
+    # console flags it and the T+1 reconcile_audit pass re-finalizes it from
+    # the settled close. A re-reconcile of a PAST date (run_date earlier than
+    # today's trading_day) is by definition post-settlement → final.
+    spy_close_provisional = run_date == today_trading_day
 
     logger.info(
         f"NAV=${nav:,.2f} | daily={daily_return:.2f}% | "
@@ -1130,6 +1155,7 @@ def run(run_date: str | None = None) -> None:
             roundtrip_stats=roundtrip_stats,
             data_warnings=data_warnings,
             generated_at=snapshot.get("captured_at"),
+            spy_close_provisional=spy_close_provisional,
         )
         attribution = report.get("alpha_attribution")
         if attribution is not None and not attribution.get("ties_to_headline"):
@@ -1145,24 +1171,31 @@ def run(run_date: str | None = None) -> None:
             fd.report(e, severity="error", context={
                 "site": "eod_report_artifact", "run_date": run_date})
 
-    try:
-        send_eod_email(
-            run_date=run_date,
-            nav=nav,
-            daily_return=daily_return,
-            spy_return=spy_return,
-            alpha=alpha,
-            sender=config["email_sender"],
-            recipients=config["email_recipients"],
-            account_snapshot=account,
-            data_warnings=data_warnings,
-            console_base_url=config.get("console_base_url"),
+    if not send_email:
+        logger.info(
+            "send_email=False — skipping EOD email for %s (re-reconcile / "
+            "reconcile_audit correction pass; artifact re-emitted, no resend).",
+            run_date,
         )
-    except Exception as e:
-        logger.error(f"EOD email failed: {e}")
-        if fd:
-            fd.report(e, severity="error", context={
-                "site": "eod_email", "run_date": run_date})
+    else:
+        try:
+            send_eod_email(
+                run_date=run_date,
+                nav=nav,
+                daily_return=daily_return,
+                spy_return=spy_return,
+                alpha=alpha,
+                sender=config["email_sender"],
+                recipients=config["email_recipients"],
+                account_snapshot=account,
+                data_warnings=data_warnings,
+                console_base_url=config.get("console_base_url"),
+            )
+        except Exception as e:
+            logger.error(f"EOD email failed: {e}")
+            if fd:
+                fd.report(e, severity="error", context={
+                    "site": "eod_email", "run_date": run_date})
 
     # Write health status
     try:
@@ -1221,6 +1254,34 @@ def run(run_date: str | None = None) -> None:
     except Exception as _ue:
         logger.warning("Uptime tracker failed: %s", _ue)
 
+    # ── T+1 self-heal: re-reconcile any prior day whose stored SPY close has
+    # since diverged from the now-settled ArcticDB close (config#1276). Cheap
+    # in the common case (a few ArcticDB reads, no re-reconcile when clean).
+    # Fail-soft: a correction-pass error must never break the primary EOD.
+    # ``run_audit=False`` on the live run is how the audit's own re-reconciles
+    # avoid recursing back into the audit.
+    if run_audit:
+        try:
+            from executor.reconcile_audit import audit_window
+            _audit = audit_window(exclude_dates={run_date}, send_email=False)
+            if _audit.get("corrected"):
+                logger.warning(
+                    "[reconcile_audit] corrected %d prior day(s) against settled "
+                    "ArcticDB: %s", len(_audit["corrected"]),
+                    [c["date"] for c in _audit["corrected"]],
+                )
+            else:
+                logger.info(
+                    "[reconcile_audit] clean — %d trailing day(s) checked, all "
+                    "stored SPY closes match settled ArcticDB within tolerance.",
+                    _audit.get("checked", 0),
+                )
+        except Exception as _ae:  # noqa: BLE001 — self-heal is secondary; primary EOD already wrote
+            logger.warning("[reconcile_audit] trailing self-heal FAILED (non-fatal): %s", _ae)
+            if fd:
+                fd.report(_ae, severity="warning", context={
+                    "site": "reconcile_audit_selfheal", "run_date": run_date})
+
     if fd:
         fd.log_summary(logger)
     conn.close()
@@ -1233,18 +1294,31 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "EOD reconciliation. Defaults to today's trading_day "
-            "(via nousergon_lib.dates.now_dual). Hard-fails on any "
-            "explicit --date that isn't today: live IB state would corrupt "
-            "the historical row's NAV/positions."
+            "(via nousergon_lib.dates.now_dual). A past --date is SAFE: since "
+            "the 2026-04-28 snapshot cutover, the row keyed by run_date sources "
+            "its NAV/positions from the durable S3 snapshot for that date (not "
+            "now-as-of IB state) and re-prices from settled ArcticDB, so "
+            "re-reconciling a past day is the canonical correction path "
+            "(config#1276). Requires a snapshot for the date."
         )
     )
     parser.add_argument(
         "--date",
         default=None,
-        help="YYYY-MM-DD; must equal today's trading_day or the run aborts.",
+        help="YYYY-MM-DD; defaults to today's trading_day. A past date re-reconciles from its snapshot.",
+    )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Suppress the EOD email (for a manual re-reconcile / correction of a past day).",
+    )
+    parser.add_argument(
+        "--no-audit",
+        action="store_true",
+        help="Skip the trailing reconcile_audit self-heal pass.",
     )
     args = parser.parse_args()
     # Capture an uncaught crash via flow-doctor before re-raising
     # (no-ops when flow-doctor is inactive).
     with guard_entrypoint():
-        run(run_date=args.date)
+        run(run_date=args.date, send_email=not args.no_email, run_audit=not args.no_audit)
