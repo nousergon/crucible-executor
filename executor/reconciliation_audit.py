@@ -6,16 +6,23 @@ tile, criticality=critical).
 
 The audit compares the system's OWN trade ledger (the ``trades`` table — what
 the daemon *recorded* it executed) against IB's actual broker state (the EOD
-snapshot — what the broker really holds). Two independent checks:
+snapshot — what the broker really holds). The integrity checks:
 
-  A. **Position parity** — the headline ``reconciliation_match_rate``.
-     Reconstruct net shares per ticker from the ledger (Σ signed
-     ``filled_shares``) and compare to IB's reported positions. Catches the
-     failures worth catching: fills the system never recorded, positions that
-     drifted, the daemon believing it holds X while IB holds Y.
-  B. **Daily-delta integrity** — a supporting per-day signal. Today's IB
-     position changes (today snapshot vs prior snapshot) vs today's recorded
-     ledger fills. Sidesteps the historical-baseline problem in (A).
+  A. **Anchored position parity** — the headline ``reconciliation_match_rate``
+     (config#1301). ``expected[t] = prior_broker_snapshot[t] + today's
+     recorded ledger fills``, compared to IB's actual book today. A mismatch
+     is TODAY's unexplained change — a fill the system never recorded, an
+     untracked same-day corporate action, or fresh drift. Anchoring on the
+     broker's own prior-day positions (ground truth) means the metric is NOT
+     dominated by the pre-ledger baseline gap; it is the honest day-over-day
+     integrity signal (mirrors the NAV anchoring of config#1281 / PR #296).
+  B. **Cumulative-ledger parity** — a DIAGNOSTIC (``cumulative_ledger_parity``):
+     net shares reconstructed from the entire ledger from inception vs IB.
+     Structurally depressed by positions predating the ledger (baseline gap)
+     and un-split-adjusted corporate actions — this is exactly why it was
+     demoted from the headline (it graded a false ~0.20 DRIFT while the live
+     book was ~aligned). Retained for operator visibility and as the
+     cold-start fallback headline when no prior snapshot exists to anchor on.
 
 DELIBERATELY NOT a NAV tautology: computing a "daemon NAV" as
 ``Σ(IB position market_value) + IB cash`` and comparing it to IB
@@ -24,11 +31,14 @@ DELIBERATELY NOT a NAV tautology: computing a "daemon NAV" as
 ledger is the only independent source, so the metric is built on it.
 
 Known reconstruction caveats (surfaced in the artifact, not hidden):
-  - Positions predating the trade ledger reconstruct short (baseline gap).
-  - Corporate actions (splits/spinoffs) change IB shares with no ledger
-    trade → an expected mismatch until the ledger is split-adjusted.
-  - These are why (B)'s daily-delta — which needs no historical baseline —
-    is reported alongside (A).
+  - Positions predating the trade ledger reconstruct short (baseline gap) —
+    these depress the cumulative diagnostic (B) but NOT the anchored headline
+    (A), which starts from the broker's prior snapshot.
+  - Corporate actions (splits/spinoffs) change IB shares with no ledger trade
+    → an expected mismatch on the action day until the ledger is
+    split-adjusted (follow-up); both (A) and (B) see it on that day.
+  - This baseline asymmetry is exactly why (A) anchors on the prior broker
+    snapshot + today's fills rather than replaying the ledger from inception.
 """
 
 from __future__ import annotations
@@ -129,27 +139,61 @@ def _ib_shares(positions: dict[str, Any]) -> dict[str, int]:
     return out
 
 
-def build_reconciliation_audit(
-    conn,
-    *,
-    today_positions: dict[str, Any],
-    prior_positions: Optional[dict[str, Any]],
-    run_date: str,
-    ib_nav: Optional[float] = None,
-    generated_at: Optional[str] = None,
-) -> dict[str, Any]:
-    """Build the reconciliation-audit payload (pure — no I/O).
+def _anchored_parity(
+    prior_ib: dict[str, int], ib: dict[str, int], ledger_today: dict[str, int]
+) -> tuple[float, list[str], int, list[dict[str, Any]]]:
+    """Absolute-position parity ANCHORED on the prior broker snapshot + today's
+    recorded fills (config#1301).
 
-    ``reconciliation_match_rate`` (the report-card metric) is the fraction of
-    positions where the ledger-reconstructed net shares equal IB's reported
-    shares, over the UNION of tickers that either side holds. A ticker IB
-    holds but the ledger can't explain (or vice-versa) is a mismatch — that
-    is the integrity signal.
+    ``expected[t] = prior_ib[t] + ledger_today[t]`` is what the system should
+    hold today IF its ledger captured every fill, started from the broker's
+    own prior-day EOD positions (ground truth). A mismatch vs the actual IB
+    book is therefore TODAY's unexplained change — an unrecorded fill, an
+    untracked same-day corporate action, or fresh drift — NOT an artifact of
+    pre-ledger history. This trusts the broker's prior snapshot as the
+    baseline rather than replaying the ledger from inception, mirroring the
+    prior-snapshot anchoring shipped for NAV in config#1281 (PR #296).
+
+    Returns ``(match_rate, universe, n_matched, mismatches)``.
     """
-    ledger = reconstruct_ledger_positions(conn, as_of_date=run_date)
-    ib = _ib_shares(today_positions)
+    universe = sorted(set(prior_ib) | set(ib) | set(ledger_today))
+    mismatches: list[dict[str, Any]] = []
+    n_matched = 0
+    for t in universe:
+        expected = prior_ib.get(t, 0) + ledger_today.get(t, 0)
+        actual = ib.get(t, 0)
+        if abs(expected - actual) <= _RECON_TOLERANCE_SHARES:
+            n_matched += 1
+        else:
+            mismatches.append({
+                "ticker": t,
+                "prior_ib_shares": prior_ib.get(t, 0),
+                "ledger_today_shares": ledger_today.get(t, 0),
+                "expected_shares": expected,
+                "ib_shares": actual,
+                "delta": actual - expected,
+                "kind": (
+                    "ib_only" if expected == 0 else
+                    "missing_in_ib" if actual == 0 else "share_mismatch"
+                ),
+            })
+    rate = 1.0 if not universe else round(n_matched / len(universe), 4)
+    return rate, universe, n_matched, mismatches
 
-    # ── A. Position parity (headline) ──
+
+def _cumulative_parity(
+    ledger: dict[str, int], ib: dict[str, int]
+) -> tuple[float, list[str], int, list[dict[str, Any]]]:
+    """Full-ledger-replay parity: net shares reconstructed from the ENTIRE
+    trades ledger (from inception) vs IB's current book.
+
+    Structurally depressed by positions predating the ledger (baseline gap)
+    and un-split-adjusted corporate actions, so it is no longer the headline
+    metric (config#1301) — retained as a diagnostic and as the cold-start
+    fallback when no prior broker snapshot is available to anchor on.
+
+    Returns ``(match_rate, universe, n_matched, mismatches)``.
+    """
     universe = sorted(set(ledger) | set(ib))
     mismatches: list[dict[str, Any]] = []
     n_matched = 0
@@ -166,65 +210,132 @@ def build_reconciliation_audit(
                     "ledger_only" if ibq == 0 else "share_mismatch"
                 ),
             })
-    # Empty universe (no positions either side) is a vacuous match → 1.0.
-    match_rate = 1.0 if not universe else round(n_matched / len(universe), 4)
+    rate = 1.0 if not universe else round(n_matched / len(universe), 4)
+    return rate, universe, n_matched, mismatches
 
-    # ── B. Daily-delta integrity (supporting) ──
+
+def build_reconciliation_audit(
+    conn,
+    *,
+    today_positions: dict[str, Any],
+    prior_positions: Optional[dict[str, Any]],
+    run_date: str,
+    ib_nav: Optional[float] = None,
+    generated_at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Build the reconciliation-audit payload (pure — no I/O).
+
+    The headline ``reconciliation_match_rate`` (the report-card metric) is
+    ANCHORED parity (config#1301): the fraction of tickers where the broker's
+    prior-day positions plus today's recorded ledger fills equal IB's actual
+    book today. This is the honest day-over-day integrity signal — it catches
+    unrecorded fills and fresh drift while NOT penalising the pre-ledger
+    baseline gap or un-split-adjusted corporate actions that structurally
+    depressed the old from-inception replay (which graded a false ~0.20 DRIFT
+    while the live book was ~aligned).
+
+    Anchoring requires a prior broker snapshot. When ``prior_positions`` is
+    ``None`` (genuinely unavailable — e.g. the very first EOD, or a missing/
+    corrupt snapshot), the headline falls back to the from-inception
+    ``cumulative`` replay (``anchored: false``) so the metric is never built
+    on a phantom empty baseline. The cumulative replay is ALWAYS computed and
+    surfaced under ``cumulative_ledger_parity`` as a diagnostic.
+    """
+    ib = _ib_shares(today_positions)
+    ledger_cum = reconstruct_ledger_positions(conn, as_of_date=run_date)
+    cum_rate, cum_universe, cum_matched, cum_mismatches = _cumulative_parity(
+        ledger_cum, ib
+    )
+
+    anchored = prior_positions is not None
     daily: dict[str, Any] = {"computed": False}
-    if prior_positions is not None:
+    if anchored:
         prior_ib = _ib_shares(prior_positions)
         ledger_today = reconstruct_ledger_positions(conn, on_date=run_date)
-        d_universe = sorted(set(prior_ib) | set(ib) | set(ledger_today))
-        d_mismatches: list[dict[str, Any]] = []
-        d_matched = 0
-        for t in d_universe:
-            ib_delta = ib.get(t, 0) - prior_ib.get(t, 0)
-            led_delta = ledger_today.get(t, 0)
-            if ib_delta == led_delta:
-                d_matched += 1
-            elif ib_delta != 0 or led_delta != 0:
-                d_mismatches.append({
-                    "ticker": t, "ib_delta": ib_delta, "ledger_delta": led_delta,
-                })
-            else:
-                d_matched += 1
+        match_rate, universe, n_matched, mismatches = _anchored_parity(
+            prior_ib, ib, ledger_today
+        )
+        position_parity = {
+            "basis": "anchored",
+            "prior_ib_positions": prior_ib,
+            "ledger_today": ledger_today,
+            "ib_positions": ib,
+            "mismatches": mismatches,
+        }
+        # daily_delta is the delta-view of the same anchored reconciliation
+        # (expected==actual ⟺ ib_delta==ledger_delta) — kept for consumers
+        # that read the per-day signal directly.
         daily = {
             "computed": True,
-            "match_rate": (
-                1.0 if not d_universe else round(d_matched / len(d_universe), 4)
-            ),
-            "n_tickers": len(d_universe),
-            "n_matched": d_matched,
-            "mismatches": d_mismatches,
+            "match_rate": match_rate,
+            "n_tickers": len(universe),
+            "n_matched": n_matched,
+            "mismatches": [
+                {
+                    "ticker": m["ticker"],
+                    "ib_delta": m["ib_shares"] - m["prior_ib_shares"],
+                    "ledger_delta": m["ledger_today_shares"],
+                }
+                for m in mismatches
+            ],
+        }
+    else:
+        # Cold-start fallback: no prior snapshot to anchor on.
+        match_rate, universe, n_matched, mismatches = (
+            cum_rate, cum_universe, cum_matched, cum_mismatches
+        )
+        position_parity = {
+            "basis": "cumulative_ledger",
+            "ledger_positions": ledger_cum,
+            "ib_positions": ib,
+            "mismatches": mismatches,
         }
 
     status = "OK" if match_rate >= 1.0 else "DRIFT"
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "date": run_date,
         "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
         # Headline metric consumed by the evaluator reconciliation_integrity grader.
         "reconciliation_match_rate": match_rate,
+        "anchored": anchored,
         "status": status,
         "n_positions": len(universe),
         "n_matched": n_matched,
         "n_mismatched": len(mismatches),
-        "position_parity": {
-            "ledger_positions": ledger,
-            "ib_positions": ib,
-            "mismatches": mismatches,
-        },
+        "position_parity": position_parity,
         "daily_delta": daily,
+        # Diagnostic only (config#1301): from-inception ledger replay vs IB.
+        # Structurally depressed by the pre-ledger baseline gap + un-split-
+        # adjusted corporate actions — NOT the headline. Surfaced so operators
+        # can still see the cumulative divergence and its drivers.
+        "cumulative_ledger_parity": {
+            "match_rate": cum_rate,
+            "n_positions": len(cum_universe),
+            "n_matched": cum_matched,
+            "n_mismatched": len(cum_mismatches),
+            "mismatches": cum_mismatches,
+            "note": (
+                "Full-ledger replay from inception vs IB; structurally "
+                "depressed by positions predating the ledger (baseline gap) "
+                "and un-split-adjusted corporate actions. Diagnostic only — "
+                "the headline reconciliation_match_rate anchors on the prior "
+                "broker snapshot + today's fills instead."
+            ),
+        },
         # Informational only — NAV parity is NOT the metric (an IB-derived
         # daemon NAV would be a tautology). Recorded for operator context.
         "ib_nav": ib_nav,
         "caveats": [
-            "Ledger reconstruction nets signed filled_shares from the trades "
-            "table; positions predating the ledger reconstruct short.",
-            "Corporate actions (splits/spinoffs) change IB shares with no "
-            "ledger trade and surface as expected mismatches until the ledger "
-            "is split-adjusted — cross-check the daily_delta signal, which "
-            "needs no historical baseline.",
+            "Headline parity anchors on the prior broker snapshot + today's "
+            "recorded fills (config#1301): a mismatch is TODAY's unexplained "
+            "change, not pre-ledger history.",
+            "Same-day corporate actions (splits/spinoffs) change IB shares "
+            "with no ledger trade and surface as expected mismatches on the "
+            "action day until the ledger is split-adjusted (follow-up).",
+            "When no prior broker snapshot is available the headline falls "
+            "back to the from-inception cumulative replay (anchored=false); "
+            "see cumulative_ledger_parity for the always-computed diagnostic.",
         ],
     }
     return payload
