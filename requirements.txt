@@ -56,6 +56,11 @@ requests~=2.32
 # extra (leaving flow-doctor stale/absent). `[flow-doctor]` is the PEP 685
 # canonical form and resolves on every pip version (config#1178).
 nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
+# krepis (MIT foundation) — direct pin: eod_emailer.py now imports the lifted
+# console deep-link chokepoint `krepis.console.console_url` (config#1300, krepis
+# v0.4.0 added it). nousergon-lib pulls krepis transitively, but the direct
+# import warrants the direct pin documenting the >=0.4.0 minimum.
+krepis>=0.4.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at

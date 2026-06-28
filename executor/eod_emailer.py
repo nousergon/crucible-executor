@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import logging
 
+from krepis.console import console_url
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONSOLE_BASE_URL = "https://console.nousergon.ai"
 # Pinned slug — must match the EOD Report page's ``url_path`` in
 # alpha-engine-dashboard app.py. A drift here breaks the email deep-link
-# (config#856 Phase 2.5). Guarded by the dashboard's slug-drift test.
+# (config#856 Phase 2.5). Guarded by the dashboard's slug-drift test. The
+# slug stays local: it's the cross-repo contract with the dashboard page.
 EOD_REPORT_SLUG = "eod-report"
 
 _HTML = """\
@@ -87,9 +89,13 @@ def _plain_pct(v: float | None) -> str:
 
 
 def eod_report_url(run_date: str, console_base_url: str | None = None) -> str:
-    """Deep-link to the console EOD Report page for ``run_date``."""
-    base = (console_base_url or DEFAULT_CONSOLE_BASE_URL).rstrip("/")
-    return f"{base}/{EOD_REPORT_SLUG}?date={run_date}"
+    """Deep-link to the console EOD Report page for ``run_date``.
+
+    Thin wrapper over the lifted :func:`krepis.console.console_url` chokepoint
+    (config#1300) — the base-URL literal now lives once in krepis. The slug
+    stays local (cross-repo contract with the dashboard ``url_path``).
+    """
+    return console_url(EOD_REPORT_SLUG, date=run_date, base=console_base_url)
 
 
 def build_eod_email(
