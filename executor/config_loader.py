@@ -102,3 +102,42 @@ def load_config() -> dict:
     """Load and return the risk.yaml config dict. Resolves the path lazily."""
     with open(get_config_path()) as f:
         return yaml.safe_load(f)
+
+
+def get_flow_doctor_yaml_path() -> str:
+    """Resolve the executor flow-doctor.yaml, experiment-package-first (config#1042).
+
+    Mirrors :func:`get_config_path` (risk.yaml) so the flow-doctor alerting /
+    log-suppression config loads from the experiment package
+    (``experiments/$ALPHA_ENGINE_EXPERIMENT_ID/executor/flow-doctor.yaml``)
+    ahead of the legacy top-level config-repo copy
+    (``alpha-engine-config/executor/flow-doctor.yaml``), with the in-repo
+    ``flow-doctor.yaml`` at the executor repo root as the final fallback.
+    This closes the last executor-loader gap in config#1042 ("Same for
+    flow-doctor.yaml resolution if applicable"): before this, all four
+    entrypoints (main/daemon/eod/snapshot) hard-coded the repo-root copy and
+    never consulted the experiment package.
+
+    Unlike :func:`get_config_path`, a missing config here must NOT raise: every
+    executor entrypoint calls ``setup_logging`` with this path at *import time*,
+    so a ``FileNotFoundError`` would block process startup. The repo-root copy
+    ships in-tree (always present in a normal checkout), so resolution normally
+    succeeds at the package or repo-root candidate; if nothing resolves (e.g. an
+    installed wheel that did not vendor the yaml), we degrade exactly as the
+    pre-config#1042 code did — hand ``setup_logging`` the repo-root path, which
+    it simply ignores unless ``FLOW_DOCTOR_ENABLED=1``.
+    """
+    repo_root_copy = os.path.join(_REPO_ROOT, "flow-doctor.yaml")
+    try:
+        return str(
+            resolve_experiment_config(
+                "executor",
+                "flow-doctor.yaml",
+                repo_root=_REPO_ROOT,
+                repo_local_fallback=repo_root_copy,
+                resolve=True,
+                resolve_symlinks=True,
+            )
+        )
+    except FileNotFoundError:
+        return repo_root_copy

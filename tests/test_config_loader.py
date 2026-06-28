@@ -79,3 +79,58 @@ def test_load_config_raises_when_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(config_loader, "_SEARCH_PATHS", [str(tmp_path / "nope.yaml")])
     with pytest.raises(FileNotFoundError):
         config_loader.load_config()
+
+
+# ── flow-doctor.yaml resolution (config#1042) ───────────────────────────────
+
+
+def test_flow_doctor_path_prefers_experiment_package(tmp_path, monkeypatch):
+    """flow-doctor.yaml resolves from the experiment package ahead of the
+    legacy top-level config-repo copy and the repo-root fallback (config#1042)."""
+    monkeypatch.setenv("ALPHA_ENGINE_EXPERIMENT_ID", "myexp")
+    # Lay out a fake config repo as a sibling of the executor repo root, with
+    # BOTH a package copy and a legacy top-level copy of flow-doctor.yaml.
+    repo_root = tmp_path / "crucible-executor"
+    (repo_root).mkdir()
+    (repo_root / "flow-doctor.yaml").write_text("flow_name: repo-root\n")  # repo-root fallback
+    cfg = tmp_path / "alpha-engine-config"
+    pkg = cfg / "experiments" / "myexp" / "executor"
+    pkg.mkdir(parents=True)
+    (pkg / "flow-doctor.yaml").write_text("flow_name: package\n")
+    legacy = cfg / "executor"
+    legacy.mkdir(parents=True)
+    (legacy / "flow-doctor.yaml").write_text("flow_name: legacy\n")
+    monkeypatch.setattr(config_loader, "_REPO_ROOT", str(repo_root))
+    # Keep HOME from resolving a real ~/alpha-engine-config during the test.
+    monkeypatch.setenv("HOME", str(tmp_path / "nohome"))
+
+    resolved = config_loader.get_flow_doctor_yaml_path()
+    assert resolved == os.path.realpath(str(pkg / "flow-doctor.yaml"))
+
+
+def test_flow_doctor_path_falls_back_to_repo_root(tmp_path, monkeypatch):
+    """With no config-repo copy present, flow-doctor.yaml resolves to the
+    in-repo repo-root copy (preserves pre-config#1042 behavior)."""
+    monkeypatch.delenv("ALPHA_ENGINE_EXPERIMENT_ID", raising=False)
+    repo_root = tmp_path / "crucible-executor"
+    repo_root.mkdir()
+    (repo_root / "flow-doctor.yaml").write_text("flow_name: repo-root\n")
+    monkeypatch.setattr(config_loader, "_REPO_ROOT", str(repo_root))
+    monkeypatch.setenv("HOME", str(tmp_path / "nohome"))
+
+    resolved = config_loader.get_flow_doctor_yaml_path()
+    assert resolved == os.path.realpath(str(repo_root / "flow-doctor.yaml"))
+
+
+def test_flow_doctor_path_never_raises_when_absent(tmp_path, monkeypatch):
+    """Even with no copy anywhere, resolution degrades to the repo-root path
+    string rather than raising — setup_logging runs at import time and must
+    never be blocked by a missing flow-doctor.yaml."""
+    monkeypatch.delenv("ALPHA_ENGINE_EXPERIMENT_ID", raising=False)
+    repo_root = tmp_path / "crucible-executor"
+    repo_root.mkdir()  # no flow-doctor.yaml written anywhere
+    monkeypatch.setattr(config_loader, "_REPO_ROOT", str(repo_root))
+    monkeypatch.setenv("HOME", str(tmp_path / "nohome"))
+
+    resolved = config_loader.get_flow_doctor_yaml_path()
+    assert resolved == os.path.join(str(repo_root), "flow-doctor.yaml")
