@@ -86,26 +86,28 @@ class TestReconstruct:
 
 class TestBuildAudit:
     def test_perfect_match_is_green(self):
+        # Anchored headline: prior broker book + today's recorded fills == IB.
         conn = _conn([
-            {"ticker": "AAPL", "action": "ENTER", "filled_shares": 100, "status": "Filled"},
-            {"ticker": "MSFT", "action": "ENTER", "filled_shares": 50, "status": "Filled"},
+            {"ticker": "AAPL", "action": "ENTER", "filled_shares": 30, "status": "Filled", "date": "2026-06-18"},
         ])
         audit = build_reconciliation_audit(
-            conn, today_positions=_pos(AAPL=100, MSFT=50),
-            prior_positions={}, run_date="2026-06-18", ib_nav=1_000_000.0,
+            conn, today_positions=_pos(AAPL=130, MSFT=50),
+            prior_positions=_pos(AAPL=100, MSFT=50), run_date="2026-06-18",
+            ib_nav=1_000_000.0,
         )
         assert audit["reconciliation_match_rate"] == 1.0
+        assert audit["anchored"] is True
         assert audit["status"] == "OK"
         assert audit["n_mismatched"] == 0
+        assert audit["position_parity"]["basis"] == "anchored"
 
     def test_ib_only_position_is_mismatch(self):
-        # IB holds GOOG the ledger never recorded buying — a real integrity hit.
-        conn = _conn([
-            {"ticker": "AAPL", "action": "ENTER", "filled_shares": 100, "status": "Filled"},
-        ])
+        # IB holds GOOG that neither the prior snapshot nor today's fills
+        # explain — a real same-day integrity hit (expected 0, actual 20).
+        conn = _conn([])
         audit = build_reconciliation_audit(
             conn, today_positions=_pos(AAPL=100, GOOG=20),
-            prior_positions={}, run_date="2026-06-18",
+            prior_positions=_pos(AAPL=100), run_date="2026-06-18",
         )
         assert audit["reconciliation_match_rate"] == 0.5
         assert audit["status"] == "DRIFT"
@@ -113,21 +115,64 @@ class TestBuildAudit:
         assert kinds == {"GOOG": "ib_only"}
 
     def test_share_mismatch_detected(self):
+        # Prior 100, ledger records a +30 ENTER today → expected 130, but IB
+        # shows only 120: a 10-share unexplained shortfall today.
+        conn = _conn([
+            {"ticker": "AAPL", "action": "ENTER", "filled_shares": 30, "status": "Filled", "date": "2026-06-18"},
+        ])
+        audit = build_reconciliation_audit(
+            conn, today_positions=_pos(AAPL=120),
+            prior_positions=_pos(AAPL=100), run_date="2026-06-18",
+        )
+        m = audit["position_parity"]["mismatches"][0]
+        assert m == {
+            "ticker": "AAPL", "prior_ib_shares": 100, "ledger_today_shares": 30,
+            "expected_shares": 130, "ib_shares": 120, "delta": -10,
+            "kind": "share_mismatch",
+        }
+
+    def test_anchoring_clears_pre_ledger_baseline_gap(self):
+        # THE config#1301 FIX: IB holds 100 AAPL from before the ledger began;
+        # no trades today. Cumulative replay from inception sees an unexplained
+        # 100-share IB position → false 0.0 DRIFT. Anchored on the prior broker
+        # snapshot (also 100) it reconciles exactly → 1.0 headline.
+        conn = _conn([])  # empty ledger (positions predate it)
+        audit = build_reconciliation_audit(
+            conn, today_positions=_pos(AAPL=100),
+            prior_positions=_pos(AAPL=100), run_date="2026-06-18",
+        )
+        assert audit["reconciliation_match_rate"] == 1.0   # anchored headline
+        assert audit["anchored"] is True
+        assert audit["status"] == "OK"
+        # The cumulative diagnostic still honestly shows the baseline-gap drift.
+        cum = audit["cumulative_ledger_parity"]
+        assert cum["match_rate"] == 0.0
+        assert cum["n_mismatched"] == 1
+        assert cum["mismatches"][0]["kind"] == "ib_only"
+
+    def test_cold_start_no_prior_falls_back_to_cumulative(self):
+        # No prior snapshot to anchor on → headline falls back to cumulative
+        # replay and is flagged anchored=false (never a phantom empty baseline).
         conn = _conn([
             {"ticker": "AAPL", "action": "ENTER", "filled_shares": 100, "status": "Filled"},
         ])
         audit = build_reconciliation_audit(
-            conn, today_positions=_pos(AAPL=90),
-            prior_positions={}, run_date="2026-06-18",
+            conn, today_positions=_pos(AAPL=100, GOOG=20),
+            prior_positions=None, run_date="2026-06-18",
         )
-        m = audit["position_parity"]["mismatches"][0]
-        assert m == {"ticker": "AAPL", "ledger_shares": 100, "ib_shares": 90, "delta": -10, "kind": "share_mismatch"}
+        assert audit["anchored"] is False
+        assert audit["position_parity"]["basis"] == "cumulative_ledger"
+        assert audit["reconciliation_match_rate"] == 0.5  # GOOG unexplained
+        assert audit["daily_delta"]["computed"] is False
+        # Diagnostic mirrors the headline in the fallback case.
+        assert audit["cumulative_ledger_parity"]["match_rate"] == 0.5
 
     def test_empty_universe_is_vacuous_green(self):
         audit = build_reconciliation_audit(
             _conn([]), today_positions={}, prior_positions={}, run_date="2026-06-18",
         )
         assert audit["reconciliation_match_rate"] == 1.0
+        assert audit["anchored"] is True
 
     def test_daily_delta_matches_recorded_fills(self):
         # Prior held AAPL 100; today IB shows 130; ledger recorded a +30 ENTER today.

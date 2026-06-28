@@ -786,9 +786,11 @@ def run(
         (run_date,),
     ).fetchone()
     prior_positions = {}
+    prior_snapshot_loaded = False
     if prior_snapshot_row and prior_snapshot_row[0]:
         try:
             prior_positions = json.loads(prior_snapshot_row[0])
+            prior_snapshot_loaded = True
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -916,7 +918,11 @@ def run(
         _recon_audit = build_reconciliation_audit(
             conn,
             today_positions=positions,
-            prior_positions=prior_positions,
+            # Anchor the headline parity on the prior broker snapshot + today's
+            # fills (config#1301). Pass None when no prior snapshot genuinely
+            # loaded so the metric falls back to cumulative replay rather than
+            # anchoring on a phantom empty baseline (which would false-RED).
+            prior_positions=prior_positions if prior_snapshot_loaded else None,
             run_date=run_date,
             ib_nav=nav,
         )
