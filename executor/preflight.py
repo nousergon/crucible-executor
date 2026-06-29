@@ -184,8 +184,15 @@ def _read_deployed_git_sha(repo_root: Path) -> str:
             f"refusing to proceed."
         )
     try:
+        # The executor runs as root via SSM, but the checkout is owned by
+        # ec2-user — git's dubious-ownership guard (CVE-2022-24765) then
+        # blocks ``rev-parse`` with exit 128, and root's $HOME is unset
+        # under SSM so no global ``safe.directory`` exception is even
+        # readable. Declare the path we already control as trusted inline,
+        # making the deploy-drift read immune to who runs it on any box
+        # (host-independent — does not rely on /etc/gitconfig state).
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-c", f"safe.directory={repo_root}", "rev-parse", "HEAD"],
             cwd=str(repo_root),
             capture_output=True,
             text=True,

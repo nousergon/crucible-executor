@@ -182,3 +182,31 @@ class TestCheckDeployDrift:
         """The default repo target is the migrated public repo, not the
         pre-migration monorepo path."""
         assert pf_mod._EXECUTOR_REPO == "nousergon/crucible-executor"
+
+    def test_rev_parse_declares_safe_directory(self, tmp_path):
+        """The deploy-drift read must pass ``-c safe.directory=<root>``.
+
+        The executor runs as root via SSM against an ec2-user-owned
+        checkout; without the inline ``safe.directory`` exception git's
+        dubious-ownership guard (CVE-2022-24765) exits 128 and the whole
+        weekday/EOD pipeline hard-fails at preflight (regression
+        2026-06-29). Guard the invocation shape so it can't silently
+        regress to a bare ``git rev-parse``.
+        """
+        root = _make_git_checkout(tmp_path)
+        head = self._head_sha(root)
+        real_run = subprocess.run
+
+        captured: list[list[str]] = []
+
+        def _spy(cmd, *a, **kw):
+            captured.append(cmd)
+            return real_run(cmd, *a, **kw)
+
+        with patch.object(pf_mod.subprocess, "run", side_effect=_spy):
+            got = pf_mod._read_deployed_git_sha(root)
+
+        assert got == head
+        assert captured and captured[0] == [
+            "git", "-c", f"safe.directory={root}", "rev-parse", "HEAD",
+        ]
