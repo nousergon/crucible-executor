@@ -154,10 +154,27 @@ class IBKRClient:
 
     # ── Market data ───────────────────────────────────────────────────────────
 
-    def get_current_price(self, ticker: str) -> float | None:
+    def get_current_price(
+        self,
+        ticker: str,
+        *,
+        max_wait: float = 6.0,
+        poll_interval: float = 0.5,
+    ) -> float | None:
         """
         Fetch last trade price for ticker.
         Returns None if no price available (pre-market, bad contract, etc.).
+
+        Polls the live ``Ticker`` for up to ``max_wait`` seconds rather than
+        reading once after a fixed sleep. A single ``sleep(1)`` is fragile:
+        right after a gateway / data-farm (re)connect the first delayed
+        ticks routinely take several seconds, so a momentary miss returns
+        nan — and downstream that silently DROPS the ticker's entire
+        optimizer allocation (observed 2026-06-29: a data-farm hiccup nan'd
+        every ticker, producing a 0-entry order book; GE's 8% target was
+        dropped). Bounded polling absorbs the cold-start/hiccup window
+        while still returning None promptly for a genuinely unpriceable
+        contract (the wait only runs to the deadline when no tick arrives).
         """
         self.ensure_connected()
         contract = Stock(ticker, "SMART", "USD")
@@ -167,16 +184,33 @@ class IBKRClient:
             logger.warning(f"Could not qualify contract for {ticker}: {e}")
             return None
 
+        def _valid(v) -> float | None:
+            return float(v) if (v is not None and math.isfinite(v) and v > 0) else None
+
         self.ib.reqMarketDataType(3)  # 3 = delayed (free); avoids Error 10089 on paper accounts
         ticker_data = self.ib.reqMktData(contract, "", False, False)
-        self.ib.sleep(1)
+        price = None
+        waited = 0.0
+        try:
+            while True:
+                self.ib.sleep(poll_interval)
+                waited += poll_interval
+                price = _valid(ticker_data.last) or _valid(ticker_data.close)
+                if price is not None or waited >= max_wait:
+                    break
+        finally:
+            # Release the subscription so a 25-ticker planner sweep doesn't
+            # accumulate streaming lines toward IB's market-data line cap.
+            try:
+                self.ib.cancelMktData(contract)
+            except Exception:
+                pass
 
-        last = ticker_data.last
-        close = ticker_data.close
-        price = last if (last is not None and math.isfinite(last) and last > 0) else None
-        price = price or (close if (close is not None and math.isfinite(close) and close > 0) else None)
-        if not price:
-            logger.warning(f"No valid price for {ticker} (last={ticker_data.last} close={ticker_data.close})")
+        if price is None:
+            logger.warning(
+                f"No valid price for {ticker} after {waited:.1f}s "
+                f"(last={ticker_data.last} close={ticker_data.close})"
+            )
             return None
 
         return float(price)
