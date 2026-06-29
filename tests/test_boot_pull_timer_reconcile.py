@@ -121,7 +121,7 @@ def test_retired_units_not_shipped():
     for name in retired:
         assert not (systemd_src / name).exists(), (
             f"{name} must not be in infrastructure/systemd/ — "
-            f"the EOD Step Function (alpha-engine-eod-pipeline) is the "
+            f"the EOD Step Function (ne-postclose-trading-pipeline) is the "
             f"canonical path. If you re-add it, the SF triggers and the "
             f"systemd timer will both fire (duplicate emails / racing "
             f"writes against ArcticDB)."

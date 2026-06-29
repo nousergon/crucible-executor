@@ -250,7 +250,7 @@ class TestCleanupConnections:
 
 
 # ── _trigger_eod_pipeline ────────────────────────────────────────────────────
-# Daemon shutdown is the canonical trigger for the alpha-engine-eod-pipeline
+# Daemon shutdown is the canonical trigger for the ne-postclose-trading-pipeline
 # Step Function. PR #94 (2026-04-22) removed this trigger and kept the
 # systemd timer; PR #117 (2026-04-28) retired the systemd timer; this test
 # locks the trigger code in place so a future "let's clean this up" doesn't
@@ -270,7 +270,7 @@ class TestTriggerEodPipeline:
             )
             sfn.start_execution.assert_called_once()
             kwargs = sfn.start_execution.call_args.kwargs
-            assert "alpha-engine-eod-pipeline" in kwargs["stateMachineArn"]
+            assert "ne-postclose-trading-pipeline" in kwargs["stateMachineArn"]
             assert kwargs["name"].startswith("eod-2026-04-29-")
 
     def test_input_payload_shape(self):

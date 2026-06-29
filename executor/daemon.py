@@ -1340,7 +1340,7 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
     try:
         import boto3 as _b3_sf
         sfn = _b3_sf.client("stepfunctions", region_name="us-east-1")
-        state_machine_arn = "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-eod-pipeline"
+        state_machine_arn = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
         trading_instance_id = "i-018eb3307a21329bf"
         dashboard_instance_id = "i-09b539c844515d549"
         sns_topic_arn = config.get(
