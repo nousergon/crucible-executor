@@ -100,3 +100,69 @@ class TestInitialConnectRetry:
             IBKRClient(reconnect_attempts=2)
 
         assert fake_ib.connect.call_count == 2  # honors reconnect_attempts, then raises loud
+
+
+class TestGetCurrentPricePolling:
+    """get_current_price must poll for a tick, not read once after a fixed
+    sleep.
+
+    Regression for 2026-06-29: a momentary IB data-farm delay returned nan
+    for every ticker within the old single ``sleep(1)`` window, producing a
+    0-entry order book and silently dropping every optimizer allocation
+    (GE's 8% target among them). Bounded polling absorbs the cold-start /
+    hiccup window; a genuinely unpriceable contract still returns None.
+    """
+
+    def _client(self):
+        client = IBKRClient.__new__(IBKRClient)
+        client.ib = MagicMock()
+        client.ib.isConnected.return_value = True
+        return client
+
+    def _wire_ticker(self, client, tick_values):
+        """tick_values: list of (last, close) revealed on successive sleeps.
+
+        The Ticker starts nan/nan and is updated in place each ib.sleep(),
+        mirroring how ib_insync mutates the live Ticker as ticks arrive.
+        """
+        ticker = SimpleNamespace(last=float("nan"), close=float("nan"))
+        client.ib.reqMktData.return_value = ticker
+        seq = list(tick_values)
+
+        def _sleep(_interval):
+            if seq:
+                last, close = seq.pop(0)
+                ticker.last, ticker.close = last, close
+
+        client.ib.sleep.side_effect = _sleep
+        return ticker
+
+    def test_returns_price_once_tick_arrives(self):
+        client = self._client()
+        # nan for the first two polls, then a valid last price.
+        self._wire_ticker(client, [(float("nan"), float("nan")),
+                                   (float("nan"), float("nan")),
+                                   (231.5, 230.0)])
+        price = client.get_current_price("GE", max_wait=6.0, poll_interval=0.5)
+        assert price == 231.5
+        assert client.ib.sleep.call_count == 3  # stopped as soon as valid
+        client.ib.cancelMktData.assert_called_once()  # subscription released
+
+    def test_falls_back_to_close_when_no_last(self):
+        client = self._client()
+        self._wire_ticker(client, [(float("nan"), 99.0)])
+        assert client.get_current_price("SPY", max_wait=2.0, poll_interval=0.5) == 99.0
+
+    def test_returns_none_after_deadline_when_never_priced(self):
+        client = self._client()
+        self._wire_ticker(client, [])  # never reveals a price
+        price = client.get_current_price("XYZ", max_wait=1.0, poll_interval=0.5)
+        assert price is None
+        # polled to the deadline (1.0 / 0.5 = 2 polls), then gave up
+        assert client.ib.sleep.call_count == 2
+        client.ib.cancelMktData.assert_called_once()  # released even on failure
+
+    def test_rejects_nonpositive_price(self):
+        client = self._client()
+        self._wire_ticker(client, [(0.0, -1.0)])
+        assert client.get_current_price("BAD", max_wait=0.5, poll_interval=0.5) is None

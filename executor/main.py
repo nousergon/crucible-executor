@@ -673,6 +673,88 @@ def _write_order_book_summary(
         logger.warning("Failed to write order book summary (non-fatal): %s", e)
 
 
+# Cross-sectional stdev of (level-neutralized) predicted_alpha below which the
+# signal the optimizer trades on is treated as genuinely collapsed. Healthy
+# batches run ~0.01 on the 21-day log-alpha scale; a true collapse drives this
+# toward 0. The floor is ~10x below a healthy day, so only a real degeneracy
+# trips it. Below ``_HOLD_BOOK_MIN_BATCH`` finite alphas the dispersion call is
+# too noisy to make — the caller falls back to the raw gate verdict.
+HOLD_BOOK_ALPHA_STDEV_FLOOR = 0.001
+_HOLD_BOOK_MIN_BATCH = 5
+
+
+def _should_hold_book(
+    gate: dict | None,
+    predictions_by_ticker: dict,
+    *,
+    alpha_stdev_floor: float = HOLD_BOOK_ALPHA_STDEV_FLOOR,
+    min_batch: int = _HOLD_BOOK_MIN_BATCH,
+) -> tuple[bool, dict]:
+    """Decide whether the §5b hold-book safeguard should suppress the optimizer
+    rebalance, returning ``(hold, diagnostics)``.
+
+    The predictor's ``output_distribution_gate`` judges the CALIBRATED ``p_up``
+    distribution (isotonic). On a low-dispersion-but-healthy day the isotonic
+    calibrator maps the whole cross-section onto a single staircase step, so
+    ``p_up`` collapses to a few unique values and the gate flags
+    ``passed=False`` — even though the model is fine. The optimizer does NOT
+    trade on ``p_up``; it trades on cross-sectional, level-neutralized
+    ``predicted_alpha``. Halting the book on a ``p_up`` calibration artifact is
+    a false halt (config#1176, observed 2026-06-29: GE's 8% target dropped on a
+    26-name batch whose ``predicted_alpha`` was cleanly differentiated).
+
+    So we hold ONLY when the gate flagged AND the tradable ``predicted_alpha``
+    signal is itself collapsed. Degeneracy is measured by cross-sectional stdev:
+    a level shift is already removed upstream by predictor-side
+    level-neutralization, so a genuine collapse shows up as near-zero
+    dispersion. This strictly *reduces* false holds — it never adds a hold the
+    old ``gate.passed is False`` path wouldn't already have taken.
+
+    Fail-safe: if the gate is absent (``None``) we proceed (the existing
+    fail-open posture — a missing gate never halts). If the gate flagged but
+    fewer than ``min_batch`` finite alphas are available to judge dispersion, we
+    fall back to the raw gate verdict and hold (conservative — can't confirm the
+    signal is healthy).
+    """
+    import math
+    import statistics
+
+    gate_flagged = gate is not None and gate.get("passed") is False
+    diag: dict = {
+        "gate_flagged": gate_flagged,
+        "failed_check": (gate or {}).get("failed_check"),
+    }
+    if not gate_flagged:
+        diag["decision"] = "proceed_gate_ok"
+        return False, diag
+
+    alphas: list[float] = []
+    for p in (predictions_by_ticker or {}).values():
+        if not isinstance(p, dict):
+            continue
+        a = p.get("predicted_alpha")
+        if a is None:
+            a = p.get("canonical_predicted_alpha")
+        if isinstance(a, (int, float)) and not isinstance(a, bool) and math.isfinite(a):
+            alphas.append(float(a))
+
+    diag["n_alpha"] = len(alphas)
+    if len(alphas) < min_batch:
+        # Can't judge the tradable signal — trust the gate verdict and hold.
+        diag["decision"] = "hold_signal_undeterminable"
+        return True, diag
+
+    stdev = statistics.pstdev(alphas)
+    degenerate = stdev < alpha_stdev_floor
+    diag["alpha_stdev"] = round(stdev, 6)
+    diag["alpha_stdev_floor"] = alpha_stdev_floor
+    diag["signal_degenerate"] = degenerate
+    diag["decision"] = (
+        "hold_signal_degenerate" if degenerate else "proceed_signal_healthy"
+    )
+    return degenerate, diag
+
+
 def _write_hold_book_flag(
     bucket: str, run_date: str, predictions_date: str | None, gate: dict
 ) -> None:
@@ -1696,25 +1778,33 @@ def run(
                 is_log_usable,
             )
             from executor.signal_reader import read_distribution_gate
-            # ── Hold-book safeguard (2026-06-01 decision) ─────────────────────
+            # ── Hold-book safeguard (2026-06-01 decision; 2026-06-29 redesign) ─
             # If the predictor's output-distribution gate flagged this batch
-            # "strongly biased", DO NOT let the optimizer rotate the book off
-            # it — hold the current positions and surface the discrepancy for
-            # operator review. Stops are still written below; the daemon's
-            # hard-risk overrides (drawdown forced-exit, catastrophic gap stop)
-            # remain active. Fail-open: a missing/None gate proceeds normally;
-            # only an explicit passed=False holds. Origin: the 6/1 8-model
-            # level-biased recalibration (89.7% DOWN-skew) flushed the book to
-            # SPY on its first inference before this safeguard existed.
+            # AND the signal the optimizer actually trades on is itself
+            # collapsed, DO NOT let the optimizer rotate the book — hold the
+            # current positions and surface the discrepancy for operator review.
+            # Stops are still written below; the daemon's hard-risk overrides
+            # (drawdown forced-exit, catastrophic gap stop) remain active.
+            #
+            # Origin: the 6/1 8-model level-biased recalibration (89.7%
+            # DOWN-skew) flushed the book to SPY before this safeguard existed.
+            # Redesign (config#1176): the gate judges isotonic ``p_up``, which
+            # collapses onto a flat staircase step on low-dispersion-but-healthy
+            # days and false-halted the book (6/22, 6/29). We now gate the hold
+            # on degeneracy of the LEVEL-NEUTRALIZED ``predicted_alpha`` the
+            # optimizer trades on, not on the ``p_up`` calibration artifact —
+            # see ``_should_hold_book``. Fail-open: a missing/None gate proceeds.
             _gate = read_distribution_gate(signals_bucket)
-            _gate_failed = _gate is not None and _gate.get("passed") is False
-            if _gate_failed:
+            _hold_book, _hold_diag = _should_hold_book(_gate, predictions_by_ticker)
+            if _hold_book:
                 logger.warning(
-                    "HOLD-BOOK SAFEGUARD ACTIVE: predictor output_distribution_gate "
-                    "FAILED (check=%s) for predictions %s — suppressing optimizer "
-                    "rebalance; current book retained (stops written; daemon "
-                    "hard-risk overrides remain active). reason=%s",
-                    _gate.get("failed_check"), predictions_date, _gate.get("reason"),
+                    "HOLD-BOOK SAFEGUARD ACTIVE: predictor gate FLAGGED (check=%s) "
+                    "AND the tradable predicted_alpha signal is collapsed for "
+                    "predictions %s — suppressing optimizer rebalance; current "
+                    "book retained (stops written; daemon hard-risk overrides "
+                    "remain active). gate_reason=%s hold_diag=%s",
+                    (_gate or {}).get("failed_check"), predictions_date,
+                    (_gate or {}).get("reason"), _hold_diag,
                 )
                 try:
                     _write_hold_book_flag(signals_bucket, run_date, predictions_date, _gate)
@@ -1724,6 +1814,21 @@ def run(
                         _hb_err,
                     )
             elif is_log_usable(shadow_log):
+                if _hold_diag.get("gate_flagged"):
+                    # Gate flagged on the isotonic p_up artifact, but the
+                    # tradable predicted_alpha is well-dispersed — this is the
+                    # config#1176 false-halt class. Proceed with the rebalance;
+                    # log loudly so the override is auditable (flow-doctor / CW).
+                    logger.warning(
+                        "HOLD-BOOK gate flagged (check=%s) but the tradable "
+                        "predicted_alpha signal is HEALTHY (%s) — the gate judges "
+                        "isotonic p_up, a calibration artifact on low-dispersion "
+                        "days (config#1176); the optimizer trades level-neutralized "
+                        "predicted_alpha. NOT holding — proceeding with optimizer "
+                        "rebalance. gate_reason=%s",
+                        (_gate or {}).get("failed_check"), _hold_diag,
+                        (_gate or {}).get("reason"),
+                    )
                 opt_entries, opt_exits = apply_optimizer_targets_to_orderbook(
                     log=shadow_log,
                     ob=ob,

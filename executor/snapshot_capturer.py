@@ -15,7 +15,7 @@ snapshot. Hard-fails on IB connection failure or S3 write failure —
 no silent fallback (the reconcile path depends on this snapshot).
 
 SF orchestration: this script runs as the `CaptureSnapshot` step in
-`alpha-engine-eod-pipeline`, between `PostMarketData` and
+`ne-postclose-trading-pipeline`, between `PostMarketData` and
 `EODReconcile`. Both depend on IB Gateway being up; the SF's
 `StopTradingInstance` step (which kills IB) only fires after
 EODReconcile completes.
