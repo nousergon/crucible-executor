@@ -66,6 +66,7 @@ from executor.market_hours import is_market_hours
 from executor.notifier import send_daemon_status, send_trade_alert
 from executor.order_book import OrderBook, build_stop_record
 from executor.price_monitor import PriceMonitor
+from executor.polygon_price_monitor import make_price_monitor
 from executor.strategies.config import load_strategy_config
 from executor.trade_logger import init_db, log_trade, get_unmatched_entry
 
@@ -202,7 +203,7 @@ def _reconnect(
                 client_id=client_id,
                 reconnect_attempts=config.get("ibkr_reconnect_attempts", 3),
             )
-            new_monitor = PriceMonitor(new_ibkr.ib)
+            new_monitor = make_price_monitor(new_ibkr.ib)
             new_monitor.subscribe(order_book.all_tickers())
             logger.info("Reconnected to IB Gateway successfully")
             send_daemon_status("\u2705 *IB Gateway reconnected*")
@@ -557,7 +558,7 @@ def run_daemon(dry_run: bool = False) -> None:
 
     ibkr = _connect_ibkr()
 
-    monitor = PriceMonitor(ibkr.ib)
+    monitor = make_price_monitor(ibkr.ib)
     exit_mgr = IntradayExitManager(strategy_config)
     entry_engine = EntryTriggerEngine(strategy_config)
 
