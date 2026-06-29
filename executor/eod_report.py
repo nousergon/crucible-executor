@@ -10,33 +10,53 @@ of inlining the whole report.
 
 Alpha attribution methodology
 -----------------------------
-Daily dollar-alpha is decomposed on a **prior-NAV basis** so the per-sleeve
-contributions sum EXACTLY to the headline alpha (``port_return - spy_return``).
-The headline dollar-alpha is, by construction::
+Daily dollar-alpha is decomposed on a **prior-NAV basis** into economically-
+meaningful sleeves that sum EXACTLY to the headline alpha for arbitrary intraday
+rotation. The headline dollar-alpha is, by construction::
 
     dollar_alpha = nav_change_usd - (spy_return/100) * prior_nav
                  = prior_nav * (daily_return - spy_return) / 100
                  = prior_nav * alpha / 100
 
-Each sleeve's additive contribution::
+Each sleeve = dollar P&L − the SPY opportunity cost on the *prior* capital that
+earned it (``spy_frac := spy_return/100``)::
 
-    position_i        : daily_return_usd_i - (spy_return/100) * prior_mv_i
-    cash & rotation   : interest_usd       - (spy_return/100) * prior_cash_residual
-    unattributed      : unattributed_usd
+    position_i (held)   : daily_return_usd_i - spy_frac * prior_close_i * retained_i
+    rotation (exited)   : Σ (exit_px - prior_close)*sold - spy_frac * prior_close*sold
+    cash                : interest_usd       - spy_frac * idle_cash
+    pricing & timing    : pricing_timing_usd                  (no SPY base)
+    unattributed (true) : unattributed_usd - rotation_realized - pricing_timing
 
-where ``prior_cash_residual := prior_nav - Σ prior_mv_i`` (over *today's* held
-tickers) is defined as the residual sleeve so the prior weights sum to
-``prior_nav`` exactly. Because ``nav_change_usd = position_pnl_usd +
-interest_usd + unattributed_usd`` (the EOD-reconcile identity), the sleeve
-contributions sum to ``dollar_alpha`` regardless of intraday rotation — capital
-that was in positions exited today lands in the cash-&-rotation sleeve, so the
-identity still closes. See ``tests/test_eod_report.py::
-test_attribution_ties_to_headline``.
+where ``retained_i := min(prior_shares_i, today_shares_i)`` (a trim's sold
+portion is benchmarked in *rotation*; a same-day-entered name carries no prior
+SPY base — the cash sleeve bore its opportunity cost), and ``idle_cash :=
+prior_nav − Σ prior-holdings MV`` is genuine idle cash only. The SPY bases sum to
+``prior_nav`` and the dollar parts sum to ``nav_change_usd`` (the EOD-reconcile
+identity ``nav_change = position_pnl + interest + unattributed``), so the sleeves
+sum to ``dollar_alpha`` exactly.
 
-This is the fix for the old emailer's "α % of Total" column, which divided each
+**Why the "pricing & timing" sleeve exists (the headline fix).** The book is
+valued two ways: the headline NAV is IB ``NetLiquidation`` while per-position P&L
+is settled close-to-close. Their day-over-day difference (IB intraday/unsettled
+marks vs settled closes — e.g. the provisional-SPY case, config#1276) used to be
+dumped wholesale into "Unattributed" (tens of bps even on no-trade days). It is
+now isolated, honestly labeled, and ``Unattributed`` shrinks to the genuine
+residual (untracked corporate actions / fees / FX). ``pricing_timing_usd`` is
+computed by the producer as ``mark_basis(t) − mark_basis(t−1)`` where
+``mark_basis = nav_ib − (cash + accrued + Σ settled_mv)`` (see
+``executor/eod_reconcile.py``); when a prior input is unavailable the term is 0,
+the gap stays in Unattributed, and a warning fires.
+
+Dividends earned are folded into each position's ``daily_return_usd`` (hence into
+``position_pnl_usd``); ``dividend_usd`` is informational only — so the reconcile
+identity has no separate dividend term and dividends are neither double-counted
+nor dropped.
+
+This also fixes the old emailer's "α % of Total" column, which divided each
 position's alpha by the *signed* grand-total alpha — so a position with genuinely
 positive alpha rendered negative whenever the day's total alpha was negative, and
 the table total (Σ $-alpha / NAV) never reconciled with the NAV-based headline.
+See ``tests/test_eod_report.py``.
 """
 
 from __future__ import annotations
@@ -49,10 +69,99 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"
+
+# Sell-side trade actions whose fills realize P&L on shares rotated out today.
+_SELL_ACTIONS = {
+    "SELL", "EXIT", "REDUCE", "COVER", "LIQUIDATION_SELL", "EMERGENCY_SELL",
+}
 
 # Artifact written per trading day; the console EOD Report page reads it.
 REPORT_KEY_TEMPLATE = "consolidated/{run_date}/eod_report.json"
+
+
+def _prior_share_close(prior_pos: dict | None) -> tuple[float, float]:
+    """Return ``(prior_shares, prior_close)`` for a prior-snapshot position.
+
+    ``closing_price`` (the settled close persisted by the prior reconcile) is the
+    canonical prior price; fall back to ``market_value / shares`` for legacy
+    snapshots that predate it.
+    """
+    pp = prior_pos or {}
+    try:
+        shares = float(pp.get("shares", 0) or 0)
+    except (TypeError, ValueError):
+        shares = 0.0
+    close = pp.get("closing_price")
+    if close is None:
+        try:
+            mv = float(pp.get("market_value", 0) or 0)
+        except (TypeError, ValueError):
+            mv = 0.0
+        close = (mv / shares) if shares else 0.0
+    else:
+        try:
+            close = float(close)
+        except (TypeError, ValueError):
+            close = 0.0
+    return shares, close
+
+
+def _sell_exit_prices(trades_today: list[dict] | None) -> dict[str, float]:
+    """Share-weighted average sell/exit fill price per ticker from today's trades."""
+    agg: dict[str, list[float]] = {}
+    for t in trades_today or []:
+        action = str(t.get("action", "")).upper()
+        if action not in _SELL_ACTIONS and "SELL" not in action:
+            continue
+        tkr = t.get("ticker")
+        # Tolerate both the mapped ``price`` (``_trades_today``) and the raw
+        # ``price_at_order`` column (``trade_logger.get_todays_trades``).
+        raw_px = t.get("price")
+        if raw_px is None:
+            raw_px = t.get("price_at_order")
+        try:
+            sh = abs(float(t.get("shares") or 0))
+            px = float(raw_px or 0)
+        except (TypeError, ValueError):
+            continue
+        if not tkr or sh <= 0 or px <= 0:
+            continue
+        slot = agg.setdefault(tkr, [0.0, 0.0])
+        slot[0] += sh * px
+        slot[1] += sh
+    return {k: v[0] / v[1] for k, v in agg.items() if v[1] > 0}
+
+
+def compute_rotation_realized(
+    positions: dict,
+    prior_positions: dict | None,
+    trades_today: list[dict] | None,
+) -> float:
+    """Realized $ P&L on shares rotated OUT today (full exits + trims).
+
+    ``Σ (exit_price − prior_close) × shares_sold`` over every prior-held ticker
+    whose share count fell today. ``shares_sold`` is the prior-vs-today position
+    delta (authoritative regardless of trade-action labels); ``exit_price`` is the
+    share-weighted sell fill, falling back to the prior close (→ $0 realized,
+    leaving the true realized in unattributed) when no sell fill is recorded.
+    This $ is part of ``unattributed_usd`` today; the attribution lifts it into
+    its own ``rotation`` sleeve so it no longer masquerades as cash drag.
+    """
+    exit_px = _sell_exit_prices(trades_today)
+    realized = 0.0
+    for tkr, pp in (prior_positions or {}).items():
+        prior_shares, prior_close = _prior_share_close(pp)
+        try:
+            today_shares = float((positions.get(tkr) or {}).get("shares", 0) or 0)
+        except (TypeError, ValueError):
+            today_shares = 0.0
+        sold = prior_shares - today_shares
+        if sold <= 0:
+            continue
+        px = exit_px.get(tkr, prior_close)
+        realized += (px - prior_close) * sold
+    return realized
 
 
 def compute_alpha_attribution(
@@ -64,57 +173,101 @@ def compute_alpha_attribution(
     interest_usd: float,
     unattributed_usd: float,
     nav_change_usd: float | None,
+    trades_today: list[dict] | None = None,
+    pricing_timing_usd: float = 0.0,
+    pricing_timing_available: bool = False,
 ) -> dict | None:
-    """Additive daily-alpha decomposition that ties to the headline alpha.
+    """Additive daily-alpha decomposition into economically-meaningful sleeves
+    that sum EXACTLY to the headline dollar-alpha for arbitrary rotation.
 
-    Returns ``None`` when attribution is undefined (first trading day with no
-    prior NAV, or no SPY reference). Otherwise returns a dict with a
-    ``components`` list whose ``contrib_usd`` values sum to ``dollar_alpha``
-    (within floating-point tolerance), plus a ``residual_usd`` tie-out check.
+    Sleeves (see the module docstring for the algebra + tie-out proof):
+    ``position`` (held, SPY-benchmarked on its *retained* prior MV), ``rotation``
+    (shares sold out today), ``cash`` (interest − SPY on genuine idle cash),
+    ``reconciliation`` ("Pricing & timing" — the IB-mark-vs-settled-close basis
+    difference, no SPY base), and ``unattributed`` (the TRUE residual after
+    rotation + pricing&timing are lifted out).
+
+    Returns ``None`` when attribution is undefined (no prior NAV, or no SPY
+    reference). Otherwise the ``components`` ``contrib_usd`` values sum to
+    ``dollar_alpha`` (``residual_usd`` is the tie-out check).
     """
     if prior_nav is None or prior_nav <= 0 or spy_return is None:
         return None
 
     spy_frac = spy_return / 100.0
-    dollar_alpha = prior_nav * ((nav_change_usd or 0.0) / prior_nav - spy_frac)
+    nav_change = nav_change_usd or 0.0
+    dollar_alpha = nav_change - spy_frac * prior_nav
 
-    def _prior_mv(tkr: str) -> float:
-        pp = (prior_positions or {}).get(tkr) or {}
-        try:
-            return float(pp.get("market_value", 0) or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    sum_prior_mv = sum(_prior_mv(t) for t in positions)
-    # Residual sleeve: prior cash + the prior market value of any position
-    # exited/rotated out today. Defined so Σ prior weights == prior_nav exactly.
-    prior_cash_residual = prior_nav - sum_prior_mv
-
+    # ── Position sleeves (names held today) ───────────────────────────────────
     components: list[dict] = []
+    sum_held_spy_base = 0.0
     for ticker, pos in sorted(positions.items()):
         daily_usd = float(pos.get("daily_return_usd", 0.0) or 0.0)
-        contrib = daily_usd - spy_frac * _prior_mv(ticker)
+        prior_shares, prior_close = _prior_share_close(
+            (prior_positions or {}).get(ticker)
+        )
+        try:
+            today_shares = float(pos.get("shares", 0) or 0)
+        except (TypeError, ValueError):
+            today_shares = 0.0
+        # Benchmark only the prior capital that was carried THROUGH the day; a
+        # trim's sold portion is handled in rotation, a same-day entry has no
+        # prior base (cash funded it).
+        retained = min(prior_shares, today_shares)
+        spy_base = prior_close * retained
+        sum_held_spy_base += spy_base
+        contrib = daily_usd - spy_frac * spy_base
         components.append({
-            "label": ticker,
-            "kind": "position",
-            "contrib_usd": contrib,
-            "contrib_bps": contrib / prior_nav * 1e4,
+            "label": ticker, "kind": "position",
+            "contrib_usd": contrib, "contrib_bps": contrib / prior_nav * 1e4,
         })
 
-    cash_contrib = float(interest_usd or 0.0) - spy_frac * prior_cash_residual
+    # ── Rotation sleeve (shares sold out today: full exits + trims) ───────────
+    exit_px = _sell_exit_prices(trades_today)
+    rotation_dollar = 0.0
+    rotation_spy_base = 0.0
+    rotated = False
+    for tkr, pp in (prior_positions or {}).items():
+        prior_shares, prior_close = _prior_share_close(pp)
+        try:
+            today_shares = float((positions.get(tkr) or {}).get("shares", 0) or 0)
+        except (TypeError, ValueError):
+            today_shares = 0.0
+        sold = prior_shares - today_shares
+        if sold <= 0:
+            continue
+        rotated = True
+        px = exit_px.get(tkr, prior_close)
+        rotation_dollar += (px - prior_close) * sold
+        rotation_spy_base += prior_close * sold
+    if rotated:
+        rot_contrib = rotation_dollar - spy_frac * rotation_spy_base
+        components.append({
+            "label": "Rotation (exited)", "kind": "rotation",
+            "contrib_usd": rot_contrib, "contrib_bps": rot_contrib / prior_nav * 1e4,
+        })
+
+    # ── Cash sleeve (genuine idle cash only) ──────────────────────────────────
+    idle_cash = prior_nav - sum_held_spy_base - rotation_spy_base
+    cash_contrib = float(interest_usd or 0.0) - spy_frac * idle_cash
     components.append({
-        "label": "Cash & rotation",
-        "kind": "cash",
-        "contrib_usd": cash_contrib,
-        "contrib_bps": cash_contrib / prior_nav * 1e4,
+        "label": "Cash", "kind": "cash",
+        "contrib_usd": cash_contrib, "contrib_bps": cash_contrib / prior_nav * 1e4,
     })
 
-    unattr = float(unattributed_usd or 0.0)
+    # ── Pricing & timing reconciliation (IB marks vs settled closes) ──────────
+    pt = float(pricing_timing_usd or 0.0) if pricing_timing_available else 0.0
+    if pricing_timing_available:
+        components.append({
+            "label": "Pricing & timing", "kind": "reconciliation",
+            "contrib_usd": pt, "contrib_bps": pt / prior_nav * 1e4,
+        })
+
+    # ── True unattributed residual (rotation + pricing&timing lifted out) ─────
+    unattr_true = float(unattributed_usd or 0.0) - rotation_dollar - pt
     components.append({
-        "label": "Unattributed",
-        "kind": "unattributed",
-        "contrib_usd": unattr,
-        "contrib_bps": unattr / prior_nav * 1e4,
+        "label": "Unattributed", "kind": "unattributed",
+        "contrib_usd": unattr_true, "contrib_bps": unattr_true / prior_nav * 1e4,
     })
 
     summed = sum(c["contrib_usd"] for c in components)
@@ -127,6 +280,11 @@ def compute_alpha_attribution(
         "dollar_alpha": dollar_alpha,
         "alpha_pct": dollar_alpha / prior_nav * 100.0,
         "components": components,
+        "rotation_realized_usd": rotation_dollar,
+        "pricing_timing_usd": pt,
+        "pricing_timing_available": bool(pricing_timing_available),
+        "unattributed_true_usd": unattr_true,
+        "idle_cash": idle_cash,
         "residual_usd": residual,
         "ties_to_headline": abs(residual) < 1.0,
     }
@@ -195,6 +353,7 @@ def build_eod_report(
     recon = nav_reconciliation or {}
     narratives = position_narratives or {}
 
+    trades_today = _trades_today(conn, run_date)
     attribution = compute_alpha_attribution(
         prior_nav=prior_nav,
         spy_return=spy_return,
@@ -203,6 +362,9 @@ def build_eod_report(
         interest_usd=recon.get("interest_usd", 0.0) or 0.0,
         unattributed_usd=recon.get("unattributed_usd", 0.0) or 0.0,
         nav_change_usd=recon.get("nav_change_usd"),
+        trades_today=trades_today,
+        pricing_timing_usd=recon.get("pricing_timing_usd", 0.0) or 0.0,
+        pricing_timing_available=bool(recon.get("pricing_timing_available", False)),
     )
     contrib_by_ticker = {
         c["label"]: c
@@ -265,12 +427,20 @@ def build_eod_report(
             "interest_usd": recon.get("interest_usd"),
             "dividend_usd": recon.get("dividend_usd"),
             "unattributed_usd": recon.get("unattributed_usd"),
+            "pricing_timing_usd": recon.get("pricing_timing_usd"),
+            "pricing_timing_available": recon.get("pricing_timing_available"),
+            "rotation_realized_usd": (
+                attribution.get("rotation_realized_usd") if attribution else None
+            ),
+            "unattributed_true_usd": (
+                attribution.get("unattributed_true_usd") if attribution else None
+            ),
         },
         "data_warnings": list(data_warnings or []),
         "alpha_attribution": attribution,
         "positions": positions_out,
         "sector_attribution": sector_out,
-        "trades_today": _trades_today(conn, run_date),
+        "trades_today": trades_today,
         "roundtrip_stats": roundtrip_stats,
         "trailing_history": _trailing_history(conn),
     }

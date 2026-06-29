@@ -782,15 +782,26 @@ def run(
     # ── Per-position daily return & alpha contribution ──────────────────────
     # Look up prior day's positions_snapshot to get yesterday's price per ticker
     prior_snapshot_row = conn.execute(
-        "SELECT positions_snapshot FROM eod_pnl WHERE positions_snapshot IS NOT NULL AND date < ? ORDER BY date DESC LIMIT 1",
+        "SELECT positions_snapshot, portfolio_nav, total_cash, accrued_interest "
+        "FROM eod_pnl WHERE positions_snapshot IS NOT NULL AND date < ? "
+        "ORDER BY date DESC LIMIT 1",
         (run_date,),
     ).fetchone()
     prior_positions = {}
     prior_snapshot_loaded = False
+    # Prior snapshot's NAV / cash / accrued, used to reconstruct the prior-day
+    # settled NAV for the pricing&timing reconciliation term below. Pulled from
+    # the SAME row as prior_positions so the settled-MV sum is consistent.
+    prior_snapshot_nav = None
+    prior_snapshot_cash = None
+    prior_snapshot_accrued = None
     if prior_snapshot_row and prior_snapshot_row[0]:
         try:
             prior_positions = json.loads(prior_snapshot_row[0])
             prior_snapshot_loaded = True
+            prior_snapshot_nav = prior_snapshot_row[1]
+            prior_snapshot_cash = prior_snapshot_row[2]
+            prior_snapshot_accrued = prior_snapshot_row[3]
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -798,6 +809,13 @@ def run(
         shares = pos.get("shares", 0)
         mv = pos.get("market_value", 0)
         current_price = mv / shares if shares else 0
+
+        # Preserve IB's raw mark-to-market BEFORE the settled-close override, so
+        # the pricing&timing reconciliation can quantify the IB-mark-vs-settled
+        # difference per name (and so a future per-name pricing attribution is
+        # possible). The settled close is the canonical valuation; this is only
+        # the IB reference mark.
+        pos["ib_market_value"] = mv
 
         # Prefer closing price from daily_closes over IB Gateway's delayed data
         if ticker in closing_prices:
@@ -876,27 +894,103 @@ def run(
         dividend_usd = sum(p.get("dividend_usd", 0.0) for p in positions.values())
 
         unattributed_usd = total_nav_change - total_day_usd - interest_usd
+
+        # ── Pricing & timing reconciliation ──────────────────────────────────
+        # The headline NAV is IB NetLiquidation; per-position P&L is settled
+        # close-to-close. Their day-over-day basis difference (IB intraday/
+        # unsettled marks vs settled closes — e.g. provisional SPY, config#1276)
+        # used to be buried wholesale in `unattributed_usd` (tens of bps even on
+        # no-trade days). Isolate it as `mark_basis(t) − mark_basis(t−1)`, where
+        #   mark_basis = nav_ib − (cash + accrued + Σ settled_mv).
+        # A constant cash/accrued offset cancels in the day-over-day difference.
+        # When any prior input is missing the term is 0, the gap stays in
+        # unattributed, and a warning fires (fail loud, never silently hide).
+        pricing_timing_usd = 0.0
+        pricing_timing_available = False
+        today_cash = account.get("total_cash")
+        if (
+            today_cash is not None
+            and prior_snapshot_loaded
+            and prior_snapshot_nav is not None
+            and prior_snapshot_cash is not None
+        ):
+            settled_mv_today = sum(
+                p.get("market_value", 0) or 0 for p in positions.values()
+            )
+            settled_mv_prior = 0.0
+            for pp in prior_positions.values():
+                cp = pp.get("closing_price")
+                if cp is not None:
+                    settled_mv_prior += float(cp) * float(pp.get("shares", 0) or 0)
+                else:
+                    settled_mv_prior += float(pp.get("market_value", 0) or 0)
+            nav_settled_today = (
+                float(today_cash) + float(today_accrued or 0.0) + settled_mv_today
+            )
+            nav_settled_prior = (
+                float(prior_snapshot_cash)
+                + float(prior_snapshot_accrued or 0.0)
+                + settled_mv_prior
+            )
+            mark_basis_today = nav - nav_settled_today
+            mark_basis_prior = float(prior_snapshot_nav) - nav_settled_prior
+            pricing_timing_usd = mark_basis_today - mark_basis_prior
+            pricing_timing_available = True
+
+        # Realized P&L on shares rotated OUT today — also currently inside
+        # `unattributed_usd`; the attribution lifts it into its own sleeve.
+        from executor.eod_report import compute_rotation_realized
+        trades_today_rows = get_todays_trades(conn, run_date)
+        rotation_realized_usd = compute_rotation_realized(
+            positions, prior_positions, trades_today_rows,
+        )
+        unattributed_true_usd = (
+            unattributed_usd - rotation_realized_usd - pricing_timing_usd
+        )
+
         nav_reconciliation = {
             "nav_change_usd": total_nav_change,
             "position_pnl_usd": total_day_usd,
             "interest_usd": interest_usd,
             "dividend_usd": dividend_usd,
             "unattributed_usd": unattributed_usd,
+            "pricing_timing_usd": pricing_timing_usd,
+            "pricing_timing_available": pricing_timing_available,
+            "rotation_realized_usd": rotation_realized_usd,
+            "unattributed_true_usd": unattributed_true_usd,
         }
         logger.info(
             "NAV recon: Δ=$%.0f | positions=$%.0f | interest=$%.0f | "
-            "dividends=$%.0f | unattributed=$%.0f",
-            total_nav_change, total_day_usd, interest_usd,
-            dividend_usd, unattributed_usd,
+            "dividends=$%.0f | rotation=$%.0f | pricing&timing=$%.0f | "
+            "unattributed(raw)=$%.0f | unattributed(true)=$%.0f",
+            total_nav_change, total_day_usd, interest_usd, dividend_usd,
+            rotation_realized_usd, pricing_timing_usd,
+            unattributed_usd, unattributed_true_usd,
         )
-        # Warn if unattributed is material (> max($100, 0.05% NAV)). Surface
-        # the gap in data_warnings so it appears in the EOD email, not only
-        # in server logs.
-        if nav and abs(unattributed_usd) > max(100.0, 0.0005 * nav):
+        # Honesty warnings — surface each material term in data_warnings (EOD
+        # email + console), never silently buried.
+        if pricing_timing_available and nav and abs(pricing_timing_usd) > max(
+            500.0, 0.0005 * nav
+        ):
+            data_warnings.append(
+                f"Pricing & timing reconciliation: ${pricing_timing_usd:+,.0f} "
+                f"({pricing_timing_usd / nav * 100:+.3f}% of NAV) — IB marks vs "
+                "settled closes; isolated from Unattributed, not hidden."
+            )
+        if not pricing_timing_available and prior_nav is not None:
+            data_warnings.append(
+                "Pricing & timing reconstruction unavailable (missing prior "
+                "snapshot cash/NAV) — the IB-mark-vs-settled-close basis gap "
+                "stays in Unattributed for this day."
+            )
+        # The TRUE residual (after rotation + pricing&timing are lifted out) is
+        # what should now be small; warn only when IT is material.
+        if nav and abs(unattributed_true_usd) > max(100.0, 0.0005 * nav):
             msg = (
-                f"NAV reconciliation gap: ${unattributed_usd:+,.0f} unattributed "
-                f"({unattributed_usd / nav * 100:+.3f}% of NAV). Likely causes: "
-                "stale prior-day prices, untracked corporate action, fees, or FX."
+                f"NAV reconciliation gap: ${unattributed_true_usd:+,.0f} "
+                f"unattributed ({unattributed_true_usd / nav * 100:+.3f}% of NAV, "
+                "after rotation + pricing&timing). Likely causes: untracked "
+                "corporate action, fees, or FX."
             )
             logger.warning(msg)
             data_warnings.append(msg)
