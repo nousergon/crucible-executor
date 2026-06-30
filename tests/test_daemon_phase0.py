@@ -301,19 +301,35 @@ class TestTriggerEodPipeline:
             assert payload["run_date"] == "2026-04-29"
             assert payload["triggered_by"] == "daemon_shutdown"
 
-    def test_failure_is_non_fatal(self):
-        """Daemon's finally block must not crash if SF start fails. The
-        trigger logs a WARN and returns; SF-side failures surface via SNS
-        HandleFailure and flow-doctor when the SF eventually fires."""
+    def test_failure_is_non_fatal_and_loud(self):
+        """Daemon's finally block must not crash if SF start fails — AND the
+        swallow must NOT be silent (config#1447). On failure the trigger
+        records two surfaces: a named CloudWatch metric ``eod_trigger_failure``
+        and a Telegram operator alert via ``send_daemon_status``. There is no
+        SNS HandleFailure path here because the SF never started, so these are
+        the only signals that a whole EOD was missed."""
         from executor.daemon import _trigger_eod_pipeline
 
-        with patch("boto3.client") as mock_boto:
-            sfn = MagicMock()
-            sfn.start_execution.side_effect = RuntimeError("transient IAM hiccup")
-            mock_boto.return_value = sfn
+        with patch("boto3.client") as mock_boto, patch(
+            "executor.daemon.send_daemon_status"
+        ) as mock_notify:
+            client = MagicMock()
+            client.start_execution.side_effect = RuntimeError("AccessDenied")
+            mock_boto.return_value = client
             # Must NOT raise — the daemon shutdown path can't tolerate an
             # exception out of this trigger.
             _trigger_eod_pipeline({}, "2026-04-29")
+
+            # Surface 1: a CloudWatch eod_trigger_failure metric was emitted.
+            metric_calls = [
+                c for c in client.put_metric_data.call_args_list
+                if c.kwargs.get("MetricData", [{}])[0].get("MetricName")
+                == "eod_trigger_failure"
+            ]
+            assert metric_calls, "expected an eod_trigger_failure CW metric"
+            # Surface 2: an operator Telegram alert naming the run_date fired.
+            mock_notify.assert_called_once()
+            assert "2026-04-29" in mock_notify.call_args.args[0]
 
     def test_uses_default_sns_topic_when_config_missing(self):
         """`_trigger_eod_pipeline({}, ...)` must still produce a valid

@@ -1334,9 +1334,17 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
     history.
 
     Failures are non-fatal so a transient SF / IAM hiccup doesn't crash
-    the daemon mid-shutdown. SF failure surfaces via the SNS HandleFailure
-    branch when it eventually fires; daemon-side failure to start
-    surfaces via the WARN log + flow-doctor capture.
+    the daemon mid-shutdown — BUT they are no longer silent. A failure to
+    start the SF means NO EOD pipeline runs at all (no NAV/alpha row, no
+    EOD email, trading box left up), and unlike a mid-pipeline failure
+    there is no SNS HandleFailure branch to fire because the SF never
+    started. So on failure we record the swallow on two surfaces per the
+    no-silent-fails rule: (1) a named CloudWatch metric
+    ``eod_trigger_failure`` (alarmable), and (2) a Telegram operator alert
+    via ``send_daemon_status``. This closed the silent-EOD-gap that bit
+    2026-06-30 (config#1447): the ne-postclose rename left the executor
+    IAM unapplied, ``start_execution`` returned AccessDenied, and the bare
+    WARN here meant the missing EOD went unnoticed until the next morning.
     """
     try:
         import boto3 as _b3_sf
@@ -1368,6 +1376,34 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
         logger.info("EOD pipeline triggered: %s", state_machine_arn)
     except Exception as exc:
         logger.warning("Failed to trigger EOD pipeline (non-fatal): %s", exc)
+        # No-silent-fails: the SF never started, so there is no SNS
+        # HandleFailure path to surface this. Record it loudly on two
+        # independent surfaces (config#1447). Each is best-effort and must
+        # not raise — daemon shutdown has already done its job.
+        try:
+            import boto3 as _b3_cw
+            _b3_cw.client("cloudwatch", region_name="us-east-1").put_metric_data(
+                Namespace="AlphaEngine/Executor",
+                MetricData=[{
+                    "MetricName": "eod_trigger_failure",
+                    "Value": 1.0,
+                    "Unit": "Count",
+                }],
+            )
+        except Exception as _metric_exc:
+            logger.warning(
+                "CloudWatch eod_trigger_failure metric failed: %s", _metric_exc,
+            )
+        try:
+            send_daemon_status(
+                f"\U0001f6a8 *EOD pipeline trigger FAILED* — no EOD will run "
+                f"for {run_date} (NAV/alpha/email missing, box left up). "
+                f"Error: {exc}"
+            )
+        except Exception as _notify_exc:
+            logger.warning(
+                "Telegram EOD-trigger-failure alert failed: %s", _notify_exc,
+            )
 
 
 def _execute_exit(
