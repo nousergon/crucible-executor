@@ -46,7 +46,7 @@ from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
 
 # Default S3 prefix. Lives under ``trades/`` alongside the order book
 # itself (``trades/order_book/{date}.json``) so the rationale and the
@@ -309,6 +309,157 @@ def _predictor_block(pred: Mapping[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _build_book_status(
+    *,
+    summary: Mapping[str, int],
+    optimizer_shadow_log: Mapping[str, Any] | None,
+    rebalance_band_pct: float | None,
+    distribution_gate: Mapping[str, Any] | None,
+    hold_book_active: bool,
+    hold_book_diag: Mapping[str, Any] | None,
+    predictions_by_ticker: Mapping[str, Any],
+) -> dict[str, Any]:
+    """One-line "why did/didn't the book move today" status for the console banner.
+
+    A pure join over structures the planner already materialized (the
+    terminal-state ``summary`` counts, the optimizer shadow-log
+    diagnostics, the predictor distribution gate, and the
+    ``_should_hold_book`` diagnostics). Answers the daily operator
+    question — *benign HOLD vs fault* — without cross-referencing the
+    planner log, the separate ``hold_book_flags`` artifact, and a
+    CloudWatch metric (the three surfaces it used to take).
+
+    ``state`` precedence, most-alarming first:
+
+    * ``allocations_dropped`` — the optimizer targeted a non-zero weight
+      but no order was created (price-resolution failure downstream). An
+      ERROR; mirrors the ``no_action_optimizer_dropped`` terminal state.
+    * ``hold_book_safeguard`` — the predictor gate flagged AND the
+      tradable ``predicted_alpha`` collapsed, so the optimizer rebalance
+      was suppressed and the current book retained.
+    * ``rebalanced`` — entries and/or exits were written.
+    * ``no_rebalance_at_target`` — the optimizer solved optimal with
+      one-way turnover below the rebalance band; the book is unchanged by
+      design (a valid HOLD, not a fault).
+
+    Dispersion of the tradable signal is the authoritative
+    ``_should_hold_book`` ``alpha_stdev`` when present (computed only when
+    the gate flagged), else the same cross-sectional ``pstdev`` recomputed
+    here over ``predicted_alpha``. Direction skew is an unambiguous label
+    count, always computed from the batch. ``n_high_confidence`` is
+    deliberately NOT recomputed here — it is the predictor's own
+    threshold-dependent metric, and re-deriving it with a possibly-
+    divergent threshold is the name-semantic-mismatch bug class.
+    """
+    import math
+    import statistics
+
+    n_entries = int(summary.get(f"n_{STATE_APPROVED_ENTRY}", 0))
+    n_exits = int(summary.get(f"n_{STATE_URGENT_EXIT}", 0)) + int(
+        summary.get(f"n_{STATE_REDUCE}", 0)
+    )
+    n_dropped = int(summary.get(f"n_{STATE_NO_ACTION_OPTIMIZER_DROPPED}", 0))
+
+    # One-way turnover the optimizer computed for this batch (the field the
+    # planner already logs as the HOLD justification).
+    turnover_one_way: float | None = None
+    if isinstance(optimizer_shadow_log, Mapping):
+        _diag = optimizer_shadow_log.get("diagnostics") or {}
+        _t = _diag.get("turnover_one_way") if isinstance(_diag, Mapping) else None
+        if isinstance(_t, (int, float)) and not isinstance(_t, bool):
+            turnover_one_way = float(_t)
+
+    # Predictor dispersion — what made a low-conviction day low-conviction.
+    alphas: list[float] = []
+    n_up = n_down = n_flat = 0
+    for p in (predictions_by_ticker or {}).values():
+        if not isinstance(p, Mapping):
+            continue
+        d = str(p.get("predicted_direction") or "").upper()
+        if d == "UP":
+            n_up += 1
+        elif d == "DOWN":
+            n_down += 1
+        elif d == "FLAT":
+            n_flat += 1
+        a = p.get("predicted_alpha")
+        if a is None:
+            a = p.get("canonical_predicted_alpha")
+        if isinstance(a, (int, float)) and not isinstance(a, bool) and math.isfinite(a):
+            alphas.append(float(a))
+
+    alpha_stdev: float | None = None
+    if isinstance(hold_book_diag, Mapping) and isinstance(
+        hold_book_diag.get("alpha_stdev"), (int, float)
+    ):
+        alpha_stdev = float(hold_book_diag["alpha_stdev"])
+    elif len(alphas) >= 2:
+        alpha_stdev = round(statistics.pstdev(alphas), 6)
+
+    _degenerate = (
+        hold_book_diag.get("signal_degenerate")
+        if isinstance(hold_book_diag, Mapping)
+        else None
+    )
+    dispersion = {
+        "n_predictions": len(predictions_by_ticker or {}),
+        "n_up": n_up,
+        "n_down": n_down,
+        "n_flat": n_flat,
+        "alpha_stdev": alpha_stdev,
+        "signal_degenerate": (None if _degenerate is None else bool(_degenerate)),
+    }
+
+    _gate = distribution_gate if isinstance(distribution_gate, Mapping) else {}
+    safeguard = {
+        "fired": bool(hold_book_active),
+        "reason": _gate.get("reason"),
+        "failed_check": _gate.get("failed_check"),
+    }
+
+    if n_dropped > 0:
+        state = "allocations_dropped"
+        headline = (
+            f"{n_dropped} allocation(s) targeted by the optimizer but dropped "
+            "before order creation — price-resolution failed. Investigate."
+        )
+    elif hold_book_active:
+        state = "hold_book_safeguard"
+        _why = safeguard["reason"] or safeguard["failed_check"] or "predictor batch flagged"
+        headline = (
+            "Hold-book safeguard fired — optimizer rebalance suppressed; current "
+            f"book retained with stops. Trigger: {_why}."
+        )
+    elif n_entries > 0 or n_exits > 0:
+        state = "rebalanced"
+        _e = "entry" if n_entries == 1 else "entries"
+        headline = f"Book rebalanced — {n_entries} {_e} + {n_exits} exit(s) written."
+    else:
+        state = "no_rebalance_at_target"
+        _t = (
+            f"{turnover_one_way * 100:.2f}%"
+            if turnover_one_way is not None
+            else "below threshold"
+        )
+        headline = (
+            "No rebalance — the optimizer solved optimal and the current portfolio "
+            f"already matches target (one-way turnover {_t}, below the rebalance "
+            "band). Existing positions retained with stops. Valid HOLD, not a fault."
+        )
+
+    return {
+        "state": state,
+        "headline": headline,
+        "n_entries": n_entries,
+        "n_exits": n_exits,
+        "n_dropped": n_dropped,
+        "turnover_one_way": turnover_one_way,
+        "rebalance_band_pct": rebalance_band_pct,
+        "safeguard": safeguard,
+        "dispersion": dispersion,
+    }
+
+
 def build_order_book_rationale(
     *,
     signals: Mapping[str, Any],
@@ -325,6 +476,9 @@ def build_order_book_rationale(
     run_id: str,
     optimizer_shadow_log: Mapping[str, Any] | None = None,
     current_positions: Mapping[str, Any] | None = None,
+    distribution_gate: Mapping[str, Any] | None = None,
+    hold_book_active: bool = False,
+    hold_book_diag: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Join the morning-planner decision structures into a per-ticker record.
 
@@ -651,6 +805,20 @@ def build_order_book_rationale(
         if isinstance(_band, (int, float)):
             rebalance_band_pct = float(_band)
 
+    # Single "why did/didn't the book move today" status (schema 1.3.0+).
+    # Joined from the summary counts + optimizer diagnostics + the
+    # distribution gate / hold-book decision already in hand at the call
+    # site — the daily HOLD-vs-fault answer in one field. [[feedback_no_silent_fails]]
+    book_status = _build_book_status(
+        summary=summary,
+        optimizer_shadow_log=optimizer_shadow_log,
+        rebalance_band_pct=rebalance_band_pct,
+        distribution_gate=distribution_gate,
+        hold_book_active=hold_book_active,
+        hold_book_diag=hold_book_diag,
+        predictions_by_ticker=predictions_by_ticker,
+    )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -663,6 +831,7 @@ def build_order_book_rationale(
         "portfolio_nav": portfolio_nav,
         "optimizer_trades": optimizer_trades,
         "rebalance_band_pct": rebalance_band_pct,
+        "book_status": book_status,
         "summary": summary,
         "tickers": records,
     }
