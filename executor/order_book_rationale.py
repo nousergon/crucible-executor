@@ -46,7 +46,7 @@ from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1.3.0"
+SCHEMA_VERSION = "1.4.0"
 
 # Default S3 prefix. Lives under ``trades/`` alongside the order book
 # itself (``trades/order_book/{date}.json``) so the rationale and the
@@ -698,6 +698,10 @@ def build_order_book_rationale(
                 "sizing_factors": sf,
                 "shares": ob_entry.get("shares"),
                 "dollar_size": ob_entry.get("dollar_size"),
+                # config#1436: whether this name was sized on a live IBKR
+                # snapshot or the last-close fallback (None on legacy/non-
+                # optimizer entries that don't resolve a price source).
+                "pricing_source": ob_entry.get("pricing_source"),
             })
             chain.append({
                 "stage": "entry_trigger",

@@ -164,6 +164,7 @@ def apply_optimizer_targets_to_orderbook(
                 delta_dollars=delta_dollars,
                 target_weight=target_weight,
                 current_price=current_price,
+                price_source=price_source,
                 atr_map=atr_map,
                 price_histories=price_histories,
                 strategy_config=strategy_config,
@@ -184,6 +185,7 @@ def apply_optimizer_targets_to_orderbook(
                 delta_dollars=delta_dollars,
                 target_weight=target_weight,
                 current_price=current_price,
+                price_source=price_source,
                 current_positions=current_positions,
                 signals_by_ticker=signals_by_ticker,
                 predictions_by_ticker=predictions_by_ticker,
@@ -305,6 +307,7 @@ def _build_entry_record(
     delta_dollars: float,
     target_weight: float,
     current_price: float,
+    price_source: str | None,
     atr_map: dict[str, float],
     price_histories: dict[str, pd.DataFrame] | None,
     strategy_config: dict,
@@ -374,10 +377,17 @@ def _build_entry_record(
         "stance": pred.get("stance"),
         "catalyst_date": pred.get("catalyst_date"),
         "sizing_source": "portfolio_optimizer",
+        # config#1436: which price the optimizer sized this name on — a live
+        # IBKR snapshot ("ibkr") or the last-close fallback from
+        # price_histories ("price_history_close") when the live feed missed.
+        # Invisible-before, so an operator could not tell a position was sized
+        # off a day-old price. Surfaced into the OBR decision_chain.
+        "pricing_source": price_source,
         "sizing_factors": {
             "optimizer_target_weight": target_weight,
             "optimizer_delta_dollars": round(delta_dollars, 2),
             "alpha_uncertainty": pred.get("predicted_alpha_std"),
+            "pricing_source": price_source,
         },
     }
 
@@ -387,6 +397,7 @@ def _build_urgent_exit_record(
     delta_dollars: float,
     target_weight: float,
     current_price: float,
+    price_source: str | None,
     current_positions: dict[str, dict],
     signals_by_ticker: dict[str, dict],
     predictions_by_ticker: dict[str, dict],
@@ -443,4 +454,6 @@ def _build_urgent_exit_record(
         # B.4c — same surfacing rationale as _build_entry_record above.
         "predicted_alpha_std": pred.get("predicted_alpha_std"),
         "sizing_source": "portfolio_optimizer",
+        # config#1436 — live snapshot vs last-close fallback (see entry builder).
+        "pricing_source": price_source,
     }

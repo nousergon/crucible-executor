@@ -190,6 +190,10 @@ def test_approved_entry_chain_has_sizing_and_trigger(scenario):
                  if s["stage"] == "position_sizer")
     assert sizer["sizing_factors"]["sector_adj"] == 1.2
     assert sizer["shares"] == 100
+    # config#1436: position_sizer stage always carries pricing_source
+    # (None on this legacy non-optimizer entry; "ibkr"/"price_history_close"
+    # on optimizer-sized names).
+    assert "pricing_source" in sizer
     trig = next(s for s in aapl["decision_chain"]
                 if s["stage"] == "entry_trigger")
     assert trig["triggers"]["vwap"] == 49.5
@@ -1025,9 +1029,9 @@ class TestBookStatus:
         base.update(over)
         return base
 
-    def test_schema_version_is_1_3_0(self):
+    def test_schema_version_is_1_4_0(self):
         payload = build_order_book_rationale(**self._base_kwargs())
-        assert payload["schema_version"] == "1.3.0"
+        assert payload["schema_version"] == "1.4.0"
         assert "book_status" in payload
 
     def test_no_rebalance_at_target_on_zero_turnover(self):

@@ -190,6 +190,9 @@ def test_buy_produces_entry_with_optimizer_sizing():
     assert e["position_pct"] == pytest.approx(0.83)
     assert e["sizing_source"] == "portfolio_optimizer"
     assert e["sizing_factors"]["optimizer_target_weight"] == 0.83
+    # config#1436: live snapshot → pricing_source "ibkr"
+    assert e["pricing_source"] == "ibkr"
+    assert e["sizing_factors"]["pricing_source"] == "ibkr"
     assert e["atr_pct"] == 0.012
     assert e["triggers"]["pullback_atr_multiple"] == 1.5
 
@@ -360,6 +363,9 @@ def test_falls_back_to_price_history_close_when_ibkr_down(_no_sleep_no_cw):
     assert len(entries) == 1
     assert entries[0]["current_price"] == 210.0  # last close
     assert entries[0]["shares"] == 483  # floor(101511.17 / 210)
+    # config#1436: sized off the fallback close → pricing_source records it
+    assert entries[0]["pricing_source"] == "price_history_close"
+    assert entries[0]["sizing_factors"]["pricing_source"] == "price_history_close"
     _no_sleep_no_cw.assert_called_once()
     assert _no_sleep_no_cw.call_args.kwargs["reason"] == "priced_via_fallback"
 
