@@ -1744,6 +1744,13 @@ def run(
         # trades are strictly worse than no trades for a one-day window.
         # ``legacy_sizer_fallback`` is deferred to a later PR.
         shadow_log: dict | None = None
+        # Hold-book safeguard state — bound here so it's always available to
+        # the order-book rationale build below (the optimizer block that
+        # assigns them only runs under ``use_optimizer``; on the legacy path
+        # these stay at their no-safeguard defaults).
+        _gate: dict | None = None
+        _hold_book: bool = False
+        _hold_diag: dict = {}
         run_optimizer_now = (
             not simulate and not dry_run
             and (
@@ -1915,6 +1922,12 @@ def run(
                     # rejection reasons instead.
                     optimizer_shadow_log=shadow_log,
                     current_positions=current_positions,
+                    # Hold-book safeguard state (schema 1.3.0 book_status) —
+                    # the gate verdict + the _should_hold_book dispersion
+                    # diag, already in hand from §5b. Pure join; no new read.
+                    distribution_gate=_gate,
+                    hold_book_active=_hold_book,
+                    hold_book_diag=_hold_diag,
                 )
                 write_order_book_rationale(
                     _rationale,

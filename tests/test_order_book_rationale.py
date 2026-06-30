@@ -988,3 +988,172 @@ class TestNoActionSubStates:
             assert "no_action" in stages, (
                 f"{ticker}: no_action stage missing from chain"
             )
+
+
+class TestBookStatus:
+    """The schema-1.3.0 ``book_status`` banner field — the single
+    "why did/didn't the book move today" status the console renders
+    above the per-ticker table. Asserts each of the four states fires
+    on the right evidence and that dispersion is surfaced authoritatively.
+    """
+
+    def _empty_books(self) -> dict[str, Any]:
+        return {
+            "date": "2026-06-30",
+            "approved_entries": [],
+            "urgent_exits": [],
+            "active_stops": [],
+            "executed_today": [],
+        }
+
+    def _base_kwargs(self, **over) -> dict[str, Any]:
+        base = dict(
+            signals={"enter": [], "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={},
+            order_book_data=self._empty_books(),
+            blocked_entries=[],
+            risk_events=[],
+            market_regime="neutral",
+            run_date="2026-06-30",
+            signal_date="2026-06-30",
+            prediction_date="2026-06-30",
+            calendar_date="2026-06-30",
+            trading_day="2026-06-30",
+            run_id="2606301400",
+            current_positions={},
+        )
+        base.update(over)
+        return base
+
+    def test_schema_version_is_1_3_0(self):
+        payload = build_order_book_rationale(**self._base_kwargs())
+        assert payload["schema_version"] == "1.3.0"
+        assert "book_status" in payload
+
+    def test_no_rebalance_at_target_on_zero_turnover(self):
+        # Today's 6/30 case: optimizer solved optimal, 0 entries/exits,
+        # one-way turnover below band → benign HOLD.
+        shadow = {
+            "shadow_status": "ok",
+            "diagnostics": {"status": "optimal", "turnover_one_way": 0.0041},
+            "optimizer_cfg": {"rebalance_band_pct": 0.25},
+        }
+        payload = build_order_book_rationale(
+            optimizer_shadow_log=shadow, **self._base_kwargs()
+        )
+        bs = payload["book_status"]
+        assert bs["state"] == "no_rebalance_at_target"
+        assert bs["n_entries"] == 0 and bs["n_exits"] == 0
+        assert bs["turnover_one_way"] == 0.0041
+        assert bs["rebalance_band_pct"] == 0.25
+        assert "0.41%" in bs["headline"]
+        assert bs["safeguard"]["fired"] is False
+
+    def test_rebalanced_when_entries_or_exits_written(self):
+        ob = {
+            **self._empty_books(),
+            "approved_entries": [_entry_with_meta("AAPL")],
+            "urgent_exits": [
+                {"ticker": "MSFT", "signal": "EXIT", "shares": 50, "reason": "x"}
+            ],
+        }
+        payload = build_order_book_rationale(
+            **self._base_kwargs(
+                signals={"enter": [_sig("AAPL", "ENTER")],
+                         "exit": [_sig("MSFT", "EXIT")], "reduce": [], "hold": []},
+                order_book_data=ob,
+                current_positions={"MSFT": {"mkt_val": 1000}},
+            )
+        )
+        bs = payload["book_status"]
+        assert bs["state"] == "rebalanced"
+        assert bs["n_entries"] == 1 and bs["n_exits"] == 1
+
+    def test_hold_book_safeguard_fired(self):
+        gate = {
+            "passed": False,
+            "failed_check": "direction_skew",
+            "reason": "89.7% DOWN-skew — strongly biased batch",
+        }
+        diag = {
+            "gate_flagged": True,
+            "alpha_stdev": 0.0008,
+            "signal_degenerate": True,
+            "decision": "hold_signal_degenerate",
+        }
+        payload = build_order_book_rationale(
+            distribution_gate=gate,
+            hold_book_active=True,
+            hold_book_diag=diag,
+            **self._base_kwargs(),
+        )
+        bs = payload["book_status"]
+        assert bs["state"] == "hold_book_safeguard"
+        assert bs["safeguard"]["fired"] is True
+        assert bs["safeguard"]["failed_check"] == "direction_skew"
+        assert "DOWN-skew" in bs["headline"]
+        # Authoritative dispersion comes from the hold-book diag.
+        assert bs["dispersion"]["alpha_stdev"] == 0.0008
+        assert bs["dispersion"]["signal_degenerate"] is True
+
+    def test_allocations_dropped_takes_top_precedence(self):
+        # A dropped allocation is an ERROR and outranks every other state,
+        # even if the safeguard also fired.
+        shadow = {
+            "tickers": ["AMD"],
+            "current_weights": [0.0],
+            "target_weights": [0.10],
+            "alpha_hat": [0.05],
+            "eligibility": [True],
+            "eligibility_reasons": [None],
+            "optimizer_cfg": {"min_score_to_enter": 55.0},
+            "would_be_trades": [
+                {"ticker": "AMD", "action": "BUY", "target_weight": 0.10,
+                 "delta_dollars": 12500.0}
+            ],
+            "diagnostics": {"status": "optimal", "turnover_one_way": 0.10},
+        }
+        payload = build_order_book_rationale(
+            signals={"enter": [_sig("AMD", "ENTER", score=80.0)],
+                     "exit": [], "reduce": [], "hold": []},
+            predictions_by_ticker={"AMD": {"predicted_direction": "UP",
+                                           "predicted_alpha": 0.05}},
+            optimizer_shadow_log=shadow,
+            hold_book_active=True,  # even with safeguard set, dropped wins
+            **{k: v for k, v in self._base_kwargs().items()
+               if k not in ("signals", "predictions_by_ticker")},
+        )
+        # Sanity: the ticker resolved to the dropped terminal state.
+        assert payload["summary"].get("n_no_action_optimizer_dropped", 0) >= 1
+        assert payload["book_status"]["state"] == "allocations_dropped"
+        assert payload["book_status"]["n_dropped"] >= 1
+
+    def test_dispersion_computed_from_predictions_when_no_diag(self):
+        # Normal day (gate ok → hold_diag carries no alpha_stdev): the
+        # producer recomputes cross-sectional stdev + direction skew from
+        # the batch so the dispersion sub-line still renders.
+        preds = {
+            "A": {"predicted_direction": "UP", "predicted_alpha": 0.02},
+            "B": {"predicted_direction": "UP", "predicted_alpha": 0.01},
+            "C": {"predicted_direction": "DOWN", "predicted_alpha": -0.03},
+            "D": {"predicted_direction": "FLAT", "predicted_alpha": 0.0},
+        }
+        payload = build_order_book_rationale(
+            predictions_by_ticker=preds,
+            **{k: v for k, v in self._base_kwargs().items()
+               if k != "predictions_by_ticker"},
+        )
+        disp = payload["book_status"]["dispersion"]
+        assert disp["n_predictions"] == 4
+        assert disp["n_up"] == 2 and disp["n_down"] == 1 and disp["n_flat"] == 1
+        assert disp["alpha_stdev"] is not None and disp["alpha_stdev"] > 0
+        assert disp["signal_degenerate"] is None  # not measured off-gate
+
+    def test_book_status_present_on_legacy_path(self):
+        # No optimizer/gate/hold args at all → still a valid book_status
+        # (state derived from the empty book). Backward-safe default args.
+        payload = build_order_book_rationale(**self._base_kwargs())
+        bs = payload["book_status"]
+        assert bs["state"] == "no_rebalance_at_target"
+        assert bs["safeguard"]["fired"] is False
+        assert bs["turnover_one_way"] is None
