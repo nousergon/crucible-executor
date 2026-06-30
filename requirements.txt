@@ -62,8 +62,13 @@ nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergo
 # krepis (MIT foundation) — direct pin: eod_emailer.py now imports the lifted
 # console deep-link chokepoint `krepis.console.console_url` (config#1300, krepis
 # v0.4.0 added it). nousergon-lib pulls krepis transitively, but the direct
-# import warrants the direct pin documenting the >=0.4.0 minimum.
-krepis>=0.4.0
+# import warrants the direct pin documenting the minimum.
+# >=0.6.0 floor (config#1450, completing config#1332 which bumped research+data
+# but missed this consumer): krepis>=0.6.0 pins flow-doctor[diagnosis,s3]>=0.6.2,
+# whose DEFAULT_DIAGNOSIS_MODEL is the served `claude-sonnet-4-6` alias. The old
+# >=0.4.0 floor let krepis 0.4/0.5 resolve flow-doctor 0.6.0rc6, whose retired
+# `claude-sonnet-4-6-20250514` pin 404'd on every flow-doctor diagnosis call.
+krepis>=0.6.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
