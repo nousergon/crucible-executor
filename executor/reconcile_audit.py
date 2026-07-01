@@ -14,11 +14,15 @@ the current settled close OR whose stored ``spy_return`` no longer matches the
 value recomputed from settled closes (the cascade case). Each correction writes
 an audit record and pages flow-doctor.
 
-It does NOT synthesize a NAV for a missing row. Ledger-replay backfill
+It does NOT blanket-synthesize a NAV for a missing row. Ledger-replay backfill
 (``backfill_eod_pnl``) reconstructs positions from the full trades ledger, which
 can drift from the broker's actual book and fabricate a wrong NAV (config#1276
 follow-up: an auto-backfilled 2026-06-24 produced 20 positions / +51% NAV vs the
-real 7). Gaps are FLAGGED for manual, position-verified backfill instead.
+real 7). Gaps are FLAGGED for manual, position-verified backfill UNLESS they pass
+the narrow, strictly-gated verified-zero-fill carry-forward + reprice auto-backfill
+(``auto_backfill_gap``, config#1454) — see the gap-handling branch below for the
+three-part gate. Any gap that fails that gate still falls through to the manual
+flag; this pass never auto-synthesizes a NAV for a day that actually traded.
 
 Design notes:
   * The check is CHEAP in the common case — a handful of ArcticDB reads; a
@@ -174,22 +178,64 @@ def audit_window(
             (d,),
         ).fetchone()
 
-        # ── Missing row (a skipped session). reconcile_audit does NOT synthesize
-        # a NAV here. Ledger-replay backfill (backfill_eod_pnl) reconstructs
-        # positions from the full trades ledger, which can drift from the
-        # broker's actual book and fabricate a wrong NAV (config#1276 follow-up:
-        # an auto-backfilled 06-24 produced 20 positions / +51% NAV vs the real
-        # 7). A gap is FLAGGED for manual, position-verified backfill — never
-        # auto-synthesized by this (close-staleness) pass.
+        # ── Missing row (a skipped session). reconcile_audit does NOT
+        # blanket-synthesize a NAV here — ledger-replay backfill
+        # (backfill_eod_pnl) reconstructs positions from the full trades
+        # ledger, which can drift from the broker's actual book and fabricate
+        # a wrong NAV (config#1276 follow-up: an auto-backfilled 06-24
+        # produced 20 positions / +51% NAV vs the real 7).
+        #
+        # config#1454 carves out ONE narrow, verified-honest exception: a day
+        # on which ZERO fills executed is deterministic to reconstruct (carry
+        # the prior day's book forward unchanged, reprice at authoritative
+        # ArcticDB closes). auto_backfill_gap.attempt_auto_backfill applies
+        # this ONLY when its strict 3-part gate passes (zero fills confirmed
+        # / prior snapshot exists / authoritative closes complete for every
+        # held ticker) — any gate failure (including a day that actually
+        # traded) still falls through to the MANUAL-backfill flag below.
         if row is None:
+            try:
+                from executor.auto_backfill_gap import attempt_auto_backfill
+                auto_result = attempt_auto_backfill(
+                    conn, gap_date=d, trades_bucket=trades_bucket, region=region,
+                )
+            except Exception as e:  # noqa: BLE001 — auto-backfill is best-effort;
+                # any failure (gate check, S3, or the downstream reconcile) must
+                # fall through to the manual-flag path, never leave a half state.
+                logger.error(
+                    "[reconcile_audit] auto-backfill attempt FAILED for %s: %s — "
+                    "falling back to MANUAL flag.", d, e,
+                )
+                auto_result = {"backfilled": False, "reason": str(e), "gate": {}}
+
+            if auto_result["backfilled"]:
+                logger.info(
+                    "[reconcile_audit] %s auto-backfilled (verified zero-fill "
+                    "carry-forward + reprice, config#1454) — gap cleared.", d,
+                )
+                if fd:
+                    fd.report(
+                        RuntimeError(
+                            f"eod_pnl gap at {d} AUTO-backfilled (verified zero-fill "
+                            f"carry-forward + reprice, config#1454). Prior trading day: "
+                            f"{auto_result['gate'].get('prior_date')}."),
+                        severity="warning",
+                        context={"site": "reconcile_audit_gap_auto_backfilled", "run_date": d})
+                continue
+
             logger.warning(
-                "[reconcile_audit] %s has NO eod_pnl row (skipped session) — flagging "
-                "gap for MANUAL backfill; not auto-synthesizing a NAV.", d)
-            gaps.append({"date": d, "settled_spy_close": settled})
+                "[reconcile_audit] %s has NO eod_pnl row (skipped session) — %s "
+                "Flagging gap for MANUAL backfill; not auto-synthesizing a NAV.",
+                d, auto_result["reason"])
+            gaps.append({
+                "date": d, "settled_spy_close": settled,
+                "auto_backfill_reason": auto_result["reason"],
+            })
             if fd:
                 fd.report(
                     RuntimeError(
-                        f"eod_pnl gap at {d}: no row (skipped session). Manually run "
+                        f"eod_pnl gap at {d}: no row (skipped session). Auto-backfill "
+                        f"not eligible ({auto_result['reason']}). Manually run "
                         f"`backfill_eod_pnl --date {d}` after verifying held positions."),
                     severity="warning",
                     context={"site": "reconcile_audit_gap", "run_date": d})
