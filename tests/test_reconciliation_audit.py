@@ -24,13 +24,14 @@ def _conn(rows: list[dict]) -> sqlite3.Connection:
     c = sqlite3.connect(":memory:")
     c.execute(
         "CREATE TABLE trades (trade_id TEXT, date TEXT, ticker TEXT, action TEXT, "
-        "shares INTEGER, filled_shares INTEGER, status TEXT)"
+        "shares INTEGER, filled_shares INTEGER, status TEXT, fill_time TEXT)"
     )
     for i, r in enumerate(rows):
         c.execute(
-            "INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
             (str(i), r.get("date", "2026-06-10"), r["ticker"], r["action"],
-             r.get("shares"), r.get("filled_shares"), r.get("status")),
+             r.get("shares"), r.get("filled_shares"), r.get("status"),
+             r.get("fill_time")),
         )
     c.commit()
     return c
@@ -82,6 +83,75 @@ class TestReconstruct:
         conn = _conn([])
         with pytest.raises(ValueError):
             reconstruct_ledger_positions(conn, as_of_date="x", on_date="y")
+
+    # ── config#1454: trading_day-vs-calendar (real fill date wins) ────────
+
+    def test_on_date_uses_fill_time_not_trading_day_tag(self):
+        # Tagged date=D-1 (trading_day) but the ACTUAL fill lands D — the
+        # daily-delta comparison must attribute it to D (where IB's book
+        # would actually reflect it), not D-1.
+        conn = _conn([
+            {"ticker": "AAPL", "action": "ENTER", "filled_shares": 50,
+             "status": "Filled", "date": "2026-06-09", "fill_time": "2026-06-10T09:31:00"},
+        ])
+        assert reconstruct_ledger_positions(conn, on_date="2026-06-10") == {"AAPL": 50}
+        assert reconstruct_ledger_positions(conn, on_date="2026-06-09") == {}
+
+    def test_on_date_excludes_trade_tagged_today_but_filled_tomorrow(self):
+        # Tagged date=D but the fill's real timestamp is D+1 — must NOT be
+        # attributed to D (IB's book on D would not yet show it).
+        conn = _conn([
+            {"ticker": "MSFT", "action": "ENTER", "filled_shares": 20,
+             "status": "Filled", "date": "2026-06-10", "fill_time": "2026-06-11T08:15:00"},
+        ])
+        assert reconstruct_ledger_positions(conn, on_date="2026-06-10") == {}
+        assert reconstruct_ledger_positions(conn, on_date="2026-06-11") == {"MSFT": 20}
+
+    def test_legacy_row_without_fill_time_falls_back_to_date_tag(self):
+        # Pre-fill_time-column rows (NULL) keep the old date-tag behavior —
+        # no regression for historical data.
+        conn = _conn([
+            {"ticker": "NVDA", "action": "ENTER", "filled_shares": 5,
+             "status": "Filled", "date": "2026-06-10", "fill_time": None},
+        ])
+        assert reconstruct_ledger_positions(conn, on_date="2026-06-10") == {"NVDA": 5}
+
+    def test_as_of_date_also_uses_effective_fill_date(self):
+        # Cumulative-through-date replay: a trade tagged D but filled D+1
+        # should NOT be included in a cumulative view as-of D (it hadn't
+        # really happened yet); it SHOULD be included as-of D+1.
+        conn = _conn([
+            {"ticker": "TSLA", "action": "ENTER", "filled_shares": 15,
+             "status": "Filled", "date": "2026-06-10", "fill_time": "2026-06-11T09:31:00"},
+        ])
+        assert reconstruct_ledger_positions(conn, as_of_date="2026-06-10") == {}
+        assert reconstruct_ledger_positions(conn, as_of_date="2026-06-11") == {"TSLA": 15}
+
+    def test_daily_delta_no_longer_double_counts_across_the_boundary(self):
+        # The config#1454 failure mode: a trade tagged trading_day=D but
+        # filled D+1 used to make BOTH days disagree with IB (D: ledger has
+        # a fill IB doesn't show yet; D+1: IB shows a fill the ledger
+        # attributed to D). Anchored on fill date, only D+1 sees the delta.
+        conn = _conn([
+            {"ticker": "AAPL", "action": "ENTER", "filled_shares": 30,
+             "status": "Filled", "date": "2026-06-17", "fill_time": "2026-06-18T09:31:05"},
+        ])
+        audit_d = build_reconciliation_audit(
+            conn, today_positions=_pos(AAPL=100), prior_positions=_pos(AAPL=100),
+            run_date="2026-06-17",
+        )
+        # D: IB unchanged from prior (100); ledger's real fill isn't D's yet.
+        assert audit_d["reconciliation_match_rate"] == 1.0
+        assert audit_d["daily_delta"]["mismatches"] == []
+
+        audit_d1 = build_reconciliation_audit(
+            conn, today_positions=_pos(AAPL=130), prior_positions=_pos(AAPL=100),
+            run_date="2026-06-18",
+        )
+        # D+1: IB now shows the +30 fill, and the ledger (keyed on fill date)
+        # agrees — clean match, no manufactured mismatch on either day.
+        assert audit_d1["reconciliation_match_rate"] == 1.0
+        assert audit_d1["daily_delta"]["mismatches"] == []
 
 
 class TestBuildAudit:
