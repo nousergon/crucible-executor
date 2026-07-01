@@ -48,6 +48,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import pandas as pd
+
 logger = logging.getLogger(__name__)
 
 # Trade-action sign conventions (see executor/daemon.py action vocabulary).
@@ -63,6 +65,33 @@ _NON_FILL_STATUSES = frozenset(
 )
 
 _RECON_TOLERANCE_SHARES = 0  # exact share parity; whole-share equities
+
+
+def _effective_trade_date(row: dict[str, Any]) -> Optional[str]:
+    """The calendar date a trade row should be attributed to for a
+    day-level ledger-vs-IB comparison: the ACTUAL fill timestamp's calendar
+    date when available, else the ledger's ``date`` tag (legacy rows with no
+    ``fill_time``).
+
+    config#1454 (position-reconciliation trading_day-vs-calendar artifact):
+    an order tagged ``date``/``trading_day`` = D that actually fills on D+1
+    (e.g. a late/overnight execution reported the next morning) previously
+    made the (B) daily-delta / anchored-parity check compare IB's actual
+    book — which only reflects fills that settled by that day's close —
+    against a ledger delta keyed on the ORDER's trading_day tag rather than
+    the fill's real date. That produced a false mismatch on BOTH D (ledger
+    counted a fill IB hadn't received yet) and D+1 (IB reflected a fill the
+    ledger attributed to D). Keying on the fill's own timestamp instead of
+    the trading_day tag fixes the root cause: the ledger delta for a given
+    day now reflects exactly the fills IB could have received by that day.
+    """
+    fill_time = row.get("fill_time")
+    if fill_time:
+        try:
+            return pd.Timestamp(fill_time).date().isoformat()
+        except (ValueError, TypeError):
+            pass
+    return row.get("date")
 
 
 def _shares_contributed(row: dict[str, Any]) -> int:
@@ -104,20 +133,37 @@ def reconstruct_ledger_positions(
     ``on_date`` restricts to trades dated exactly that day — used for the
     (B) daily-delta check. Pass at most one. Tickers netting to 0 are
     dropped.
+
+    Both bounds are evaluated against each row's EFFECTIVE date — the real
+    fill timestamp's calendar date (``_effective_trade_date``), not the
+    ledger's ``date``/``trading_day`` tag. This closes the config#1454
+    trading_day-vs-calendar artifact: a trade tagged trading_day=D that
+    actually filled on D+1 must compare against IB's book on D+1 (when the
+    fill was real), not D (when it wasn't in IB's book yet).
+
+    Deliberately NOT narrowed by a SQL date filter first: the tag and the
+    true fill date can in principle drift by more than a day (e.g. a fill
+    reported several days late), and a tight SQL pre-filter would silently
+    reproduce exactly the bug this function fixes by excluding those rows
+    before the Python effective-date check ever sees them. The full-table
+    scan is deliberate and cheap at this executor's single-portfolio ledger
+    scale; correctness here matters more than a SQL-side bound.
     """
     if as_of_date and on_date:
         raise ValueError("pass at most one of as_of_date / on_date")
-    sql = "SELECT ticker, action, shares, filled_shares, status FROM trades"
-    params: tuple = ()
-    if on_date is not None:
-        sql += " WHERE date = ?"
-        params = (on_date,)
-    elif as_of_date is not None:
-        sql += " WHERE date <= ?"
-        params = (as_of_date,)
+
+    sql = (
+        "SELECT ticker, action, shares, filled_shares, status, date, "
+        "fill_time FROM trades"
+    )
     net: dict[str, int] = {}
-    for ticker, action, shares, filled_shares, status in conn.execute(sql, params):
+    for ticker, action, shares, filled_shares, status, date_, fill_time in conn.execute(sql):
         if not ticker:
+            continue
+        eff_date = _effective_trade_date({"date": date_, "fill_time": fill_time})
+        if on_date is not None and eff_date != on_date:
+            continue
+        if as_of_date is not None and (eff_date is None or eff_date > as_of_date):
             continue
         delta = _shares_contributed({
             "ticker": ticker, "action": action, "shares": shares,
