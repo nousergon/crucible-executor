@@ -8,7 +8,10 @@
                 "ssm:GetParametersByPath",
                 "ssm:GetParameter"
             ],
-            "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/*"
+            "Resource": [
+                "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/*",
+                "arn:aws:ssm:us-east-1:711398986525:parameter/vires/*"
+            ]
         }
     ]
 }
