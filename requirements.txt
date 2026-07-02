@@ -73,7 +73,12 @@ nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergo
 # whose DEFAULT_DIAGNOSIS_MODEL is the served `claude-sonnet-4-6` alias. The old
 # >=0.4.0 floor let krepis 0.4/0.5 resolve flow-doctor 0.6.0rc6, whose retired
 # `claude-sonnet-4-6-20250514` pin 404'd on every flow-doctor diagnosis call.
-krepis>=0.6.0
+# >=0.8.0 floor (config#1610): krepis v0.8.0 added the session axis —
+# `session_date()` (the session being traded; daemon/main/order_book run_date)
+# and `assert_within_session()` (write-time content-vs-key guard on trade log
+# + nav_series). The prior now_dual().trading_day run_date mislabeled every
+# live session D-1 and mis-joined the EOD reconcile.
+krepis>=0.8.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at

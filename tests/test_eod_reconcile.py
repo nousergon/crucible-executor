@@ -404,21 +404,35 @@ class TestSnapshotContract:
                 run(run_date=None)
 
     def test_explicit_run_date_passes_through(self):
-        """Phase 2 removed the run_date != today hard-block — explicit
-        historical run_dates are now valid as long as a snapshot exists.
-        This test confirms run() doesn't raise on the date itself; the
-        snapshot-existence check happens later in the flow."""
+        """Historical run_dates are valid on the CORRECTION path
+        (run_audit=False — how reconcile_audit and operator replays call
+        in) as long as a snapshot exists. This test confirms run() doesn't
+        raise on the date itself there; the snapshot-existence check
+        happens later in the flow. The LIVE path (run_audit=True) hard-
+        blocks a mismatched date — see test_live_run_refuses_mismatched_
+        date below (config#1610)."""
         with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
              patch("executor.eod_reconcile.load_config") as mock_cfg:
             mock_now_dual.return_value = SimpleNamespace(
                 trading_day="2026-04-28", calendar_date="2026-04-28"
             )
             mock_cfg.side_effect = RuntimeError("expected_test_sentinel")
-            # An explicit historical run_date used to raise (PR #116). With
-            # Phase 2's snapshot contract it must reach load_config — the
-            # snapshot-existence check is the new gate.
             with pytest.raises(RuntimeError, match="expected_test_sentinel"):
-                run(run_date="2026-04-25")
+                run(run_date="2026-04-25", run_audit=False)
+
+    def test_live_run_refuses_mismatched_date(self):
+        """The LIVE daily path (run_audit=True) must refuse a run_date that
+        isn't the just-closed session (config#1610): with CaptureSnapshot
+        skipped, EODReconcile is the first date-checking state, and this
+        guard is what stops a mislabeled SF run_date from silently joining
+        one session's trades against another session's snapshot (the
+        eod-2026-06-30 skip-swallow)."""
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            with pytest.raises(RuntimeError, match="refusing live run"):
+                run(run_date="2026-04-25", run_audit=True)
 
     def test_run_raises_when_snapshot_missing(self):
         """If no snapshot exists at s3://...trades/snapshots/{run_date}.json,
@@ -468,7 +482,7 @@ class TestSnapshotContract:
             mock_db.return_value = MagicMock()
             mock_load.return_value = None
             with pytest.raises(RuntimeError) as exc:
-                run(run_date="2026-04-25")
+                run(run_date="2026-04-25", run_audit=False)
             msg = str(exc.value)
             assert "2026-04-25" in msg
             assert "snapshot_capturer.py" in msg

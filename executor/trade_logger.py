@@ -65,14 +65,18 @@ _TRADES_MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN realized_alpha_pct REAL",
     "ALTER TABLE trades ADD COLUMN days_held INTEGER",
     "ALTER TABLE trades ADD COLUMN slippage_vs_signal REAL",
-    # ── Date-convention dual-tracking (2026-04-24) ──
-    # See alpha-engine-docs/private/DATE_CONVENTIONS.md. Every trade-related
-    # artifact pairs calendar_date (existing `date`/`created_at` audit columns)
-    # with a trading_day (NYSE last-completed-session attribution) and, where
-    # applicable, the signal_trading_day that originated the trade. Both new
-    # columns are nullable so backfill on existing rows is a separate one-shot
-    # script (scripts/backfill_trading_day.py) and old log_trade() callers
-    # without the new context keep working as NULLs.
+    # ── Date-convention dual-tracking (2026-04-24; axes named config#1610) ──
+    # See alpha-engine-docs/private/DATE_CONVENTIONS.md. The `date` column is
+    # the SESSION axis: the NYSE session the trade physically executed in
+    # (the daemon's run_date = session_date; the reconcile/snapshot join
+    # key). `trading_day` is the KNOWLEDGE axis: the last CLOSED session at
+    # fill time — "what closed data was this trade acting on" (D-1 for an
+    # intraday fill). `signal_trading_day` is the knowledge day of the
+    # originating signals.json where applicable; `created_at` is wall-clock
+    # audit. Both dual-tracking columns are nullable so backfill on existing
+    # rows is a separate one-shot script (scripts/backfill_trading_day.py)
+    # and old log_trade() callers without the new context keep working as
+    # NULLs.
     "ALTER TABLE trades ADD COLUMN trading_day TEXT",
     "ALTER TABLE trades ADD COLUMN signal_trading_day TEXT",
     # GICS sector name (e.g. "Financials"). Populated from signals.json at
@@ -280,6 +284,30 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             # Lib not yet bumped on this deploy — leave NULL. Backfill script
             # closes the gap. Don't hard-fail on a missing optional dep.
             trading_day = None
+    # Content-vs-key guard (config#1610): `date` is the SESSION axis — the
+    # session the trade executed in — so a fill_time in a different session
+    # than the label is a mis-key (the daemon's frozen run_date drifting, or
+    # a caller passing the knowledge axis by mistake). Deliberate swallow:
+    # the ERROR log is the recording surface, and the row is still inserted
+    # — refusing to record an ALREADY-EXECUTED order would trade an audit
+    # gap for a label bug, strictly worse. The startup strict-guard and the
+    # cross-component invariant test are the hard enforcement.
+    _fill_time = trade.get("fill_time")
+    if _fill_time and trade.get("date"):
+        try:
+            from datetime import datetime as _dt
+            from nousergon_lib.dates import assert_within_session
+            assert_within_session(
+                _dt.fromisoformat(str(_fill_time).replace("Z", "+00:00")),
+                str(trade["date"]),
+            )
+        except ValueError as _axis_err:
+            logger.error(
+                "trades.date session mis-key (row inserted anyway): %s",
+                _axis_err,
+            )
+        except Exception:
+            pass  # lib not yet bumped / unparseable fill_time — best-effort
     conn.execute(
         """
         INSERT INTO trades (

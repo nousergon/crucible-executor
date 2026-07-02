@@ -410,16 +410,30 @@ def run_daemon(dry_run: bool = False) -> None:
 
     client_id = strategy_config.get("intraday_client_id", 2)
     poll_interval = strategy_config.get("intraday_poll_interval_sec", 60)
-    # Trading-day axis (issue config#1016): run_date keys the daemon's trade
-    # artifacts and is the trading_day passed into log_trade for every fill,
-    # so it must attribute to the last closed NYSE session via now_dual().
-    # It must use the SAME axis as main.py's order-book `date` field, otherwise
-    # the order-book freshness match (order_book.py) would treat the
-    # morning-batch book as stale pre-open on a session whose date.today()
-    # already advanced. On a trading day after the open trading_day == today.
-    from nousergon_lib.dates import now_dual
-    _dual = now_dual()
-    run_date = _dual.trading_day
+    # Session axis (config#1610; supersedes the config#1016 rationale):
+    # run_date keys the daemon's EVENT artifacts — trades.date, nav_series,
+    # decision capture, the EOD SF trigger — so it must be the SESSION BEING
+    # TRADED (session_date), NOT now_dual().trading_day. trading_day is the
+    # last *closed* session (= D-1 during a live session; #1016's comment
+    # believed otherwise), which mislabeled every session from 6/23–7/2 and
+    # mis-joined EOD reconciles against the wrong day's snapshot.
+    # trading_day remains the knowledge axis: log_trade derives it per fill
+    # (D-1, "what closed data was this trade acting on"). run_date must use
+    # the SAME axis as main.py's order-book `date` field or the order-book
+    # freshness match (order_book.py) discards the morning book — both
+    # flipped together in this change. Frozen once at startup: stays correct
+    # through the close, and the post-close shutdown path can't drift onto
+    # the next session.
+    from nousergon_lib.dates import session_date
+    try:
+        run_date = session_date(strict=True).isoformat()
+    except ValueError as _axis_err:
+        # Weekend/holiday/post-close start — no session to trade. Exit
+        # loudly-but-cleanly (mirrors the intraday_enabled early-return);
+        # silently attributing this start to the NEXT session would
+        # re-create the mislabel bug in the other direction.
+        logger.error("No live NYSE session to trade at startup: %s", _axis_err)
+        return
 
     # ── Intraday reconcile-to-target state (optimizer authority) ─────────────
     # When the optimizer owns the book, hard-risk exits (catastrophic gap stop,
