@@ -7,28 +7,27 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from executor.order_book import OrderBook, _current_trading_day, _default_book
+from executor.order_book import OrderBook, _current_session_date, _default_book
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
 def _today() -> str:
-    # The order book's ``date`` field and its load-time freshness check key on
-    # the *trading day* (last closed NYSE session via now_dual().trading_day),
-    # NOT the raw calendar date (config#1016). Pre-open on a weekday these
-    # differ, so the load tests must compare against the trading-day axis the
-    # source actually stamps — comparing to date.today() is time-of-day flaky
-    # (green after the close, red pre-open).
-    return _current_trading_day()
+    # The order book's ``date`` field and its load-time freshness check key
+    # on the SESSION axis (session_date — the session the book is for,
+    # config#1610), NOT the raw calendar date or the last closed trading
+    # day. The load tests must compare against the axis the source actually
+    # stamps — anything else is time-of-day flaky.
+    return _current_session_date()
 
 
 def _yesterday() -> str:
-    # A date guaranteed strictly before the current trading day, so the
+    # A date guaranteed strictly before the current session, so the
     # stale-book discard fires regardless of time-of-day. Walk back from the
-    # current trading day rather than from date.today() (which can EQUAL the
-    # trading day pre-open, making the "stale" book look current).
-    return (date.fromisoformat(_current_trading_day()) - timedelta(days=1)).isoformat()
+    # current session rather than from date.today() (which can differ from
+    # the session date around weekends/holidays).
+    return (date.fromisoformat(_current_session_date()) - timedelta(days=1)).isoformat()
 
 
 def _make_book(tmp_path, data: dict | None = None):
@@ -292,79 +291,98 @@ def test_save_atomic_no_tmp(tmp_path):
     assert not path.with_suffix(".tmp").exists()
 
 
-# ── 19. trading-day axis (issue config#1016) ─────────────────────────────
+# ── 19. session axis (config#1610; supersedes config#1016) ──────────────
 #
 # The order book keys its `date` field and its load-time freshness check on
-# the last *closed* NYSE session (now_dual().trading_day), not the raw
-# calendar date, so the morning batch (main.py) and the daemon (daemon.py) —
-# which both derive run_date from now_dual().trading_day — agree on which
-# book is "today's" even when read pre-open or on a non-session calendar day.
+# the SESSION axis — the NYSE session the book is FOR (session_date: the
+# session in progress, or next upcoming on a non-session day) — so the
+# morning batch (main.py) and the daemon (daemon.py), which both derive
+# run_date from the same helper, agree on which book is "today's" whether
+# read pre-open, intraday, or on a weekend.
 
 
-def test_current_trading_day_resolves_to_prior_session_on_weekend(monkeypatch):
-    """On a Saturday, _current_trading_day() walks back to the prior Friday
-    session — NOT date.today(). Mirrors the now_dual() contract in
-    nousergon_lib.dates (Sat 2026-04-25 → trading_day 2026-04-24)."""
-    from nousergon_lib.dates import now_dual
+def _patch_session(monkeypatch, moment):
+    """Point the lazily-imported session_date at a fixed moment."""
+    import nousergon_lib.dates as dates_mod
+    from nousergon_lib.dates import session_date as real_session_date
+    monkeypatch.setattr(
+        dates_mod, "session_date",
+        lambda now=None, **kw: real_session_date(moment, **kw),
+    )
 
+
+def test_current_session_date_maps_weekend_to_next_session(monkeypatch):
+    """On a Saturday, _current_session_date() resolves to the NEXT session
+    (Monday) — a weekend-built book is for Monday, not the closed Friday.
+    (Sat 2026-04-25 → session 2026-04-27.)"""
     saturday = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)  # 8 AM ET Sat
-    # _current_trading_day imports now_dual lazily from nousergon_lib.dates,
-    # so patch that source symbol.
-    import nousergon_lib.dates as dates_mod
-    monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=saturday))
+    _patch_session(monkeypatch, saturday)
 
-    assert _current_trading_day() == "2026-04-24"
-    # And it is NOT the raw calendar date.
-    assert _current_trading_day() != saturday.date().isoformat()
+    assert _current_session_date() == "2026-04-27"
+    assert _current_session_date() != saturday.date().isoformat()
 
 
-def test_default_book_keys_on_trading_day_when_offsession(monkeypatch):
-    """A fresh book built on a weekend keys `date` to the prior session."""
-    import nousergon_lib.dates as dates_mod
-    from nousergon_lib.dates import now_dual
+def test_current_session_date_is_physical_session_intraday(monkeypatch):
+    """Intraday, the session is TODAY — not the last closed session (D-1).
+    This is the config#1610 incident shape: a daemon started 2026-07-02
+    intraday must key its artifacts 2026-07-02, not 2026-07-01."""
+    intraday = datetime(2026, 7, 2, 13, 31, tzinfo=timezone.utc)  # 9:31 ET
+    _patch_session(monkeypatch, intraday)
 
+    assert _current_session_date() == "2026-07-02"
+
+
+def test_default_book_keys_on_next_session_when_offsession(monkeypatch):
+    """A fresh book built on a weekend keys `date` to the next session."""
     sunday = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc)
-    monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=sunday))
+    _patch_session(monkeypatch, sunday)
 
     book = _default_book()
-    assert book["date"] == "2026-04-24"  # Friday session, not Sunday calendar
+    assert book["date"] == "2026-04-27"  # Monday session, not Sunday calendar
 
 
-def test_load_keeps_book_written_on_prior_calendar_day_same_session(monkeypatch, tmp_path):
-    """The exact bug config#1016 guards: a book the morning batch wrote keyed
-    to the trading session must NOT be discarded as 'stale' on a pre-open read
-    whose calendar date has advanced but whose session has not.
+def test_load_keeps_preopen_book_intraday_same_session(monkeypatch, tmp_path):
+    """The freshness match both #1016 and #1610 protect: a book the morning
+    batch wrote pre-open for session D must NOT be discarded as 'stale' by
+    the daemon reading it later the same session."""
+    intraday = datetime(2026, 7, 2, 14, 0, tzinfo=timezone.utc)  # 10 AM ET
+    _patch_session(monkeypatch, intraday)
 
-    Saturday read of a book keyed to Friday's session (2026-04-24) keeps it,
-    because Saturday's trading_day is still Friday."""
-    import nousergon_lib.dates as dates_mod
-    from nousergon_lib.dates import now_dual
-
-    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
-    monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=saturday))
-
-    book_data = _default_book(run_date="2026-04-24")  # Friday session key
+    book_data = _default_book(run_date="2026-07-02")  # written pre-open
     book_data["approved_entries"].append({"ticker": "AAPL", "status": "pending"})
     path = _make_book(tmp_path, book_data)
 
     loaded = OrderBook.load(path)
-    # Same trading session → book preserved, entries intact.
-    assert loaded.data["date"] == "2026-04-24"
+    assert loaded.data["date"] == "2026-07-02"
+    assert loaded.data["approved_entries"][0]["ticker"] == "AAPL"
+
+
+def test_load_keeps_weekend_book_on_monday(monkeypatch, tmp_path):
+    """A Saturday operator book (keyed to Monday's session) survives the
+    Monday pre-open read — same session on both sides."""
+    monday_preopen = datetime(2026, 4, 27, 13, 0, tzinfo=timezone.utc)  # 9 ET
+    _patch_session(monkeypatch, monday_preopen)
+
+    book_data = _default_book(run_date="2026-04-27")  # written Saturday
+    book_data["approved_entries"].append({"ticker": "AAPL", "status": "pending"})
+    path = _make_book(tmp_path, book_data)
+
+    loaded = OrderBook.load(path)
+    assert loaded.data["date"] == "2026-04-27"
     assert loaded.data["approved_entries"][0]["ticker"] == "AAPL"
 
 
 def test_load_discards_book_from_prior_session(monkeypatch, tmp_path):
-    """A book from a genuinely earlier session is still discarded."""
-    import nousergon_lib.dates as dates_mod
-    from nousergon_lib.dates import now_dual
+    """A book from a genuinely earlier session is still discarded — incl.
+    a book keyed on the OLD (last-closed / D-1) axis, which is exactly the
+    stale state the fix leaves behind on the box at cutover."""
+    intraday = datetime(2026, 7, 2, 14, 0, tzinfo=timezone.utc)
+    _patch_session(monkeypatch, intraday)
 
-    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)  # session = Fri 4/24
-    monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=saturday))
-
-    stale = _default_book(run_date="2026-04-23")  # Thursday session — older
+    stale = _default_book(run_date="2026-07-01")  # D-1 (old-axis key)
     stale["approved_entries"].append({"ticker": "AAPL", "status": "pending"})
     path = _make_book(tmp_path, stale)
 
     loaded = OrderBook.load(path)
-    assert loaded.data["date"] == "2026-04-24"  # rebuilt on current session
+    assert loaded.data["date"] == "2026-07-02"  # rebuilt on current session
     assert loaded.data["approved_entries"] == []

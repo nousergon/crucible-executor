@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import boto3
@@ -349,6 +349,23 @@ class IntradayNavSeriesWriter:
         if nav is None:
             return False
 
+        # Content-vs-key guard (config#1610): a NAV point ticks during the
+        # session labeled on the file — a point timestamped in a different
+        # session than its key is the exact mislabel that mis-joined the EOD
+        # reconcile (nav_series/2026-07-01.json full of 07-02 timestamps).
+        # Refuse the mis-keyed point (ERROR + skipped write; the recording
+        # surfaces are this log line and chart/heartbeat staleness) rather
+        # than raising into the order loop's fire-and-forget except.
+        now_utc = datetime.now(timezone.utc)
+        try:
+            from nousergon_lib.dates import assert_within_session
+            assert_within_session(now_utc, trading_day)
+        except ValueError as _axis_err:
+            logger.error("nav_series point refused — %s", _axis_err)
+            return False
+        except ImportError:
+            pass  # lib not yet bumped on this deploy — guard is best-effort
+
         key = self.key_for(trading_day)
         existing, status = _get_json_from_s3(self._s3, self._bucket, key)
         if status == "error":
@@ -361,13 +378,18 @@ class IntradayNavSeriesWriter:
             if isinstance(prior, list):
                 points = prior
 
-        now_iso = datetime.utcnow().isoformat() + "Z"
+        now_iso = now_utc.replace(tzinfo=None).isoformat() + "Z"
         points.append({"t": now_iso, "nav": nav, "spy": spy_last})
         if len(points) > self._max_points:
             points = points[-self._max_points:]
 
         payload = {
+            # Historical field name; holds the SESSION the curve belongs to
+            # (session axis, config#1610). `session_date` states it
+            # explicitly; `trading_day` is retained for consumers
+            # (additive-only S3 contract).
             "trading_day": trading_day,
+            "session_date": trading_day,
             "updated_at": now_iso,
             "points": points,
         }

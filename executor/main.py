@@ -410,11 +410,18 @@ def _read_signals(
 
     signals = get_actionable_signals(signals_raw)
 
-    # Alert if signals are stale (research didn't run recently)
+    # Alert if signals are stale (research didn't run recently).
+    # Freshness is a KNOWLEDGE-axis comparison: signals.json is keyed by
+    # trading_day (last closed session), so age is measured against
+    # now_dual().trading_day — NOT run_date, which is the session axis
+    # (config#1610) and sits one session ahead intraday (comparing against
+    # it would false-alert every Monday on perfectly fresh Friday signals).
     if not simulate:
         try:
-            signals_date_raw = signals_raw.get("date", run_date)
-            _sig_age = (date.fromisoformat(run_date) - date.fromisoformat(signals_date_raw)).days
+            from nousergon_lib.dates import now_dual as _now_dual
+            _knowledge_day = _now_dual().trading_day
+            signals_date_raw = signals_raw.get("date", _knowledge_day)
+            _sig_age = (date.fromisoformat(_knowledge_day) - date.fromisoformat(signals_date_raw)).days
             if _sig_age > 2:
                 from executor.notifier import send_daemon_status
                 send_daemon_status(
@@ -941,22 +948,27 @@ def run(
     All other behaviour (risk guard, position sizer, trade logger) is unchanged.
     """
     orders = []
-    # Trading-day axis (issue config#1016): run_date keys every trade artifact
-    # this module produces — order_books/{run_date}/, hold_book_flags/{run_date}.json,
-    # trades/order_book/{run_date}.json, the order book's `date` field, and the
-    # trades.date column via downstream log_trade. Those are all session-keyed
-    # artifacts, so run_date must attribute to the last *closed* NYSE session
-    # (now_dual().trading_day), not the raw calendar date. On a trading day after
-    # the open this equals date.today(); on weekends/holidays/pre-open it walks
-    # back to the prior session — which is the correct key for an operator run.
+    # Session axis (config#1610; supersedes the config#1016 rationale):
+    # run_date keys every trade artifact this module produces —
+    # order_books/{run_date}/, hold_book_flags/{run_date}.json,
+    # trades/order_book/{run_date}.json, the order book's `date` field, and
+    # the trades.date column via downstream log_trade. Those are all
+    # session-keyed EVENT artifacts, so run_date is the session this book
+    # is FOR: session_date(), the physical session in progress or next
+    # upcoming — NOT now_dual().trading_day, which is the last *closed*
+    # session (D-1 pre-open/intraday; #1016's comment believed it advanced
+    # at the open — it does not). Must match daemon.py's run_date axis or
+    # the order-book freshness check discards the morning book. Non-strict:
+    # a weekend/holiday operator run legitimately builds the book for the
+    # NEXT session (a Saturday book is for Monday, not the closed Friday).
     # calendar_date is retained for the audit log line (when the process ran).
-    from nousergon_lib.dates import now_dual
+    from nousergon_lib.dates import now_dual, session_date
     _dual = now_dual()
-    run_date = _dual.trading_day
+    run_date = session_date().isoformat()
     _health_start = _time.time()
     logger.info(
-        "Executor starting | trading_day=%s calendar_date=%s | dry_run=%s | simulate=%s",
-        run_date, _dual.calendar_date, dry_run, simulate,
+        "Executor starting | session=%s trading_day=%s calendar_date=%s | dry_run=%s | simulate=%s",
+        run_date, _dual.trading_day, _dual.calendar_date, dry_run, simulate,
     )
 
     config = load_config()

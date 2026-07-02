@@ -19,25 +19,28 @@ _ORDER_BOOK_DIR = Path(__file__).resolve().parent.parent / "data"
 _ORDER_BOOK_PATH = _ORDER_BOOK_DIR / "order_book.json"
 
 
-def _current_trading_day() -> str:
-    """Last closed NYSE session as an ISO string (the order book's session axis).
+def _current_session_date() -> str:
+    """The NYSE session in progress / next upcoming, as an ISO string.
 
-    Issue config#1016: the order book's ``date`` field and its load-time
-    freshness check key on the *trading day*, not the raw calendar date, so
-    that the morning batch (main.py) and the daemon (daemon.py) — which both
-    derive run_date from ``now_dual().trading_day`` — agree on which book is
-    "today's". A pre-open weekday read still resolves to the prior session
-    until the open, matching the run_date the producers wrote with. On a
-    trading day after the close this equals ``date.today()``.
+    Session axis (config#1610; supersedes the config#1016 rationale): the
+    order book's ``date`` field and its load-time freshness check key on
+    ``session_date`` — the session the book is FOR — so the morning batch
+    (main.py) and the daemon (daemon.py), which both derive run_date from
+    the same helper, agree on which book is "today's". Pre-open and
+    intraday this is the physical session being traded; a book written on
+    a weekend keys to the next session (a Saturday operator book is for
+    Monday). The prior ``now_dual().trading_day`` axis resolved to the
+    last *closed* session (D-1 intraday), which mislabeled the book and
+    every downstream trade artifact one session behind.
     """
-    from nousergon_lib.dates import now_dual
+    from nousergon_lib.dates import session_date
 
-    return now_dual().trading_day
+    return session_date().isoformat()
 
 
 def _default_book(run_date: str | None = None) -> dict:
     return {
-        "date": run_date or _current_trading_day(),
+        "date": run_date or _current_session_date(),
         "approved_entries": [],
         "urgent_exits": [],
         "active_stops": [],
@@ -123,9 +126,9 @@ class OrderBook:
                     finally:
                         fcntl.flock(lock_f, fcntl.LOCK_UN)
                 # Discard stale book from a previous trading session. Compare on
-                # the trading-day axis (config#1016) so the daemon doesn't treat
+                # the session axis (config#1610) so the daemon doesn't treat
                 # the morning batch's book as stale on a pre-open weekday read.
-                if data.get("date") != _current_trading_day():
+                if data.get("date") != _current_session_date():
                     logger.info("Order book is from %s — starting fresh", data.get("date"))
                     data = _default_book()
                 return cls(data, path)

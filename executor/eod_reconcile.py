@@ -498,6 +498,23 @@ def run(
             run_date,
         )
     else:
+        # Axis guard (config#1610), mirroring snapshot_capturer: the LIVE
+        # daily run (run_audit=True) joins today's trades against today's
+        # snapshot, so an explicit run_date must equal the just-closed
+        # session — post-close, session_date == now_dual().trading_day.
+        # A mismatched date (e.g. an SF input carrying a mislabeled daemon
+        # run_date) would silently join one session's trades against a
+        # different session's snapshot → mis-stated NAV. Historical
+        # re-reconciles legitimately pass past dates but arrive via
+        # run_audit=False (the reconcile_audit correction pass).
+        if run_audit and run_date != today_trading_day:
+            raise RuntimeError(
+                f"EOD reconcile refusing live run with run_date={run_date!r} "
+                f"!= today's trading_day {today_trading_day!r}. A live "
+                f"reconcile must join the just-closed session; historical "
+                f"correction passes go through reconcile_audit "
+                f"(run_audit=False)."
+            )
         logger.info("EOD reconciliation | date=%s (explicit)", run_date)
     # Previous NYSE trading day — the baseline every "daily" figure must be
     # measured against. Used to detect skipped-SF gaps (config#1228).
@@ -1406,7 +1423,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--date",
         default=None,
-        help="YYYY-MM-DD; defaults to today's trading_day. A past date re-reconciles from its snapshot.",
+        help=(
+            "YYYY-MM-DD; defaults to today's trading_day. A past date "
+            "re-reconciles from its snapshot and REQUIRES --no-audit (the "
+            "correction path) — the live path refuses non-current dates "
+            "(config#1610 axis guard)."
+        ),
     )
     parser.add_argument(
         "--no-email",

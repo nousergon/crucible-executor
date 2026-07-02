@@ -314,33 +314,44 @@ def series_writer(mock_s3):
     return IntradayNavSeriesWriter(bucket="test-bucket", s3_client=mock_s3)
 
 
+@pytest.fixture
+def live_session() -> str:
+    # The writer's content-vs-key guard (config#1610) refuses a label that
+    # doesn't contain the point's real wall-clock timestamp, so write tests
+    # must label with the CURRENT session rather than a fixed date.
+    from nousergon_lib.dates import session_date
+
+    return session_date().isoformat()
+
+
 class TestIntradayNavSeriesWriter:
     def test_key_format(self):
         assert IntradayNavSeriesWriter.key_for("2026-06-18") == (
             NAV_SERIES_PREFIX + "2026-06-18.json"
         )
 
-    def test_first_tick_starts_new_series(self, series_writer, mock_s3):
+    def test_first_tick_starts_new_series(self, series_writer, mock_s3, live_session):
         mock_s3.get_object.side_effect = _no_such_key()
-        ok = series_writer.write("2026-06-18", _ACCT, spy_last=740.96)
+        ok = series_writer.write(live_session, _ACCT, spy_last=740.96)
         assert ok is True
         call = mock_s3.put_object.call_args
-        assert call.kwargs["Key"] == NAV_SERIES_PREFIX + "2026-06-18.json"
+        assert call.kwargs["Key"] == NAV_SERIES_PREFIX + f"{live_session}.json"
         body = _written_payload(mock_s3)
-        assert body["trading_day"] == "2026-06-18"
+        assert body["trading_day"] == live_session
+        assert body["session_date"] == live_session
         assert len(body["points"]) == 1
         p = body["points"][0]
         assert p["nav"] == _ACCT["net_liquidation"]
         assert p["spy"] == 740.96
         assert "t" in p
 
-    def test_appends_to_existing_series(self, series_writer, mock_s3):
+    def test_appends_to_existing_series(self, series_writer, mock_s3, live_session):
         prior = {
-            "trading_day": "2026-06-18",
-            "points": [{"t": "2026-06-18T13:45:00Z", "nav": 999_000.0, "spy": 739.0}],
+            "trading_day": live_session,
+            "points": [{"t": f"{live_session}T13:45:00Z", "nav": 999_000.0, "spy": 739.0}],
         }
         mock_s3.get_object.return_value = _get_body(prior)
-        series_writer.write("2026-06-18", _ACCT, spy_last=740.96)
+        series_writer.write(live_session, _ACCT, spy_last=740.96)
         body = _written_payload(mock_s3)
         assert len(body["points"]) == 2
         assert body["points"][0]["nav"] == 999_000.0  # prior preserved
@@ -363,12 +374,12 @@ class TestIntradayNavSeriesWriter:
         # fresh single-point list on a transient read failure.
         mock_s3.put_object.assert_not_called()
 
-    def test_max_points_trims_oldest(self, mock_s3):
+    def test_max_points_trims_oldest(self, mock_s3, live_session):
         writer = IntradayNavSeriesWriter(
             bucket="test-bucket", s3_client=mock_s3, max_points=3
         )
         prior = {
-            "trading_day": "2026-06-18",
+            "trading_day": live_session,
             "points": [
                 {"t": "t1", "nav": 1.0, "spy": 1.0},
                 {"t": "t2", "nav": 2.0, "spy": 2.0},
@@ -376,15 +387,15 @@ class TestIntradayNavSeriesWriter:
             ],
         }
         mock_s3.get_object.return_value = _get_body(prior)
-        writer.write("2026-06-18", _ACCT, spy_last=740.96)
+        writer.write(live_session, _ACCT, spy_last=740.96)
         body = _written_payload(mock_s3)
         assert len(body["points"]) == 3
         assert body["points"][0]["nav"] == 2.0  # oldest (t1) dropped
         assert body["points"][-1]["nav"] == _ACCT["net_liquidation"]
 
-    def test_spy_none_stored(self, series_writer, mock_s3):
+    def test_spy_none_stored(self, series_writer, mock_s3, live_session):
         mock_s3.get_object.side_effect = _no_such_key()
-        series_writer.write("2026-06-18", _ACCT, spy_last=None)
+        series_writer.write(live_session, _ACCT, spy_last=None)
         body = _written_payload(mock_s3)
         assert body["points"][0]["spy"] is None
 
