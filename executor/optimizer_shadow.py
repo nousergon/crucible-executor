@@ -600,7 +600,19 @@ def _build_adv_usd(
     if not signals_bucket:
         return adv, {"adv_names_covered": 0, "adv_names_total": n_real,
                      "adv_source": "none_no_bucket"}
-    tradeability = read_universe_tradeability(signals_bucket, run_date)
+    # The reader already fails soft (returns {} on any S3/credential/parse
+    # error), but wrap defensively so NO tradeability-read failure mode can
+    # ever propagate up into run_shadow_optimizer and null the shadow log.
+    # A None/{} map ↔ "no ADV coverage" ↔ the optimizer's flat-L1 fallback.
+    try:
+        tradeability = read_universe_tradeability(signals_bucket, run_date)
+    except Exception as exc:  # noqa: BLE001 — construction refinement, never a gate
+        logger.warning(
+            "Universe tradeability read raised (%s) — ADV absent, flat-L1 "
+            "tcost fallback.", exc,
+        )
+        return adv, {"adv_names_covered": 0, "adv_names_total": n_real,
+                     "adv_source": "none_read_error"}
     adv_by_ticker = extract_adv_usd(tradeability)
     covered = 0
     for i, t in enumerate(tickers):

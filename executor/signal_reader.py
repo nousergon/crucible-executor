@@ -9,7 +9,7 @@ import logging
 from datetime import date, timedelta
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from nousergon_lib.eval_artifacts import load_latest_eval_artifact
 from nousergon_lib.universe import filter_to_universe
@@ -251,12 +251,19 @@ def read_universe_tradeability(
     are keyed on the SAME liquidity numbers the research board scores.
 
     Returns ``{ticker: tradeability_block}`` for every stock with a block, or an
-    EMPTY dict on any miss (artifact absent — pre-#343 rollout, an out-of-band
-    date, a malformed payload). FAIL-SOFT by contract: the optimizer treats a
+    EMPTY dict on any miss. FAIL-SOFT by contract — the optimizer treats a
     missing/empty map as "no ADV info" and degrades to the flat L1 turnover
     penalty (see portfolio_optimizer.solve_target_weights). A read failure must
-    NEVER block the morning planner — tradeability is a construction refinement,
-    not a gate.
+    NEVER block the morning planner (tradeability is a construction refinement,
+    not a gate), so EVERY failure mode returns ``{}`` rather than propagating:
+
+      * missing artifact (NoSuchKey/404) — pre-#343 rollout / out-of-band date;
+      * any other ``ClientError`` (403 AccessDenied, throttling, …);
+      * the ``BotoCoreError`` family — ``NoCredentialsError`` (e.g. CI / a box
+        with no AWS creds), ``EndpointConnectionError``, connect/read timeouts;
+      * a malformed / non-JSON payload.
+
+    Mirrors the fail-soft except-style of the ``read_*`` helpers above.
     """
     d = run_date or str(date.today())
     key = f"scanner/universe/{d}/universe.json"
@@ -274,6 +281,18 @@ def read_universe_tradeability(
             )
             return {}
         logger.warning("Failed reading universe tradeability (%s) — ADV absent", e)
+        return {}
+    except BotoCoreError as e:
+        # Credential / endpoint / connection-level failures (NoCredentialsError,
+        # EndpointConnectionError, ConnectTimeoutError, …) all subclass
+        # BotoCoreError but NOT ClientError — catch them here so a no-creds
+        # environment or a transient network fault degrades to the flat-L1
+        # fallback instead of crashing the shadow optimizer. [[feedback_no_silent_fails]]
+        # recording surface = this WARN log.
+        logger.warning(
+            "boto core error reading universe tradeability s3://%s/%s (%s) — "
+            "ADV absent, flat-L1 tcost fallback.", s3_bucket, key, e,
+        )
         return {}
     except (ValueError, json.JSONDecodeError) as e:
         logger.warning("Malformed universe artifact s3://%s/%s (%s) — ADV absent",

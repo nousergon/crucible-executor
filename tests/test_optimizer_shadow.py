@@ -38,6 +38,25 @@ from executor.optimizer_shadow import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_universe_tradeability_read(monkeypatch):
+    """Isolate the scanner-tradeability S3 read from AWS by default.
+
+    ``_build_and_solve`` calls ``read_universe_tradeability`` (config#1401) to
+    key the √-impact cost term on per-name ADV$. That helper opens a real boto3
+    client; with no AWS creds (CI) it fails soft to ``{}``, but relying on the
+    live boto path made these tests environment-dependent (they only passed on
+    a box with ambient creds — see the #321 CI red). Default the read to ``{}``
+    (no ADV coverage → the optimizer's flat-L1 fallback, the bit-identical
+    pre-1401 behavior) so the shadow tests are deterministic and creds-free.
+    Tests that WANT ADV coverage re-patch it explicitly.
+    """
+    monkeypatch.setattr(
+        "executor.signal_reader.read_universe_tradeability",
+        lambda *a, **k: {},
+    )
+
+
 def _synthetic_price_df(n_rows: int = 260, seed: int = 0) -> pd.DataFrame:
     """Build a price history DataFrame with a 'close' column."""
     rng = np.random.default_rng(seed)
@@ -105,6 +124,73 @@ def test_happy_path_assembles_inputs_and_writes_to_s3():
     assert latest_call["Key"] == "predictor/optimizer_shadow/latest.json"
     body = json.loads(dated_call["Body"])
     assert body["shadow_status"] == "ok"
+
+
+def test_adv_coverage_engages_participation_aware_tcost(monkeypatch):
+    """When the scanner tradeability artifact supplies ADV$, the shadow solve
+    uses the participation-aware √-impact cost term (not the flat-L1 fallback)
+    and records ADV coverage in the log (config#1401)."""
+    inputs = _baseline_inputs()
+    # Patch the tradeability read to return ADV$ for the real names.
+    monkeypatch.setattr(
+        "executor.signal_reader.read_universe_tradeability",
+        lambda *a, **k: {
+            "AAPL": {"adv_usd": 8.0e9, "tradeability_score": 95.0},
+            "MSFT": {"adv_usd": 6.0e9, "tradeability_score": 92.0},
+            "JNJ":  {"adv_usd": 3.0e9, "tradeability_score": 80.0},
+        },
+    )
+    s3 = MagicMock()
+    log = run_shadow_optimizer(s3_client=s3, **inputs)
+
+    assert log is not None
+    assert log["shadow_status"] == "ok"
+    diag = log["diagnostics"]
+    assert diag["tcost_term_mode"] == "sqrt_impact"
+    assert diag["tcost_n_names_with_adv"] == 3
+    assert diag["max_pct_adv_applied"] is True
+    assert log["adv_coverage"]["adv_names_covered"] == 3
+    assert log["adv_coverage"]["adv_source"] == "scanner_universe_tradeability"
+    # ADV$ vector is emitted (SPY/CASH → None).
+    assert log["adv_usd"][-2:] == [None, None]
+
+
+def test_shadow_optimizer_failsoft_when_tradeability_read_has_no_credentials(monkeypatch):
+    """REGRESSION (#321 CI red): in a no-AWS-creds environment the scanner
+    tradeability read raises NoCredentialsError deep in botocore. That must
+    degrade to 'no ADV coverage → flat-L1 tcost fallback', NEVER crash the
+    shadow optimizer. Verify both layers: (a) read_universe_tradeability itself
+    swallows NoCredentialsError → {}, and (b) the end-to-end shadow solve still
+    succeeds with the flat-L1 term."""
+    from botocore.exceptions import NoCredentialsError
+
+    import executor.signal_reader as sr
+
+    # Layer (a): the reader swallows the BotoCoreError-family credential error.
+    boto_client = MagicMock()
+    boto_client.get_object.side_effect = NoCredentialsError()
+    monkeypatch.setattr(sr.boto3, "client", lambda *a, **k: boto_client)
+    assert sr.read_universe_tradeability("test-bucket", "2026-05-11") == {}
+
+    # Layer (b): drive the real reader (still no creds) through the shadow solve.
+    # Undo the autouse {} stub so the genuine read path runs; boto3.client is
+    # still the no-creds mock above.
+    monkeypatch.setattr(
+        "executor.signal_reader.read_universe_tradeability",
+        sr.read_universe_tradeability,
+    )
+    inputs = _baseline_inputs()
+    s3 = MagicMock()
+    log = run_shadow_optimizer(s3_client=s3, **inputs)
+
+    assert log is not None, (
+        "Shadow optimizer must survive a no-credentials tradeability read"
+    )
+    assert log["shadow_status"] == "ok"
+    diag = log["diagnostics"]
+    assert diag["tcost_term_mode"] == "flat_l1"
+    assert diag["max_pct_adv_applied"] is False
+    assert log["adv_coverage"]["adv_names_covered"] == 0
 
 
 def test_extract_universe_tickers_accepts_production_dict_shape():
