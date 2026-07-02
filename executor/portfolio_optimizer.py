@@ -7,13 +7,38 @@ no-conviction fill, cash is a pinned operational sleeve, conviction picks
 express deviation from SPY within sector + position + vol-target constraints.
 
 Math:
-    maximize   wᵀα̂  −  λ · wᵀΣ_H w  −  γ · wᵀΩw  −  τ · ‖w − w_prev‖₁
+    maximize   wᵀα̂  −  λ · wᵀΣ_H w  −  γ · wᵀΩw  −  C(w − w_prev)/NAV
     s.t.       Σwᵢ = 1                                    (budget)
                w[CASH] = cash_sleeve                       (sleeve pin)
                0 ≤ wᵢ ≤ stance_capᵢ                       (per-name cap)
                Σ_{i∈sector S} wᵢ ≤ max_sector_pct          (sector cap)
+               |wᵢ − w_prevᵢ| · NAV ≤ max_pct_adv · ADVᵢ   (participation cap)
                wᵢ = 0 for i with eligibility=False         (gate mask)
                wᵀΣ_H w ≤ σ²_target_H                       (vol-target SOC)
+
+Transaction-cost term (tradeability arc, §43 — config#1401): the objective's
+cost term is the participation-aware **square-root market-impact** cost from
+the fleet's ONE shared engine (``nousergon_lib.quant.transaction_cost``,
+lib#144), NOT a flat L1 turnover penalty. Per-name one-side dollar cost is
+
+    C_i(Δwᵢ) = |Δwᵢ|·NAV · (half_spread + commission)/1e4              (linear)
+             + impact_coef/1e4 · NAV^{1.5} · |Δwᵢ|^{1.5} / √ADVᵢ        (impact)
+
+i.e. cost ∝ half_spread + c·√(participation) per Almgren-Chriss/Kissell, so the
+DOLLAR cost scales as |Δwᵢ|^{1.5} (participation^{1.5}) — CONVEX in the trade
+size, so ``−Σ C_i / NAV`` is concave and the objective stays DCP. Keying the
+impact term on per-name ADV$ (from the scanner tradeability artifact) makes
+turnover cost participation-aware: rebalancing an illiquid name is penalized far
+more than a liquid one, where the flat 5bps L1 penalty was liquidity-blind. When
+a name has no ADV coverage the impact term drops to the half-spread+commission
+floor (the lib's conservative fallback) — never an error, never a silent zero.
+The impact coefficient is a literature default (impact_coef_bps≈10 at 100%
+participation) and configurable via the ``transaction_cost`` config block; a
+TCA calibration loop against realized slippage_vs_signal (daemon.py:1570) is a
+documented FOLLOW-ON, not built here. When ``adv_usd`` is None (or all-NaN, or
+``portfolio_notional`` is None — pre-tradeability-artifact rollout) the term
+degrades to the legacy flat L1 turnover penalty (``tcost_bps``), preserving
+bit-identical fail-soft behavior. See §43 + optimizer-sota-upgrades-260526.md.
 
 Horizon convention: Σ_H is the H-day covariance, where H is set via
 ``cfg["sigma_horizon_days"]`` (default 1 = daily, preserves legacy behavior).
@@ -38,6 +63,7 @@ into shadow mode (PR 2).
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -69,6 +95,9 @@ def solve_target_weights(
     *,
     alpha_uncertainty: np.ndarray | None = None,
     covariance: np.ndarray | None = None,
+    adv_usd: np.ndarray | None = None,
+    portfolio_notional: float | None = None,
+    name_sigma: np.ndarray | None = None,
 ) -> OptimizerResult:
     """
     Solve the constrained MVO and return target weights + diagnostics.
@@ -117,6 +146,27 @@ def solve_target_weights(
             look-ahead (Σ is daily-stable). ``returns_panel`` may be None when
             ``covariance`` is provided. None ↔ estimate Σ from returns_panel
             as before.
+        adv_usd: optional shape (N,) per-name average daily DOLLAR volume
+            (price × shares), read from the scanner tradeability artifact's
+            ``tradeability.adv_usd`` block (crucible-research#343). Drives BOTH
+            the participation-aware √-impact cost term AND the max-%-ADV
+            participation constraint. Entries that are NaN / ≤0 (coverage gap)
+            fall back to the half-spread+commission cost floor and are exempt
+            from the participation constraint (no ADV → no participation bound
+            can be formed — conservative degrade, never a crash). SPY and CASH
+            entries are ignored (benchmark fill / sleeve carry no market
+            impact). None ↔ no ADV info → the cost term degrades to the legacy
+            flat ``tcost_bps`` L1 penalty and the participation constraint is
+            skipped (bit-identical pre-tradeability behavior).
+        portfolio_notional: optional book size in dollars (NAV) — required to
+            convert weight deltas to trade notionals for the √-impact term and
+            the max-%-ADV constraint. When None (or ≤0) the participation-aware
+            path is disabled and the optimizer falls back to the legacy flat
+            ``tcost_bps`` penalty, preserving fail-soft behavior.
+        name_sigma: optional shape (N,) per-name daily return volatility used
+            for the Almgren-Chriss σ-scaling of the impact term (σᵢ/refσ, where
+            refσ = the cross-sectional median). None ↔ σ-agnostic √-impact (the
+            lib default), which is the safe institutional baseline.
 
     Returns:
         OptimizerResult with weights (length N, sums to 1, sleeve pinned) and
@@ -161,10 +211,14 @@ def solve_target_weights(
     sigma_psd = cp.psd_wrap(sigma)
     w = cp.Variable(N)
 
+    tcost = _build_tcost_term(
+        cp, w, w_prev, adv_usd, portfolio_notional, name_sigma,
+        spy_idx, cash_idx, cfg,
+    )
     objective_terms = [
         alpha_hat @ w,
         - cfg["risk_aversion"] * cp.quad_form(w, sigma_psd),
-        - (cfg["tcost_bps"] / 1e4) * cp.norm(w - w_prev, 1),
+        tcost.objective_term,
     ]
     if alpha_unc_used:
         # γ · sum_i (σ_α̂_i² · w_i²) — diagonal-Ω Garlappi-Uppal-Wang penalty.
@@ -197,6 +251,20 @@ def solve_target_weights(
         idx = [i for i, s in enumerate(sectors) if s == sector_label]
         constraints.append(cp.sum(w[idx]) <= cfg["max_sector_pct"])
 
+    # ── max-%-ADV participation constraint (tradeability arc, config#1401) ──
+    # Bound the single-solve trade in each name to a fraction of its average
+    # daily dollar volume: |Δwᵢ|·NAV ≤ max_pct_adv · ADVᵢ. This is the HARD
+    # capacity guardrail the √-impact objective term complements — the cost
+    # term prices participation, this constraint refuses to trade a name so
+    # thin that even a small book move would move the market. Only applied to
+    # names with usable ADV coverage (NaN/≤0 → no bound can be formed → exempt,
+    # conservative degrade) and only when a book notional is known; SPY/CASH
+    # (benchmark fill / sleeve) carry no market impact and are always exempt.
+    adv_cap_meta = _apply_max_pct_adv_constraint(
+        cp, w, w_prev, constraints, adv_usd, portfolio_notional,
+        spy_idx, cash_idx, cfg,
+    )
+
     problem = cp.Problem(objective, constraints)
     weights, status = _solve_with_fallback(problem, w, cfg)
 
@@ -206,6 +274,8 @@ def solve_target_weights(
             weights, w_prev, sigma, alpha_hat, spy_idx, "infeasible_fallback", cfg,
             omega_diag=omega_diag, alpha_unc_used=alpha_unc_used,
         )
+        diagnostics.update(tcost.diagnostics)
+        diagnostics.update(adv_cap_meta)
         return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
     weights = _clip_and_renormalize(weights, effective_caps, cash_idx, cfg)
@@ -215,6 +285,8 @@ def solve_target_weights(
         omega_diag=omega_diag, alpha_unc_used=alpha_unc_used,
     )
     diagnostics.update(governor)
+    diagnostics.update(tcost.diagnostics)
+    diagnostics.update(adv_cap_meta)
     return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
 
@@ -237,6 +309,31 @@ OPTIMIZER_CONFIG_DEFAULTS: dict = {
     "max_sector_pct": 0.25,
     "covariance_shrinkage": "ledoit_wolf",
     "min_position_pct": 0.005,
+    # ── Participation-aware transaction cost (tradeability arc, config#1401) ─
+    # ``tcost_mode`` selects the objective's turnover-cost term:
+    #   "sqrt_impact" (default) — the canonical participation-aware √-impact
+    #     dollar cost from nousergon_lib.quant.transaction_cost (lib#144),
+    #     keyed on per-name ADV$. Requires adv_usd + portfolio_notional; when
+    #     either is absent it AUTOMATICALLY degrades to the flat L1 penalty
+    #     (fail-soft). This is the institutional-correct construction cost.
+    #   "flat_l1" — the legacy flat ``tcost_bps`` L1 penalty (liquidity-blind).
+    #     Kept for A/B and as the explicit fallback the auto-degrade lands on.
+    # The impact COEFFICIENT (impact_coef_bps, half_spread_bps, commission_bps)
+    # lives in the ``transaction_cost`` config block consumed by
+    # TransactionCostModel.from_config — literature defaults today; a TCA
+    # calibration loop against realized slippage_vs_signal (daemon.py:1570) is
+    # the documented FOLLOW-ON that will tune impact_coef_bps. See §43.
+    "tcost_mode": "sqrt_impact",
+    # ── max-%-ADV participation constraint (config#1401) ─────────────────────
+    # HARD capacity guardrail: |Δwᵢ|·NAV ≤ max_pct_adv · ADVᵢ per name per
+    # solve. None → constraint OFF (bit-identical legacy behavior). 0.05 = a
+    # single-solve trade may consume at most 5% of a name's average daily
+    # dollar volume — a conservative institutional participation ceiling that
+    # keeps the √-impact objective term honest (the cost prices participation;
+    # this refuses to trade a name so thin the model can't be trusted). Only
+    # binds on names with ADV coverage; requires portfolio_notional to convert
+    # weight deltas to notionals — skipped (with a diagnostic) when absent.
+    "max_pct_adv": 0.05,
     # Horizon (trading days) at which Σ is expressed. 1 = legacy daily Σ
     # (bit-identical to pre-260526 behavior); set to 21 to align Σ with the
     # canonical 21d log-domain α̂. See optimizer-sota-upgrades-260526.md §A.1.
@@ -326,6 +423,212 @@ def _resolve_alpha_uncertainty(
     omega = arr ** 2
     used = bool(np.any(omega > 0.0))
     return omega, used
+
+
+@dataclass(frozen=True)
+class _TCostTerm:
+    """The optimizer objective's turnover-cost term + its observability."""
+    objective_term: object          # a cvxpy expression (concave, DCP-safe)
+    diagnostics: dict
+
+
+def _clean_adv(
+    adv_usd: np.ndarray | None, N: int, spy_idx: int, cash_idx: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize an ADV$ vector → (adv, usable_mask).
+
+    ``adv`` has NaN/≤0/non-finite entries coerced to 0.0 (no coverage).
+    ``usable_mask`` is True only for real names (not SPY/CASH) with ADV>0.
+    SPY (benchmark fill) and CASH (sleeve) carry no market impact and are
+    always excluded from both the cost term and the participation constraint.
+    ``adv_usd=None`` → all-zero adv, all-False mask (no ADV info at all).
+    """
+    if adv_usd is None:
+        return np.zeros(N), np.zeros(N, dtype=bool)
+    adv = np.asarray(adv_usd, dtype=np.float64).ravel()
+    if adv.shape != (N,):
+        raise ValueError(
+            f"adv_usd shape {adv.shape} != ({N},) — one ADV$ entry per ticker"
+        )
+    adv = np.where(np.isfinite(adv) & (adv > 0.0), adv, 0.0)
+    usable = adv > 0.0
+    usable[spy_idx] = False
+    usable[cash_idx] = False
+    return adv, usable
+
+
+def _resolve_ref_sigma(
+    name_sigma: np.ndarray | None, usable_mask: np.ndarray,
+) -> tuple[np.ndarray | None, float | None]:
+    """Return (sigma_used, ref_sigma) for the Almgren-Chriss σ-scaling.
+
+    ref_sigma is the cross-sectional MEDIAN σ over usable names (the lib's
+    self-calibrating reference: the median-vol name reproduces the σ-agnostic
+    cost). Returns (None, None) — σ-agnostic — when no per-name σ is supplied
+    or no usable finite-positive σ exists (safe institutional default).
+    """
+    if name_sigma is None:
+        return None, None
+    sig = np.asarray(name_sigma, dtype=np.float64).ravel()
+    finite_pos = np.isfinite(sig) & (sig > 0.0) & usable_mask
+    if not np.any(finite_pos):
+        return None, None
+    ref = float(np.median(sig[finite_pos]))
+    if not (ref > 0.0):
+        return None, None
+    return sig, ref
+
+
+def _build_tcost_term(
+    cp, w, w_prev: np.ndarray,
+    adv_usd: np.ndarray | None,
+    portfolio_notional: float | None,
+    name_sigma: np.ndarray | None,
+    spy_idx: int, cash_idx: int,
+    cfg: dict,
+) -> _TCostTerm:
+    """Build the objective's turnover-cost term.
+
+    Consumes the fleet's canonical √-impact ``TransactionCostModel`` (lib#144)
+    for the coefficients — the executor never re-derives the impact math. The
+    per-name one-side DOLLAR cost decomposes into a cvxpy-DCP-safe convex sum:
+
+        C_i = (half_spread+commission)/1e4 · NAV · |Δwᵢ|          (linear)
+            + impact_coef·(σᵢ/refσ)/1e4 · NAV^{1.5}/√ADVᵢ · |Δwᵢ|^{1.5}
+
+    |Δwᵢ| is convex; |Δwᵢ|^{1.5} = power(|Δwᵢ|,1.5) is convex; both enter the
+    objective as ``−ΣC_i/NAV`` (concave → valid in cp.Maximize). Dividing by
+    NAV keeps the term commensurate with the (weight-space) α̂ and risk terms.
+
+    Fail-soft: when tcost_mode="flat_l1", OR portfolio_notional is missing/≤0,
+    OR no name has usable ADV coverage, the term degrades to the legacy flat
+    ``tcost_bps`` L1 penalty ``−(tcost_bps/1e4)·‖w−w_prev‖₁`` — bit-identical
+    to pre-1401 behavior. The chosen mode is surfaced in diagnostics.
+    """
+    flat_l1 = - (cfg["tcost_bps"] / 1e4) * cp.norm(w - w_prev, 1)
+    mode = str(cfg.get("tcost_mode", "sqrt_impact"))
+    N = w.shape[0]
+    adv, usable = _clean_adv(adv_usd, N, spy_idx, cash_idx)
+    n_usable = int(np.sum(usable))
+
+    def _flat(reason: str) -> _TCostTerm:
+        return _TCostTerm(
+            objective_term=flat_l1,
+            diagnostics={
+                "tcost_term_mode": "flat_l1",
+                "tcost_fallback_reason": reason,
+                "tcost_n_names_with_adv": n_usable,
+            },
+        )
+
+    if mode == "flat_l1":
+        return _flat("configured_flat_l1")
+    if mode != "sqrt_impact":
+        raise ValueError(f"Unknown tcost_mode: {mode!r} (expected sqrt_impact|flat_l1)")
+    if portfolio_notional is None or not (float(portfolio_notional) > 0.0):
+        return _flat("no_portfolio_notional")
+    if n_usable == 0:
+        # No ADV coverage anywhere (pre-tradeability-artifact rollout, or an
+        # all-gap universe) → cannot form the participation-aware term.
+        return _flat("no_adv_coverage")
+
+    try:
+        from nousergon_lib.quant.transaction_cost import TransactionCostModel
+    except ImportError as e:  # pragma: no cover - pin guarantees availability
+        logger.warning(
+            "nousergon_lib.quant.transaction_cost unavailable (%s) — falling "
+            "back to flat L1 turnover penalty. Bump the nousergon-lib pin to "
+            ">=v0.75.0 (lib#144).", e,
+        )
+        return _flat("lib_unavailable")
+
+    model = TransactionCostModel.from_config(cfg)
+    nav = float(portfolio_notional)
+    sig_used, ref_sigma = _resolve_ref_sigma(name_sigma, usable)
+
+    # Linear (half-spread + commission) part — applies to EVERY name that
+    # trades, ADV-covered or not: it's the spread/commission floor, not impact.
+    linear_bps = model.half_spread_bps + model.commission_bps
+    dw = w - w_prev
+    linear_cost = (linear_bps / 1e4) * nav * cp.abs(dw)  # per-name $, vector
+
+    # Impact part — only names with ADV coverage. k_i · |Δwᵢ|^{1.5}, where
+    # k_i = impact_coef·(σᵢ/refσ)/1e4 · NAV^{1.5} / √ADVᵢ.
+    impact_terms = []
+    for i in np.where(usable)[0]:
+        sigma_scale = 1.0
+        if sig_used is not None and ref_sigma:
+            s = sig_used[i]
+            if np.isfinite(s) and s > 0.0:
+                sigma_scale = float(s) / ref_sigma
+        k_i = (
+            model.impact_coef_bps * sigma_scale / 1e4
+            * (nav ** 1.5) / math.sqrt(adv[i])
+        )
+        if k_i > 0.0:
+            impact_terms.append(k_i * cp.power(cp.abs(dw[i]), 1.5))
+
+    total_cost = cp.sum(linear_cost)
+    if impact_terms:
+        total_cost = total_cost + cp.sum(impact_terms)
+    # Normalize dollar cost back to weight units (÷NAV) so the cost term is
+    # commensurate with the weight-space α̂ / risk / uncertainty terms.
+    objective_term = - total_cost / nav
+    return _TCostTerm(
+        objective_term=objective_term,
+        diagnostics={
+            "tcost_term_mode": "sqrt_impact",
+            "tcost_n_names_with_adv": n_usable,
+            "tcost_impact_coef_bps": float(model.impact_coef_bps),
+            "tcost_sigma_scaled": bool(sig_used is not None and ref_sigma),
+            "tcost_portfolio_notional": nav,
+        },
+    )
+
+
+def _apply_max_pct_adv_constraint(
+    cp, w, w_prev: np.ndarray, constraints: list,
+    adv_usd: np.ndarray | None,
+    portfolio_notional: float | None,
+    spy_idx: int, cash_idx: int,
+    cfg: dict,
+) -> dict:
+    """Append the per-name max-%-ADV participation constraint, in place.
+
+    ``|wᵢ − w_prevᵢ| · NAV ≤ max_pct_adv · ADVᵢ`` for every real name with
+    usable ADV coverage. cvxpy encodes ``|Δwᵢ| ≤ bound_i`` as the linear pair
+    ``Δwᵢ ≤ bound_i``, ``−Δwᵢ ≤ bound_i`` (kept affine so the LP/SOCP stays
+    convex). Skipped (returns a diagnostic) when the cap is disabled, no book
+    notional is known, or no name has ADV coverage — fail-soft, never a crash.
+
+    Returns a diagnostics dict recording whether the cap was applied + to how
+    many names, so an operator can see the constraint is (or isn't) live.
+    """
+    cap = cfg.get("max_pct_adv")
+    N = w.shape[0]
+    adv, usable = _clean_adv(adv_usd, N, spy_idx, cash_idx)
+    n_usable = int(np.sum(usable))
+    if cap is None or not (float(cap) > 0.0):
+        return {"max_pct_adv_applied": False, "max_pct_adv_reason": "disabled"}
+    if portfolio_notional is None or not (float(portfolio_notional) > 0.0):
+        return {"max_pct_adv_applied": False, "max_pct_adv_reason": "no_portfolio_notional"}
+    if n_usable == 0:
+        return {"max_pct_adv_applied": False, "max_pct_adv_reason": "no_adv_coverage"}
+
+    nav = float(portfolio_notional)
+    cap = float(cap)
+    idx = np.where(usable)[0]
+    # Per-name weight-space bound: max_pct_adv·ADVᵢ / NAV.
+    bounds = cap * adv[idx] / nav
+    dw = w[idx] - w_prev[idx]
+    constraints.append(dw <= bounds)
+    constraints.append(-dw <= bounds)
+    return {
+        "max_pct_adv_applied": True,
+        "max_pct_adv": cap,
+        "max_pct_adv_n_names_constrained": int(len(idx)),
+        "max_pct_adv_min_bound_weight": float(np.min(bounds)) if len(bounds) else None,
+    }
 
 
 def _validate_inputs(

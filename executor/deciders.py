@@ -502,6 +502,7 @@ def decide_entries(
     run_date: str,
     predictions_date: str | None = None,
     regime_intensity_z: float | None = None,
+    adv_map: dict | None = None,
 ) -> EntryPlan:
     """Pure decision pipeline for ENTER signals.
 
@@ -815,6 +816,11 @@ def decide_entries(
             # None → 1.0× multiplier (graceful degrade); only affects sizing
             # once ``barrier_win_prob_sizing_enabled`` is flipped on.
             barrier_win_prob=pred_data.get("barrier_win_prob"),
+            # Per-name ADV$ from the scanner tradeability artifact
+            # (crucible-research#343). None when the map is absent / the ticker
+            # is uncovered → the ADV size cap is skipped (legacy sizing). See
+            # position_sizer.compute_position_size (config#1401).
+            adv_usd=(adv_map or {}).get(ticker),
         )
 
         # Emit executor:position_sizer DecisionArtifact (L2308 PR 2).

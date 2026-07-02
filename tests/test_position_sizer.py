@@ -646,3 +646,84 @@ class TestBarrierWinProbSizing:
             )["position_pct"]
 
         assert _pp(0.1) < _pp(0.9)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADV-based size cap (tradeability arc, config#1401)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAdvSizeCap:
+    """Per-name ADV size cap: a single new position may consume at most
+    ``adv_size_cap_pct_adv`` of the name's average daily dollar volume."""
+
+    def _size(self, *, adv_usd, **cfg_over):
+        # Single entry → base_weight 1.0, capped at max_position_pct=0.05 →
+        # $5,000 target on a $100k book (before any ADV cap).
+        return compute_position_size(
+            ticker="THINCO",
+            portfolio_nav=100_000,
+            enter_signals=[{"ticker": "THINCO"}],
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=100.0,
+            config=_base_config(**cfg_over),
+            adv_usd=adv_usd,
+        )
+
+    def test_adv_cap_binds_on_illiquid_name(self):
+        """ADV so thin that 10% of it < the $5k target → dollar_size clipped to
+        10% of ADV and adv_cap_applied flagged."""
+        # ADV = $20,000 → 10% cap = $2,000 < $5,000 target.
+        r = self._size(adv_usd=20_000.0, adv_size_cap_pct_adv=0.10)
+        assert r["adv_cap_applied"] is True
+        assert r["dollar_size"] == pytest.approx(2_000.0)
+        assert r["shares"] == 20  # floor(2000 / 100)
+        # position_pct reflects the capped notional.
+        assert r["position_pct"] == pytest.approx(0.02, abs=1e-6)
+
+    def test_adv_cap_does_not_bind_on_liquid_name(self):
+        """Ample ADV → 10% cap far exceeds the $5k target → no clip, legacy size."""
+        # ADV = $50M → 10% cap = $5M ≫ $5,000 target.
+        r = self._size(adv_usd=50_000_000.0, adv_size_cap_pct_adv=0.10)
+        assert r["adv_cap_applied"] is False
+        assert r["dollar_size"] == pytest.approx(5_000.0)
+        assert r["position_pct"] == pytest.approx(0.05)
+
+    def test_adv_cap_scales_with_pct_config(self):
+        """Tightening adv_size_cap_pct_adv tightens the notional monotonically."""
+        loose = self._size(adv_usd=100_000.0, adv_size_cap_pct_adv=0.20)["dollar_size"]
+        tight = self._size(adv_usd=100_000.0, adv_size_cap_pct_adv=0.02)["dollar_size"]
+        assert tight < loose
+        assert tight == pytest.approx(2_000.0)   # 2% of 100k
+        assert loose == pytest.approx(5_000.0)   # 20% of 100k = 20k, but target 5k wins
+
+    def test_adv_cap_failsoft_when_adv_missing(self):
+        """No ADV coverage (adv_usd=None) → cap skipped, legacy sizing preserved."""
+        r = self._size(adv_usd=None, adv_size_cap_pct_adv=0.10)
+        assert r["adv_cap_applied"] is False
+        assert r["dollar_size"] == pytest.approx(5_000.0)
+
+    def test_adv_cap_failsoft_on_nonpositive_or_nan_adv(self):
+        """ADV ≤0 / NaN is a coverage gap, not a floor — cap skipped."""
+        for bad in (0.0, -1.0, float("nan")):
+            r = self._size(adv_usd=bad, adv_size_cap_pct_adv=0.10)
+            assert r["adv_cap_applied"] is False
+            assert r["dollar_size"] == pytest.approx(5_000.0)
+
+    def test_adv_cap_disabled_via_flag(self):
+        """adv_size_cap_enabled=False → cap never applies even on a thin name."""
+        r = self._size(
+            adv_usd=20_000.0, adv_size_cap_pct_adv=0.10, adv_size_cap_enabled=False,
+        )
+        assert r["adv_cap_applied"] is False
+        assert r["dollar_size"] == pytest.approx(5_000.0)
+
+    def test_adv_cap_can_zero_out_below_min_dollar(self):
+        """When the ADV cap drops the notional below min_position_dollar, the
+        min-size gate zeroes the order (never places a sub-min ticket)."""
+        # ADV = $2,000 → 10% = $200 < min_position_dollar ($500) → shares 0.
+        r = self._size(adv_usd=2_000.0, adv_size_cap_pct_adv=0.10)
+        assert r["adv_cap_applied"] is True
+        assert r["dollar_size"] == pytest.approx(200.0)
+        assert r["shares"] == 0

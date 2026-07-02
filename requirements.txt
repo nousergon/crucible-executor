@@ -58,7 +58,12 @@ websocket-client~=1.8
 # does NOT normalize underscore->hyphen, so `[flow_doctor]` silently drops the
 # extra (leaving flow-doctor stale/absent). `[flow-doctor]` is the PEP 685
 # canonical form and resolves on every pip version (config#1178).
-nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
+# v0.75.0 floor (config#1401): PR nousergon-lib#144 added the canonical
+# √-impact `TransactionCostModel` (nousergon_lib.quant.transaction_cost) — the
+# ONE shared cost engine (ARCHITECTURE §15/§43). The portfolio optimizer's
+# participation-aware impact-cost term + the position_sizer ADV cap consume it
+# directly instead of re-deriving the market-impact math.
+nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.75.0
 # krepis (MIT foundation) — direct pin: eod_emailer.py now imports the lifted
 # console deep-link chokepoint `krepis.console.console_url` (config#1300, krepis
 # v0.4.0 added it). nousergon-lib pulls krepis transitively, but the direct

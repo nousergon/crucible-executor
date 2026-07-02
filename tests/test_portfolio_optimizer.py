@@ -1058,3 +1058,195 @@ class TestTurnoverGovernor:
         result = self._solve_from_prev(cap=None, flag=None)
         assert result.diagnostics["turnover_capped"] is False
         assert result.diagnostics["large_move_flagged"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Participation-aware √-impact transaction cost + max-%-ADV constraint
+# (tradeability arc, config#1401 — consumes nousergon_lib #144 TransactionCostModel)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _feasible_universe(n_active=2, daily_vol=0.01):
+    """Baseline universe with SPY/CASH stance caps → 1.0 (as ``_solve`` does),
+    so the budget constraint is feasible when calling solve_target_weights
+    directly (the kwargs-splat path used by the ADV tests below)."""
+    u = _baseline_universe(n_active=n_active, daily_vol=daily_vol)
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    return u
+
+
+def _adv_universe(n_active=2, daily_vol=0.01):
+    """Feasible baseline + an ADV$ vector (SPY/CASH NaN) for the impact term."""
+    u = _feasible_universe(n_active=n_active, daily_vol=daily_vol)
+    N = len(u["tickers"])
+    adv = np.full(N, np.nan)
+    for i in range(n_active):
+        adv[i] = 50_000_000.0  # liquid default; per-test overrides
+    return u, adv
+
+
+def test_sqrt_impact_term_produces_valid_weight_vector():
+    """With adv_usd + portfolio_notional, the participation-aware term is used
+    and the solve still returns a valid (sums-to-1, sleeve-pinned, capped)
+    weight vector."""
+    u, adv = _adv_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.04
+    result = solve_target_weights(
+        **u, adv_usd=adv, portfolio_notional=1_000_000.0,
+    )
+    w = result.weights
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.diagnostics["tcost_term_mode"] == "sqrt_impact"
+    assert result.diagnostics["tcost_n_names_with_adv"] == 2
+    assert w.sum() == pytest.approx(1.0, abs=1e-6)
+    assert w[u["cash_idx"]] == pytest.approx(0.03, abs=1e-6)
+    assert np.all(w >= -1e-8)
+    assert np.all(w <= u["stance_caps"] + 1e-6)
+
+
+def test_sqrt_impact_penalizes_illiquid_name_more_than_liquid():
+    """Two names with IDENTICAL α̂ but different ADV: the illiquid name (thin
+    ADV → higher √-impact cost to trade INTO from w_prev=0) is sized smaller."""
+    u, adv = _adv_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05  # liquid
+    u["alpha_hat"][1] = 0.05  # illiquid, same alpha
+    adv[0] = 500_000_000.0    # very liquid
+    adv[1] = 2_000_000.0      # thin — costly to trade into
+    # Impact coefficient large enough that the illiquid name's marginal impact
+    # cost overtakes its α̂ BEFORE the 0.08 stance cap binds, so the two names
+    # separate (a modest coef leaves both pinned at the cap).
+    u["cfg"] = {**u["cfg"], "transaction_cost": {"impact_coef_bps": 3000.0},
+                "max_pct_adv": None}
+    result = solve_target_weights(
+        **u, adv_usd=adv, portfolio_notional=5_000_000.0,
+    )
+    w = result.weights
+    assert result.diagnostics["tcost_term_mode"] == "sqrt_impact"
+    assert w[0] > w[1] + 1e-4, (
+        f"Liquid name should size larger than the equally-attractive illiquid "
+        f"name; got w_liquid={w[0]:.4f} w_illiquid={w[1]:.4f}"
+    )
+
+
+def test_max_pct_adv_constraint_binds_and_caps_participation():
+    """The max-%-ADV constraint bounds |Δw|·NAV ≤ max_pct_adv·ADV per name.
+    With a thin ADV the target trade is clipped to the participation bound."""
+    u, adv = _adv_universe(n_active=1)
+    u["alpha_hat"][0] = 0.20  # strongly wants the full 0.08 cap
+    adv[0] = 1_000_000.0      # thin
+    nav = 10_000_000.0
+    max_pct_adv = 0.05
+    # Bound in weight space: 0.05 * 1e6 / 1e7 = 0.005 → the name can move at most
+    # 0.5% of NAV from w_prev=0 in a single solve.
+    u["cfg"] = {**u["cfg"], "max_pct_adv": max_pct_adv,
+                "transaction_cost": {"impact_coef_bps": 0.0}}  # isolate constraint
+    result = solve_target_weights(
+        **u, adv_usd=adv, portfolio_notional=nav,
+    )
+    w = result.weights
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.diagnostics["max_pct_adv_applied"] is True
+    bound_weight = max_pct_adv * adv[0] / nav  # 0.005
+    assert w[0] <= bound_weight + 1e-5, (
+        f"Trade must respect the {max_pct_adv:.0%}-of-ADV participation cap "
+        f"(bound {bound_weight:.4f}); got w={w[0]:.4f}"
+    )
+    assert w[0] == pytest.approx(bound_weight, abs=5e-4)
+
+
+def test_max_pct_adv_constraint_off_when_disabled():
+    """max_pct_adv=None → no participation constraint; the name reaches its cap."""
+    u, adv = _adv_universe(n_active=1)
+    u["alpha_hat"][0] = 0.20
+    adv[0] = 1_000_000.0
+    u["cfg"] = {**u["cfg"], "max_pct_adv": None,
+                "transaction_cost": {"impact_coef_bps": 0.0}}
+    result = solve_target_weights(
+        **u, adv_usd=adv, portfolio_notional=10_000_000.0,
+    )
+    assert result.diagnostics["max_pct_adv_applied"] is False
+    assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_tcost_failsoft_to_flat_l1_when_adv_absent():
+    """No adv_usd → the cost term degrades to the flat L1 penalty and the
+    participation constraint is skipped (bit-identical pre-tradeability)."""
+    u = _feasible_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05
+    # No adv_usd, no portfolio_notional passed.
+    result = solve_target_weights(**u)
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.diagnostics["tcost_term_mode"] == "flat_l1"
+    assert result.diagnostics["tcost_fallback_reason"] == "no_portfolio_notional"
+    assert result.diagnostics["max_pct_adv_applied"] is False
+    assert result.diagnostics["max_pct_adv_reason"] == "no_portfolio_notional"
+
+
+def test_tcost_failsoft_when_notional_present_but_no_adv_coverage():
+    """portfolio_notional given but every name's ADV is NaN → still flat L1."""
+    u = _feasible_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05
+    N = len(u["tickers"])
+    result = solve_target_weights(
+        **u, adv_usd=np.full(N, np.nan), portfolio_notional=1_000_000.0,
+    )
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.diagnostics["tcost_term_mode"] == "flat_l1"
+    assert result.diagnostics["tcost_fallback_reason"] == "no_adv_coverage"
+    assert result.diagnostics["max_pct_adv_reason"] == "no_adv_coverage"
+
+
+def test_tcost_flat_l1_matches_legacy_bit_identical():
+    """sqrt_impact fail-soft to flat_l1 reproduces the LEGACY flat-penalty solve
+    exactly (same weights as the pre-1401 path with tcost_mode absent)."""
+    u1 = _feasible_universe(n_active=3)
+    u1["alpha_hat"][:3] = [0.05, 0.03, 0.01]
+    r_legacy = solve_target_weights(**{k: (v.copy() if isinstance(v, np.ndarray) else v)
+                                       for k, v in u1.items()})
+    assert r_legacy.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    u2 = _feasible_universe(n_active=3)
+    u2["alpha_hat"][:3] = [0.05, 0.03, 0.01]
+    r_failsoft = solve_target_weights(
+        **u2, adv_usd=None, portfolio_notional=None,
+    )
+    np.testing.assert_allclose(r_legacy.weights, r_failsoft.weights, atol=1e-9)
+
+
+def test_sigma_scaling_engages_with_name_sigma():
+    """Passing name_sigma engages the Almgren-Chriss σ-scaling (diagnostic flag),
+    and the solve remains valid."""
+    u, adv = _adv_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.05
+    N = len(u["tickers"])
+    name_sigma = np.full(N, np.nan)
+    name_sigma[0] = 0.01
+    name_sigma[1] = 0.04  # 4× more volatile → higher impact cost
+    u["cfg"] = {**u["cfg"], "transaction_cost": {"impact_coef_bps": 400.0},
+                "max_pct_adv": None}
+    result = solve_target_weights(
+        **u, adv_usd=adv, portfolio_notional=5_000_000.0, name_sigma=name_sigma,
+    )
+    assert result.diagnostics["tcost_sigma_scaled"] is True
+    # The higher-σ name (index 1) costs more to trade into → sized smaller.
+    assert result.weights[0] >= result.weights[1] - 1e-6
+
+
+def test_adv_partial_coverage_mixes_impact_and_floor():
+    """When only SOME names have ADV, the covered ones use √-impact and the
+    uncovered ones fall to the half-spread+commission floor; still valid."""
+    u, adv = _adv_universe(n_active=3)
+    u["alpha_hat"][:3] = [0.05, 0.05, 0.05]
+    adv[0] = 50_000_000.0
+    adv[1] = np.nan          # uncovered → floor
+    adv[2] = 3_000_000.0     # thin → penalized
+    u["cfg"] = {**u["cfg"], "max_pct_adv": None,
+                "transaction_cost": {"impact_coef_bps": 300.0}}
+    result = solve_target_weights(
+        **u, adv_usd=adv, portfolio_notional=5_000_000.0,
+    )
+    assert result.diagnostics["tcost_term_mode"] == "sqrt_impact"
+    assert result.diagnostics["tcost_n_names_with_adv"] == 2  # names 0 and 2
+    assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)

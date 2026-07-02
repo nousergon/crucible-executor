@@ -152,6 +152,7 @@ def run_shadow_optimizer(
             config=config,
             run_date=run_date,
             legacy_orders=legacy_orders or [],
+            signals_bucket=signals_bucket,
         )
         # L4515 turnover tripwire: band-check the executed turnover (daily +
         # rolling) BEFORE the artifact write so the verdict rides the daily
@@ -196,6 +197,7 @@ def _build_and_solve(
     config: dict,
     run_date: str,
     legacy_orders: list[dict],
+    signals_bucket: str | None = None,
 ) -> dict:
     optimizer_cfg = {
         **OPTIMIZER_CONFIG_DEFAULTS,
@@ -233,6 +235,17 @@ def _build_and_solve(
         tickers, signals_by_ticker, predictions_by_ticker,
         current_positions, config, spy_idx, cash_idx,
     )
+    # Per-name ADV$ from the scanner tradeability artifact (crucible-research#343)
+    # drives the participation-aware √-impact cost term + max-%-ADV constraint
+    # (config#1401). Fail-soft: absent artifact → all-NaN adv_usd → the optimizer
+    # degrades to the flat L1 tcost penalty (bit-identical pre-tradeability).
+    adv_usd, adv_coverage = _build_adv_usd(
+        tickers, signals_bucket, run_date, spy_idx, cash_idx,
+    )
+    # Per-name daily σ for the Almgren-Chriss σ-scaling of the impact term.
+    # Reuse the returns panel we already built (no extra I/O); σ-agnostic when
+    # a column has no usable history.
+    name_sigma = _build_name_sigma(returns_panel, spy_idx, cash_idx)
 
     result = solve_target_weights(
         tickers=tickers,
@@ -246,6 +259,9 @@ def _build_and_solve(
         cash_idx=cash_idx,
         cfg=optimizer_cfg,
         alpha_uncertainty=alpha_uncertainty,
+        adv_usd=adv_usd,
+        portfolio_notional=float(portfolio_nav) if portfolio_nav and portfolio_nav > 0 else None,
+        name_sigma=name_sigma,
     )
 
     # Turnover-governor large-move flag: the optimizer requested a one-way
@@ -329,6 +345,8 @@ def _build_and_solve(
         "stance_caps": [float(x) for x in stance_caps],
         "sectors": sectors,
         "covariance_daily": [[float(x) for x in row] for row in sigma_daily],
+        "adv_usd": [None if not np.isfinite(x) else float(x) for x in adv_usd],
+        "adv_coverage": adv_coverage,
         "would_be_trades": would_be_trades,
         "diagnostics": result.diagnostics,
         "legacy_orders": [_redact_order(o) for o in legacy_orders],
@@ -550,6 +568,73 @@ def _build_alpha_uncertainty(
             sigma[i] = v
         # else leave NaN — partial-rollout case; B.3 handles by skipping penalty
     return sigma
+
+
+def _build_adv_usd(
+    tickers: list[str],
+    signals_bucket: str | None,
+    run_date: str,
+    spy_idx: int,
+    cash_idx: int,
+) -> tuple[np.ndarray, dict]:
+    """Build the per-name ADV$ vector (aligned to ``tickers``) from the scanner
+    tradeability artifact + a small coverage-observability dict.
+
+    Returns ``(adv_usd, coverage)`` where ``adv_usd[i]`` is name i's average
+    daily dollar volume, or ``np.nan`` when uncovered (SPY/CASH are always NaN —
+    benchmark fill / sleeve carry no market impact). ``coverage`` records how
+    many real names had ADV so an operator can see whether the participation-
+    aware term actually engaged.
+
+    FAIL-SOFT end to end: no bucket, an absent artifact, or a read error →
+    all-NaN vector → the optimizer degrades to the flat L1 turnover penalty.
+    Never raises (the read helper already swallows S3/parse errors).
+    """
+    from executor.signal_reader import (
+        extract_adv_usd,
+        read_universe_tradeability,
+    )
+
+    adv = np.full(len(tickers), np.nan)
+    n_real = sum(1 for i in range(len(tickers)) if i not in (spy_idx, cash_idx))
+    if not signals_bucket:
+        return adv, {"adv_names_covered": 0, "adv_names_total": n_real,
+                     "adv_source": "none_no_bucket"}
+    tradeability = read_universe_tradeability(signals_bucket, run_date)
+    adv_by_ticker = extract_adv_usd(tradeability)
+    covered = 0
+    for i, t in enumerate(tickers):
+        if i in (spy_idx, cash_idx):
+            continue
+        v = adv_by_ticker.get(t)
+        if v is not None:
+            adv[i] = v
+            covered += 1
+    return adv, {
+        "adv_names_covered": covered,
+        "adv_names_total": n_real,
+        "adv_source": "scanner_universe_tradeability" if covered else "none_uncovered",
+    }
+
+
+def _build_name_sigma(
+    returns_panel: np.ndarray, spy_idx: int, cash_idx: int,
+) -> np.ndarray:
+    """Per-name daily return σ from the returns panel, for the Almgren-Chriss
+    σ-scaling of the impact term. SPY/CASH → NaN (excluded from the impact
+    term). A column with no finite std → NaN → that name is σ-agnostic."""
+    N = returns_panel.shape[1]
+    sig = np.full(N, np.nan)
+    for i in range(N):
+        if i in (spy_idx, cash_idx):
+            continue
+        col = returns_panel[:, i]
+        col = col[np.isfinite(col)]
+        if col.size >= 2:
+            s = float(np.std(col, ddof=1))
+            if np.isfinite(s) and s > 0:
+                sig[i] = s
+    return sig
 
 
 def _build_returns_panel(

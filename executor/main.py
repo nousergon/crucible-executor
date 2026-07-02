@@ -482,6 +482,7 @@ def _plan_entries(
     simulate: bool,
     predictions_date: str | None = None,
     regime_intensity_z: float | None = None,
+    adv_map: dict | None = None,
 ) -> tuple[int, list[dict], list[dict], list[dict]]:
     """Live-shell wrapper around ``executor.deciders.decide_entries``.
 
@@ -535,6 +536,7 @@ def _plan_entries(
         run_date=run_date,
         predictions_date=predictions_date,
         regime_intensity_z=regime_intensity_z,
+        adv_map=adv_map,
     )
 
     # Dispatch decisions to side-effecting layer.
@@ -1644,6 +1646,25 @@ def run(
             blocked_entries: list[dict] = []
             plan_risk_events: list[dict] = []
         else:
+            # Per-name ADV$ from the scanner tradeability artifact
+            # (crucible-research#343) → the position_sizer ADV size cap
+            # (config#1401). Fail-soft: absent artifact → empty map → no cap
+            # (legacy sizing). Loaded once here and threaded through
+            # _plan_entries → decide_entries → compute_position_size.
+            try:
+                from executor.signal_reader import (
+                    extract_adv_usd,
+                    read_universe_tradeability,
+                )
+                adv_map = extract_adv_usd(
+                    read_universe_tradeability(signals_bucket, run_date)
+                )
+            except Exception as _adv_err:  # noqa: BLE001 — construction refinement, never a gate
+                logger.warning(
+                    "ADV map load failed (%s) — position sizer ADV cap disabled "
+                    "this run (fail-soft).", _adv_err,
+                )
+                adv_map = {}
             # ``regime_intensity_z`` resolved once at §2b' above — threaded
             # into both Wire 2 (position_sizer) and Wire 3 (compute_drawdown_multiplier).
             n_entered, entry_orders, blocked_entries, plan_risk_events = _plan_entries(
@@ -1671,6 +1692,7 @@ def run(
                 simulate=simulate,
                 predictions_date=predictions_date,
                 regime_intensity_z=regime_intensity_z,
+                adv_map=adv_map,
             )
         orders.extend(entry_orders)
 

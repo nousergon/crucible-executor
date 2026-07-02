@@ -73,6 +73,7 @@ def compute_position_size(
     stance: str | None = None,
     regime_intensity_z: float | None = None,
     barrier_win_prob: float | None = None,
+    adv_usd: float | None = None,
 ) -> dict:
     """
     Compute position size for a new ENTER order.
@@ -84,11 +85,21 @@ def compute_position_size(
       4. upside_adj: price_target_upside < min_price_target_upside → config multiplier
       5. drawdown_adj: multiplier from graduated drawdown tiers (1.0/0.50/0.25)
       6. position_weight = min(base * sector * conviction * upside * dd, max_position_pct)
-      7. dollar_size = portfolio_nav * position_weight
-      8. shares = floor(dollar_size / current_price)
+      7. ADV cap (tradeability arc, config#1401): dollar_size is additionally
+         capped at ``max_pct_adv × adv_usd`` so a single new position can never
+         consume more than a configured slice of the name's average daily dollar
+         volume — the per-name capacity guardrail that mirrors the optimizer's
+         max-%-ADV constraint. Skipped when ``adv_usd`` is missing/≤0 (coverage
+         gap → conservative degrade, no cap) or the cap is disabled.
+      8. dollar_size = portfolio_nav * position_weight  (then ADV-capped)
+      9. shares = floor(dollar_size / current_price)
+
+    ``adv_usd`` — the name's average daily DOLLAR volume from the scanner
+    tradeability artifact (crucible-research#343, ``tradeability.adv_usd``).
+    None ↔ no ADV coverage → no ADV cap applied (preserves legacy sizing).
 
     Returns:
-        {"shares": int, "dollar_size": float, "position_pct": float}
+        {"shares": int, "dollar_size": float, "position_pct": float, ...}
     """
     n = max(len(enter_signals), 1)
     base_weight = 1.0 / n
@@ -259,6 +270,39 @@ def compute_position_size(
         position_weight = min(position_weight, atr_only_weight, max_pct)
 
     dollar_size = portfolio_nav * position_weight
+
+    # ── ADV-based size cap (tradeability arc, config#1401) ───────────────────
+    # Per-name capacity guardrail: a single new position may consume at most
+    # ``adv_size_cap_pct_adv`` of the name's average daily DOLLAR volume. This
+    # mirrors the optimizer's max-%-ADV constraint at the position-sizer layer
+    # (the legacy per-name path that runs when the optimizer isn't authoritative)
+    # so an illiquid ENTER can't be sized to a notional the market can't absorb.
+    # FAIL-SOFT: no ADV coverage (adv_usd None/≤0/NaN) → no cap, legacy sizing
+    # preserved. The cost of thin liquidity is priced by the optimizer's √-impact
+    # term; this is the HARD ceiling. Default ON at a conservative 10% of ADV —
+    # a single new position is a one-side trade, so 10% leaves ample headroom
+    # under the optimizer's 5%-of-ADV per-solve participation cap once cut over.
+    adv_cap_applied = False
+    adv_size_cap_pct = config.get("adv_size_cap_pct_adv", 0.10)
+    if (
+        config.get("adv_size_cap_enabled", True)
+        and adv_size_cap_pct is not None and adv_size_cap_pct > 0
+        and adv_usd is not None
+    ):
+        try:
+            adv_f = float(adv_usd)
+        except (TypeError, ValueError):
+            adv_f = 0.0
+        if adv_f > 0.0 and adv_f == adv_f:  # positive + not NaN
+            adv_cap_dollars = adv_size_cap_pct * adv_f
+            if dollar_size > adv_cap_dollars:
+                dollar_size = adv_cap_dollars
+                position_weight = (
+                    dollar_size / portfolio_nav if portfolio_nav and portfolio_nav > 0
+                    else position_weight
+                )
+                adv_cap_applied = True
+
     shares = math.floor(dollar_size / current_price) if current_price and current_price > 0 else 0
 
     # Minimum position size check (Task 1.2)
@@ -273,6 +317,7 @@ def compute_position_size(
         f"earnings_adj={earnings_adj} coverage_adj={coverage_adj} "
         f"stance_adj={stance_adj} regime_adj={regime_adj} "
         f"barrier_win_prob_adj={barrier_win_prob_adj} "
+        f"adv_cap_applied={adv_cap_applied} "
         f"→ {position_weight:.3f} NAV = ${dollar_size:.0f} = {shares} shares"
     )
 
@@ -292,4 +337,5 @@ def compute_position_size(
         "stance_adj": stance_adj,
         "regime_adj": regime_adj,
         "barrier_win_prob_adj": barrier_win_prob_adj,
+        "adv_cap_applied": adv_cap_applied,
     }

@@ -230,6 +230,91 @@ def read_distribution_gate(s3_bucket: str) -> dict | None:
         raise
 
 
+def read_universe_tradeability(
+    s3_bucket: str, run_date: str | None = None,
+) -> dict[str, dict]:
+    """Read the per-name tradeability block from the scanner universe artifact.
+
+    The scanner (crucible-research#343) emits, on
+
+        s3://{bucket}/scanner/universe/{run_date}/universe.json
+        s3://{bucket}/scanner/universe/latest.json           (sidecar pointer)
+
+    a schema-v3 board where each ``stocks[]`` entry carries a ``tradeability``
+    block::
+
+        {"expected_cost_bps": float|null, "tradeability_score": 0-100|null,
+         "adv_usd": float|null, "reference_notional_usd": float}
+
+    This lifts ADV$ (``adv_usd``) into the executor so the portfolio optimizer's
+    participation-aware √-impact cost term + max-%-ADV constraint (config#1401)
+    are keyed on the SAME liquidity numbers the research board scores.
+
+    Returns ``{ticker: tradeability_block}`` for every stock with a block, or an
+    EMPTY dict on any miss (artifact absent — pre-#343 rollout, an out-of-band
+    date, a malformed payload). FAIL-SOFT by contract: the optimizer treats a
+    missing/empty map as "no ADV info" and degrades to the flat L1 turnover
+    penalty (see portfolio_optimizer.solve_target_weights). A read failure must
+    NEVER block the morning planner — tradeability is a construction refinement,
+    not a gate.
+    """
+    d = run_date or str(date.today())
+    key = f"scanner/universe/{d}/universe.json"
+    s3 = boto3.client("s3")
+    try:
+        obj = s3.get_object(Bucket=s3_bucket, Key=key)
+        data = json.loads(obj["Body"].read())
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("NoSuchKey", "404"):
+            logger.info(
+                "No scanner universe artifact at s3://%s/%s — optimizer will "
+                "run without per-name ADV (flat-L1 tcost fallback).",
+                s3_bucket, key,
+            )
+            return {}
+        logger.warning("Failed reading universe tradeability (%s) — ADV absent", e)
+        return {}
+    except (ValueError, json.JSONDecodeError) as e:
+        logger.warning("Malformed universe artifact s3://%s/%s (%s) — ADV absent",
+                       s3_bucket, key, e)
+        return {}
+
+    stocks = data.get("stocks") or []
+    out: dict[str, dict] = {}
+    for s in stocks:
+        if not isinstance(s, dict):
+            continue
+        ticker = s.get("ticker")
+        block = s.get("tradeability")
+        if ticker and isinstance(block, dict):
+            out[ticker] = block
+    logger.info(
+        "Universe tradeability loaded | n_names=%d | schema_version=%s",
+        len(out), data.get("schema_version"),
+    )
+    return out
+
+
+def extract_adv_usd(tradeability_by_ticker: dict[str, dict]) -> dict[str, float]:
+    """Pull ``{ticker: adv_usd}`` (float) out of a tradeability map, dropping
+    names whose ``adv_usd`` is null / non-finite / ≤0 (a coverage gap, never a
+    fabricated 0). The optimizer treats an absent ticker as "no ADV coverage"
+    → half-spread+commission cost floor + exempt from the participation cap."""
+    out: dict[str, float] = {}
+    for ticker, block in (tradeability_by_ticker or {}).items():
+        if not isinstance(block, dict):
+            continue
+        adv = block.get("adv_usd")
+        try:
+            adv_f = float(adv)
+        except (TypeError, ValueError):
+            continue
+        if adv_f > 0.0 and adv_f == adv_f:  # positive + not NaN
+            out[ticker] = adv_f
+    return out
+
+
 def read_signals(s3_bucket: str, run_date: str | None = None) -> dict:
     """
     Download signals/{date}/signals.json from S3.
