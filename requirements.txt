@@ -61,7 +61,7 @@ websocket-client~=1.8
 # v0.82.0 floor (config#1741): fleet forum-topic Telegram config
 # (nousergon_lib.flow_doctor_fleet) + flow-doctor notify_event routing.
 # v0.75.0 added canonical √-impact TransactionCostModel (ARCHITECTURE §15/§43).
-nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@d4a000b01599ccf6b830620a3070505733ed4a95
+nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.82.0
 # krepis (MIT foundation) — direct pin: eod_emailer.py now imports the lifted
 # console deep-link chokepoint `krepis.console.console_url` (config#1300, krepis
 # v0.4.0 added it). nousergon-lib pulls krepis transitively, but the direct
