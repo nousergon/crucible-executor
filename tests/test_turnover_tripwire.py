@@ -77,7 +77,7 @@ def test_daily_breach_pages_error(published):
     assert "ERROR" in severities
     daily = next(c for c in published if c["severity"] == "ERROR")
     assert daily["dedup_key"] == "turnover_tripwire_daily_2026-06-10"
-    assert daily["sns"] is True and daily["telegram"] is True
+    assert daily["sns"] is True and daily["telegram"] is False
 
 
 def test_rolling_breach_sums_prior_days_and_pages_warn(published):

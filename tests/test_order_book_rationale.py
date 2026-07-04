@@ -760,15 +760,14 @@ def test_obr_write_failure_publishes_alert_not_silent_swallow():
         "before merging."
     )
     assert "obr_write_failed_" in src, (
-        "OBR write-failure handler must call `nousergon_lib.alerts.publish` "
+        "OBR write-failure handler must call `publish_ops_alert` "
         "with a `dedup_key` starting `obr_write_failed_` so the failure "
         "reaches Telegram/SNS rather than silently swallowing "
         "([[feedback_no_silent_fails]])."
     )
-    assert "from nousergon_lib import alerts" in src, (
-        "OBR write-failure handler must import nousergon_lib.alerts "
-        "lazily (inside the except) so a missing lib at boot doesn't "
-        "break the planner cold-start."
+    assert "publish_ops_alert" in src, (
+        "OBR write-failure handler must route via executor.notifier.publish_ops_alert "
+        "(config#1740 T3 — flow-doctor forum topics, not raw telegram=True)."
     )
 
 

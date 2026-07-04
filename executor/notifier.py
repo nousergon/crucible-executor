@@ -102,3 +102,55 @@ def send_daemon_status(message: str) -> bool:
         except Exception:
             pass
     return send_message(message)
+
+
+def _normalize_flow_doctor_severity(severity: str) -> str:
+    """Map alerts.publish severity strings to flow-doctor notify_on tiers."""
+    normalized = severity.lower()
+    if normalized == "warn":
+        return "warning"
+    return normalized
+
+
+def publish_ops_alert(
+    message: str,
+    *,
+    severity: str,
+    source: str,
+    dedup_key: str | None = None,
+) -> None:
+    """Dual-channel ops alert: SNS via alerts.publish + Telegram via flow-doctor.
+
+    Migration arc: config#1740 T3 — retire raw ``telegram=True`` fan-out to
+    General; executor flow-doctor.yaml routes by severity to forum topics.
+    """
+    from nousergon_lib import alerts as _alerts
+
+    _alerts.publish(
+        message=message,
+        severity=severity,
+        source=source,
+        sns=True,
+        telegram=False,
+        dedup_key=dedup_key,
+    )
+    fd = get_flow_doctor()
+    if fd is None:
+        return
+    try:
+        subject = message.split("\n", 1)[0].replace("*", "").strip()
+        if not subject:
+            subject = f"Executor alert [{severity.upper()}]"
+        fd.notify_event(
+            subject,
+            body=message,
+            severity=_normalize_flow_doctor_severity(severity),
+            dedup_key=dedup_key or subject,
+            context={"source": source},
+        )
+    except Exception as exc:
+        logger.warning(
+            "flow-doctor notify_event failed for ops alert (%s): %s — SNS already sent",
+            source,
+            exc,
+        )

@@ -210,13 +210,12 @@ def _publish(out: dict, *, severity: str, dedup_key: str, message: str) -> None:
     publish failure must never block the planner; it is recorded in the
     artifact's ``publish_error`` field."""
     try:
-        from nousergon_lib import alerts as _alerts
-        _alerts.publish(
+        from executor.notifier import publish_ops_alert
+
+        publish_ops_alert(
             message=message,
             severity=severity,
             source="alpha-engine/executor/turnover_tripwire.py",
-            sns=True,
-            telegram=True,
             dedup_key=dedup_key,
         )
     except Exception as e:  # noqa: BLE001 — secondary observability

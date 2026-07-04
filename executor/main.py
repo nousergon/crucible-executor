@@ -1986,8 +1986,9 @@ def run(
                     _rat_err,
                 )
                 try:
-                    from nousergon_lib import alerts as _alerts
-                    _alerts.publish(
+                    from executor.notifier import publish_ops_alert
+
+                    publish_ops_alert(
                         message=(
                             f"[executor/main.py] Order-book rationale write "
                             f"failed for run_date={run_date}: "
@@ -1997,8 +1998,6 @@ def run(
                         ),
                         severity="WARN",
                         source="alpha-engine/executor/main.py",
-                        sns=True,
-                        telegram=True,
                         dedup_key=f"obr_write_failed_{run_date}",
                     )
                 except Exception as _alert_err:  # noqa: BLE001 — secondary observability

@@ -283,8 +283,9 @@ def _build_and_solve(
             _req * 100, (_flag or 0) * 100, (_cap or 0) * 100, run_date,
         )
         try:
-            from nousergon_lib import alerts as _alerts
-            _alerts.publish(
+            from executor.notifier import publish_ops_alert
+
+            publish_ops_alert(
                 message=(
                     f"[executor] Optimizer requested a large rebalance: "
                     f"one-way turnover {_req:.1%} exceeds the {_flag:.0%} flag "
@@ -294,8 +295,6 @@ def _build_and_solve(
                 ),
                 severity="WARN",
                 source="alpha-engine/executor/optimizer_shadow.py",
-                sns=True,
-                telegram=True,
                 dedup_key=f"optimizer_large_move_{run_date}",
             )
         except Exception as _alert_err:  # noqa: BLE001 — secondary observability
