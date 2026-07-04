@@ -57,3 +57,28 @@ def _block_real_alert_publish(monkeypatch):
         return
     monkeypatch.setattr(alerts, "publish", MagicMock(name="alerts.publish"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _block_real_telegram_send(monkeypatch):
+    """Stub ``executor.notifier.send_message`` so NO test pages a real
+    Telegram chat.
+
+    Sibling guard to ``_block_real_alert_publish`` above: that fixture blocks
+    ``nousergon_lib.alerts.publish``, but ``executor/notifier.py`` also calls
+    ``nousergon_lib.telegram.send_message`` directly (imported by name, so the
+    patch target is ``executor.notifier.send_message``) from
+    ``send_daemon_status``/``send_trade_alert``. Confirmed live 2026-07-03:
+    ``test_perf_simulate_mode.py``'s ``simulate=False`` coverage exercised the
+    real (unmocked) path and delivered 6 live "Order book written" + 1 live
+    "Stale signals" alert to the production Telegram channel (config#1692).
+    """
+    try:
+        from executor import notifier
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(
+        notifier, "send_message", MagicMock(name="notifier.send_message", return_value=True)
+    )
+    yield

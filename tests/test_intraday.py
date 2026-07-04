@@ -409,9 +409,15 @@ class TestNotifier:
     the formatters correctly route through the lib substrate.
     """
 
-    def test_send_trade_alert_no_config(self):
-        # Preserve ALPHA_ENGINE_SECRETS_SOURCE=env from conftest so get_secret()
-        # reads from this (cleared) env-dict instead of falling through to SSM.
+    def test_send_trade_alert_no_config(self, monkeypatch):
+        # This test deliberately exercises the REAL nousergon_lib.telegram.send_message
+        # (conftest's autouse _block_real_telegram_send fixture mocks it for every
+        # other test) to prove the no-credentials path safely returns False. Safe to
+        # do so here specifically because os.environ is cleared + ALPHA_ENGINE_SECRETS_SOURCE
+        # is pinned to "env", so get_secret() cannot see TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
+        # regardless of what's configured on the host — no real network call is possible.
+        from nousergon_lib.telegram import send_message as real_send_message
+        monkeypatch.setattr("executor.notifier.send_message", real_send_message)
         with patch.dict("os.environ", {"ALPHA_ENGINE_SECRETS_SOURCE": "env"}, clear=True):
             assert send_trade_alert("BUY", "AAPL", 10, 150.0) is False
 
@@ -435,9 +441,13 @@ class TestNotifier:
         msg = mock_send.call_args.args[0]
         assert "*WEIRD AAPL*" in msg
 
-    def test_send_daemon_status_no_config(self):
-        # Preserve ALPHA_ENGINE_SECRETS_SOURCE=env from conftest so get_secret()
-        # reads from this (cleared) env-dict instead of falling through to SSM.
+    def test_send_daemon_status_no_config(self, monkeypatch):
+        # See test_send_trade_alert_no_config above: deliberately un-mocks the
+        # autouse telegram guard to exercise the real send_message no-credentials
+        # path, safely, since the cleared+pinned env below guarantees no token
+        # is ever visible to get_secret() regardless of host configuration.
+        from nousergon_lib.telegram import send_message as real_send_message
+        monkeypatch.setattr("executor.notifier.send_message", real_send_message)
         with patch.dict("os.environ", {"ALPHA_ENGINE_SECRETS_SOURCE": "env"}, clear=True):
             assert send_daemon_status("test") is False
 

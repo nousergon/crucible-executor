@@ -147,23 +147,21 @@ class TestSimulateModeSkipsArcticDBFilter:
             "executor.signal_reader.filter_buy_candidates_to_universe",
             side_effect=lambda s, b: s,  # passthrough
         ) as mock_filter:
-            try:
-                main_mod._read_signals(
-                    config={
-                        "signals_bucket": "test-bucket",
-                        "coverage_admission_enabled": False,
-                    },
-                    signals_bucket="test-bucket",
-                    run_date="2026-04-25",
-                    simulate=False,
-                    signals_override=self._minimal_signals_override(),
-                    conn=None,
-                )
-            except Exception:
-                # _read_signals does more in non-simulate (predictions read,
-                # stale check, telegram). It's OK if those fail — we only
-                # care that the filter was invoked.
-                pass
+            # _read_signals does more in non-simulate (predictions read,
+            # stale check, telegram) — conftest's autouse fixtures mock the
+            # real S3/telegram side effects, so this runs to completion
+            # without needing to swallow exceptions to mask a live send.
+            main_mod._read_signals(
+                config={
+                    "signals_bucket": "test-bucket",
+                    "coverage_admission_enabled": False,
+                },
+                signals_bucket="test-bucket",
+                run_date="2026-04-25",
+                simulate=False,
+                signals_override=self._minimal_signals_override(),
+                conn=None,
+            )
             assert mock_filter.call_count == 1, (
                 f"Live mode invoked filter {mock_filter.call_count} times "
                 "— expected exactly 1"
