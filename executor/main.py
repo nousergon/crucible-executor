@@ -932,6 +932,48 @@ def _write_stops_and_finalize(
         logger.debug("Order book Telegram notification failed", exc_info=True)
 
 
+def _write_order_book_or_raise(
+    ibkr,
+    ob: OrderBook,
+    price_histories: dict | None,
+    atr_map: dict,
+    strategy_config: dict,
+    conn,
+    run_date: str,
+    blocked_entries: list[dict] | None = None,
+    signals_bucket: str | None = None,
+    use_optimizer: bool = False,
+) -> None:
+    """Call ``_write_stops_and_finalize`` and FAIL LOUD on any failure (config#1234).
+
+    ``ob.save()`` inside ``_write_stops_and_finalize`` is the order book's
+    local-disk persist; the intraday daemon reads ONLY that file to place
+    every order for the rest of the session. Previously this call site
+    swallowed ANY failure (including a failed ``ob.save()``) into a WARNING —
+    a ghost success: the planner reports OK while the daemon runs the whole
+    day on a stale/empty book. Re-raising propagates to ``run()``'s outer
+    except (reports to flow-doctor, writes health status=failed) and on to
+    ``guard_entrypoint``, mirroring crucible-research#312 / crucible-predictor#304.
+
+    The best-effort sub-steps that follow ``ob.save()`` inside
+    ``_write_stops_and_finalize`` — S3 ``backup_to_s3`` (audit-trail mirror;
+    its key IS the registered ``morning_planner_orders`` freshness-monitor
+    target, so a transient S3-only failure is still caught by that
+    defense-in-depth backstop), the dashboard summary write, and the Telegram
+    notification — already self-catch and log non-fatal WARNs internally, so
+    they cannot mask a genuine ``ob.save()`` failure and do not need to be
+    split out further.
+    """
+    try:
+        _write_stops_and_finalize(
+            ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date,
+            blocked_entries, signals_bucket, use_optimizer=use_optimizer,
+        )
+    except Exception as e:
+        logger.error("Failed to write order book: %s", e)
+        raise
+
+
 def run(
     dry_run: bool = False,
     simulate: bool = False,
@@ -1909,10 +1951,7 @@ def run(
 
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
-            try:
-                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer)
-            except Exception as e:
-                logger.warning("Failed to write order book: %s", e)
+            _write_order_book_or_raise(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer)
 
         # ── 6b. Per-ticker order-book rationale artifact ────────────────────────
         # Audit-stable record answering "why is ticker X in state S

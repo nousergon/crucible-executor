@@ -473,6 +473,49 @@ def _apply_dividend_delta(
         pos["dividend_paid_usd"] = -div_delta
 
 
+def _export_trade_csvs_to_s3(conn, s3, trades_bucket: str) -> None:
+    """Export trades/eod_pnl/shadow_book history to S3 for dashboard consumption.
+
+    FAIL LOUD (config#1234) for ``trades_full.csv`` and ``eod_pnl.csv`` — the
+    two ARTIFACT_REGISTRY ``severity=critical`` exports (``trades_full_log``,
+    ``eod_reconcile_pnl``: "NAV / alpha-vs-SPY ground truth"). ``log_eod()``
+    (called by ``run()`` before this) already writes the DB row fail-loud (no
+    try/except); this is the S3 CSV mirror of that same ground truth, so a
+    swallowed PUT here was the same ghost-success shape — the EOD SF reports
+    OK while the dashboard's trade log / P&L history is silently stale or
+    missing. No try/except around either PUT: a failure propagates to the
+    caller (``run()``) and on to ``guard_entrypoint`` (mirrors
+    crucible-research#312 / crucible-predictor#304).
+
+    ``shadow_book.csv`` is NOT in ARTIFACT_REGISTRY.yaml — no SF/Lambda or
+    dashboard-critical consumer depends on it (it mirrors the executor's
+    internal shadow-book simulation for diagnostic/analysis use only, unlike
+    the two ground-truth exports above). Kept fail-soft on purpose; the WARN
+    below is its recording surface per the audit's secondary-artifact rule.
+    """
+    trades_df = pd.read_sql("SELECT * FROM trades ORDER BY date, created_at", conn)
+    eod_df = pd.read_sql("SELECT * FROM eod_pnl ORDER BY date", conn)
+    shadow_df = pd.read_sql("SELECT * FROM executor_shadow_book ORDER BY date, created_at", conn)
+
+    for df, key in [
+        (trades_df, "trades/trades_full.csv"),
+        (eod_df, "trades/eod_pnl.csv"),
+    ]:
+        buf = df.to_csv(index=False).encode()
+        s3.put_object(Bucket=trades_bucket, Key=key, Body=buf)
+        logger.info(f"Exported {key} ({len(df)} rows) to s3://{trades_bucket}/{key}")
+
+    try:
+        shadow_buf = shadow_df.to_csv(index=False).encode()
+        s3.put_object(Bucket=trades_bucket, Key="trades/shadow_book.csv", Body=shadow_buf)
+        logger.info(
+            f"Exported trades/shadow_book.csv ({len(shadow_df)} rows) to "
+            f"s3://{trades_bucket}/trades/shadow_book.csv"
+        )
+    except Exception as e:
+        logger.warning(f"S3 CSV export failed for trades/shadow_book.csv (non-fatal, diagnostic-only): {e}")
+
+
 def run(
     run_date: str | None = None,
     *,
@@ -1113,21 +1156,8 @@ def run(
         logger.info(f"Sector attribution: {sector_attribution}")
 
     # Export full history CSVs for dashboard consumption
-    trades_df = pd.read_sql("SELECT * FROM trades ORDER BY date, created_at", conn)
-    eod_df = pd.read_sql("SELECT * FROM eod_pnl ORDER BY date", conn)
-    shadow_df = pd.read_sql("SELECT * FROM executor_shadow_book ORDER BY date, created_at", conn)
     s3 = boto3.client("s3")
-    for df, key in [
-        (trades_df, "trades/trades_full.csv"),
-        (eod_df, "trades/eod_pnl.csv"),
-        (shadow_df, "trades/shadow_book.csv"),
-    ]:
-        try:
-            buf = df.to_csv(index=False).encode()
-            s3.put_object(Bucket=trades_bucket, Key=key, Body=buf)
-            logger.info(f"Exported {key} ({len(df)} rows) to s3://{trades_bucket}/{key}")
-        except Exception as e:
-            logger.warning(f"S3 CSV export failed for {key}: {e}")
+    _export_trade_csvs_to_s3(conn, s3, trades_bucket)
 
     # ── Reference-rate showcase artifact (metron/reference_rate.json) ─────────
     # Publish the illustrative-only Reference Rate contract artifact Metron renders
