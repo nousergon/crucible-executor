@@ -1,31 +1,43 @@
 """
 Telegram trade notification sender — daemon-side structured-message formatters.
 
-Sits on top of ``nousergon_lib.telegram.send_message`` (lib v0.14.0+), which
-handles token/chat_id resolution, markdown escape, retry/timeout, and
-fire-and-forget bool-return semantics. This module contributes daemon-specific
-*message formatting* — emoji + structured trade/status templates — and
-nothing else.
+Routes through flow-doctor ``notify_event()`` when the daemon's shared
+``FlowDoctor`` instance is active (forum topic ``#trades`` via
+``nousergon_lib.flow_doctor_fleet``). Falls back to the legacy
+``nousergon_lib.telegram.send_message`` primitive when flow-doctor is
+inactive (local dev / tests without yaml).
 
-Setup (one-time):
-  1. Message @BotFather on Telegram → /newbot → save the bot token
-  2. Set ``TELEGRAM_BOT_TOKEN`` in SSM at ``/alpha-engine/TELEGRAM_BOT_TOKEN``
-  3. Message the bot, then call getUpdates to get your chat_id
-  4. Set ``TELEGRAM_CHAT_ID`` in SSM at ``/alpha-engine/TELEGRAM_CHAT_ID``
-
-Migration arc: ROADMAP L1067 PR 2a (2026-05-13). Previously this module owned
-the primitive send path inline; the surveillance Lambda arc required a second
-producer, so the primitive was consolidated into ``nousergon_lib.telegram``
-to prevent the "two writers diverged silently" antipattern.
+Migration arc: config#1741 (fleet Telegram consolidation T1).
 """
 
 from __future__ import annotations
 
 import logging
 
+from nousergon_lib.flow_doctor_fleet import trade_alert_dedup_key
+from nousergon_lib.logging import get_flow_doctor
 from nousergon_lib.telegram import send_message
 
 logger = logging.getLogger(__name__)
+
+
+def _format_trade_message(
+    action: str,
+    ticker: str,
+    shares: int,
+    price: float,
+    trigger: str,
+    source: str,
+) -> str:
+    emoji = {"BUY": "\U0001f7e2", "SELL": "\U0001f534", "REDUCE": "\U0001f7e1"}.get(
+        action, "⚪"
+    )
+    return (
+        f"{emoji} *{action} {ticker}*\n"
+        f"Shares: {shares} @ ${price:.2f}\n"
+        f"Trigger: {trigger}\n"
+        f"Source: {source}"
+    )
 
 
 def send_trade_alert(
@@ -36,18 +48,41 @@ def send_trade_alert(
     trigger: str = "",
     source: str = "daemon",
 ) -> bool:
-    """Send a Telegram push notification for a trade execution.
-
-    Returns True if sent successfully, False otherwise (missing secrets,
-    network error, non-200 response — all swallowed by the lib substrate).
-    """
-    emoji = {"BUY": "\U0001f7e2", "SELL": "\U0001f534", "REDUCE": "\U0001f7e1"}.get(action, "⚪")
-    msg = (
-        f"{emoji} *{action} {ticker}*\n"
-        f"Shares: {shares} @ ${price:.2f}\n"
-        f"Trigger: {trigger}\n"
-        f"Source: {source}"
-    )
+    """Send a Telegram push notification for a trade execution."""
+    msg = _format_trade_message(action, ticker, shares, price, trigger, source)
+    fd = get_flow_doctor()
+    if fd is not None:
+        try:
+            rid = fd.notify_event(
+                f"{action} {ticker}",
+                body=msg,
+                severity="info",
+                context={
+                    "action": action,
+                    "ticker": ticker,
+                    "shares": shares,
+                    "price": price,
+                    "trigger": trigger,
+                    "source": source,
+                },
+                dedup_key=trade_alert_dedup_key(action, ticker, shares, price),
+            )
+            if rid is not None:
+                logger.info("Telegram alert sent via flow-doctor: %s %s", action, ticker)
+                return True
+            logger.warning(
+                "Telegram trade alert suppressed by flow-doctor dedup: %s %s",
+                action,
+                ticker,
+            )
+            return False
+        except Exception as exc:
+            logger.warning(
+                "flow-doctor notify_event failed for trade alert (%s %s): %s — falling back",
+                action,
+                ticker,
+                exc,
+            )
 
     ok = send_message(msg)
     if ok:
@@ -59,4 +94,11 @@ def send_trade_alert(
 
 def send_daemon_status(message: str) -> bool:
     """Send a general status message (daemon start/stop, errors, IB events)."""
+    fd = get_flow_doctor()
+    if fd is not None:
+        try:
+            rid = fd.notify_event(message, severity="warning")
+            return rid is not None
+        except Exception:
+            pass
     return send_message(message)

@@ -404,30 +404,27 @@ class TestMarketHours:
 
 class TestNotifier:
     """Daemon-side formatter tests. Primitive send/escape behavior is locked
-    upstream in nousergon_lib.telegram's own test suite (29 tests). These
-    tests cover only the daemon-specific message-shape contracts and that
-    the formatters correctly route through the lib substrate.
+    upstream in nousergon_lib.telegram's own test suite. These tests cover
+    message-shape contracts and flow-doctor vs legacy routing.
     """
 
     def test_send_trade_alert_no_config(self, monkeypatch):
-        # This test deliberately exercises the REAL nousergon_lib.telegram.send_message
-        # (conftest's autouse _block_real_telegram_send fixture mocks it for every
-        # other test) to prove the no-credentials path safely returns False. Safe to
-        # do so here specifically because os.environ is cleared + ALPHA_ENGINE_SECRETS_SOURCE
-        # is pinned to "env", so get_secret() cannot see TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
-        # regardless of what's configured on the host — no real network call is possible.
+        # Deliberately exercises real send_message (see conftest autouse guard).
         from nousergon_lib.telegram import send_message as real_send_message
         monkeypatch.setattr("executor.notifier.send_message", real_send_message)
         with patch.dict("os.environ", {"ALPHA_ENGINE_SECRETS_SOURCE": "env"}, clear=True):
-            assert send_trade_alert("BUY", "AAPL", 10, 150.0) is False
+            with patch("executor.notifier.get_flow_doctor", return_value=None):
+                assert send_trade_alert("BUY", "AAPL", 10, 150.0) is False
 
+    @patch("executor.notifier.get_flow_doctor", return_value=None)
     @patch("executor.notifier.send_message", return_value=True)
-    def test_send_trade_alert_success(self, mock_send):
+    def test_send_trade_alert_success(self, mock_send, _mock_fd):
         assert send_trade_alert("BUY", "AAPL", 10, 150.0, "pullback", "daemon") is True
         mock_send.assert_called_once()
 
+    @patch("executor.notifier.get_flow_doctor", return_value=None)
     @patch("executor.notifier.send_message", return_value=True)
-    def test_send_trade_alert_message_format(self, mock_send):
+    def test_send_trade_alert_message_format(self, mock_send, _mock_fd):
         send_trade_alert("BUY", "AAPL", 10, 150.0, "pullback", "daemon")
         msg = mock_send.call_args.args[0]
         assert "*BUY AAPL*" in msg
@@ -435,24 +432,23 @@ class TestNotifier:
         assert "Trigger: pullback" in msg
         assert "Source: daemon" in msg
 
+    @patch("executor.notifier.get_flow_doctor", return_value=None)
     @patch("executor.notifier.send_message", return_value=True)
-    def test_send_trade_alert_unknown_action_uses_fallback_emoji(self, mock_send):
+    def test_send_trade_alert_unknown_action_uses_fallback_emoji(self, mock_send, _mock_fd):
         send_trade_alert("WEIRD", "AAPL", 10, 150.0)
         msg = mock_send.call_args.args[0]
         assert "*WEIRD AAPL*" in msg
 
     def test_send_daemon_status_no_config(self, monkeypatch):
-        # See test_send_trade_alert_no_config above: deliberately un-mocks the
-        # autouse telegram guard to exercise the real send_message no-credentials
-        # path, safely, since the cleared+pinned env below guarantees no token
-        # is ever visible to get_secret() regardless of host configuration.
         from nousergon_lib.telegram import send_message as real_send_message
         monkeypatch.setattr("executor.notifier.send_message", real_send_message)
         with patch.dict("os.environ", {"ALPHA_ENGINE_SECRETS_SOURCE": "env"}, clear=True):
-            assert send_daemon_status("test") is False
+            with patch("executor.notifier.get_flow_doctor", return_value=None):
+                assert send_daemon_status("test") is False
 
+    @patch("executor.notifier.get_flow_doctor", return_value=None)
     @patch("executor.notifier.send_message", return_value=True)
-    def test_send_daemon_status_success(self, mock_send):
+    def test_send_daemon_status_success(self, mock_send, _mock_fd):
         assert send_daemon_status("daemon started") is True
         mock_send.assert_called_once_with("daemon started")
 
