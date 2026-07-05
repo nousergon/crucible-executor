@@ -185,6 +185,108 @@ def _ib_shares(positions: dict[str, Any]) -> dict[str, int]:
     return out
 
 
+def same_day_split_ratios(
+    splits_by_ticker: dict[str, list[dict[str, Any]]], run_date: str
+) -> dict[str, float]:
+    """Map ``{ticker: cumulative split ratio}`` for splits whose ex-date
+    (``execution_date``) is exactly ``run_date`` (config#1682).
+
+    ``splits_by_ticker`` is the raw Polygon ``/v3/reference/splits`` payload
+    keyed by ticker (see :meth:`PolygonClient.get_splits`). The ratio is
+    ``split_to / split_from`` — the factor IB multiplies the held share count
+    by on the ex-date (2-for-1 → 2.0; 1-for-10 reverse → 0.1). If a ticker has
+    more than one split dated the same day (rare) the ratios compound. Malformed
+    rows (missing / zero / non-numeric ``split_from``/``split_to``) are skipped
+    with a warning rather than silently defaulting to 1.0 — a swallowed bad
+    ratio would re-introduce exactly the false mismatch this closes.
+
+    Pure: no I/O. The caller fetches the splits (see
+    :func:`fetch_same_day_split_ratios`) and passes the result in, keeping
+    :func:`build_reconciliation_audit` free of network calls.
+    """
+    ratios: dict[str, float] = {}
+    for ticker, splits in (splits_by_ticker or {}).items():
+        for s in splits or []:
+            if s.get("execution_date") != run_date:
+                continue
+            try:
+                to, frm = float(s["split_to"]), float(s["split_from"])
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "[reconciliation_audit] malformed split for %s on %s: %r "
+                    "— skipping (not defaulting to 1.0)", ticker, run_date, s,
+                )
+                continue
+            if to <= 0 or frm <= 0:
+                logger.warning(
+                    "[reconciliation_audit] non-positive split ratio for %s on "
+                    "%s: split_to=%s split_from=%s — skipping", ticker, run_date,
+                    s.get("split_to"), s.get("split_from"),
+                )
+                continue
+            ratios[ticker] = ratios.get(ticker, 1.0) * (to / frm)
+    return ratios
+
+
+def _apply_split_ratios(
+    shares: dict[str, int], ratios: dict[str, float]
+) -> dict[str, int]:
+    """Rebase a pre-corporate-action share map onto today's post-action basis.
+
+    For each ticker with a same-day split ratio, the pre-action holding
+    (the prior broker snapshot, or the from-inception ledger reconstruction)
+    is multiplied by the ratio so it lines up with IB's post-split book. Tickers
+    with no same-day action pass through unchanged. Returns a new dict (does not
+    mutate the input).
+    """
+    if not ratios:
+        return dict(shares)
+    out = dict(shares)
+    for ticker, ratio in ratios.items():
+        if ticker in out:
+            out[ticker] = int(round(out[ticker] * ratio))
+    return out
+
+
+def fetch_same_day_split_ratios(
+    tickers, run_date: str, *, client: Any | None = None
+) -> dict[str, float]:
+    """I/O wiring helper: fetch same-day split ratios for ``tickers`` via Polygon.
+
+    Separate from the pure :func:`build_reconciliation_audit` builder so the
+    latter stays testable without network. Best-effort by contract — any failure
+    (missing ``POLYGON_API_KEY``, rate limit, HTTP error) returns ``{}`` and logs,
+    because a same-day split is rare and the reconciliation audit is secondary
+    observability that must never abort the EOD path. Inject ``client`` (a
+    ``PolygonClient``-shaped object exposing ``get_splits``) in tests.
+    """
+    tickers = [t for t in (tickers or []) if t]
+    if not tickers:
+        return {}
+    try:
+        if client is None:
+            from polygon_client import PolygonClient  # lazy: optional dep / key
+
+            client = PolygonClient()
+        splits_by_ticker: dict[str, list[dict[str, Any]]] = {}
+        for t in tickers:
+            try:
+                splits_by_ticker[t] = client.get_splits(t, start=run_date)
+            except Exception:  # noqa: BLE001 — per-ticker isolation
+                logger.warning(
+                    "[reconciliation_audit] split fetch failed for %s; "
+                    "treating as no same-day action", t, exc_info=True,
+                )
+        return same_day_split_ratios(splits_by_ticker, run_date)
+    except Exception:  # noqa: BLE001 — client construction / key absent
+        logger.warning(
+            "[reconciliation_audit] same-day split fetch unavailable "
+            "(no POLYGON_API_KEY or client error); proceeding un-adjusted",
+            exc_info=True,
+        )
+        return {}
+
+
 def _anchored_parity(
     prior_ib: dict[str, int], ib: dict[str, int], ledger_today: dict[str, int]
 ) -> tuple[float, list[str], int, list[dict[str, Any]]]:
@@ -268,6 +370,7 @@ def build_reconciliation_audit(
     run_date: str,
     ib_nav: Optional[float] = None,
     generated_at: Optional[str] = None,
+    corporate_actions: Optional[dict[str, float]] = None,
 ) -> dict[str, Any]:
     """Build the reconciliation-audit payload (pure — no I/O).
 
@@ -286,9 +389,24 @@ def build_reconciliation_audit(
     ``cumulative`` replay (``anchored: false``) so the metric is never built
     on a phantom empty baseline. The cumulative replay is ALWAYS computed and
     surfaced under ``cumulative_ledger_parity`` as a diagnostic.
+
+    ``corporate_actions`` (config#1682) is ``{ticker: same-day split ratio}``
+    for splits/spinoffs whose ex-date is ``run_date`` — actions that change IB's
+    share count with no corresponding ledger trade and would otherwise register
+    as false mismatches on the action day. The ratio (``split_to/split_from``,
+    e.g. 2.0 for a 2-for-1) rebases the *pre-action* share baselines onto today's
+    post-action IB basis: the prior broker snapshot for the anchored headline,
+    and the from-inception reconstruction for the cumulative diagnostic. Today's
+    ledger fills are already recorded in post-split terms (IB reports post-split
+    quantities), so only the pre-action carry is rebased. The applied ratios are
+    echoed under ``corporate_actions_applied``. Fetched out-of-band and passed in
+    (see :func:`fetch_same_day_split_ratios`) to keep this builder pure.
     """
+    ratios = corporate_actions or {}
     ib = _ib_shares(today_positions)
-    ledger_cum = reconstruct_ledger_positions(conn, as_of_date=run_date)
+    ledger_cum = _apply_split_ratios(
+        reconstruct_ledger_positions(conn, as_of_date=run_date), ratios
+    )
     cum_rate, cum_universe, cum_matched, cum_mismatches = _cumulative_parity(
         ledger_cum, ib
     )
@@ -296,7 +414,7 @@ def build_reconciliation_audit(
     anchored = prior_positions is not None
     daily: dict[str, Any] = {"computed": False}
     if anchored:
-        prior_ib = _ib_shares(prior_positions)
+        prior_ib = _apply_split_ratios(_ib_shares(prior_positions), ratios)
         ledger_today = reconstruct_ledger_positions(conn, on_date=run_date)
         match_rate, universe, n_matched, mismatches = _anchored_parity(
             prior_ib, ib, ledger_today
@@ -372,13 +490,25 @@ def build_reconciliation_audit(
         # Informational only — NAV parity is NOT the metric (an IB-derived
         # daemon NAV would be a tautology). Recorded for operator context.
         "ib_nav": ib_nav,
+        # Same-day split ratios applied to the pre-action baselines (config#1682).
+        # Empty {} when no ticker had an ex-date == run_date corporate action.
+        "corporate_actions_applied": dict(ratios),
         "caveats": [
             "Headline parity anchors on the prior broker snapshot + today's "
             "recorded fills (config#1301): a mismatch is TODAY's unexplained "
             "change, not pre-ledger history.",
-            "Same-day corporate actions (splits/spinoffs) change IB shares "
-            "with no ledger trade and surface as expected mismatches on the "
-            "action day until the ledger is split-adjusted (follow-up).",
+            (
+                "Same-day corporate actions (splits/spinoffs) change IB shares "
+                "with no ledger trade; their split ratios are applied to the "
+                "pre-action baselines (prior snapshot + from-inception ledger) "
+                "so they no longer register as false mismatches (config#1682). "
+                "See corporate_actions_applied for what was rebased on this day."
+            )
+            if ratios else (
+                "Same-day corporate actions (splits/spinoffs) change IB shares "
+                "with no ledger trade; none had an ex-date on this run_date, so "
+                "no split adjustment was applied (config#1682)."
+            ),
             "When no prior broker snapshot is available the headline falls "
             "back to the from-inception cumulative replay (anchored=false); "
             "see cumulative_ledger_parity for the always-computed diagnostic.",
