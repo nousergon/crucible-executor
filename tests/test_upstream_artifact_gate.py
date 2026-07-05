@@ -65,8 +65,7 @@ class TestCheckUpstreamDeliverables:
                 "staging/daily_closes/2026-06-20.parquet": _ANCIENT,
             }
         )
-        with mock.patch("executor.health_status.read_health", return_value=_health_ok()):
-            failures = check_upstream_deliverables(
+        failures = check_upstream_deliverables(
                 "alpha-engine-research", now=_MONDAY_PREOPEN, s3_client=s3
             )
 

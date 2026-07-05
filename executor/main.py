@@ -1971,13 +1971,14 @@ def run(
         # ── 8. Write health status ────────────────────────────────────────────
         if not simulate:
             try:
-                from executor.health_status import write_health
+                from nousergon_lib.health import Deliverable, write_health
                 n_exit = len(exit_orders)
                 n_blocked = len(enter_signals) - n_entered
                 write_health(
-                    bucket=signals_bucket,
                     module_name="executor",
-                    status="ok",
+                    deliverables=[
+                        Deliverable(name="morning_plan", required=True, produced=True),
+                    ],
                     run_date=run_date,
                     duration_seconds=_time.time() - _health_start,
                     summary={
@@ -1986,13 +1987,14 @@ def run(
                         "n_exit": n_exit,
                         "n_blocked": n_blocked,
                     },
+                    bucket=signals_bucket,
                 )
             except Exception as _he:
                 logger.warning("Health status write failed: %s", _he)
 
             # ── Data manifest ──────────────────────────────────────────────────
             try:
-                from executor.health_status import write_data_manifest
+                from executor.data_manifest import write_data_manifest
                 write_data_manifest(
                     bucket=signals_bucket,
                     module_name="executor_morning",
@@ -2026,14 +2028,16 @@ def run(
                 "site": "executor_main", "dry_run": dry_run, "run_date": run_date})
         if not simulate:
             try:
-                from executor.health_status import write_health
+                from nousergon_lib.health import Deliverable, write_health
                 write_health(
-                    bucket=config.get("signals_bucket", "alpha-engine-research") if 'config' in dir() else "alpha-engine-research",
                     module_name="executor",
-                    status="failed",
+                    deliverables=[
+                        Deliverable(name="morning_plan", required=True, produced=False),
+                    ],
                     run_date=run_date,
                     duration_seconds=_time.time() - _health_start,
                     error=str(sys.exc_info()[1]),
+                    bucket=config.get("signals_bucket", "alpha-engine-research") if 'config' in dir() else "alpha-engine-research",
                 )
             except Exception:
                 logger.debug("Health status write failed on error path", exc_info=True)
