@@ -1023,8 +1023,17 @@ def run(
     try:
         from executor.reconciliation_audit import (
             build_reconciliation_audit,
+            fetch_same_day_split_ratios,
             write_reconciliation_audit,
         )
+
+        # Same-day corporate actions (splits/spinoffs) change IB's share count
+        # with no ledger trade and would false-mismatch the anchored parity on
+        # the ex-date (config#1682). Fetch split ratios for held tickers and
+        # rebase the pre-action baselines. Best-effort: no POLYGON_API_KEY or a
+        # fetch error yields {} (un-adjusted), never aborting the audit.
+        _held_tickers = set(positions or {}) | set(prior_positions or {})
+        _split_ratios = fetch_same_day_split_ratios(_held_tickers, run_date)
 
         _recon_audit = build_reconciliation_audit(
             conn,
@@ -1036,6 +1045,7 @@ def run(
             prior_positions=prior_positions if prior_snapshot_loaded else None,
             run_date=run_date,
             ib_nav=nav,
+            corporate_actions=_split_ratios,
         )
         _recon_key = write_reconciliation_audit(
             _recon_audit,

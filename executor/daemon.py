@@ -24,6 +24,7 @@ The daemon uses clientId=2 to avoid conflicts with the morning batch (clientId=1
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -378,6 +379,94 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _signals_fingerprint(signals: dict | None) -> str | None:
+    """Return a stable content fingerprint for a signals payload (config#897).
+
+    Used to detect a mid-session signals.json refresh (e.g. a manual
+    Saturday-SF re-run during a weekday session) so the daemon only recomputes
+    the surveillance universe and touches IB subscriptions when the payload
+    actually changed. ``None`` when signals are unavailable, so a failed read
+    never spuriously looks like a change.
+    """
+    if not signals:
+        return None
+    try:
+        return hashlib.sha256(
+            json.dumps(signals, sort_keys=True, default=str).encode()
+        ).hexdigest()
+    except (TypeError, ValueError):  # unserializable payload — treat as opaque
+        return None
+
+
+def _refresh_surveillance_universe(
+    monitor,
+    *,
+    config: dict,
+    run_date: str,
+    order_book: "OrderBook",
+    ibkr,
+    dry_run: bool,
+    last_fingerprint: str | None,
+    current_tickers: list[str],
+) -> tuple[list[str], str | None]:
+    """Re-derive the IB surveillance universe if signals.json changed (config#897).
+
+    Re-reads signals.json, and — only when its content fingerprint differs from
+    ``last_fingerprint`` — recomputes the surveillance universe and diff-applies
+    it to the monitor (subscribe newly-added, cancel newly-removed). Preserves
+    the existing universe on an unchanged payload (zero IB churn) and fails soft
+    to the current universe on a read error (logs a warning, never crashes the
+    daemon or drops live subscriptions).
+
+    Returns ``(tickers, fingerprint)`` — the universe now in force and the
+    fingerprint to carry into the next tick. On no-op / failure these are the
+    unchanged current values.
+    """
+    try:
+        from executor.signal_reader import read_signals_with_fallback
+        signals = read_signals_with_fallback(config["signals_bucket"], run_date)
+    except Exception as sig_err:  # noqa: BLE001
+        logger.warning(
+            "surveillance refresh: read_signals_with_fallback failed (%s) — "
+            "keeping current universe (%d tickers)",
+            sig_err, len(current_tickers),
+        )
+        return current_tickers, last_fingerprint
+
+    fingerprint = _signals_fingerprint(signals)
+    if fingerprint is not None and fingerprint == last_fingerprint:
+        # Unchanged signals.json — no recompute, no IB churn.
+        return current_tickers, last_fingerprint
+
+    try:
+        positions = list(ibkr.get_positions().keys()) if not dry_run else []
+    except Exception as pos_err:  # noqa: BLE001
+        logger.warning(
+            "surveillance refresh: get_positions failed (%s) — universe degrades",
+            pos_err,
+        )
+        positions = []
+
+    new_tickers = compute_surveillance_universe(
+        signals,
+        order_book_tickers=order_book.all_tickers(),
+        current_positions=positions,
+    )
+
+    if set(new_tickers) == set(current_tickers):
+        # Payload changed but the derived universe did not (e.g. a rewrite that
+        # didn't add/remove names). Adopt the new fingerprint, skip IB work.
+        return new_tickers, fingerprint
+
+    added, removed = monitor.resubscribe(new_tickers)
+    logger.info(
+        "surveillance universe refreshed mid-session (config#897): "
+        "+%s -%s → %d tickers",
+        sorted(added) or "[]", sorted(removed) or "[]", len(new_tickers),
+    )
+    return new_tickers, fingerprint
+
+
 def run_daemon(dry_run: bool = False) -> None:
     """Main daemon loop — runs until market close or shutdown signal."""
     global _shutdown_requested
@@ -608,6 +697,13 @@ def run_daemon(dry_run: bool = False) -> None:
         current_positions=positions_for_surveillance,
     )
     monitor.subscribe(tickers)
+
+    # Fingerprint of the signals payload the current IB subscription was
+    # derived from. The poll loop re-reads signals.json each tick and, when
+    # this fingerprint changes (a mid-session Research re-run), diff-applies
+    # the new surveillance universe to the monitor instead of waiting for a
+    # daemon restart (config#897). None when signals were unreadable at boot.
+    surveillance_fingerprint = _signals_fingerprint(signals_for_surveillance)
 
     # Research-conviction map for intraday drawdown forced-exit ranking
     # (config#844). Built once from the already-loaded signals payload so
@@ -933,6 +1029,23 @@ def run_daemon(dry_run: bool = False) -> None:
             # Reload order book in case morning batch updated it
             order_book = OrderBook.load()
             order_book.merge_executed(executed_tickers)
+
+            # Re-derive the IB surveillance universe if signals.json was
+            # refreshed mid-session (config#897). Re-reads signals.json and
+            # only recomputes + diff-applies subscriptions when the payload
+            # changed — unchanged signals produce zero IB churn, and a read
+            # failure fails soft to the current universe. Runs after the
+            # order_book reload so newly-tracked book names are included.
+            tickers, surveillance_fingerprint = _refresh_surveillance_universe(
+                monitor,
+                config=config,
+                run_date=run_date,
+                order_book=order_book,
+                ibkr=ibkr,
+                dry_run=dry_run,
+                last_fingerprint=surveillance_fingerprint,
+                current_tickers=tickers,
+            )
 
             # Per-tick structured log line consumed by uptime_tracker.
             # Format is stable — parsers match on the DAEMON_TICK prefix.

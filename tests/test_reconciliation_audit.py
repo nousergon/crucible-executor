@@ -15,7 +15,9 @@ import pytest
 
 from executor.reconciliation_audit import (
     build_reconciliation_audit,
+    fetch_same_day_split_ratios,
     reconstruct_ledger_positions,
+    same_day_split_ratios,
     write_reconciliation_audit,
 )
 
@@ -280,6 +282,113 @@ class TestBuildAudit:
         # match_rate is built from the ledger, not NAV.
         assert "reconciliation_match_rate" in audit
         assert audit["daily_delta"]["computed"] is False
+
+
+class TestSameDaySplitRatios:
+    """Pure ratio extraction for same-day corporate actions (config#1682)."""
+
+    def test_forward_split_ratio_on_run_date(self):
+        splits = {"AAPL": [{"execution_date": "2026-06-18", "split_from": 1, "split_to": 2}]}
+        assert same_day_split_ratios(splits, "2026-06-18") == {"AAPL": 2.0}
+
+    def test_reverse_split_ratio(self):
+        splits = {"CMPS": [{"execution_date": "2026-06-18", "split_from": 10, "split_to": 1}]}
+        assert same_day_split_ratios(splits, "2026-06-18") == {"CMPS": 0.1}
+
+    def test_ignores_splits_dated_other_days(self):
+        splits = {"AAPL": [{"execution_date": "2026-06-17", "split_from": 1, "split_to": 2}]}
+        assert same_day_split_ratios(splits, "2026-06-18") == {}
+
+    def test_multiple_same_day_splits_compound(self):
+        splits = {"X": [
+            {"execution_date": "2026-06-18", "split_from": 1, "split_to": 2},
+            {"execution_date": "2026-06-18", "split_from": 1, "split_to": 3},
+        ]}
+        assert same_day_split_ratios(splits, "2026-06-18") == {"X": 6.0}
+
+    def test_malformed_and_nonpositive_skipped_not_defaulted(self):
+        splits = {
+            "BAD": [{"execution_date": "2026-06-18", "split_to": 2}],          # missing split_from
+            "ZERO": [{"execution_date": "2026-06-18", "split_from": 0, "split_to": 2}],
+        }
+        # Neither silently becomes 1.0 — they are simply absent.
+        assert same_day_split_ratios(splits, "2026-06-18") == {}
+
+
+class TestCorporateActionAdjustment:
+    """A same-day split no longer produces a false reconciliation mismatch."""
+
+    def _split_day_audit(self, corporate_actions):
+        # AAPL 2-for-1 split on 2026-06-18: IB doubles 100 -> 200 with NO ledger
+        # trade. Prior snapshot holds the pre-split 100.
+        conn = _conn([
+            {"ticker": "AAPL", "action": "ENTER", "filled_shares": 100,
+             "status": "Filled", "date": "2026-06-01"},
+        ])
+        return build_reconciliation_audit(
+            conn,
+            today_positions=_pos(AAPL=200),
+            prior_positions=_pos(AAPL=100),
+            run_date="2026-06-18",
+            corporate_actions=corporate_actions,
+        )
+
+    def test_unadjusted_split_day_false_mismatches(self):
+        # Baseline: without the corporate-action ratio the anchored parity reads
+        # a false mismatch (expected 100 != IB 200) — the bug this issue closes.
+        audit = self._split_day_audit(corporate_actions=None)
+        assert audit["reconciliation_match_rate"] < 1.0
+        assert audit["status"] == "DRIFT"
+        assert audit["corporate_actions_applied"] == {}
+
+    def test_split_adjusted_reconciles_clean(self):
+        # With the 2.0 ratio the pre-split baseline is rebased 100 -> 200 and the
+        # day reconciles exactly; the cumulative diagnostic is rebased too.
+        audit = self._split_day_audit(corporate_actions={"AAPL": 2.0})
+        assert audit["reconciliation_match_rate"] == 1.0
+        assert audit["status"] == "OK"
+        assert audit["corporate_actions_applied"] == {"AAPL": 2.0}
+        assert audit["cumulative_ledger_parity"]["match_rate"] == 1.0
+
+    def test_real_fill_on_split_day_still_reconciles(self):
+        # Pre-split 100 (snapshot), a real same-day BUY of 20 recorded post-split,
+        # then a 2:1 split of the 100 carry -> IB = 100*2 + 20 = 220.
+        conn = _conn([
+            {"ticker": "AAPL", "action": "ENTER", "filled_shares": 100,
+             "status": "Filled", "date": "2026-06-01"},
+            {"ticker": "AAPL", "action": "ENTER", "filled_shares": 20,
+             "status": "Filled", "date": "2026-06-18"},
+        ])
+        audit = build_reconciliation_audit(
+            conn,
+            today_positions=_pos(AAPL=220),
+            prior_positions=_pos(AAPL=100),
+            run_date="2026-06-18",
+            corporate_actions={"AAPL": 2.0},
+        )
+        assert audit["reconciliation_match_rate"] == 1.0
+
+
+class TestFetchSameDaySplitRatios:
+    def test_uses_injected_client(self):
+        client = MagicMock()
+        client.get_splits.return_value = [
+            {"execution_date": "2026-06-18", "split_from": 1, "split_to": 2},
+        ]
+        out = fetch_same_day_split_ratios(["AAPL"], "2026-06-18", client=client)
+        assert out == {"AAPL": 2.0}
+        client.get_splits.assert_called_once_with("AAPL", start="2026-06-18")
+
+    def test_per_ticker_error_isolated(self):
+        client = MagicMock()
+        client.get_splits.side_effect = RuntimeError("polygon down")
+        # A fetch failure degrades to no-adjustment rather than aborting.
+        assert fetch_same_day_split_ratios(["AAPL"], "2026-06-18", client=client) == {}
+
+    def test_empty_tickers_short_circuits(self):
+        client = MagicMock()
+        assert fetch_same_day_split_ratios([], "2026-06-18", client=client) == {}
+        client.get_splits.assert_not_called()
 
 
 class TestWrite:
