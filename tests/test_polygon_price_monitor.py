@@ -114,6 +114,28 @@ class TestOnMessage:
         with pytest.raises(ValueError):
             PolygonPriceMonitor()
 
+    # ── mid-session resubscribe parity with PriceMonitor (config#897) ────────
+
+    def test_subscribed_tickers_reflects_target(self, monkeypatch):
+        m = self._monitor(monkeypatch)
+        m._tickers = ["AAPL", "MSFT"]
+        assert m.subscribed_tickers() == {"AAPL", "MSFT"}
+
+    def test_resubscribe_updates_target_and_reports_delta(self, monkeypatch):
+        m = self._monitor(monkeypatch)
+        m._tickers = ["AAPL", "MSFT"]
+        added, removed = m.resubscribe(["AAPL", "NVDA"])
+        assert added == {"NVDA"}
+        assert removed == {"MSFT"}
+        assert m.subscribed_tickers() == {"AAPL", "NVDA"}
+
+    def test_resubscribe_unchanged_is_no_op(self, monkeypatch):
+        m = self._monitor(monkeypatch)
+        m._tickers = ["AAPL", "MSFT"]
+        added, removed = m.resubscribe(["MSFT", "AAPL"])
+        assert added == set() and removed == set()
+        assert m._tickers == ["AAPL", "MSFT"]  # target untouched
+
 
 class TestSourceSelection:
     def test_price_source_default(self, monkeypatch):

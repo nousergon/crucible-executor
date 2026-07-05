@@ -181,6 +181,33 @@ class PolygonPriceMonitor:
         """Return current price state for a ticker, or None."""
         return self.prices.get(ticker)
 
+    def subscribed_tickers(self) -> set[str]:
+        """Return the set of symbols currently subscribed to the feed."""
+        return set(self._tickers)
+
+    def resubscribe(self, tickers: list[str]) -> tuple[set[str], set[str]]:
+        """Reconcile the subscribed universe to ``tickers`` (config#897).
+
+        Interface-compatible with :meth:`PriceMonitor.resubscribe`. The polygon
+        WebSocket subscription is (re)issued from the reader thread on its next
+        (re)connect using ``self._tickers``; sending a fresh subscribe frame on
+        the live socket is out of scope here, so this updates the target list
+        and returns the ``(added, removed)`` diff. Returns empty sets (no-op)
+        when the universe is unchanged so callers can skip needless work.
+        """
+        desired = list(dict.fromkeys(tickers))  # de-dupe, keep order
+        current = set(self._tickers)
+        added = set(desired) - current
+        removed = current - set(desired)
+        if not added and not removed:
+            return set(), set()
+        self._tickers = desired
+        logger.info(
+            "PolygonPriceMonitor.resubscribe: +%d -%d tickers (now %d)",
+            len(added), len(removed), len(self._tickers),
+        )
+        return added, removed
+
     def unsubscribe_all(self) -> None:
         """Close the socket and stop the reader thread."""
         self._stop.set()
