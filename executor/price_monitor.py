@@ -24,27 +24,97 @@ class PriceMonitor:
         self.prices: dict[str, dict] = {}
         self._contracts: dict[str, Stock] = {}
         self._subscriptions: list[Ticker] = []
+        # Per-symbol handle on the reqMktData result so a single symbol can be
+        # cancelled precisely on a mid-session resubscribe (config#897), rather
+        # than matching by contract identity on the flat list.
+        self._sub_by_symbol: dict[str, Ticker] = {}
 
     def subscribe(self, tickers: list[str]) -> None:
         """Subscribe to delayed (free) market data for all tickers."""
         self._ib.reqMarketDataType(3)  # 3 = delayed (free)
 
         for symbol in tickers:
-            contract = Stock(symbol, "SMART", "USD")
-            try:
-                self._ib.qualifyContracts(contract)
-            except Exception as e:
-                logger.warning("Could not qualify %s — skipping: %s", symbol, e)
-                continue
-
-            ticker_data = self._ib.reqMktData(contract, genericTickList="", snapshot=False)
-            self._contracts[symbol] = contract
-            self._subscriptions.append(ticker_data)
-            logger.debug("Subscribed to delayed data for %s", symbol)
+            self._subscribe_one(symbol)
 
         # Register tick handler
         self._ib.pendingTickersEvent += self._on_pending_tickers
         logger.info("Subscribed to %d/%d tickers for delayed streaming", len(self._contracts), len(tickers))
+
+    def _subscribe_one(self, symbol: str) -> bool:
+        """Request delayed market data for a single symbol.
+
+        Returns ``True`` if the subscription was established, ``False`` if the
+        contract could not be qualified (already-subscribed symbols are a no-op
+        and return ``True``). Does NOT register the tick handler — callers do
+        that once via :meth:`subscribe` / :meth:`resubscribe`.
+        """
+        if symbol in self._contracts:
+            return True
+        contract = Stock(symbol, "SMART", "USD")
+        try:
+            self._ib.qualifyContracts(contract)
+        except Exception as e:
+            logger.warning("Could not qualify %s — skipping: %s", symbol, e)
+            return False
+
+        ticker_data = self._ib.reqMktData(contract, genericTickList="", snapshot=False)
+        self._contracts[symbol] = contract
+        self._subscriptions.append(ticker_data)
+        self._sub_by_symbol[symbol] = ticker_data
+        logger.debug("Subscribed to delayed data for %s", symbol)
+        return True
+
+    def subscribed_tickers(self) -> set[str]:
+        """Return the set of symbols currently subscribed to market data."""
+        return set(self._contracts)
+
+    def resubscribe(self, tickers: list[str]) -> tuple[set[str], set[str]]:
+        """Reconcile live subscriptions to ``tickers`` via a minimal diff.
+
+        Subscribes only symbols newly present and cancels only symbols newly
+        absent — the shared set is left untouched so an unchanged universe
+        produces zero IB churn. Returns ``(added, removed)`` (the symbols for
+        which subscribe/cancel was actually attempted) for logging/telemetry.
+        """
+        desired = set(tickers)
+        current = set(self._contracts)
+        added = desired - current
+        removed = current - desired
+
+        if not added and not removed:
+            return set(), set()
+
+        # Ensure the delayed data type is set even if the initial subscribe()
+        # happened on a prior (dropped) connection.
+        if added:
+            self._ib.reqMarketDataType(3)
+        added_ok: set[str] = set()
+        for symbol in sorted(added):
+            if self._subscribe_one(symbol):
+                added_ok.add(symbol)
+
+        for symbol in sorted(removed):
+            self._cancel_one(symbol)
+
+        logger.info(
+            "resubscribe: +%d -%d tickers (now %d subscribed)",
+            len(added_ok), len(removed), len(self._contracts),
+        )
+        return added_ok, set(removed)
+
+    def _cancel_one(self, symbol: str) -> None:
+        """Cancel market data for a single symbol and drop its bookkeeping."""
+        contract = self._contracts.pop(symbol, None)
+        ticker_data = self._sub_by_symbol.pop(symbol, None)
+        if contract is None:
+            return
+        try:
+            self._ib.cancelMktData(contract)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not cancel market data for %s: %s", symbol, e)
+        if ticker_data is not None:
+            self._subscriptions = [t for t in self._subscriptions if t is not ticker_data]
+        logger.debug("Cancelled delayed data for %s", symbol)
 
     def _on_pending_tickers(self, tickers: set[Ticker]) -> None:
         """Callback fired by ib_insync when ticker data updates."""
@@ -85,6 +155,7 @@ class PriceMonitor:
                 pass
         self._subscriptions.clear()
         self._contracts.clear()
+        self._sub_by_symbol.clear()
         logger.info("Unsubscribed from all market data")
 
     def get_price(self, ticker: str) -> dict | None:

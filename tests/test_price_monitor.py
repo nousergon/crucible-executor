@@ -34,9 +34,15 @@ def test_finite_helper(val, expected):
 
 
 def _make_ib_mock():
-    """A mock IB connection: reqMarketDataType, qualifyContracts, reqMktData, etc."""
+    """A mock IB connection: reqMarketDataType, qualifyContracts, reqMktData, etc.
+
+    reqMktData returns a DISTINCT MagicMock per call (mirroring ib_insync,
+    which hands back a distinct Ticker per subscription) so per-symbol
+    subscription bookkeeping can be exercised.
+    """
     ib = MagicMock()
     ib.pendingTickersEvent = MagicMock()
+    ib.reqMktData.side_effect = lambda *a, **k: MagicMock(name="ticker_data")
     return ib
 
 
@@ -196,3 +202,103 @@ def test_get_price_returns_state_or_none():
     pm._on_pending_tickers({ticker})
 
     assert pm.get_price("AAPL")["last"] == 150.0
+
+
+# ── subscribed_tickers accessor + diff-based resubscribe (config#897) ────────
+
+
+def test_subscribed_tickers_reflects_current_subscriptions():
+    ib = _make_ib_mock()
+    pm = PriceMonitor(ib)
+    assert pm.subscribed_tickers() == set()
+
+    pm.subscribe(["AAPL", "MSFT"])
+    assert pm.subscribed_tickers() == {"AAPL", "MSFT"}
+
+
+def test_resubscribe_adds_only_new_tickers():
+    ib = _make_ib_mock()
+    pm = PriceMonitor(ib)
+    pm.subscribe(["AAPL", "MSFT"])
+    ib.reqMktData.reset_mock()
+    ib.cancelMktData.reset_mock()
+
+    added, removed = pm.resubscribe(["AAPL", "MSFT", "NVDA", "TSLA"])
+
+    assert added == {"NVDA", "TSLA"}
+    assert removed == set()
+    # Only the two NEW tickers hit reqMktData — no churn on the shared set.
+    assert ib.reqMktData.call_count == 2
+    assert ib.cancelMktData.call_count == 0
+    assert pm.subscribed_tickers() == {"AAPL", "MSFT", "NVDA", "TSLA"}
+
+
+def test_resubscribe_cancels_only_removed_tickers():
+    ib = _make_ib_mock()
+    pm = PriceMonitor(ib)
+    pm.subscribe(["AAPL", "MSFT", "NVDA"])
+    ib.reqMktData.reset_mock()
+    ib.cancelMktData.reset_mock()
+
+    added, removed = pm.resubscribe(["AAPL"])
+
+    assert added == set()
+    assert removed == {"MSFT", "NVDA"}
+    assert ib.cancelMktData.call_count == 2
+    assert ib.reqMktData.call_count == 0
+    assert pm.subscribed_tickers() == {"AAPL"}
+    assert len(pm._subscriptions) == 1
+
+
+def test_resubscribe_unchanged_universe_is_no_op():
+    ib = _make_ib_mock()
+    pm = PriceMonitor(ib)
+    pm.subscribe(["AAPL", "MSFT"])
+    ib.reqMktData.reset_mock()
+    ib.cancelMktData.reset_mock()
+    ib.reqMarketDataType.reset_mock()
+
+    added, removed = pm.resubscribe(["MSFT", "AAPL"])  # same set, different order
+
+    assert added == set()
+    assert removed == set()
+    assert ib.reqMktData.call_count == 0
+    assert ib.cancelMktData.call_count == 0
+    # No IB calls at all on an unchanged universe — zero churn.
+    assert ib.reqMarketDataType.call_count == 0
+    assert pm.subscribed_tickers() == {"AAPL", "MSFT"}
+
+
+def test_resubscribe_handles_simultaneous_add_and_remove():
+    ib = _make_ib_mock()
+    pm = PriceMonitor(ib)
+    pm.subscribe(["AAPL", "MSFT"])
+    ib.reqMktData.reset_mock()
+    ib.cancelMktData.reset_mock()
+
+    added, removed = pm.resubscribe(["AAPL", "NVDA"])
+
+    assert added == {"NVDA"}
+    assert removed == {"MSFT"}
+    assert ib.reqMktData.call_count == 1
+    assert ib.cancelMktData.call_count == 1
+    assert pm.subscribed_tickers() == {"AAPL", "NVDA"}
+
+
+def test_resubscribe_skips_unqualifiable_new_ticker():
+    ib = _make_ib_mock()
+
+    def qualify(contract):
+        if contract.symbol == "BAD":
+            raise RuntimeError("contract not found")
+
+    pm = PriceMonitor(ib)
+    pm.subscribe(["AAPL"])
+    ib.qualifyContracts.side_effect = qualify
+
+    added, removed = pm.resubscribe(["AAPL", "BAD"])
+
+    # BAD failed to qualify → not reported as added, not tracked.
+    assert added == set()
+    assert "BAD" not in pm.subscribed_tickers()
+    assert pm.subscribed_tickers() == {"AAPL"}
