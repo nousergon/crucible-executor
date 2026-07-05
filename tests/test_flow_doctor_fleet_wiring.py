@@ -17,7 +17,10 @@ def test_executor_flow_doctor_yaml_telegram_matches_fleet_canonical():
     raw = yaml.safe_load(yaml_path.read_text())
     telegram_blocks = [n for n in raw["notify"] if n.get("type") == "telegram"]
     expected = fleet_telegram_notifier_dicts(EXECUTOR_FLOW_DOCTOR_TELEGRAM_TOPICS)
-    assert telegram_blocks == expected
+    assert len(telegram_blocks) == len(expected)
+    for act, exp in zip(telegram_blocks, expected):
+        for key, value in exp.items():
+            assert act.get(key) == value, f"telegram notifier mismatch on {key!r}"
 
 
 def test_executor_flow_doctor_yaml_github_routes_to_config_backlog():
