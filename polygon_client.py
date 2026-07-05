@@ -184,6 +184,45 @@ class PolygonClient:
 
         return all_dividends
 
+    def get_splits(
+        self,
+        ticker: str,
+        start: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Fetch stock-split history for a ticker (``/v3/reference/splits``).
+
+        Returns list of dicts with keys: ``ticker``, ``execution_date``
+        (the ex-date the split takes effect on the broker's book),
+        ``split_from``, ``split_to`` (e.g. a 2-for-1 split is
+        ``split_from=1, split_to=2`` → share count multiplies by 2; a 1-for-10
+        reverse split is ``split_from=10, split_to=1`` → ×0.1).
+
+        Mirrors :meth:`get_dividends` (same auth, rate limiter, pagination).
+        Used by reconciliation to split-adjust the ledger's pre-action share
+        count so a same-day corporate action that changes IB's book with no
+        corresponding ledger trade does not register as a false mismatch
+        (config#1682).
+        """
+        params: dict = {"ticker": ticker, "limit": limit, "sort": "execution_date"}
+        if start:
+            params["execution_date.gte"] = start
+        all_splits: list[dict] = []
+        next_url: str | None = None
+
+        # First page
+        data = self._get("/v3/reference/splits", params=params)
+        all_splits.extend(data.get("results", []))
+        next_url = data.get("next_url")
+
+        # Paginate
+        while next_url:
+            resp = self._get_raw_url(next_url)
+            all_splits.extend(resp.get("results", []))
+            next_url = resp.get("next_url")
+
+        return all_splits
+
     def _get_raw_url(self, url: str) -> dict:
         """GET a full URL (for pagination next_url)."""
         self._wait_for_slot()
