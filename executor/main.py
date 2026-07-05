@@ -1012,70 +1012,27 @@ def run(
     from nousergon_lib.logging import get_flow_doctor
     fd = get_flow_doctor() if not simulate else None
 
-    # ── 0. Check upstream health — hard-fail if anything upstream is broken ──
-    # Running on stale signals or a failed predictor produces a degraded
-    # portfolio that contradicts the system's design. Per the "hard-fail until
-    # stable" standard, any unknown/failed/stale upstream must abort executor
-    # BEFORE we read signals or touch the order book. The trading instance
-    # will remain idle for the day and be stopped at 13:30 PT as usual.
-    # Per-module staleness tolerance (hours):
-    #   research           — 192h (runs weekly Sat; grace covers Sat→next Fri)
-    #   predictor_inference — 26h (runs every weekday morning; catches a Mon
-    #                               miss without false-alarming on the weekend)
-    #   daily_data         — 26h (same weekday 13:05 UTC cadence as predictor;
-    #                               stamp written by alpha-engine-data after
-    #                               daily_closes.collect — catches ran-and-failed
-    #                               states that the direct LastModified check
-    #                               below would miss)
-    _UPSTREAM_MAX_AGE_H = {"research": 192, "predictor_inference": 26, "daily_data": 26}
-
+    # ── 0. Check upstream deliverables — hard-fail if inputs are missing/stale ──
+    # Independent artifact-freshness gate (config#1725 Phase A): probes the
+    # real S3 deliverables via nousergon_lib.artifact_freshness instead of
+    # self-reported health/*.json stamps. The trading instance stays idle for
+    # the day and is stopped at EOD as usual when this gate trips.
     if not simulate:
-        _health_failures: list[str] = []
-        try:
-            from executor.health_status import check_upstream_health
-            # Pass the loosest module tolerance as the library default so
-            # check_upstream_health doesn't prematurely mark research stale;
-            # we re-check per-module against _UPSTREAM_MAX_AGE_H below.
-            upstream = check_upstream_health(
-                signals_bucket,
-                list(_UPSTREAM_MAX_AGE_H),
-                max_age_hours=max(_UPSTREAM_MAX_AGE_H.values()),
-            )
-        except Exception as _ue:
-            # A health-check read failure is itself a reason to hard-fail —
-            # we don't know the state of upstream, so we refuse to trade.
-            upstream = {}
-            _health_failures.append(f"health-check error: {_ue}")
+        from executor.upstream_artifact_gate import check_upstream_deliverables
 
-        for mod, max_hrs in _UPSTREAM_MAX_AGE_H.items():
-            info = upstream.get(mod)
-            if info is None:
-                _health_failures.append(f"{mod}: no health data returned")
-                continue
-            if info["status"] == "unknown":
-                _health_failures.append(f"{mod}: no health data found")
-            elif info["status"] == "failed":
-                _health_failures.append(f"{mod}: last run FAILED")
-            elif info["age_hours"] is None or info["age_hours"] < 0:
-                _health_failures.append(f"{mod}: last_success missing")
-            elif info["age_hours"] > max_hrs:
-                _health_failures.append(
-                    f"{mod}: {info['age_hours']:.0f}h ({info['age_hours']/24:.1f}d) stale "
-                    f"(max {max_hrs}h)"
-                )
-
-        if _health_failures:
+        _upstream_failures = check_upstream_deliverables(signals_bucket)
+        if _upstream_failures:
             msg = (
-                "Upstream health FAILED — executor aborting:\n"
-                + "\n".join(f"  - {w}" for w in _health_failures)
+                "Upstream deliverables FAILED — executor aborting:\n"
+                + "\n".join(f"  - {w}" for w in _upstream_failures)
             )
             logger.error(msg)
             try:
                 from executor.notifier import send_daemon_status
                 send_daemon_status(
-                    "\u274c *Upstream health FAILED*\n"
+                    "\u274c *Upstream deliverables FAILED*\n"
                     f"Date: {run_date}\n"
-                    + "\n".join(f"- {w}" for w in _health_failures)
+                    + "\n".join(f"- {w}" for w in _upstream_failures)
                     + "\n\nExecutor aborted — no order book written."
                 )
             except Exception:
@@ -1083,8 +1040,8 @@ def run(
             raise RuntimeError(msg)
 
         # Direct freshness check on the ArcticDB macro library. The
-        # stamp-based check_upstream_health above covers predictor/research
-        # "did it run"; this catches the "stamp green but data blob is
+        # artifact-freshness gate above covers research/predictor/daily_closes
+        # deliverables; this catches the "stamp green but data blob is
         # yesterday's" failure mode (partial writes, retries skipping
         # DataPhase1). SPY is the canary — written by the daily_append
         # post-close job to the macro library (NOT universe). If SPY has
