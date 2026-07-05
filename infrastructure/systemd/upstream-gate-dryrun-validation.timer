@@ -1,0 +1,11 @@
+[Unit]
+Description=One-shot upstream gate dry-run validation — Mon 2026-07-06 14:15 UTC (config#1725 closes-when)
+
+[Timer]
+# After weekday MorningEnrich + PredictorInference; before RunMorningPlanner in typical SF timing.
+OnCalendar=2026-07-06 14:15:00 UTC
+Persistent=true
+Unit=upstream-gate-dryrun-validation.service
+
+[Install]
+WantedBy=timers.target
