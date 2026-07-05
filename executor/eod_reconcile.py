@@ -1317,11 +1317,12 @@ def run(
 
     # Write health status
     try:
-        from executor.health_status import write_health
+        from nousergon_lib.health import Deliverable, write_health
         write_health(
-            bucket=trades_bucket,
             module_name="eod_reconcile",
-            status="ok",
+            deliverables=[
+                Deliverable(name="eod_reconcile", required=True, produced=True),
+            ],
             run_date=run_date,
             duration_seconds=_time.time() - _health_start,
             summary={
@@ -1330,13 +1331,14 @@ def run(
                 "alpha": round(alpha, 4) if alpha is not None else None,
                 "n_positions": len(positions),
             },
+            bucket=trades_bucket,
         )
     except Exception as _he:
         logger.warning("Health status write failed: %s", _he)
 
     # ── Data manifest ──────────────────────────────────────────────────────
     try:
-        from executor.health_status import write_data_manifest
+        from executor.data_manifest import write_data_manifest
         trades_today_count = conn.execute(
             "SELECT COUNT(*) FROM trades WHERE date=?", (run_date,)
         ).fetchone()[0]

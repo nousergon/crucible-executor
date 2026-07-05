@@ -1282,7 +1282,7 @@ def run_daemon(dry_run: bool = False) -> None:
 
         # ── Data manifest ──────────────────────────────────────────────────
         try:
-            from executor.health_status import write_data_manifest
+            from executor.data_manifest import write_data_manifest
             write_data_manifest(
                 bucket=config.get("signals_bucket", "alpha-engine-research"),
                 module_name="daemon",
