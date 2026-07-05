@@ -57,11 +57,11 @@ else
     log "WARN ~/.netrc refresh skipped — SSM /alpha-engine/GITHUB_TOKEN unreadable/empty; keeping existing ~/.netrc (private-repo pull will WARN below if the on-disk token is also stale)"
 fi
 
+# Weekday/EOD SF only SSM-invokes executor + data on this box; dashboard and
+# backtester live on ae-dashboard / Saturday spots (see config#1767).
 REPOS=(
     /home/ec2-user/alpha-engine-config
     /home/ec2-user/alpha-engine
-    /home/ec2-user/alpha-engine-backtester
-    /home/ec2-user/alpha-engine-dashboard
     /home/ec2-user/alpha-engine-data
 )
 
