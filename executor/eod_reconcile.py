@@ -403,11 +403,13 @@ def _compute_daily_return(
         unattributed bucket rather than fabricate an inflated number.
       * opened since the prior trading day (absent from the prior snapshot)
         → return vs entry ``avg_cost`` (unchanged legacy behavior).
-      * held-through with **more shares today than yesterday** (adds on top of
-        a retained core) → retained shares vs the previous trading day's
-        close; added shares vs today's buy fill (share-weighted ENTER price,
-        else ``avg_cost``). Using the prior close for added shares dumps their
-        entry-to-close P&L into the NAV ``unattributed`` bucket.
+      * held-through with **more shares today than yesterday** AND a recorded
+        ENTER fill today → retained shares vs the previous trading day's
+        close; added shares vs the share-weighted buy fill. Without a fill,
+        fall back to the legacy all-shares prior-close path (share-count drift
+        from snapshots/corporate actions must not trigger avg_cost guessing).
+        Using the prior close for confirmed intraday adds dumps entry-to-close
+        P&L into the NAV ``unattributed`` bucket.
     """
     held_through = prior_pos is not None
     if not held_through:
@@ -446,18 +448,18 @@ def _compute_daily_return(
                 prior_shares = 0.0
         added = max(0.0, shares - prior_shares) if prior_shares > 0 else 0.0
         retained = min(prior_shares, shares) if prior_shares > 0 else 0.0
-        if held_through and added > 0 and retained > 0:
-            entry_px = add_entry_px
-            if entry_px is None or entry_px <= 0:
-                try:
-                    entry_px = float(pos.get("avg_cost", current_price) or current_price)
-                except (TypeError, ValueError):
-                    entry_px = current_price
+        if (
+            held_through
+            and added > 0
+            and retained > 0
+            and add_entry_px is not None
+            and add_entry_px > 0
+        ):
             daily_usd = (
                 (current_price - prior_price) * retained
-                + (current_price - entry_px) * added
+                + (current_price - add_entry_px) * added
             )
-            prior_mv = prior_price * retained + entry_px * added
+            prior_mv = prior_price * retained + add_entry_px * added
             daily_pct = (daily_usd / prior_mv * 100) if prior_mv else 0.0
             return daily_pct, daily_usd, prior_price, None
         return (
