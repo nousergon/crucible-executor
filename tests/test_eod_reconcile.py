@@ -11,8 +11,11 @@ from executor.eod_reconcile import (
     _load_signals_from_s3,
     _load_predictions_from_s3,
     _build_position_contexts,
+    _compute_daily_return,
     run,
 )
+from executor.eod_report import _buy_entry_prices
+from datetime import date
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -312,6 +315,89 @@ def test_build_position_contexts_handles_bad_rationale_json(
 
     assert len(contexts) == 1
     assert contexts[0]["entry_rationale"] is None  # failed parse → None
+
+
+# ── Per-position daily return (partial adds) ───────────────────────────────────
+
+
+class TestComputeDailyReturn:
+    """Gap-aware daily return; partial adds must not use prior close for new shares."""
+
+    _PREV_TD = date(2026, 7, 2)
+
+    def test_held_through_flat_shares(self):
+        pct, usd, prior, na = _compute_daily_return(
+            "AMD",
+            {"shares": 148, "avg_cost": 500.0},
+            {"shares": 148, "closing_price": 517.82},
+            current_price=552.05,
+            shares=148,
+            prior_close=517.82,
+            prior_close_date=self._PREV_TD,
+            expected_prev_td=self._PREV_TD,
+        )
+        assert na is None
+        assert prior == pytest.approx(517.82)
+        assert usd == pytest.approx((552.05 - 517.82) * 148, abs=0.01)
+
+    def test_partial_add_splits_baseline(self):
+        """Regression for 2026-07-06 ADBE: +193 @ 213.62 on a 332-share core."""
+        pct, usd, prior, na = _compute_daily_return(
+            "ADBE",
+            {"shares": 525, "avg_cost": 200.0},
+            {"shares": 332, "closing_price": 219.72},
+            current_price=218.07,
+            shares=525,
+            prior_close=219.72,
+            prior_close_date=self._PREV_TD,
+            expected_prev_td=self._PREV_TD,
+            add_entry_px=213.62,
+        )
+        assert na is None
+        expected = (218.07 - 219.72) * 332 + (218.07 - 213.62) * 193
+        assert usd == pytest.approx(expected, abs=0.01)
+        assert usd != pytest.approx((218.07 - 219.72) * 525, abs=0.01)
+
+    def test_partial_add_spy_core(self):
+        """2026-07-06 SPY: +27 @ 751.79 on 786-share core."""
+        pct, usd, prior, na = _compute_daily_return(
+            "SPY",
+            {"shares": 813, "avg_cost": 746.0},
+            {"shares": 786, "closing_price": 744.8},
+            current_price=751.28,
+            shares=813,
+            prior_close=744.8,
+            prior_close_date=self._PREV_TD,
+            expected_prev_td=self._PREV_TD,
+            add_entry_px=751.79,
+        )
+        expected = (751.28 - 744.8) * 786 + (751.28 - 751.79) * 27
+        assert usd == pytest.approx(expected, abs=0.01)
+
+    def test_trim_unchanged(self):
+        """Trims still price only the retained shares vs prior close."""
+        pct, usd, prior, na = _compute_daily_return(
+            "GOOG",
+            {"shares": 114, "avg_cost": 358.0},
+            {"shares": 226, "closing_price": 356.18},
+            current_price=364.9,
+            shares=114,
+            prior_close=356.18,
+            prior_close_date=self._PREV_TD,
+            expected_prev_td=self._PREV_TD,
+        )
+        assert usd == pytest.approx((364.9 - 356.18) * 114, abs=0.01)
+
+
+class TestBuyEntryPrices:
+    def test_share_weighted_enter_fills(self):
+        trades = [
+            {"action": "ENTER", "ticker": "ADBE", "shares": 100, "price": 210.0},
+            {"action": "ENTER", "ticker": "ADBE", "shares": 93, "price": 217.5},
+        ]
+        assert _buy_entry_prices(trades)["ADBE"] == pytest.approx(
+            (100 * 210.0 + 93 * 217.5) / 193, abs=1e-6
+        )
 
 
 # ── Daily return & alpha computation (inline math from run()) ────────────────

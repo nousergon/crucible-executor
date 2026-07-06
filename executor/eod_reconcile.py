@@ -375,6 +375,7 @@ def _compute_daily_return(
     prior_close: float | None,
     prior_close_date: "date | None",
     expected_prev_td: "date",
+    add_entry_px: float | None = None,
 ) -> tuple[float, float, float | None, str | None]:
     """Gap-aware per-position daily return.
 
@@ -402,6 +403,13 @@ def _compute_daily_return(
         unattributed bucket rather than fabricate an inflated number.
       * opened since the prior trading day (absent from the prior snapshot)
         → return vs entry ``avg_cost`` (unchanged legacy behavior).
+      * held-through with **more shares today than yesterday** AND a recorded
+        ENTER fill today → retained shares vs the previous trading day's
+        close; added shares vs the share-weighted buy fill. Without a fill,
+        fall back to the legacy all-shares prior-close path (share-count drift
+        from snapshots/corporate actions must not trigger avg_cost guessing).
+        Using the prior close for confirmed intraday adds dumps entry-to-close
+        P&L into the NAV ``unattributed`` bucket.
     """
     held_through = prior_pos is not None
     if not held_through:
@@ -432,6 +440,28 @@ def _compute_daily_return(
         prior_price = _resolve_prior_price(prior_pos, pos, current_price)
 
     if prior_price and prior_price > 0:
+        prior_shares = 0.0
+        if prior_pos:
+            try:
+                prior_shares = float(prior_pos.get("shares", 0) or 0)
+            except (TypeError, ValueError):
+                prior_shares = 0.0
+        added = max(0.0, shares - prior_shares) if prior_shares > 0 else 0.0
+        retained = min(prior_shares, shares) if prior_shares > 0 else 0.0
+        if (
+            held_through
+            and added > 0
+            and retained > 0
+            and add_entry_px is not None
+            and add_entry_px > 0
+        ):
+            daily_usd = (
+                (current_price - prior_price) * retained
+                + (current_price - add_entry_px) * added
+            )
+            prior_mv = prior_price * retained + add_entry_px * added
+            daily_pct = (daily_usd / prior_mv * 100) if prior_mv else 0.0
+            return daily_pct, daily_usd, prior_price, None
         return (
             (current_price / prior_price - 1) * 100,
             (current_price - prior_price) * shares,
@@ -822,6 +852,12 @@ def run(
         except (json.JSONDecodeError, TypeError):
             pass
 
+    from executor.eod_report import _buy_entry_prices
+    from executor.trade_logger import get_todays_trades
+
+    trades_today_rows = get_todays_trades(conn, run_date)
+    buy_entry_px = _buy_entry_prices(trades_today_rows)
+
     for ticker, pos in positions.items():
         shares = pos.get("shares", 0)
         mv = pos.get("market_value", 0)
@@ -852,6 +888,7 @@ def run(
             ticker, pos, prior_pos, current_price, shares,
             prior_closes.get(ticker), prior_close_dates.get(ticker),
             expected_prev_td,
+            add_entry_px=buy_entry_px.get(ticker),
         )
         pos["daily_return_pct"] = daily_pct
         pos["daily_return_usd"] = daily_usd
@@ -957,7 +994,6 @@ def run(
         # Realized P&L on shares rotated OUT today — also currently inside
         # `unattributed_usd`; the attribution lifts it into its own sleeve.
         from executor.eod_report import compute_rotation_realized
-        trades_today_rows = get_todays_trades(conn, run_date)
         rotation_realized_usd = compute_rotation_realized(
             positions, prior_positions, trades_today_rows,
         )
