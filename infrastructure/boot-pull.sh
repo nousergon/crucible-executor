@@ -83,6 +83,22 @@ for repo in "${REPOS[@]}"; do
 
     log "Pulling $repo ..."
     cd "$repo"
+
+    # Ownership reclaim: a script inside the checkout run via sudo (e.g. a
+    # timer-install step) can leave root-owned files/dirs in the ec2-user
+    # checkout. `git reset --hard` then fails with "unable to unlink ...
+    # Permission denied" and the box silently runs stale code until the
+    # executor's deploy-drift preflight refuses — 40 min into the pipeline
+    # (2026-07-06 incident, config#1811: infrastructure/ops/ was left
+    # root-owned by upstream-gate-dryrun-validation's sudo install step,
+    # failing every boot-pull that day). Detect-then-chown keeps the common
+    # clean-boot path to a single find(1) scan.
+    if [ -n "$(find "$repo" -not -user ec2-user -print -quit 2>/dev/null)" ]; then
+        log "WARN $repo — foreign-owned files found in checkout; reclaiming (chown -R ec2-user)"
+        sudo chown -R ec2-user:ec2-user "$repo" >> "$LOG" 2>&1 \
+            || log "WARN $repo — chown reclaim failed; git reset may fail below"
+    fi
+
     PREV_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
     CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
     if [ "$CURRENT_BRANCH" != "main" ]; then
@@ -108,7 +124,7 @@ for repo in "${REPOS[@]}"; do
             fi
         fi
     else
-        log "FAIL $repo — fetch/reset failed (network or auth — e.g. stale ~/.netrc PAT)"
+        log "FAIL $repo — fetch/checkout/reset failed; last git lines: $(tail -3 "$LOG" | tr '\n' ';')"
         PULL_FAILURES=$((PULL_FAILURES + 1))
         FAILED_REPOS+=("$repo (git)")
     fi

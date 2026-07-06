@@ -26,3 +26,23 @@ def test_trading_box_cleanup_script_exists():
     text = path.read_text()
     assert "alpha-engine-dashboard" in text
     assert "predictor" in text
+
+
+def test_boot_pull_reclaims_foreign_owned_files_before_git_reset():
+    """Ownership reclaim must precede the git fetch/reset block.
+
+    2026-07-06 incident (config#1811): a feature branch's sudo timer-install
+    step left infrastructure/ops/ root-owned inside the ec2-user checkout;
+    `git reset --hard origin/main` failed with "unable to unlink ...
+    Permission denied" on every boot, the box silently ran 4-commits-stale
+    code on a stray branch, and the day's pipeline burned ~40 min before the
+    executor's deploy-drift preflight refused. The reclaim block makes that
+    failure mode structurally impossible; this test pins its presence AND
+    its ordering (reclaim before reset — after would be useless).
+    """
+    src = _BOOT_PULL.read_text()
+    assert "-not -user ec2-user" in src, "foreign-ownership detection missing"
+    assert 'chown -R ec2-user:ec2-user "$repo"' in src, "ownership reclaim missing"
+    reclaim_pos = src.index("-not -user ec2-user")
+    reset_pos = src.index("git reset --hard origin/main")
+    assert reclaim_pos < reset_pos, "ownership reclaim must run BEFORE git reset"
