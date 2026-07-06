@@ -406,3 +406,59 @@ class TestIntradayNavSeriesWriter:
             operation_name="PutObject",
         )
         assert series_writer.write("2026-06-18", _ACCT, spy_last=740.96) is False
+
+
+class TestNavSeriesSessionRefusalLogging:
+    def test_stale_label_logs_error(self, caplog):
+        """D-1 label during a live session is a true mis-key — ERROR."""
+        import logging
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+        from zoneinfo import ZoneInfo
+
+        ET = ZoneInfo("America/New_York")
+        intraday = datetime(2026, 7, 7, 10, 0, tzinfo=ET).astimezone(timezone.utc)
+        stale_label = "2026-07-06"  # D-1 relative to the live Tue session
+
+        mock_s3 = MagicMock()
+        writer = IntradayNavSeriesWriter(bucket="b", s3_client=mock_s3)
+        caplog.set_level(logging.INFO)
+
+        with patch("executor.intraday_snapshot.datetime") as mock_dt:
+            real_dt = datetime
+            mock_dt.now.return_value = intraday
+            mock_dt.side_effect = lambda *a, **k: real_dt(*a, **k)
+            assert writer.write(stale_label, _ACCT, spy_last=740.0) is False
+
+        assert any("nav_series point refused" in r.message for r in caplog.records)
+        assert any(
+            r.levelno == logging.ERROR and "nav_series" in r.message for r in caplog.records
+        )
+        mock_s3.get_object.assert_not_called()
+
+    def test_post_close_wind_down_logs_info(self, caplog):
+        """Frozen run_date after 16:00 ET on session day — INFO, not ERROR."""
+        import logging
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+        from zoneinfo import ZoneInfo
+
+        ET = ZoneInfo("America/New_York")
+        post_close = datetime(2026, 7, 6, 16, 6, tzinfo=ET).astimezone(timezone.utc)
+        labeled = "2026-07-06"
+
+        mock_s3 = MagicMock()
+        writer = IntradayNavSeriesWriter(bucket="b", s3_client=mock_s3)
+        caplog.set_level(logging.INFO)
+
+        with patch("executor.intraday_snapshot.datetime") as mock_dt:
+            real_dt = datetime
+            mock_dt.now.return_value = post_close
+            mock_dt.side_effect = lambda *a, **k: real_dt(*a, **k)
+            assert writer.write(labeled, _ACCT, spy_last=740.0) is False
+
+        assert any("nav_series point skipped (post-close)" in r.message for r in caplog.records)
+        assert not any(
+            r.levelno == logging.ERROR and "nav_series" in r.message for r in caplog.records
+        )
+        mock_s3.get_object.assert_not_called()

@@ -17,9 +17,13 @@ logger = logging.getLogger(__name__)
 
 _ET = pytz.timezone("US/Eastern")
 _MARKET_OPEN = time(9, 30)
+# Default 16:00 ET — must match krepis ``session_date`` / ``assert_within_session``
+# (config#1610). A later close (the old 16:15 default) left the daemon polling
+# for 15 minutes after the session axis rolled, spamming nav_series guard
+# ERRORs into flow-doctor #ops-health every tick.
 _MARKET_CLOSE = time(
     int(os.environ.get("MARKET_CLOSE_HOUR", "16")),
-    int(os.environ.get("MARKET_CLOSE_MINUTE", "15")),
+    int(os.environ.get("MARKET_CLOSE_MINUTE", "0")),
 )
 
 # NYSE observed holidays through 2030.

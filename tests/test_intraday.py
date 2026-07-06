@@ -383,6 +383,12 @@ class TestMarketHours:
         now = _ET.localize(datetime(2026, 4, 8, 17, 0))
         assert is_market_hours(now) is False
 
+    def test_market_hours_at_close_boundary(self):
+        """Default close is 16:00 ET — aligned with session_date (config#1610)."""
+        assert is_market_hours(_ET.localize(datetime(2026, 4, 8, 15, 59))) is True
+        assert is_market_hours(_ET.localize(datetime(2026, 4, 8, 16, 0))) is False
+        assert is_market_hours(_ET.localize(datetime(2026, 4, 8, 16, 5))) is False
+
     def test_market_hours_weekend(self):
         now = _ET.localize(datetime(2026, 4, 11, 10, 30))
         assert is_market_hours(now) is False
