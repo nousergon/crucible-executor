@@ -76,6 +76,9 @@ _SELL_ACTIONS = {
     "SELL", "EXIT", "REDUCE", "COVER", "LIQUIDATION_SELL", "EMERGENCY_SELL",
 }
 
+# Buy-side trade actions whose fills establish entry price for shares added today.
+_BUY_ACTIONS = frozenset({"ENTER", "BUY", "COVER"})
+
 # Artifact written per trading day; the console EOD Report page reads it.
 REPORT_KEY_TEMPLATE = "consolidated/{run_date}/eod_report.json"
 
@@ -117,6 +120,30 @@ def _sell_exit_prices(trades_today: list[dict] | None) -> dict[str, float]:
         tkr = t.get("ticker")
         # Tolerate both the mapped ``price`` (``_trades_today``) and the raw
         # ``price_at_order`` column (``trade_logger.get_todays_trades``).
+        raw_px = t.get("price")
+        if raw_px is None:
+            raw_px = t.get("price_at_order")
+        try:
+            sh = abs(float(t.get("shares") or 0))
+            px = float(raw_px or 0)
+        except (TypeError, ValueError):
+            continue
+        if not tkr or sh <= 0 or px <= 0:
+            continue
+        slot = agg.setdefault(tkr, [0.0, 0.0])
+        slot[0] += sh * px
+        slot[1] += sh
+    return {k: v[0] / v[1] for k, v in agg.items() if v[1] > 0}
+
+
+def _buy_entry_prices(trades_today: list[dict] | None) -> dict[str, float]:
+    """Share-weighted average buy/enter fill price per ticker from today's trades."""
+    agg: dict[str, list[float]] = {}
+    for t in trades_today or []:
+        action = str(t.get("action", "")).upper()
+        if action not in _BUY_ACTIONS and "BUY" not in action:
+            continue
+        tkr = t.get("ticker")
         raw_px = t.get("price")
         if raw_px is None:
             raw_px = t.get("price_at_order")
