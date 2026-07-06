@@ -33,8 +33,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -50,6 +51,36 @@ NAV_SERIES_PREFIX = "intraday/nav_series/"
 # ~390 points across a session; 2000 leaves generous headroom for a faster
 # poll interval while bounding the read-modify-write object size.
 _MAX_SERIES_POINTS = 2000
+_ET = ZoneInfo("America/New_York")
+_NYSE_CLOSE_ET = time(16, 0)
+
+
+def _log_nav_series_session_refusal(trading_day: str, axis_err: ValueError, now_utc: datetime) -> None:
+    """Log a refused nav_series point at the right severity.
+
+    Post-close wind-down (daemon still polling with a frozen run_date while
+    ``session_date`` has rolled to the next session, but still on the labeled
+    session's calendar day) is expected — INFO only. A stale-label mis-key
+    (e.g. D-1 run_date during a live session) stays ERROR.
+    """
+    try:
+        from nousergon_lib.dates import session_date
+
+        labeled = date.fromisoformat(trading_day)
+        actual = session_date(now_utc)
+        now_et = now_utc.astimezone(_ET)
+        post_close_wind_down = (
+            actual != labeled
+            and now_et.date() == labeled
+            and now_et.time() > _NYSE_CLOSE_ET
+        )
+    except (ImportError, ValueError):
+        post_close_wind_down = False
+
+    if post_close_wind_down:
+        logger.info("nav_series point skipped (post-close) — %s", axis_err)
+    else:
+        logger.error("nav_series point refused — %s", axis_err)
 
 
 def _put_json_to_s3(s3: Any, bucket: str, key: str, payload: dict) -> bool:
@@ -353,15 +384,15 @@ class IntradayNavSeriesWriter:
         # session labeled on the file — a point timestamped in a different
         # session than its key is the exact mislabel that mis-joined the EOD
         # reconcile (nav_series/2026-07-01.json full of 07-02 timestamps).
-        # Refuse the mis-keyed point (ERROR + skipped write; the recording
-        # surfaces are this log line and chart/heartbeat staleness) rather
-        # than raising into the order loop's fire-and-forget except.
+        # Refuse the mis-keyed point (skipped write; severity depends on
+        # whether this is post-close wind-down vs a true stale-label bug)
+        # rather than raising into the order loop's fire-and-forget except.
         now_utc = datetime.now(timezone.utc)
         try:
             from nousergon_lib.dates import assert_within_session
             assert_within_session(now_utc, trading_day)
         except ValueError as _axis_err:
-            logger.error("nav_series point refused — %s", _axis_err)
+            _log_nav_series_session_refusal(trading_day, _axis_err, now_utc)
             return False
         except ImportError:
             pass  # lib not yet bumped on this deploy — guard is best-effort
