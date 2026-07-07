@@ -8,6 +8,13 @@ Routes through flow-doctor ``notify_event()`` when the daemon's shared
 inactive (local dev / tests without yaml).
 
 Migration arc: config#1741 (fleet Telegram consolidation T1).
+
+config#1813: ``notify_event()`` returns a non-None report id on every
+dispatch outcome except dedup — including ``severity_filtered`` (no
+notifier opted in at this event's severity), which is exactly what a
+stale/shadowed flow-doctor override yaml produces. Success logging here
+checks ``FlowDoctor.last_dispatched()`` (flow-doctor>=0.8.3, via the
+nousergon-lib[flow-doctor] pin) instead of trusting a non-None report id.
 """
 
 from __future__ import annotations
@@ -67,15 +74,31 @@ def send_trade_alert(
                 },
                 dedup_key=trade_alert_dedup_key(action, ticker, shares, price),
             )
-            if rid is not None:
-                logger.info("Telegram alert sent via flow-doctor: %s %s", action, ticker)
-                return True
-            logger.warning(
-                "Telegram trade alert suppressed by flow-doctor dedup: %s %s",
-                action,
-                ticker,
-            )
-            return False
+            # A non-None report id means the event was seen and persisted —
+            # NOT that it reached a notifier. flow-doctor>=0.8.3's
+            # last_dispatched()/last_dispatch_reason() expose the real
+            # per-call outcome; a stale/shadowed override yaml missing the
+            # trades Telegram topic returns a report id via
+            # severity_filtered while sending nothing (config#1813 — this
+            # is exactly the bug that logged a false "Telegram alert sent"
+            # for ~all of 2026-07-06's morning trades).
+            if rid is None:
+                logger.warning(
+                    "Telegram trade alert suppressed by flow-doctor dedup: %s %s",
+                    action,
+                    ticker,
+                )
+                return False
+            if not fd.last_dispatched():
+                logger.warning(
+                    "Telegram trade alert NOT delivered by flow-doctor (reason=%s): %s %s",
+                    fd.last_dispatch_reason(),
+                    action,
+                    ticker,
+                )
+                return False
+            logger.info("Telegram alert sent via flow-doctor: %s %s", action, ticker)
+            return True
         except Exception as exc:
             logger.warning(
                 "flow-doctor notify_event failed for trade alert (%s %s): %s — falling back",
@@ -98,7 +121,9 @@ def send_daemon_status(message: str) -> bool:
     if fd is not None:
         try:
             rid = fd.notify_event(message, severity="warning")
-            return rid is not None
+            if rid is None:
+                return False
+            return fd.last_dispatched()
         except Exception:
             pass
     return send_message(message)
