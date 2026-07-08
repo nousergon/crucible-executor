@@ -13,6 +13,36 @@ LOG="/var/log/boot-pull.log"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
+# ── Shared git-sync serialization (config#1944) ────────────────────────────
+# boot-pull.service and the weekday Step Function's CodeFreshnessGate +
+# ChronicGapSelfHeal (nousergon-data infrastructure/step_function_daily.json)
+# all run `git fetch / checkout -f main / reset --hard / pull` on the SAME
+# ec2-user checkouts on THIS trading box. They are independent git writers and
+# raced on `.git/index.lock`: 2026-07-08 ne-preopen-trading FailExecution —
+# CodeFreshnessGate's checkout/reset died with "Another git process seems to be
+# running" (exit 128) because boot-pull's `git reset --hard` still held
+# alpha-engine-data/.git/index.lock.
+#
+# A shared advisory flock is window-free (a kernel mutex — whoever acquires
+# first runs, the other blocks) and auto-releases on process death, unlike a
+# bare .git/index.lock which can strand a stale lock and deadlock. Every
+# trading-box git-sync section acquires this SAME lock inode so the writers
+# serialize instead of racing.
+#
+# Lock lives in ec2-user's HOME, NOT /var/lock: /var/lock -> /run/lock is
+# root:root 0755, so this script (runs as ec2-user) cannot create a lock file
+# there, and the SF gate runs its git as `sudo -u ec2-user`. Every actor
+# flocks this path AS ec2-user, so opening it for the lock always succeeds
+# regardless of which actor created the inode first. The nousergon-data gate
+# MUST use this identical path — pinned by a guard test in each repo.
+#
+# FAIL-LOUD: a `flock -w` timeout is a genuinely stuck git writer, not a
+# swallowable condition — flock returns non-zero, the per-repo `if` below takes
+# its else branch, PULL_FAILURES increments, and the script exits 1 (surfaced
+# via flow-doctor + the FAIL log lines). Never swallow a lock timeout.
+GIT_SYNC_LOCK="${AE_GIT_SYNC_LOCK:-/home/ec2-user/.ae-git-sync.lock}"
+GIT_SYNC_LOCK_WAIT="${AE_GIT_SYNC_LOCK_WAIT:-150}"
+
 log "=== boot-pull started ==="
 
 # ── Refresh the GitHub PAT in ~/.netrc from SSM ────────────────────────────
@@ -104,9 +134,14 @@ for repo in "${REPOS[@]}"; do
     if [ "$CURRENT_BRANCH" != "main" ]; then
         log "NOTE $repo — on branch '$CURRENT_BRANCH', will reset to origin/main (policy: boot always tracks main)"
     fi
-    if git fetch origin >> "$LOG" 2>&1 \
-       && git checkout -f main >> "$LOG" 2>&1 \
-       && git reset --hard origin/main >> "$LOG" 2>&1; then
+    # Serialize the index-mutating git ops behind the shared flock (config#1944)
+    # so this boot-pull can't race the weekday CodeFreshnessGate /
+    # ChronicGapSelfHeal on .git/index.lock. flock holds the lock for the whole
+    # fetch+checkout+reset group (window-free) and returns non-zero on a -w
+    # timeout (fail-loud -> else branch below). The ownership reclaim above runs
+    # OUTSIDE the lock deliberately (it is not a git-index op; a test pins that
+    # the reclaim still precedes the reset).
+    if flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c 'git fetch origin && git checkout -f main && git reset --hard origin/main' >> "$LOG" 2>&1; then
         NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
         log "OK   $repo — $(git log --oneline -1)"
 
@@ -124,7 +159,7 @@ for repo in "${REPOS[@]}"; do
             fi
         fi
     else
-        log "FAIL $repo — fetch/checkout/reset failed; last git lines: $(tail -3 "$LOG" | tr '\n' ';')"
+        log "FAIL $repo — git-sync under flock failed (fetch/checkout/reset error OR ${GIT_SYNC_LOCK_WAIT}s lock timeout on $GIT_SYNC_LOCK); last git lines: $(tail -3 "$LOG" | tr '\n' ';')"
         PULL_FAILURES=$((PULL_FAILURES + 1))
         FAILED_REPOS+=("$repo (git)")
     fi
