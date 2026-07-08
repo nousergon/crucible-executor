@@ -63,7 +63,9 @@ executor-specific:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import time
 from pathlib import Path
 
 from nousergon_lib.preflight import BasePreflight, _fetch_origin_main_sha
@@ -79,6 +81,48 @@ _EXECUTOR_REPO = "nousergon/crucible-executor"
 # The deployed checkout root — two levels up from this file
 # (executor/preflight.py → repo root). Mirrors config_loader._REPO_ROOT.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# config#1955: the pipeline pins the executor SHA it synced the box to at its
+# freshness gate (T0) into this file. The daemon is started by systemd
+# (`systemctl restart alpha-engine-daemon.service`), whose process env does NOT
+# inherit the RunDaemon SSM shell's exports — so a file is the only channel that
+# reaches BOTH the direct-python RunMorningPlanner and the systemd daemon.
+_PINNED_SHA_FILE = Path("/home/ec2-user/.frozen_executor_sha")
+# The gate rewrites the pin every pipeline morning; a file older than this is
+# treated as stale (e.g. an off-pipeline daemon auto-restart a day later) and
+# ignored, so the check live-fetches origin/main rather than pinning yesterday.
+_PINNED_SHA_MAX_AGE_S = 18 * 3600
+
+
+def _resolve_pinned_executor_sha() -> str | None:
+    """Resolve the pipeline-pinned executor SHA, or None to live-fetch.
+
+    Precedence (config#1955):
+      1. ``EXPECTED_EXECUTOR_SHA`` env var — explicit, e.g. exported by the
+         RunMorningPlanner SSM step (direct-python, same process tree).
+      2. The freshness-gate-written pin file (``_PINNED_SHA_FILE``, override
+         via ``EXPECTED_EXECUTOR_SHA_FILE``) — the ONLY channel that reaches the
+         systemd-restarted daemon. Honored only when RECENT (mtime within
+         ``_PINNED_SHA_MAX_AGE_S``); a stale file falls through to live-fetch.
+      3. None — caller compares against a live ``origin/main`` fetch (today's
+         manual / off-pipeline behavior).
+    """
+    env = (os.environ.get("EXPECTED_EXECUTOR_SHA") or "").strip()
+    if env:
+        return env
+    path = Path(os.environ.get("EXPECTED_EXECUTOR_SHA_FILE") or _PINNED_SHA_FILE)
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return None  # no pin file → live-fetch fallback
+    if age > _PINNED_SHA_MAX_AGE_S:
+        log.info(
+            "Deploy-drift: ignoring stale executor pin file %s (age %.0fs > "
+            "%ds) — live-fetching origin/main instead.",
+            path, age, _PINNED_SHA_MAX_AGE_S,
+        )
+        return None
+    return (path.read_text().strip() or None)
 
 
 class ExecutorPreflight(BasePreflight):
@@ -104,6 +148,7 @@ class ExecutorPreflight(BasePreflight):
         *,
         repo_root: Path | None = None,
         timeout: float = 5.0,
+        expected_sha: str | None = None,
     ) -> None:
         """Hard-fail if the deployed checkout's HEAD lags ``repo@branch`` HEAD.
 
@@ -135,10 +180,52 @@ class ExecutorPreflight(BasePreflight):
             repo_root: Checkout root to read HEAD from. Defaults to the
                 executor repo root inferred from this file's location.
             timeout: GitHub API timeout in seconds.
+            expected_sha: When set (or ``EXPECTED_EXECUTOR_SHA`` is in the
+                environment), validate the deployed checkout against THIS
+                pinned SHA — the commit the pipeline synced the box to at its
+                freshness gate (T0) — instead of a live-refetched
+                ``origin/main``. Explicit arg wins over the env var; both
+                absent → today's live-fetch behavior.
         """
         root = repo_root or _REPO_ROOT
         deployed = _read_deployed_git_sha(root)
 
+        # config#1955: prefer the pipeline-pinned SHA over a live origin/main
+        # fetch. ``check_deploy_drift`` historically compared the box's HEAD
+        # against a LIVE-fetched ``origin/main`` — a moving target during the
+        # ~48-min pipeline. ne-groomer[bot] merges benign docs/config commits
+        # throughout the trading day, so any commit landing between the
+        # freshness gate (T0) and this preflight (~T0+48min) retroactively
+        # failed an already-validated run (2026-07-08 preopen FailExecution: a
+        # docs-only CONTRIBUTING.md merge tripped it — no orders placed).
+        # Pinning to the SHA the run synced the box to is a STRONGER fail-loud
+        # invariant (it catches a genuine mid-run de-sync of the box) and is
+        # immune to a moving upstream. Fail-loud is re-pointed, never loosened.
+        if expected_sha is None:
+            expected_sha = _resolve_pinned_executor_sha()
+
+        if expected_sha is not None:
+            if deployed != expected_sha:
+                raise RuntimeError(
+                    f"Deploy drift: executor checkout at {root} is on "
+                    f"{deployed[:12]} but this run pinned "
+                    f"EXPECTED_EXECUTOR_SHA={expected_sha[:12]} at its freshness "
+                    f"gate. The box de-synced from the SHA the pipeline synced "
+                    f"it to mid-run — refusing to proceed. Running code that is "
+                    f"not what this run validated is the 2026-04-20 stale-code "
+                    f"class. (This is NOT tripped by a benign mid-pipeline "
+                    f"merge to origin/main — that no longer moves the target.)"
+                )
+            log.info(
+                "Deploy-drift: executor checkout at %s matches pipeline-pinned "
+                "EXPECTED_EXECUTOR_SHA %s ✓",
+                deployed[:12], expected_sha[:12],
+            )
+            return
+
+        # No pinned SHA (manual / off-pipeline invocation): preserve today's
+        # behavior — compare against live ``origin/main`` HEAD, with
+        # GitHub-unreachable → warn-and-continue.
         upstream = _fetch_origin_main_sha(repo, branch=branch, timeout=timeout)
         if upstream is None:
             # _fetch_origin_main_sha already logged the reason. Warn-and-

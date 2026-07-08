@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -210,3 +211,116 @@ class TestCheckDeployDrift:
         assert captured and captured[0] == [
             "git", "-c", f"safe.directory={root}", "rev-parse", "HEAD",
         ]
+
+
+class TestCheckDeployDriftPinnedSha:
+    """config#1955: pin the freshness target at pipeline start.
+
+    When a pinned SHA is available (env var, or the freshness-gate pin file),
+    the gate validates the box against the SHA the run synced it to — NOT a
+    live ``origin/main`` that keeps moving during the ~48-min pipeline. A benign
+    mid-pipeline merge (docs OR code) can no longer retroactively fail an
+    already-validated run (2026-07-08 preopen FailExecution). Fail-loud is
+    re-pointed, never loosened.
+    """
+
+    def _head_sha(self, root: Path) -> str:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    def _isolate_pin_file(self, monkeypatch, tmp_path):
+        """Point the pin-file lookup at a nonexistent tmp path so tests never
+        pick up a real /home/ec2-user/.frozen_executor_sha on the box."""
+        monkeypatch.setenv("EXPECTED_EXECUTOR_SHA_FILE", str(tmp_path / "nope.sha"))
+        monkeypatch.delenv("EXPECTED_EXECUTOR_SHA", raising=False)
+
+    # ── explicit arg / env var ──────────────────────────────────────────────
+    def test_pinned_sha_arg_match_passes_without_live_fetch(self, tmp_path):
+        root = _make_git_checkout(tmp_path)
+        head = self._head_sha(root)
+        pf = ExecutorPreflight(bucket="b", mode="daemon")
+        with patch.object(pf_mod, "_fetch_origin_main_sha") as fetch:
+            pf.check_deploy_drift(repo_root=root, expected_sha=head)
+        fetch.assert_not_called()
+
+    def test_pinned_sha_passes_even_when_origin_main_advanced(self, tmp_path):
+        """The exact 2026-07-08 shape: box on the pinned SHA, origin/main has
+        since advanced (a docs commit). Must PASS — the pinned path never
+        consults the moving upstream."""
+        root = _make_git_checkout(tmp_path)
+        head = self._head_sha(root)
+        pf = ExecutorPreflight(bucket="b", mode="daemon")
+        with patch.object(pf_mod, "_fetch_origin_main_sha", return_value="c0ffee" * 6 + "abcd"):
+            pf.check_deploy_drift(repo_root=root, expected_sha=head)  # must not raise
+
+    def test_pinned_sha_mismatch_hard_fails(self, tmp_path):
+        """Box de-synced from the pinned SHA mid-run → still hard-fail (the
+        invariant is stronger, not looser)."""
+        root = _make_git_checkout(tmp_path)
+        pf = ExecutorPreflight(bucket="b", mode="daemon")
+        with patch.object(pf_mod, "_fetch_origin_main_sha") as fetch:
+            with pytest.raises(RuntimeError, match="EXPECTED_EXECUTOR_SHA"):
+                pf.check_deploy_drift(repo_root=root, expected_sha="dead" * 10)
+            fetch.assert_not_called()
+
+    def test_env_var_supplies_pinned_sha(self, tmp_path, monkeypatch):
+        self._isolate_pin_file(monkeypatch, tmp_path)
+        root = _make_git_checkout(tmp_path)
+        head = self._head_sha(root)
+        monkeypatch.setenv("EXPECTED_EXECUTOR_SHA", head)
+        pf = ExecutorPreflight(bucket="b", mode="daemon")
+        with patch.object(pf_mod, "_fetch_origin_main_sha") as fetch:
+            pf.check_deploy_drift(repo_root=root)
+        fetch.assert_not_called()
+
+    def test_empty_env_var_and_no_file_falls_back_to_live_fetch(self, tmp_path, monkeypatch):
+        self._isolate_pin_file(monkeypatch, tmp_path)
+        monkeypatch.setenv("EXPECTED_EXECUTOR_SHA", "  ")  # whitespace = absent
+        root = _make_git_checkout(tmp_path)
+        head = self._head_sha(root)
+        pf = ExecutorPreflight(bucket="b", mode="daemon")
+        with patch.object(pf_mod, "_fetch_origin_main_sha", return_value=head) as fetch:
+            pf.check_deploy_drift(repo_root=root)
+        fetch.assert_called_once()
+
+    # ── pin FILE (the daemon channel) ───────────────────────────────────────
+    def test_fresh_pin_file_supplies_sha(self, tmp_path, monkeypatch):
+        root = _make_git_checkout(tmp_path)
+        head = self._head_sha(root)
+        pin = tmp_path / "pin.sha"
+        pin.write_text(head + "\n")  # trailing newline must be tolerated
+        monkeypatch.delenv("EXPECTED_EXECUTOR_SHA", raising=False)
+        monkeypatch.setenv("EXPECTED_EXECUTOR_SHA_FILE", str(pin))
+        pf = ExecutorPreflight(bucket="b", mode="daemon")
+        with patch.object(pf_mod, "_fetch_origin_main_sha") as fetch:
+            pf.check_deploy_drift(repo_root=root)  # pinned via file, no raise
+        fetch.assert_not_called()
+
+    def test_stale_pin_file_is_ignored_and_live_fetches(self, tmp_path, monkeypatch):
+        """A pin file older than the freshness window (off-pipeline daemon
+        auto-restart the next day) must be ignored → live-fetch, not a
+        false-fail on yesterday's SHA."""
+        root = _make_git_checkout(tmp_path)
+        head = self._head_sha(root)
+        pin = tmp_path / "pin.sha"
+        pin.write_text("dead" * 10)  # a stale/wrong SHA
+        old = time.time() - (pf_mod._PINNED_SHA_MAX_AGE_S + 3600)
+        os.utime(pin, (old, old))
+        monkeypatch.delenv("EXPECTED_EXECUTOR_SHA", raising=False)
+        monkeypatch.setenv("EXPECTED_EXECUTOR_SHA_FILE", str(pin))
+        pf = ExecutorPreflight(bucket="b", mode="daemon")
+        with patch.object(pf_mod, "_fetch_origin_main_sha", return_value=head) as fetch:
+            pf.check_deploy_drift(repo_root=root)  # falls back → passes on live
+        fetch.assert_called_once()
+
+    def test_env_var_wins_over_pin_file(self, tmp_path, monkeypatch):
+        root = _make_git_checkout(tmp_path)
+        head = self._head_sha(root)
+        pin = tmp_path / "pin.sha"
+        pin.write_text("dead" * 10)  # file has a WRONG sha; env has the right one
+        monkeypatch.setenv("EXPECTED_EXECUTOR_SHA_FILE", str(pin))
+        monkeypatch.setenv("EXPECTED_EXECUTOR_SHA", head)
+        pf = ExecutorPreflight(bucket="b", mode="daemon")
+        pf.check_deploy_drift(repo_root=root)  # env wins → passes, no raise
