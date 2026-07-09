@@ -69,6 +69,11 @@ nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergo
 # >=0.10.2 floor (config#1741): flow-doctor>=0.8.1 pin for notify_event + forum
 # topic routing; krepis telegram explicit-credential overrides.
 # >=0.8.0 added session axis (config#1610): session_date() + assert_within_session().
+# krepis's own flow-doctor extra pin (flow-doctor[diagnosis,s3]>=0.8.1,<0.9,
+# see krepis pyproject.toml) already covers flow-doctor>=0.8.3 (config#1813:
+# FlowDoctor.last_dispatch_reason()/last_dispatched(), the real per-call
+# dispatch outcome that executor/notifier.py checks instead of trusting a
+# non-None notify_event() report id) — no version bump needed on this line.
 krepis>=0.10.2
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);

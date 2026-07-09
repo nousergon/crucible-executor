@@ -46,3 +46,45 @@ def test_boot_pull_reclaims_foreign_owned_files_before_git_reset():
     reclaim_pos = src.index("-not -user ec2-user")
     reset_pos = src.index("git reset --hard origin/main")
     assert reclaim_pos < reset_pos, "ownership reclaim must run BEFORE git reset"
+
+
+def test_boot_pull_git_sync_runs_under_shared_flock():
+    """config#1944: the per-repo git fetch/checkout/reset must run under a
+    shared advisory flock so boot-pull.service can't race the weekday
+    CodeFreshnessGate / ChronicGapSelfHeal (nousergon-data
+    step_function_daily.json) on .git/index.lock.
+
+    2026-07-08 ne-preopen-trading FailExecution: boot-pull's `git reset --hard`
+    held alpha-engine-data/.git/index.lock while the gate's checkout/reset ran
+    -> "Another git process seems to be running" (exit 128) -> no orders placed.
+    The flock is window-free (kernel mutex) and auto-releases on process death.
+    This pins that a future edit can't silently drop back to bare, race-prone
+    git calls.
+    """
+    import re
+
+    src = _BOOT_PULL.read_text()
+    # The lock must live in ec2-user's HOME, not /var/lock: /var/lock ->
+    # /run/lock is root:root 0755, so an ec2-user boot-pull cannot create a
+    # lock file there. The nousergon-data gate flocks this SAME path.
+    assert "/home/ec2-user/.ae-git-sync.lock" in src, (
+        "git-sync flock must use the shared /home/ec2-user/.ae-git-sync.lock "
+        "path (the nousergon-data CodeFreshnessGate uses the identical inode)."
+    )
+    # A bounded flock must wrap the index-mutating reset (window-free), and the
+    # bound must be > boot-pull's own 120s TimeoutStartSec so a genuinely stuck
+    # writer fails loud rather than the flock timing out prematurely.
+    assert re.search(r"flock -w \S+ \S+ bash -c '[^']*git reset --hard origin/main", src), (
+        "the git fetch/checkout/reset group must run under `flock -w <wait> "
+        "<lock> bash -c '...'` so the whole index mutation is serialized."
+    )
+
+
+def test_boot_pull_git_sync_lock_wait_exceeds_boot_pull_timeout():
+    """The flock wait budget must exceed boot-pull.service's TimeoutStartSec
+    (120s) so the gate can outwait a full boot-pull git-sync rather than the
+    flock timing out and failing a healthy run."""
+    src = _BOOT_PULL.read_text()
+    assert 'GIT_SYNC_LOCK_WAIT="${AE_GIT_SYNC_LOCK_WAIT:-150}"' in src, (
+        "flock wait must default to 150s (> boot-pull.service TimeoutStartSec=120)."
+    )
