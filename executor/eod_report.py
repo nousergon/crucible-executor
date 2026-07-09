@@ -69,7 +69,7 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 
 # Sell-side trade actions whose fills realize P&L on shares rotated out today.
 _SELL_ACTIONS = {
@@ -414,6 +414,12 @@ def build_eod_report(
             "alpha_contrib_bps": contrib["contrib_bps"] if contrib else None,
             "sector": pos.get("sector", "Unknown"),
             "rationale": narratives.get(ticker),
+            # ── Per-ticker price-source traceability (schema 2.1) ──────────
+            "prior_shares": pos.get("prior_shares"),
+            "retained_shares": pos.get("retained_shares"),
+            "added_shares": pos.get("added_shares"),
+            "prior_price": pos.get("prior_price"),
+            "entry_price": pos.get("entry_price"),
         })
 
     sector_out = [
