@@ -892,6 +892,26 @@ def run(
         )
         pos["daily_return_pct"] = daily_pct
         pos["daily_return_usd"] = daily_usd
+
+        # ── Per-ticker price-source traceability (schema 2.1) ─────────────────
+        # Expose the lot breakdown + source prices so the report consumer can
+        # trace exactly which prices drove each position's daily return:
+        #   retained_shares × (close − prior_close) + added_shares × (close − entry_fill)
+        prior_shares = 0.0
+        if prior_pos:
+            try:
+                prior_shares = float(prior_pos.get("shares", 0) or 0)
+            except (TypeError, ValueError):
+                prior_shares = 0.0
+        retained = min(prior_shares, shares) if prior_shares > 0 else 0.0
+        added = max(0.0, shares - prior_shares) if prior_shares > 0 else 0.0
+        pos["prior_shares"] = prior_shares
+        pos["retained_shares"] = retained
+        pos["added_shares"] = added
+        pos["prior_price"] = prior_price
+        pos["entry_price"] = buy_entry_px.get(ticker)
+        # ── end price-source traceability ─────────────────────────────────────
+
         if na_reason:
             # Fail loud: the figure is an explicit N/A, not a silent zero.
             pos["daily_return_na"] = True

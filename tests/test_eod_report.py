@@ -264,8 +264,8 @@ class TestPricingTiming:
 
 
 class TestBuildEodReport:
-    def test_schema_version_is_2_0(self):
-        assert SCHEMA_VERSION == "2.0"
+    def test_schema_version_is_2_1(self):
+        assert SCHEMA_VERSION == "2.1"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -286,6 +286,12 @@ class TestBuildEodReport:
                     "shares": 360, "market_value": 70164.0,
                     "daily_return_pct": 1.68, "daily_return_usd": 1156.0,
                     "sector": "Information Technology",
+                    # Schema 2.1 price-source traceability (set by eod_reconcile.run())
+                    "prior_shares": 0.0,
+                    "retained_shares": 0.0,
+                    "added_shares": 0.0,
+                    "prior_price": None,
+                    "entry_price": None,
                 },
             },
             prior_positions={},
@@ -311,13 +317,19 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.0"
+        assert report["schema_version"] == "2.1"
         assert report["run_date"] == "2026-06-22"
         assert report["summary"]["nav"] == 991322.0
         adbe = report["positions"][0]
         assert adbe["ticker"] == "ADBE"
         assert adbe["alpha_contrib_bps"] is not None
         assert adbe["rationale"]
+        # Schema 2.1: per-ticker price-source traceability fields
+        assert adbe["prior_shares"] == 0.0    # no prior position
+        assert adbe["retained_shares"] == 0.0
+        assert adbe["added_shares"] == 0.0
+        assert adbe["prior_price"] is None
+        assert adbe["entry_price"] is None
         # New nav_reconciliation fields surfaced
         nr = report["nav_reconciliation"]
         assert nr["pricing_timing_usd"] == -2200.0
