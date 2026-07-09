@@ -47,6 +47,30 @@ computed by the producer as ``mark_basis(t) − mark_basis(t−1)`` where
 ``executor/eod_reconcile.py``); when a prior input is unavailable the term is 0,
 the gap stays in Unattributed, and a warning fires.
 
+**Per-ticker allocation of the pricing & timing sleeve (config#2046).** The
+aggregate telescopes exactly into a per-name sum, since
+``mark_basis(t) = Σ_{held today} (ib_market_value_i − market_value_i)`` and
+``mark_basis(t−1) = Σ_{held yesterday} (ib_market_value_i − market_value_i)``
+(settled) — both persisted per position since schema 2.1 (crucible-executor
+PR343). So ``pricing_timing_usd = Σ_i [basis_today_i − basis_prior_i]`` over
+every ticker held on either day (a same-day entry/exit nets against a zero
+baseline on the day it wasn't held). Each name's slice is folded into its own
+sleeve — held/entered names into their ``position`` component, fully-exited
+names into ``rotation`` — so "Pricing & Timing" as a *generic, unattributed*
+bucket disappears on any day schema-2.1 data is complete. When either day's
+``ib_market_value``/``market_value`` is missing for a name (pre-PR343 legacy
+snapshot), that name's slice is deliberately left OUT of the per-ticker split
+— never guessed — and falls through to the ``reconciliation`` component,
+which now represents only the genuinely-unattributable leftover (per
+feedback_no_silent_fails: attribute what you can name, label what you can't).
+
+**Unattributed is intentionally NOT decomposed per ticker.** Unlike pricing &
+timing, the true residual (fees, FX, untracked corporate actions, snapshot
+timing mismatches) has no per-position basis in the data the executor
+currently captures — force-allocating it to a ticker would be a fabricated
+number, not a derived one. It stays a portfolio-level sleeve until a producer
+change gives it one (see config#2046 discussion).
+
 Dividends earned are folded into each position's ``daily_return_usd`` (hence into
 ``position_pnl_usd``); ``dividend_usd`` is informational only — so the reconcile
 identity has no separate dividend term and dividends are neither double-counted
@@ -69,7 +93,7 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.1"
+SCHEMA_VERSION = "2.2"
 
 # Sell-side trade actions whose fills realize P&L on shares rotated out today.
 _SELL_ACTIONS = {
@@ -208,11 +232,14 @@ def compute_alpha_attribution(
     that sum EXACTLY to the headline dollar-alpha for arbitrary rotation.
 
     Sleeves (see the module docstring for the algebra + tie-out proof):
-    ``position`` (held, SPY-benchmarked on its *retained* prior MV), ``rotation``
-    (shares sold out today), ``cash`` (interest − SPY on genuine idle cash),
-    ``reconciliation`` ("Pricing & timing" — the IB-mark-vs-settled-close basis
-    difference, no SPY base), and ``unattributed`` (the TRUE residual after
-    rotation + pricing&timing are lifted out).
+    ``position`` (held, SPY-benchmarked on its *retained* prior MV, plus its
+    own slice of the pricing&timing basis gap when attributable), ``rotation``
+    (shares sold out today, plus the exited names' slice of that gap),
+    ``cash`` (interest − SPY on genuine idle cash), ``reconciliation``
+    ("Pricing & timing" — only the leftover portion no ticker could be
+    attributed, no SPY base), and ``unattributed`` (the TRUE residual after
+    rotation + pricing&timing are lifted out; deliberately NOT per-ticker —
+    see module docstring).
 
     Returns ``None`` when attribution is undefined (no prior NAV, or no SPY
     reference). Otherwise the ``components`` ``contrib_usd`` values sum to
@@ -224,6 +251,39 @@ def compute_alpha_attribution(
     spy_frac = spy_return / 100.0
     nav_change = nav_change_usd or 0.0
     dollar_alpha = nav_change - spy_frac * prior_nav
+
+    # ── Per-ticker pricing & timing decomposition (config#2046) ──────────────
+    # See the module docstring for the telescoping proof. A name's slice is
+    # computed only when BOTH days' ``ib_market_value``/``market_value`` are
+    # present for it; otherwise it is left out of the map entirely and its
+    # dollars fall through to the ``reconciliation`` residual below — never
+    # guessed.
+    pt = float(pricing_timing_usd or 0.0) if pricing_timing_available else 0.0
+    pt_by_ticker: dict[str, float] = {}
+    if pricing_timing_available:
+        for tkr in set(positions) | set((prior_positions or {}).keys()):
+            pos_t = positions.get(tkr)
+            pos_p = (prior_positions or {}).get(tkr)
+            if pos_t is None:
+                basis_today = 0.0
+            else:
+                ib_t, mv_t = pos_t.get("ib_market_value"), pos_t.get("market_value")
+                basis_today = (
+                    (ib_t - mv_t) if (ib_t is not None and mv_t is not None) else None
+                )
+            if pos_p is None:
+                basis_prior = 0.0
+            else:
+                ib_p, mv_p = pos_p.get("ib_market_value"), pos_p.get("market_value")
+                basis_prior = (
+                    (ib_p - mv_p) if (ib_p is not None and mv_p is not None) else None
+                )
+            if basis_today is None or basis_prior is None:
+                continue
+            delta = basis_today - basis_prior
+            if delta:
+                pt_by_ticker[tkr] = delta
+    pt_attributed_total = sum(pt_by_ticker.values())
 
     # ── Position sleeves (names held today) ───────────────────────────────────
     components: list[dict] = []
@@ -243,10 +303,14 @@ def compute_alpha_attribution(
         retained = min(prior_shares, today_shares)
         spy_base = prior_close * retained
         sum_held_spy_base += spy_base
-        contrib = daily_usd - spy_frac * spy_base
+        position_alpha = daily_usd - spy_frac * spy_base
+        pt_contrib = pt_by_ticker.get(ticker, 0.0)
+        contrib = position_alpha + pt_contrib
         components.append({
             "label": ticker, "kind": "position",
             "contrib_usd": contrib, "contrib_bps": contrib / prior_nav * 1e4,
+            "position_alpha_usd": position_alpha,
+            "pricing_timing_usd": pt_contrib,
         })
 
     # ── Rotation sleeve (shares sold out today: full exits + trims) ───────────
@@ -254,6 +318,7 @@ def compute_alpha_attribution(
     rotation_dollar = 0.0
     rotation_spy_base = 0.0
     rotated = False
+    pt_exited_total = 0.0
     for tkr, pp in (prior_positions or {}).items():
         prior_shares, prior_close = _prior_share_close(pp)
         try:
@@ -267,11 +332,18 @@ def compute_alpha_attribution(
         px = exit_px.get(tkr, prior_close)
         rotation_dollar += (px - prior_close) * sold
         rotation_spy_base += prior_close * sold
+        if tkr not in positions:
+            # Fully exited (vs a trim, whose remainder is still a position row
+            # above and already carries its own full pt slice).
+            pt_exited_total += pt_by_ticker.get(tkr, 0.0)
     if rotated:
-        rot_contrib = rotation_dollar - spy_frac * rotation_spy_base
+        rotation_alpha = rotation_dollar - spy_frac * rotation_spy_base
+        rot_contrib = rotation_alpha + pt_exited_total
         components.append({
             "label": "Rotation (exited)", "kind": "rotation",
             "contrib_usd": rot_contrib, "contrib_bps": rot_contrib / prior_nav * 1e4,
+            "rotation_alpha_usd": rotation_alpha,
+            "pricing_timing_usd": pt_exited_total,
         })
 
     # ── Cash sleeve (genuine idle cash only) ──────────────────────────────────
@@ -282,15 +354,19 @@ def compute_alpha_attribution(
         "contrib_usd": cash_contrib, "contrib_bps": cash_contrib / prior_nav * 1e4,
     })
 
-    # ── Pricing & timing reconciliation (IB marks vs settled closes) ──────────
-    pt = float(pricing_timing_usd or 0.0) if pricing_timing_available else 0.0
+    # ── Pricing & timing reconciliation residual ──────────────────────────────
+    # Only the slice no ticker could be attributed (see decomposition above) —
+    # ~$0 whenever both days' snapshots carry schema-2.1 ib_market_value.
+    pt_unattributable = pt - pt_attributed_total
     if pricing_timing_available:
         components.append({
             "label": "Pricing & timing", "kind": "reconciliation",
-            "contrib_usd": pt, "contrib_bps": pt / prior_nav * 1e4,
+            "contrib_usd": pt_unattributable,
+            "contrib_bps": pt_unattributable / prior_nav * 1e4,
         })
 
     # ── True unattributed residual (rotation + pricing&timing lifted out) ─────
+    # Deliberately portfolio-level, not per-ticker — see module docstring.
     unattr_true = float(unattributed_usd or 0.0) - rotation_dollar - pt
     components.append({
         "label": "Unattributed", "kind": "unattributed",
@@ -310,6 +386,8 @@ def compute_alpha_attribution(
         "rotation_realized_usd": rotation_dollar,
         "pricing_timing_usd": pt,
         "pricing_timing_available": bool(pricing_timing_available),
+        "pricing_timing_by_ticker": pt_by_ticker,
+        "pricing_timing_unattributable_usd": pt_unattributable,
         "unattributed_true_usd": unattr_true,
         "idle_cash": idle_cash,
         "residual_usd": residual,
@@ -412,6 +490,11 @@ def build_eod_report(
             "daily_return_usd": pos.get("daily_return_usd"),
             "alpha_contrib_usd": contrib["contrib_usd"] if contrib else None,
             "alpha_contrib_bps": contrib["contrib_bps"] if contrib else None,
+            # Schema 2.2 (config#2046): breakdown of alpha_contrib_usd into the
+            # pure settled-close economic alpha vs this name's own slice of the
+            # pricing&timing (IB-mark-vs-settled) basis gap.
+            "position_alpha_usd": contrib.get("position_alpha_usd") if contrib else None,
+            "pricing_timing_contrib_usd": contrib.get("pricing_timing_usd") if contrib else None,
             "sector": pos.get("sector", "Unknown"),
             "rationale": narratives.get(ticker),
             # ── Per-ticker price-source traceability (schema 2.1) ──────────
@@ -467,6 +550,12 @@ def build_eod_report(
             ),
             "unattributed_true_usd": (
                 attribution.get("unattributed_true_usd") if attribution else None
+            ),
+            # Schema 2.2 (config#2046): the leftover slice of pricing&timing
+            # no ticker could be attributed — ~0 when schema-2.1 data is
+            # complete for every held/exited name.
+            "pricing_timing_unattributable_usd": (
+                attribution.get("pricing_timing_unattributable_usd") if attribution else None
             ),
         },
         "data_warnings": list(data_warnings or []),

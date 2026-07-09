@@ -263,9 +263,145 @@ class TestPricingTiming:
         assert attr["unattributed_true_usd"] == pytest.approx(15.0, abs=1e-6)
 
 
+class TestPricingTimingPerTicker:
+    """config#2046: pricing&timing allocated to specific stocks via schema-2.1
+    ``ib_market_value``/``market_value``, instead of sitting in a generic
+    portfolio-wide bucket."""
+
+    def test_retained_position_gets_its_own_basis_gap(self):
+        attr = compute_alpha_attribution(
+            prior_nav=1_000_000.0,
+            spy_return=-0.72,
+            positions={
+                "SPY": {
+                    "shares": 600, "daily_return_usd": -4000.0,
+                    "market_value": 476000.0, "ib_market_value": 475658.0,
+                },
+            },
+            prior_positions={
+                "SPY": {
+                    "shares": 600, "closing_price": 800.0,
+                    "market_value": 480000.0, "ib_market_value": 481200.0,
+                },
+            },
+            interest_usd=0.0,
+            unattributed_usd=-1542.0,
+            nav_change_usd=-5542.0,
+            pricing_timing_usd=-1542.0,
+            pricing_timing_available=True,
+        )
+        assert abs(attr["residual_usd"]) < 1.0
+        pos = _by_kind(attr, "position")
+        assert pos["label"] == "SPY"
+        # basis_today = 475658-476000 = -342; basis_prior = 481200-480000 = 1200
+        # delta = -342 - 1200 = -1542 (the whole aggregate, single position)
+        assert pos["pricing_timing_usd"] == pytest.approx(-1542.0, abs=1e-6)
+        assert pos["position_alpha_usd"] == pytest.approx(-544.0, abs=1e-2)
+        assert pos["contrib_usd"] == pytest.approx(-2086.0, abs=1e-2)
+        recon = _by_kind(attr, "reconciliation")
+        assert recon["contrib_usd"] == pytest.approx(0.0, abs=1e-6)
+        assert attr["pricing_timing_by_ticker"]["SPY"] == pytest.approx(-1542.0)
+        assert attr["pricing_timing_unattributable_usd"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_new_entry_gets_full_same_day_basis_gap(self):
+        """A same-day entry has no prior-day basis to net against — its whole
+        today's IB-vs-settled gap is attributable to it."""
+        attr = compute_alpha_attribution(
+            prior_nav=1_000_000.0,
+            spy_return=0.0,
+            positions={
+                "NEW": {
+                    "shares": 100, "daily_return_usd": 50.0,
+                    "market_value": 10000.0, "ib_market_value": 10080.0,
+                },
+            },
+            prior_positions={},
+            interest_usd=0.0,
+            unattributed_usd=80.0,
+            nav_change_usd=130.0,
+            pricing_timing_usd=80.0,
+            pricing_timing_available=True,
+        )
+        assert abs(attr["residual_usd"]) < 1.0
+        pos = _by_kind(attr, "position")
+        assert pos["pricing_timing_usd"] == pytest.approx(80.0)
+        assert pos["contrib_usd"] == pytest.approx(130.0)
+        recon = _by_kind(attr, "reconciliation")
+        assert recon["contrib_usd"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_fully_exited_name_folds_into_rotation_not_reconciliation(self):
+        attr = compute_alpha_attribution(
+            prior_nav=1_000_000.0,
+            spy_return=0.0,
+            positions={},
+            prior_positions={
+                "OLD": {
+                    "shares": 200, "closing_price": 50.0,
+                    "market_value": 10000.0, "ib_market_value": 9900.0,
+                },
+            },
+            trades_today=[
+                {"action": "SELL", "ticker": "OLD", "shares": 200, "price": 52.0},
+            ],
+            interest_usd=0.0,
+            unattributed_usd=500.0,
+            nav_change_usd=500.0,
+            pricing_timing_usd=100.0,
+            pricing_timing_available=True,
+        )
+        assert abs(attr["residual_usd"]) < 1.0
+        assert _by_kind(attr, "position") is None
+        rot = _by_kind(attr, "rotation")
+        # basis_prior = 9900-10000 = -100; exited → delta = 0 - (-100) = 100
+        assert rot["pricing_timing_usd"] == pytest.approx(100.0)
+        assert rot["contrib_usd"] == pytest.approx(500.0)  # 400 realized + 100 pt
+        recon = _by_kind(attr, "reconciliation")
+        assert recon["contrib_usd"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_missing_ib_market_value_falls_to_residual_not_guessed(self):
+        """A retained name lacking schema-2.1 fields (legacy prior snapshot)
+        must NOT get a fabricated per-ticker slice — its share of the gap
+        stays in the generic reconciliation residual."""
+        attr = compute_alpha_attribution(
+            prior_nav=1_000_000.0,
+            spy_return=0.0,
+            positions={
+                "A": {
+                    "shares": 10, "daily_return_usd": 0.0,
+                    "market_value": 1000.0, "ib_market_value": 1010.0,
+                },
+                "B": {
+                    "shares": 10, "daily_return_usd": 0.0,
+                    "market_value": 2000.0,  # no ib_market_value — legacy gap
+                },
+            },
+            prior_positions={
+                "A": {
+                    "shares": 10, "closing_price": 100.0,
+                    "market_value": 1000.0, "ib_market_value": 1005.0,
+                },
+                "B": {
+                    "shares": 10, "closing_price": 200.0,
+                    "market_value": 2000.0, "ib_market_value": 2020.0,
+                },
+            },
+            interest_usd=0.0,
+            unattributed_usd=17.0,
+            nav_change_usd=17.0,
+            pricing_timing_usd=17.0,
+            pricing_timing_available=True,
+        )
+        assert abs(attr["residual_usd"]) < 1.0
+        by_label = {c["label"]: c for c in attr["components"] if c["kind"] == "position"}
+        assert by_label["A"]["pricing_timing_usd"] == pytest.approx(5.0)  # 10-5
+        assert by_label["B"]["pricing_timing_usd"] == pytest.approx(0.0)  # not guessed
+        recon = _by_kind(attr, "reconciliation")
+        assert recon["contrib_usd"] == pytest.approx(12.0, abs=1e-6)  # 17 - 5
+
+
 class TestBuildEodReport:
-    def test_schema_version_is_2_1(self):
-        assert SCHEMA_VERSION == "2.1"
+    def test_schema_version_is_2_2(self):
+        assert SCHEMA_VERSION == "2.2"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -317,7 +453,7 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.1"
+        assert report["schema_version"] == "2.2"
         assert report["run_date"] == "2026-06-22"
         assert report["summary"]["nav"] == 991322.0
         adbe = report["positions"][0]
@@ -330,12 +466,18 @@ class TestBuildEodReport:
         assert adbe["added_shares"] == 0.0
         assert adbe["prior_price"] is None
         assert adbe["entry_price"] is None
+        # Schema 2.2 (config#2046): no ib_market_value on this fixture, so
+        # ADBE gets no pricing&timing slice — the whole $2200 stays in the
+        # generic reconciliation residual (legacy-data fallback).
+        assert adbe["pricing_timing_contrib_usd"] == 0.0
+        assert adbe["position_alpha_usd"] == pytest.approx(adbe["alpha_contrib_usd"])
         # New nav_reconciliation fields surfaced
         nr = report["nav_reconciliation"]
         assert nr["pricing_timing_usd"] == -2200.0
         assert nr["pricing_timing_available"] is True
         assert nr["rotation_realized_usd"] is not None
         assert nr["unattributed_true_usd"] is not None
+        assert nr["pricing_timing_unattributable_usd"] == pytest.approx(-2200.0)
         # The reconciliation sleeve appears in the attribution
         assert "reconciliation" in {
             c["kind"] for c in report["alpha_attribution"]["components"]
