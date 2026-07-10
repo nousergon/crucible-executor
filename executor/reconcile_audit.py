@@ -68,6 +68,18 @@ DEFAULT_TOLERANCE_BPS = 1.0
 DEFAULT_TRAILING_DAYS = 5
 AUDIT_KEY_TEMPLATE = "trades/eod_corrections/{run_date}.json"
 
+# A correction at/above this magnitude is a statistical outlier vs. the normal
+# settlement-lag band (06-22 was 1.5bp, 06-25's genuine incident was 11bp) and
+# is worth paging a human. Below it, the correction is routine provisional-vs-
+# settled drift — still written to the S3 audit trail + dashboard, but logged
+# at severity="info" so it doesn't page Telegram (config#2145: a 1.46bp
+# correction on 2026-07-09 paged identically to a real incident, training the
+# operator to ignore this producer's warnings). A SECOND (or later) correction
+# within the same audit run is treated as page-worthy regardless of its own
+# magnitude — one date drifting is routine noise, multiple dates drifting
+# together in one pass signals a systemic feed issue, not settlement lag.
+PAGE_THRESHOLD_BPS = 5.0
+
 
 def _window_dates(
     *,
@@ -142,6 +154,7 @@ def audit_window(
     end: str | None = None,
     exclude_dates: set[str] | frozenset[str] = frozenset(),
     tolerance_bps: float = DEFAULT_TOLERANCE_BPS,
+    page_threshold_bps: float = PAGE_THRESHOLD_BPS,
     dry_run: bool = False,
     send_email: bool = False,
     config: dict | None = None,
@@ -305,11 +318,26 @@ def audit_window(
         after = ({"spy_close": after_row[0], "spy_return_pct": after_row[1],
                   "daily_alpha_pct": after_row[2]} if after_row else None)
 
+        # Page-worthiness: an outlier-magnitude correction, OR a correction
+        # that isn't the first in this run (multiple dates drifting together
+        # is systemic, not routine settlement lag) — see PAGE_THRESHOLD_BPS.
+        # Every flow-doctor severity level maps to SOME Telegram notifier in
+        # flow-doctor.yaml (critical→#critical, error/warning→#ops-health,
+        # info→#trades) — there is no "silent" severity to pick. So routine,
+        # in-band corrections skip the fd.report() call entirely rather than
+        # trying to pick a severity that happens not to page; they still get
+        # the full S3 audit trail (below) and a local INFO log line.
+        is_recurrence = len(corrected) >= 1
+        is_outlier = divergence_bps is None or divergence_bps == float("inf") or divergence_bps >= page_threshold_bps
+        page_worthy = is_outlier or is_recurrence
+
         record = {
             "date": d,
             "reason": reason,
             "tolerance_bps": tolerance_bps,
+            "page_threshold_bps": page_threshold_bps,
             "divergence_bps": divergence_bps,
+            "paged": page_worthy,
             "settled_spy_close": settled,
             "before": before,
             "after": after,
@@ -317,17 +345,23 @@ def audit_window(
             "corrected_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_audit_record(trades_bucket=trades_bucket, run_date=d, record=record, region=region)
-        if fd:
-            fd.report(
-                RuntimeError(
-                    f"EOD value for {d} corrected post-settlement ({reason}): "
-                    f"SPY close {(before or {}).get('spy_close')} → {after.get('spy_close') if after else settled}"
-                ),
-                severity="warning",
-                context={"site": "reconcile_audit_corrected", "run_date": d, "reason": reason},
-            )
+        correction_message = (
+            f"EOD value for {d} corrected post-settlement ({reason}): "
+            f"SPY close {(before or {}).get('spy_close')} → {after.get('spy_close') if after else settled}"
+        )
+        if page_worthy:
+            if fd:
+                fd.report(
+                    RuntimeError(correction_message),
+                    severity="warning",
+                    context={"site": "reconcile_audit_corrected", "run_date": d, "reason": reason,
+                             "divergence_bps": divergence_bps, "page_threshold_bps": page_threshold_bps},
+                )
+        else:
+            logger.info("[reconcile_audit] %s (in-band, %.2fbp < %.2fbp threshold — audit trail "
+                        "only, not paged)", correction_message, divergence_bps, page_threshold_bps)
         corrected.append({"date": d, "reason": reason, "divergence_bps": divergence_bps,
-                          "before": before, "after": after, "applied": True})
+                          "before": before, "after": after, "applied": True, "paged": page_worthy})
 
     conn.close()
     summary = {
@@ -355,6 +389,9 @@ def main() -> None:
     parser.add_argument("--end", default=None, help="YYYY-MM-DD window end (default: today's trading_day).")
     parser.add_argument("--tolerance-bps", type=float, default=DEFAULT_TOLERANCE_BPS,
                         help=f"Divergence tolerance in bps (default {DEFAULT_TOLERANCE_BPS}).")
+    parser.add_argument("--page-threshold-bps", type=float, default=PAGE_THRESHOLD_BPS,
+                        help=f"Divergence at/above which a correction pages (severity=warning) "
+                             f"instead of just logging (severity=info) (default {PAGE_THRESHOLD_BPS}).")
     parser.add_argument("--dry-run", action="store_true", help="Report divergences; change nothing.")
     parser.add_argument("--email", action="store_true",
                         help="Resend EOD email for corrected days (default: suppressed).")
@@ -364,6 +401,7 @@ def main() -> None:
         start=args.start,
         end=args.end,
         tolerance_bps=args.tolerance_bps,
+        page_threshold_bps=args.page_threshold_bps,
         dry_run=args.dry_run,
         send_email=args.email,
     )

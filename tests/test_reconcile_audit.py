@@ -3,7 +3,7 @@ that were frozen pre-settlement (config#1276)."""
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from executor import reconcile_audit
 from executor.reconcile_audit import _window_dates, audit_window
@@ -166,6 +166,84 @@ class TestAuditWindow:
             audit_window(start="2026-06-25", end="2026-06-26",
                          exclude_dates={"2026-06-26"}, config=_cfg(db))
         assert "2026-06-26" not in seen and "2026-06-25" in seen
+
+    # ── severity banding (config#2145) ──────────────────────────────────────
+
+    def test_in_band_correction_not_paged(self, tmp_path):
+        # 1.46bp divergence (the 2026-07-09 case: 751.60 -> 751.71) is below
+        # PAGE_THRESHOLD_BPS (5.0) — audit trail is still written, but
+        # flow-doctor is never invoked. Every flow-doctor severity maps to
+        # SOME Telegram notifier in flow-doctor.yaml, so "not paged" means
+        # skipping the fd.report() call entirely, not picking a lower severity.
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-07-09", 751.60, -0.01, 1.52)])
+        settled = {"2026-07-09": 751.71}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (751.71, d))
+            conn.commit(); conn.close()
+
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k") as write_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-07-09", end="2026-07-09", config=_cfg(db))
+        assert len(res["corrected"]) == 1
+        c = res["corrected"][0]
+        assert c["paged"] is False
+        assert 1.0 < c["divergence_bps"] < 5.0
+        fd_mock.report.assert_not_called()
+        write_mock.assert_called_once()  # audit trail unaffected by paging decision
+        assert write_mock.call_args.kwargs["record"]["paged"] is False
+
+    def test_outlier_correction_pages(self, tmp_path):
+        # 10.9bp divergence (>= PAGE_THRESHOLD_BPS) still pages flow-doctor
+        # at severity=warning — the config#1276 incident class this guard
+        # exists to catch must keep paging.
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
+        settled = {"2026-06-25": 734.30}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (734.30, d))
+            conn.commit(); conn.close()
+
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-06-25", end="2026-06-25", config=_cfg(db))
+        assert res["corrected"][0]["paged"] is True
+        fd_mock.report.assert_called_once()
+        assert fd_mock.report.call_args.kwargs["severity"] == "warning"
+
+    def test_second_in_band_correction_in_same_window_pages_as_recurrence(self, tmp_path):
+        # Two dates each individually in-band (1-2bp) but BOTH drifting in the
+        # same audit pass is systemic, not routine settlement lag — the 2nd+
+        # correction pages regardless of its own magnitude.
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-25", 734.20, 0.10, 1.40), ("2026-06-26", 728.90, -0.72, 0.33)])
+        settled = {"2026-06-25": 734.30, "2026-06-26": 728.99}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (settled[d], d))
+            conn.commit(); conn.close()
+
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-06-25", end="2026-06-26", config=_cfg(db))
+        assert len(res["corrected"]) == 2
+        assert res["corrected"][0]["paged"] is False  # first: in-band, routine
+        assert res["corrected"][1]["paged"] is True   # second: recurrence in same pass
+        assert fd_mock.report.call_count == 1
 
     def test_no_settled_close_skips_gracefully(self, tmp_path):
         db = str(tmp_path / "t.db")
