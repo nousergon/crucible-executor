@@ -316,6 +316,7 @@ def compute_alpha_attribution(
     # ── Rotation sleeve (shares sold out today: full exits + trims) ───────────
     exit_px = _sell_exit_prices(trades_today)
     rotation_spy_base = 0.0
+    rotation_dollar = 0.0
     for tkr, pp in (prior_positions or {}).items():
         prior_shares, prior_close = _prior_share_close(pp)
         try:
@@ -326,9 +327,10 @@ def compute_alpha_attribution(
         if sold <= 0:
             continue
         px = exit_px.get(tkr, prior_close)
-        rotation_dollar = (px - prior_close) * sold
+        ticker_realized = (px - prior_close) * sold
+        rotation_dollar += ticker_realized
         rotation_spy_base += prior_close * sold
-        rotation_alpha = rotation_dollar - spy_frac * prior_close * sold
+        rotation_alpha = ticker_realized - spy_frac * prior_close * sold
         # Pricing & timing: only include if fully exited (trim's pt is in its position row).
         pt_contrib = pt_by_ticker.get(tkr, 0.0) if tkr not in positions else 0.0
         rot_contrib = rotation_alpha + pt_contrib

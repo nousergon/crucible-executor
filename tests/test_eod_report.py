@@ -215,8 +215,9 @@ class TestRotationSleeve:
                 {"action": "EXIT", "ticker": "WDAY", "shares": 300, "price": 219.0},
             ],
             interest_usd=0.0,
-            # realized = (79-78)*1000 + (219-220)*300 = 1000 - 300 = 700
-            unattributed_usd=700.0,
+            # nav_change = realized_rotation + interest + true_unattributed
+            # nav_change = 700 + 0 + 1000 = 1700 (so true_unattributed = 1000)
+            unattributed_usd=1700.0,
             nav_change_usd=1700.0,
         )
         assert abs(attr["residual_usd"]) < 1.0
@@ -231,9 +232,11 @@ class TestRotationSleeve:
 
         # GEHC: (79-78)*1000 = 1000 realized; benchmarked on 78*1000 = 78k
         # WDAY: (219-220)*300 = -300 realized; benchmarked on 220*300 = 66k
-        # With 0% spy return, alpha = realized (no spy basis adjustment)
-        assert rot_gehc["rotation_alpha_usd"] == pytest.approx(1000.0, abs=1e-6)
-        assert rot_wday["rotation_alpha_usd"] == pytest.approx(-300.0, abs=1e-6)
+        # With 0.5% spy return, alpha = realized - spy_cost
+        # GEHC: 1000 - 0.005*78k = 1000 - 390 = 610
+        # WDAY: -300 - 0.005*66k = -300 - 330 = -630
+        assert rot_gehc["rotation_alpha_usd"] == pytest.approx(610.0, abs=1e-6)
+        assert rot_wday["rotation_alpha_usd"] == pytest.approx(-630.0, abs=1e-6)
 
 
 class TestPricingTiming:
