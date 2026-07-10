@@ -315,10 +315,7 @@ def compute_alpha_attribution(
 
     # ── Rotation sleeve (shares sold out today: full exits + trims) ───────────
     exit_px = _sell_exit_prices(trades_today)
-    rotation_dollar = 0.0
     rotation_spy_base = 0.0
-    rotated = False
-    pt_exited_total = 0.0
     for tkr, pp in (prior_positions or {}).items():
         prior_shares, prior_close = _prior_share_close(pp)
         try:
@@ -328,22 +325,18 @@ def compute_alpha_attribution(
         sold = prior_shares - today_shares
         if sold <= 0:
             continue
-        rotated = True
         px = exit_px.get(tkr, prior_close)
-        rotation_dollar += (px - prior_close) * sold
+        rotation_dollar = (px - prior_close) * sold
         rotation_spy_base += prior_close * sold
-        if tkr not in positions:
-            # Fully exited (vs a trim, whose remainder is still a position row
-            # above and already carries its own full pt slice).
-            pt_exited_total += pt_by_ticker.get(tkr, 0.0)
-    if rotated:
-        rotation_alpha = rotation_dollar - spy_frac * rotation_spy_base
-        rot_contrib = rotation_alpha + pt_exited_total
+        rotation_alpha = rotation_dollar - spy_frac * prior_close * sold
+        # Pricing & timing: only include if fully exited (trim's pt is in its position row).
+        pt_contrib = pt_by_ticker.get(tkr, 0.0) if tkr not in positions else 0.0
+        rot_contrib = rotation_alpha + pt_contrib
         components.append({
-            "label": "Rotation (exited)", "kind": "rotation",
+            "label": tkr, "kind": "rotation",
             "contrib_usd": rot_contrib, "contrib_bps": rot_contrib / prior_nav * 1e4,
             "rotation_alpha_usd": rotation_alpha,
-            "pricing_timing_usd": pt_exited_total,
+            "pricing_timing_usd": pt_contrib,
         })
 
     # ── Cash sleeve (genuine idle cash only) ──────────────────────────────────

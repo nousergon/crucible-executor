@@ -199,6 +199,42 @@ class TestRotationSleeve:
         )
         assert realized == pytest.approx(200.0, abs=1e-6)
 
+    def test_rotation_decomposed_per_ticker(self):
+        """Multiple exited positions get separate rotation components, not
+        aggregated into one 'Rotation (exited)' bucket."""
+        attr = compute_alpha_attribution(
+            prior_nav=1_000_000.0,
+            spy_return=0.5,
+            positions={},
+            prior_positions={
+                "GEHC": {"shares": 1000, "closing_price": 78.0},  # exited (mv 78k)
+                "WDAY": {"shares": 300, "closing_price": 220.0},  # exited (mv 66k)
+            },
+            trades_today=[
+                {"action": "EXIT", "ticker": "GEHC", "shares": 1000, "price": 79.0},
+                {"action": "EXIT", "ticker": "WDAY", "shares": 300, "price": 219.0},
+            ],
+            interest_usd=0.0,
+            # realized = (79-78)*1000 + (219-220)*300 = 1000 - 300 = 700
+            unattributed_usd=700.0,
+            nav_change_usd=1700.0,
+        )
+        assert abs(attr["residual_usd"]) < 1.0
+        # Both tickers should have separate rotation components
+        rot_components = [c for c in attr["components"] if c["kind"] == "rotation"]
+        assert len(rot_components) == 2
+
+        rot_gehc = next((c for c in rot_components if c["label"] == "GEHC"), None)
+        rot_wday = next((c for c in rot_components if c["label"] == "WDAY"), None)
+        assert rot_gehc is not None
+        assert rot_wday is not None
+
+        # GEHC: (79-78)*1000 = 1000 realized; benchmarked on 78*1000 = 78k
+        # WDAY: (219-220)*300 = -300 realized; benchmarked on 220*300 = 66k
+        # With 0% spy return, alpha = realized (no spy basis adjustment)
+        assert rot_gehc["rotation_alpha_usd"] == pytest.approx(1000.0, abs=1e-6)
+        assert rot_wday["rotation_alpha_usd"] == pytest.approx(-300.0, abs=1e-6)
+
 
 class TestPricingTiming:
     def test_pricing_timing_isolated(self):
