@@ -69,7 +69,7 @@ from executor.order_book import OrderBook, build_stop_record
 from executor.price_monitor import PriceMonitor
 from executor.polygon_price_monitor import make_price_monitor
 from executor.strategies.config import load_strategy_config
-from executor.trade_logger import init_db, log_trade, get_unmatched_entry
+from executor.trade_logger import init_db, log_trade, get_unmatched_entry, log_risk_event
 
 from nousergon_lib.logging import setup_logging, guard_entrypoint
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
@@ -542,6 +542,12 @@ def run_daemon(dry_run: bool = False) -> None:
     _hard_risk_exit_seen = False           # event flag: a hard-risk exit freed cash → re-solve
     _resolve_count = 0
     _shadow_log_cache: dict | None = None
+    # Per-position catastrophic-gap-stop-watch cohort (config#846): worst
+    # intraday drop each gap-only position experienced vs its reference,
+    # whether the stop fired, and the threshold in effect. Flushed once per
+    # session to risk_events in the finally block so the offline
+    # catastrophic_gap_stop_pct tuner has a realized-outcome cohort to join.
+    _gap_watch: dict[str, dict] = {}
     if resolve_enabled:
         logger.info(
             "Intraday reconcile ENABLED — drawdown overlay + event-driven "
@@ -1143,6 +1149,35 @@ def run_daemon(dry_run: bool = False) -> None:
                             stop_kind, ticker,
                         )
                     exit_signal = exit_mgr.check_catastrophic_gap(stop, price_state)
+                    # Accumulate the gap-stop-watch cohort (config#846): the
+                    # worst drop this position reaches vs its reference, and
+                    # whether the stop fired — the counterfactual the offline
+                    # catastrophic_gap_stop_pct tuner needs (firings alone can't
+                    # tell you whether a tighter/looser threshold would help).
+                    # Pure observability: best-effort, never perturbs the exit
+                    # path, flushed once at session end.
+                    try:
+                        _gap = exit_mgr.catastrophic_gap_drop(stop, price_state)
+                        if _gap is not None:
+                            _w = _gap_watch.get(ticker)
+                            if _w is None:
+                                _w = {
+                                    "max_drop": _gap["drop"],
+                                    "reference_price": _gap["reference"],
+                                    "price_at_max_drop": _gap["current"],
+                                    "threshold": _gap["threshold"],
+                                    "fired": False,
+                                }
+                                _gap_watch[ticker] = _w
+                            elif _gap["drop"] > _w["max_drop"]:
+                                _w["max_drop"] = _gap["drop"]
+                                _w["price_at_max_drop"] = _gap["current"]
+                            _w["fired"] = _w["fired"] or _gap["fired"]
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "gap-watch accumulation failed for %s", ticker,
+                            exc_info=True,
+                        )
                 else:
                     # Check for trail update first
                     trail_update = exit_mgr.should_update_trail(stop, price_state["last"])
@@ -1293,6 +1328,7 @@ def run_daemon(dry_run: bool = False) -> None:
                                 # hard-risk exit fires (coalesces same-tick stops,
                                 # prevents per-tick churn).
                                 _hard_risk_exit_seen = False
+                                n_enq = 0
                                 if res["status"] not in ("optimal", "optimal_inaccurate"):
                                     logger.error(
                                         "Intraday re-solve status=%r — NOT redeploying; "
@@ -1300,7 +1336,6 @@ def run_daemon(dry_run: bool = False) -> None:
                                         res["status"], avail,
                                     )
                                 else:
-                                    n_enq = 0
                                     for b in res["buys"]:
                                         if b["ticker"] in _stopped_out_today:
                                             continue
@@ -1322,6 +1357,38 @@ def run_daemon(dry_run: bool = False) -> None:
                                         "Intraday re-solve #%d: enqueued %d redeploy buy(s) "
                                         "for ~$%.0f freed cash (vol_ann=%s)",
                                         _resolve_count, n_enq, avail, res.get("vol_ann"),
+                                    )
+                                # Log the cash-resolution event (config#846) so the
+                                # intraday_resolve_* thresholds can be tuned offline
+                                # against realized outcomes: freed cash, solver
+                                # status, redeploy count, and the window/cap params
+                                # in effect. Best-effort observability.
+                                try:
+                                    log_risk_event(conn, {
+                                        "date": run_date,
+                                        "event_type": "intraday_resolve",
+                                        "rule": "intraday_resolve",
+                                        "value": round(float(avail), 2),
+                                        "threshold": round(float(resolve_min_freed_pct * nav), 2),
+                                        "reason": res.get("status"),
+                                        "context": {
+                                            "resolve_count": _resolve_count,
+                                            "n_redeployed": n_enq,
+                                            "solve_status": res.get("status"),
+                                            "vol_ann": res.get("vol_ann"),
+                                            "nav": round(float(nav), 2),
+                                            "min_freed_cash_pct": resolve_min_freed_pct,
+                                            "cutoff_et": resolve_cutoff_et,
+                                            "max_per_day": resolve_max_per_day,
+                                            "redeploy_tickers": [
+                                                b["ticker"] for b in res.get("buys", [])
+                                            ],
+                                        },
+                                    })
+                                except Exception:  # noqa: BLE001
+                                    logger.debug(
+                                        "intraday_resolve event log failed",
+                                        exc_info=True,
                                     )
                 except Exception as _rec_err:
                     logger.error(
@@ -1388,6 +1455,35 @@ def run_daemon(dry_run: bool = False) -> None:
             )
         except Exception:
             logger.debug("Data manifest write failed", exc_info=True)
+
+        # ── Flush the catastrophic-gap-stop-watch cohort (config#846) ──────
+        # One risk_events row per gap-only position: worst intraday drop vs
+        # reference, whether the stop fired, and the threshold in effect —
+        # the realized-outcome cohort the offline catastrophic_gap_stop_pct
+        # tuner joins to score_performance_outcomes. Best-effort; a logging
+        # failure must never mask a trading-session error.
+        if conn is not None and _gap_watch:
+            for _tk, _w in _gap_watch.items():
+                try:
+                    log_risk_event(conn, {
+                        "date": run_date,
+                        "event_type": "catastrophic_gap_watch",
+                        "rule": "catastrophic_gap_stop",
+                        "ticker": _tk,
+                        "value": round(float(_w["max_drop"]), 6),
+                        "threshold": round(float(_w["threshold"]), 6),
+                        "reason": "fired" if _w["fired"] else "watched",
+                        "context": {
+                            "max_drop": _w["max_drop"],
+                            "reference_price": _w["reference_price"],
+                            "price_at_max_drop": _w["price_at_max_drop"],
+                            "fired": _w["fired"],
+                        },
+                    })
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "gap-watch flush failed for %s", _tk, exc_info=True,
+                    )
 
         _cleanup_connections(monitor, ibkr)
         if conn:

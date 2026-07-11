@@ -195,6 +195,80 @@ def test_log_risk_event_null_context_persists_as_null(db):
     assert ctx is None
 
 
+def test_catastrophic_gap_watch_cohort_is_queryable(db):
+    """config#846: the daemon flushes one row per gap-only position — worst
+    drop vs reference, whether the stop fired, threshold in effect — so the
+    offline catastrophic_gap_stop_pct tuner has a realized-outcome cohort to
+    join. Validate the persisted shape round-trips queryably."""
+    log_risk_event(db, {
+        "date": "2026-04-15",
+        "event_type": "catastrophic_gap_watch",
+        "rule": "catastrophic_gap_stop",
+        "ticker": "AAPL",
+        "value": 0.083,          # worst drop
+        "threshold": 0.15,       # pct in effect
+        "reason": "watched",     # did not fire
+        "context": {"max_drop": 0.083, "reference_price": 200.0,
+                    "price_at_max_drop": 183.4, "fired": False},
+    })
+    log_risk_event(db, {
+        "date": "2026-04-15",
+        "event_type": "catastrophic_gap_watch",
+        "rule": "catastrophic_gap_stop",
+        "ticker": "NVDA",
+        "value": 0.19,
+        "threshold": 0.15,
+        "reason": "fired",
+        "context": {"max_drop": 0.19, "reference_price": 100.0,
+                    "price_at_max_drop": 81.0, "fired": True},
+    })
+    rows = db.execute(
+        "SELECT ticker, value, threshold, reason, context_json FROM risk_events "
+        "WHERE event_type='catastrophic_gap_watch' ORDER BY ticker"
+    ).fetchall()
+    assert len(rows) == 2
+    aapl, nvda = rows
+    assert aapl[0] == "AAPL" and aapl[3] == "watched"
+    assert json.loads(aapl[4])["fired"] is False
+    assert nvda[0] == "NVDA" and nvda[3] == "fired"
+    assert json.loads(nvda[4])["fired"] is True
+    # The tuner's core query: which watched positions crossed a candidate
+    # threshold — answerable entirely from the persisted cohort.
+    crossed = db.execute(
+        "SELECT ticker FROM risk_events "
+        "WHERE event_type='catastrophic_gap_watch' AND value >= 0.15"
+    ).fetchall()
+    assert [r[0] for r in crossed] == ["NVDA"]
+
+
+def test_intraday_resolve_event_is_queryable(db):
+    """config#846: each intraday cash-resolution event records freed cash,
+    solver status, redeploy count, and the window/cap params — the cohort the
+    intraday_resolve_* tuner needs."""
+    event_id = log_risk_event(db, {
+        "date": "2026-04-15",
+        "event_type": "intraday_resolve",
+        "rule": "intraday_resolve",
+        "value": 4200.0,           # freed cash
+        "threshold": 1000.0,       # min_freed_cash_pct * nav
+        "reason": "optimal",
+        "context": {"resolve_count": 1, "n_redeployed": 2, "solve_status": "optimal",
+                    "vol_ann": 0.14, "nav": 100_000.0, "min_freed_cash_pct": 0.01,
+                    "cutoff_et": "15:30", "max_per_day": 5,
+                    "redeploy_tickers": ["MSFT", "GOOGL"]},
+    })
+    row = db.execute(
+        "SELECT event_id, value, reason, context_json FROM risk_events "
+        "WHERE event_type='intraday_resolve'"
+    ).fetchone()
+    assert row[0] == event_id
+    assert row[1] == 4200.0
+    assert row[2] == "optimal"
+    ctx = json.loads(row[3])
+    assert ctx["redeploy_tickers"] == ["MSFT", "GOOGL"]
+    assert ctx["max_per_day"] == 5
+
+
 # ── log_eod ─────────────────────────────────────────────────────────────────
 
 
