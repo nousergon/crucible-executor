@@ -276,6 +276,72 @@ class TestIntradayExitManager:
         )
         assert result is not None
 
+    # ── catastrophic_gap_drop — observability cohort helper (config#846) ──
+
+    def test_gap_drop_reports_fire_and_magnitude(self):
+        mgr = self._mgr()  # default pct 0.15
+        gap = mgr.catastrophic_gap_drop(
+            {"ticker": "AAPL", "gap_reference_price": 200.0, "shares": 10},
+            {"last": 169.0},  # -15.5% from reference
+        )
+        assert gap is not None
+        assert gap["fired"] is True
+        assert gap["reference"] == 200.0
+        assert gap["current"] == 169.0
+        assert gap["threshold"] == 0.15
+        assert abs(gap["drop"] - (200.0 - 169.0) / 200.0) < 1e-9
+
+    def test_gap_drop_reports_non_firing_counterfactual(self):
+        # The whole point of the cohort: a watched position whose drop did
+        # NOT reach the threshold still yields a magnitude for offline tuning.
+        mgr = self._mgr()
+        gap = mgr.catastrophic_gap_drop(
+            {"ticker": "AAPL", "gap_reference_price": 200.0, "shares": 10},
+            {"last": 185.0},  # -7.5% — below the 15% threshold
+        )
+        assert gap is not None
+        assert gap["fired"] is False
+        assert abs(gap["drop"] - 0.075) < 1e-9
+
+    def test_gap_drop_never_fires_when_disabled_but_still_reports_drop(self):
+        # Disabled: the counterfactual drop is still meaningful (would a run
+        # WITH the stop enabled have helped?), but ``fired`` must stay False so
+        # check_catastrophic_gap keeps its disabled-early-return behavior.
+        mgr = self._mgr(catastrophic_gap_stop_enabled=False)
+        gap = mgr.catastrophic_gap_drop(
+            {"ticker": "AAPL", "gap_reference_price": 200.0, "shares": 10},
+            {"last": 150.0},  # -25%
+        )
+        assert gap is not None
+        assert gap["fired"] is False
+        assert abs(gap["drop"] - 0.25) < 1e-9
+        # And the acting path still returns None when disabled.
+        assert mgr.check_catastrophic_gap(
+            {"ticker": "AAPL", "gap_reference_price": 200.0, "shares": 10},
+            {"last": 150.0},
+        ) is None
+
+    def test_gap_drop_none_without_valid_reference_or_price(self):
+        mgr = self._mgr()
+        # No live price.
+        assert mgr.catastrophic_gap_drop(
+            {"ticker": "AAPL", "gap_reference_price": 200.0}, {"last": None},
+        ) is None
+        # No reference and no entry_price.
+        assert mgr.catastrophic_gap_drop(
+            {"ticker": "AAPL"}, {"last": 100.0},
+        ) is None
+
+    def test_gap_drop_falls_back_to_entry_price(self):
+        mgr = self._mgr()
+        gap = mgr.catastrophic_gap_drop(
+            {"ticker": "AAPL", "entry_price": 100.0},  # no gap_reference_price
+            {"last": 82.0},
+        )
+        assert gap is not None
+        assert gap["reference"] == 100.0
+        assert abs(gap["drop"] - 0.18) < 1e-9
+
 
 # ---------------------------------------------------------------------------
 # build_stop_record — book-authority chokepoint (WDAY 2026-06-05 regression)

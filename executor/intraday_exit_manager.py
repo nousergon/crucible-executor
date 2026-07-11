@@ -112,6 +112,41 @@ class IntradayExitManager:
         """
         if not self._config.get("catastrophic_gap_stop_enabled", True):
             return None
+        gap = self.catastrophic_gap_drop(stop, price_state)
+        if gap is None or not gap["fired"]:
+            return None
+        return {
+            "ticker": stop["ticker"],
+            "action": "EXIT",
+            "shares": stop.get("shares", 0),
+            "reason": "catastrophic_gap_stop",
+            "detail": (
+                f"price ${gap['current']:.2f} <= {(1 - gap['threshold']):.0%} of "
+                f"reference ${gap['reference']:.2f} "
+                f"(drop {gap['drop']:.1%} >= {gap['threshold']:.1%})"
+            ),
+        }
+
+    def catastrophic_gap_drop(self, stop: dict, price_state: dict) -> dict | None:
+        """Observability helper for the catastrophic-gap-stop cohort (config#846).
+
+        Returns the fractional drop of ``price_state['last']`` below the
+        record's ``gap_reference_price`` (falling back to ``entry_price``),
+        together with the reference, current price, configured threshold, and
+        whether the stop would fire — WITHOUT taking any action. The daemon
+        accumulates this per position so ``catastrophic_gap_stop_pct`` can be
+        tuned offline against realized outcomes; no such cohort exists today
+        (the stop only ever logs its FIRINGS, never the counterfactual drop of
+        the positions it watched but did not stop). Returns ``None`` when the
+        drop is not computable (no live price, no valid reference).
+
+        This deliberately does NOT gate on ``catastrophic_gap_stop_enabled``:
+        the counterfactual drop is meaningful for threshold tuning even in a
+        run where the stop is disabled. ``fired`` still folds in the enabled
+        state, so a disabled run never reports a fire and
+        :meth:`check_catastrophic_gap` (which early-returns when disabled)
+        keeps its exact prior behavior.
+        """
         current_price = price_state.get("last")
         if not current_price or current_price <= 0:
             return None
@@ -119,19 +154,15 @@ class IntradayExitManager:
         if not ref or ref <= 0:
             return None
         threshold = self._config.get("catastrophic_gap_stop_pct", 0.15)
+        enabled = self._config.get("catastrophic_gap_stop_enabled", True)
         drop = (ref - current_price) / ref
-        if drop >= threshold:
-            return {
-                "ticker": stop["ticker"],
-                "action": "EXIT",
-                "shares": stop.get("shares", 0),
-                "reason": "catastrophic_gap_stop",
-                "detail": (
-                    f"price ${current_price:.2f} <= {(1 - threshold):.0%} of "
-                    f"reference ${ref:.2f} (drop {drop:.1%} >= {threshold:.1%})"
-                ),
-            }
-        return None
+        return {
+            "drop": drop,
+            "reference": ref,
+            "current": current_price,
+            "threshold": threshold,
+            "fired": bool(enabled and drop >= threshold),
+        }
 
     # ── Private rule checks ──────────────────────────────────────────────────
 
