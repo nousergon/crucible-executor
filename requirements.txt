@@ -4,7 +4,7 @@ pyyaml~=6.0
 yfinance~=0.2.54
 numpy<2
 pandas~=2.2
-pyarrow~=14.0
+pyarrow~=23.0
 # arcticdb: reads atr_14_pct from the universe library at morning planner time.
 # Single source of truth for ATR across the executor — pullback trigger scaling,
 # position sizing, and trailing stops all consume the feature-store value so
