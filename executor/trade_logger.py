@@ -548,6 +548,22 @@ def get_entry_dates(conn: sqlite3.Connection, tickers: list[str]) -> dict[str, s
     return entry_dates
 
 
+def get_executed_entry_tickers(conn: sqlite3.Connection, run_date: str) -> set[str]:
+    """Tickers with an ENTER fill logged for ``run_date`` (session axis).
+
+    Crash-restart seeding surface (config#2328): the daemon rehydrates its
+    in-memory ``executed_tickers`` set from this at startup so a restart does
+    not re-place a BUY whose fill already reached trades.db even if the order
+    book save that follows never landed. ``date`` is the session axis =
+    daemon ``run_date`` (see trades schema / _TRADES_MIGRATIONS notes).
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT ticker FROM trades WHERE date=? AND action='ENTER'",
+        (run_date,),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
 def get_entry_stance_and_catalyst(
     conn: sqlite3.Connection, tickers: list[str],
 ) -> dict[str, dict]:

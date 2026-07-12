@@ -254,14 +254,67 @@ class OrderBook:
         """Add an active stop record."""
         self._data.setdefault("active_stops", []).append(stop)
 
+    def mark_entry_executing(self, ticker: str, trigger_reason: str) -> None:
+        """Stamp a write-ahead ``executing`` status on a pending entry.
+
+        Crash-safety WAL (config#2328): the daemon calls this and ``save()``s
+        BEFORE placing the IB BUY order, so an entry whose order was sent to
+        the broker is durably marked in-doubt on disk. On a crash-restart the
+        entry is no longer ``pending`` (``pending_entries`` excludes it), so
+        the naive entry loop cannot re-place the BUY; startup reconciliation
+        (``executing_entries``) resolves it against broker truth instead.
+
+        Keeps the record in ``approved_entries`` (unlike ``mark_entry_executed``
+        which moves it to ``executed_today``) — the order is not confirmed yet.
+        """
+        for entry in self._data.get("approved_entries", []):
+            if entry["ticker"] == ticker and entry.get("status") == "pending":
+                entry["status"] = "executing"
+                entry["trigger_reason"] = trigger_reason
+                entry["executing_at"] = datetime.now().isoformat()
+                break
+
+    def executing_entries(self) -> list[dict]:
+        """Return entries left in the write-ahead ``executing`` state.
+
+        Non-empty only after a crash between order placement and finalization
+        (config#2328). The daemon reconciles each against the broker at
+        startup: revert to ``pending`` if the order never landed, finalize via
+        ``mark_entry_executed`` if the position/order exists, or leave as-is
+        (fail-safe) if broker state is unreadable.
+        """
+        return [
+            e for e in self._data.get("approved_entries", [])
+            if e.get("status") == "executing"
+        ]
+
+    def revert_entry_to_pending(self, ticker: str) -> None:
+        """Roll a write-ahead ``executing`` entry back to ``pending``.
+
+        Used when reconciliation proves the order never reached the broker
+        (Rejected order, or restart with no matching position/working order),
+        so the legitimate entry can be re-driven through the guarded path.
+        """
+        for entry in self._data.get("approved_entries", []):
+            if entry["ticker"] == ticker and entry.get("status") == "executing":
+                entry["status"] = "pending"
+                entry.pop("executing_at", None)
+                break
+
     def mark_entry_executed(self, ticker: str, trigger_reason: str) -> None:
-        """Mark an entry as executed and move to executed_today."""
+        """Mark an entry as executed and move to executed_today.
+
+        Matches a ``pending`` entry (normal path) OR an ``executing`` one
+        (the write-ahead WAL entry being finalized after its order confirmed,
+        config#2328).
+        """
         entries = self._data.get("approved_entries", [])
         for entry in entries:
-            if entry["ticker"] == ticker and entry.get("status") == "pending":
+            if entry["ticker"] == ticker and entry.get("status") in ("pending", "executing"):
                 entry["status"] = "executed"
                 entry["trigger_reason"] = trigger_reason
                 entry["executed_at"] = datetime.now().isoformat()
+                entry.pop("executing_at", None)
                 self._data.setdefault("executed_today", []).append(entry)
                 break
         self._data["approved_entries"] = [
