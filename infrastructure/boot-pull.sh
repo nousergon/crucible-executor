@@ -145,14 +145,17 @@ for repo in "${REPOS[@]}"; do
         NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
         log "OK   $repo — $(git log --oneline -1)"
 
-        # Deploy gate: syntax check only (no IB Gateway connection needed)
+        # Deploy gate: import smoke test (catches syntax + transitive ImportErrors;
+        # no IB Gateway connection needed). Imports pull the full transitive module
+        # graph, so a broken dependency in any executor module surfaces here pre-
+        # planner, not at runtime.
         if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
             if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
-                log "GATE $repo — running syntax validation..."
-                if .venv/bin/python -c "import ast; ast.parse(open('executor/main.py').read()); ast.parse(open('executor/daemon.py').read()); ast.parse(open('executor/eod_reconcile.py').read())" >> "$LOG" 2>&1; then
-                    log "OK   $repo — syntax check passed"
+                log "GATE $repo — running import smoke test..."
+                if .venv/bin/python -c "import executor.main, executor.daemon, executor.eod_reconcile" >> "$LOG" 2>&1; then
+                    log "OK   $repo — import smoke test passed"
                 else
-                    log "FAIL $repo — syntax check failed, rolling back to $PREV_SHA"
+                    log "FAIL $repo — import smoke test failed, rolling back to $PREV_SHA"
                     git reset --hard "$PREV_SHA" >> "$LOG" 2>&1
                     log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
                 fi
