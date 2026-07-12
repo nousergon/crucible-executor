@@ -432,6 +432,27 @@ class IBKRClient:
                 pending += remaining
         return pending
 
+    def get_open_buy_shares(self, ticker: str) -> int:
+        """Return total un-filled BUY shares currently working at IB for ticker.
+
+        Symmetric to ``get_open_sell_shares``. Used by the pre-BUY duplicate
+        guard (config#2328) so a crash-restarted daemon won't re-place an ENTER
+        whose original order is still working at the broker. Scans
+        ``openTrades()`` for BUY orders matching ticker and sums
+        ``totalQuantity - filled``.
+        """
+        self.ensure_connected()
+        pending = 0
+        for trade in self.ib.openTrades():
+            if trade.contract.symbol != ticker:
+                continue
+            if trade.order.action != "BUY":
+                continue
+            remaining = int(trade.order.totalQuantity) - int(trade.orderStatus.filled or 0)
+            if remaining > 0:
+                pending += remaining
+        return pending
+
     def disconnect(self):
         self.ib.disconnect()
         logger.info("Disconnected from IB Gateway")
