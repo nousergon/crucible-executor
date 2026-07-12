@@ -88,3 +88,24 @@ def test_boot_pull_git_sync_lock_wait_exceeds_boot_pull_timeout():
     assert 'GIT_SYNC_LOCK_WAIT="${AE_GIT_SYNC_LOCK_WAIT:-150}"' in src, (
         "flock wait must default to 150s (> boot-pull.service TimeoutStartSec=120)."
     )
+
+
+def test_boot_pull_deploy_gate_uses_import_smoke_test():
+    """config#2353: the deploy gate must perform a full import smoke test
+    (not just ast.parse) to catch ImportErrors in transitive modules.
+
+    An ImportError in any of the ~50 executor modules (not just the three
+    entrypoints main/daemon/eod_reconcile) would previously pass the AST-only
+    check and surface at planner runtime. The import test pulls the full
+    dependency graph, catching broken deps pre-deployment.
+    """
+    src = _BOOT_PULL.read_text()
+    # The gate must use import, not ast.parse
+    assert "import executor.main, executor.daemon, executor.eod_reconcile" in src, (
+        "deploy gate must use Python imports (not ast.parse) to catch transitive "
+        "ImportErrors in executor modules."
+    )
+    # Verify the old ast.parse check is removed
+    assert "ast.parse" not in src, (
+        "obsolete ast.parse syntax-only check must be removed (config#2353)."
+    )
