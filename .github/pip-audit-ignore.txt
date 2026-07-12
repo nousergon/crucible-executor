@@ -1,0 +1,16 @@
+# pip-audit ignore list (nousergon/alpha-engine-config#2342)
+# Every entry below MUST carry a dated rationale comment directly above it.
+# No blanket suppression — each accepted advisory is named individually.
+# Format:
+#   # <rationale> — accepted 2026-07-12, revisit <YYYY-MM-DD or "when a fix is released">
+#   <VULN-ID>
+#
+# No entries as of 2026-07-12: a full `pip-audit` run against the CI
+# environment (Python 3.11, `pip install -r requirements.txt`) came back
+# clean after bumping pyarrow 14.0.2 -> 23.0.1 (fixes PYSEC-2024-161 and
+# PYSEC-2026-113; verified via `pytest tests/ -v`, all 1496 tests pass).
+# pip/setuptools/urllib3/requests findings observed during local
+# investigation were artifacts of testing under Python 3.9 (unavailable
+# python3.11 in the sandbox at first) — botocore's urllib3 upper bound
+# only applies to python_version < "3.10", so those never affected the
+# real CI environment. Re-verified clean end-to-end on Python 3.11.
