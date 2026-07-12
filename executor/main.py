@@ -2019,6 +2019,17 @@ def run(
             fd.log_summary(logger)
         logger.info(f"Executor complete | dry_run={dry_run} | simulate={simulate}")
 
+        if not simulate and not dry_run:
+            try:
+                import subprocess
+                subprocess.run(
+                    ["bash", "/home/ec2-user/alpha-engine/infrastructure/emit-heartbeat.sh", "executor-morning"],
+                    check=False,
+                    capture_output=True,
+                )
+            except Exception as _e:
+                logger.warning("Heartbeat emit failed: %s (non-fatal)", _e)
+
         if simulate:
             return orders
     except Exception as _exc:

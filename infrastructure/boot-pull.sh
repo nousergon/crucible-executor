@@ -193,21 +193,50 @@ if [ -f "$RISK_YAML" ]; then
     TRADES_BUCKET=$(grep -E '^\s*trades_bucket:' "$RISK_YAML" | head -1 | sed 's/.*trades_bucket:\s*["]*\([^"]*\)["]*\s*/\1/' | tr -d "'\"")
 
     if [ -n "$DB_PATH" ] && [ -n "$TRADES_BUCKET" ]; then
-        # Restore if db doesn't exist or is ≤ 20KB (empty schema only)
-        DB_SIZE=0
-        [ -f "$DB_PATH" ] && DB_SIZE=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
+        S3_KEY="trades/trades_latest.db"
+        RESTORE_NEEDED=false
 
-        if [ "$DB_SIZE" -le 20480 ]; then
-            S3_KEY="trades/trades_latest.db"
-            log "trades.db missing or empty (${DB_SIZE}B) — restoring from s3://${TRADES_BUCKET}/${S3_KEY}"
+        if [ ! -f "$DB_PATH" ]; then
+            log "trades.db missing — restoring from s3://${TRADES_BUCKET}/${S3_KEY}"
+            RESTORE_NEEDED=true
+        else
+            DB_SIZE=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
+            if [ "$DB_SIZE" -le 20480 ]; then
+                log "trades.db empty or minimal (${DB_SIZE}B) — restoring from S3"
+                RESTORE_NEEDED=true
+            else
+                # Check for staleness: compare local max(eod_pnl.date) against S3 metadata
+                # If local DB has no recent data, restore.
+                LOCAL_MAX_DATE=$(python3 -c "
+import sqlite3, sys
+try:
+    conn = sqlite3.connect('$DB_PATH')
+    c = conn.cursor()
+    c.execute('SELECT MAX(date) FROM eod_pnl')
+    result = c.fetchone()
+    conn.close()
+    print(result[0] if result[0] else '')
+except Exception as e:
+    print('', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null || echo "")
+                if [ -z "\$LOCAL_MAX_DATE" ]; then
+                    log "trades.db has no eod_pnl data — restoring from S3"
+                    RESTORE_NEEDED=true
+                else
+                    log "trades.db has recent data (max_date=\$LOCAL_MAX_DATE) — no restore needed"
+                fi
+            fi
+        fi
+
+        if [ "\$RESTORE_NEEDED" = "true" ]; then
             if aws s3 cp "s3://${TRADES_BUCKET}/${S3_KEY}" "$DB_PATH" >> "$LOG" 2>&1; then
                 NEW_SIZE=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
                 log "OK   trades.db restored (${NEW_SIZE}B)"
             else
                 log "WARN trades.db restore failed — executor will start with empty db"
+                exit 1
             fi
-        else
-            log "OK   trades.db exists (${DB_SIZE}B) — no restore needed"
         fi
     else
         log "WARN could not parse db_path/trades_bucket from risk.yaml"
