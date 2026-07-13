@@ -31,8 +31,18 @@ absent ⇒ that axis is skipped for that role).
 ## Roles managed here
 
 - **`alpha-engine-executor-role`** — assumed by the **trading** EC2 instance
-  (`ae-trading`) only. 9 inline policies (trading-scoped: S3, SES, SNS,
-  CloudWatch, SSM read/send, EC2 spot, EOD Step Function). Trust policy
+  (`ae-trading`) AND, via the same `alpha-engine-executor-profile` instance
+  profile, the ephemeral groom-dispatch spot boxes (`groom_spot_bootstrap.sh`
+  — full groom runs and the standalone end-of-SF sweep box both launch under
+  this profile). 10 inline policies (trading-scoped: S3, SES, SNS,
+  CloudWatch, SSM read/send, EC2 spot, EOD Step Function; plus
+  `alpha-engine-stepfunctions-diagnose`, added 2026-07-13 — read-only
+  `states:ListExecutions`/`DescribeExecution`/`DescribeStateMachine` on the
+  three trading-pipeline state machines, so the groom sweep box's
+  deterministic `gate:*-sf` sweep (`gate_sf_run_sweep.py`, config#2397) can
+  check whether a named pipeline has succeeded since a gate was applied,
+  without a cross-role `AssumeRole` hop into the GHA-OIDC-only
+  `saturday-sf-watch-role`). Trust policy
   (`ec2.amazonaws.com`) and managed attachment (`AmazonSSMManagedInstanceCore`)
   are codified via the reserved files. Until 2026-06-09 this role was also the
   instance profile for the dashboard box and carried dashboard/cyphering/mnemon
