@@ -6,7 +6,7 @@ a versioned, purpose-built artifact at a stable key. Metron MUST consume THIS, n
 reach around it into the executor's producer-private `trades/snapshots/` path.
 
 Disclosure scope (deliberately minimal — illustrative only, no claims):
-  * current positions (ticker / shares / avg_cost / market_value / sector)
+  * current positions (ticker / shares / avg_cost / market_value / sector / asset_type)
   * portfolio NAV (net_liquidation only)
   * a NAV-vs-SPY history series (the illustrative performance curve)
 
@@ -30,7 +30,7 @@ Schema (additive-only per CLAUDE.md S3 contract):
       "account": {"net_liquidation": float},
       "positions": [
         {"ticker": str, "shares": float, "avg_cost": float,
-         "market_value": float, "sector": str}
+         "market_value": float, "sector": str, "asset_type": "STK" | "ETF"}
       ],
       "nav_history": [
         {"date": "YYYY-MM-DD", "nav": float, "spy_close": float | null}
@@ -54,6 +54,18 @@ DISCLAIMER = (
     "Illustrative reference portfolio. Not investment advice; "
     "no representation is made as to performance."
 )
+
+# Broad-market index/ETF core positions the portfolio-optimizer holds as the
+# no-conviction fill (SPY primarily; VOO/IVV/SPLG are substitutes the optimizer
+# may swap to). Single source of truth shared with ``eod_reconcile._index_etf_sector``
+# — a ticker added here is simultaneously tagged with the right sector label AND
+# reported to Metron as ETF, not equity. New core-ETF substitutes get added here.
+INDEX_ETF_TICKERS = frozenset({"SPY", "VOO", "IVV", "SPLG"})
+
+
+def _asset_type_for(ticker: str) -> str:
+    """IBKR-vocabulary asset category (STK/ETF) for a held ticker."""
+    return "ETF" if ticker in INDEX_ETF_TICKERS else "STK"
 
 # History depth published in the artifact (trading days). ~2y is enough for the
 # illustrative NAV-vs-SPY curve without bloating the object; the executor's full
@@ -88,6 +100,7 @@ def build_payload(
                 "avg_cost": pos.get("avg_cost"),
                 "market_value": pos.get("market_value"),
                 "sector": pos.get("sector") or "Unknown",
+                "asset_type": _asset_type_for(ticker),
             }
         )
 
