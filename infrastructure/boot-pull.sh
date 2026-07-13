@@ -208,31 +208,81 @@ if [ -f "$RISK_YAML" ]; then
                 log "trades.db empty or minimal (${DB_SIZE}B) — restoring from S3"
                 RESTORE_NEEDED=true
             else
-                # Check for staleness: compare local max(eod_pnl.date) against S3 metadata
-                # If local DB has no recent data, restore.
-                LOCAL_MAX_DATE=$(python3 -c "
-import sqlite3, sys
+                # Check for staleness: compare local max(eod_pnl.date) against the
+                # expected most-recent trading day, not just presence of any row.
+                #
+                # config#2356: the presence-only check ("does eod_pnl have ANY
+                # row") cannot catch a snapshot-restored stale-but-large DB — a
+                # box restored from a 3-week-old EBS snapshot has plenty of
+                # non-null eod_pnl rows (just old ones) and would incorrectly
+                # report "has recent data". Compute the expected floor date via
+                # nousergon_lib.trading_calendar (same helper executor/main.py's
+                # ArcticDB freshness gate and executor/eod_reconcile.py use) and
+                # require LOCAL_MAX_DATE to be within 1 trading day of the last
+                # closed session — that tolerance absorbs the case where today's
+                # EOD ingestion simply hasn't run yet, without masking a
+                # genuinely stale restore (2+ trading days behind triggers
+                # restore).
+                #
+                # AE_VENV_PY must point at the alpha-engine venv set up earlier
+                # in THIS script (the .venv/bin/pip install -r requirements.txt
+                # step above, which runs before this block) so nousergon_lib is
+                # importable — mirrors the FD_VENV precedent below in this same
+                # file. Falls back to bare python3 (best-effort: sqlite parsing
+                # still works without nousergon_lib, only the recency half of
+                # the check is skipped) if the venv isn't present yet.
+                AE_VENV_PY="/home/ec2-user/alpha-engine/.venv/bin/python"
+                if [ ! -x "$AE_VENV_PY" ]; then
+                    AE_VENV_PY="python3"
+                fi
+
+                LOCAL_MAX_DATE=$("$AE_VENV_PY" - "$DB_PATH" <<'PYEOF' 2>/dev/null || echo ""
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
 try:
-    conn = sqlite3.connect('$DB_PATH')
+    conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    c.execute('SELECT MAX(date) FROM eod_pnl')
+    c.execute("SELECT MAX(date) FROM eod_pnl")
     result = c.fetchone()
     conn.close()
-    print(result[0] if result[0] else '')
-except Exception as e:
-    print('', file=sys.stderr)
+    print(result[0] if result and result[0] else "")
+except Exception:
+    print("", file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null || echo "")
-                if [ -z "\$LOCAL_MAX_DATE" ]; then
+PYEOF
+)
+
+                if [ -z "$LOCAL_MAX_DATE" ]; then
                     log "trades.db has no eod_pnl data — restoring from S3"
                     RESTORE_NEEDED=true
                 else
-                    log "trades.db has recent data (max_date=\$LOCAL_MAX_DATE) — no restore needed"
+                    # Floor date: last_closed_trading_day() minus 1 trading day
+                    # of tolerance. LOCAL_MAX_DATE older than this floor means
+                    # the DB is missing at least 2 trading days of EOD data —
+                    # the "stale-but-large" snapshot-restore scenario.
+                    STALENESS_FLOOR=$("$AE_VENV_PY" <<'PYEOF' 2>/dev/null || echo ""
+try:
+    from nousergon_lib.trading_calendar import last_closed_trading_day, subtract_trading_days
+    print(subtract_trading_days(last_closed_trading_day(), 1).isoformat())
+except Exception:
+    print("")
+PYEOF
+)
+                    if [ -n "$STALENESS_FLOOR" ] && [ "$LOCAL_MAX_DATE" \< "$STALENESS_FLOOR" ]; then
+                        log "trades.db eod_pnl is stale (max_date=$LOCAL_MAX_DATE < floor=$STALENESS_FLOOR) — restoring from S3"
+                        RESTORE_NEEDED=true
+                    elif [ -z "$STALENESS_FLOOR" ]; then
+                        log "WARN could not compute staleness floor (nousergon_lib.trading_calendar unavailable) — falling back to presence-only check (max_date=$LOCAL_MAX_DATE)"
+                    else
+                        log "trades.db has recent data (max_date=$LOCAL_MAX_DATE, floor=$STALENESS_FLOOR) — no restore needed"
+                    fi
                 fi
             fi
         fi
 
-        if [ "\$RESTORE_NEEDED" = "true" ]; then
+        if [ "$RESTORE_NEEDED" = "true" ]; then
             if aws s3 cp "s3://${TRADES_BUCKET}/${S3_KEY}" "$DB_PATH" >> "$LOG" 2>&1; then
                 NEW_SIZE=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
                 log "OK   trades.db restored (${NEW_SIZE}B)"
