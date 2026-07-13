@@ -6,11 +6,8 @@ resolve to "Broad Market / Index" rather than falling through the GICS
 lookup chain to a bare "—"/"Unknown" that reads as missing data.
 """
 
-from executor.eod_reconcile import (
-    _INDEX_ETF_SECTOR,
-    _INDEX_ETF_TICKERS,
-    _index_etf_sector,
-)
+from executor.eod_reconcile import _INDEX_ETF_SECTOR, _index_etf_sector
+from executor.reference_rate import INDEX_ETF_TICKERS as _INDEX_ETF_TICKERS
 
 
 class TestIndexEtfSector:

@@ -178,9 +178,11 @@ def _load_constituents_sector_map(bucket: str) -> dict[str, str]:
 # rather than "this is the broad-market core." Tag it explicitly so every
 # downstream consumer (public site, private console, sector attribution)
 # inherits a meaningful label. New core ETFs the optimizer may substitute
-# get added to ``_INDEX_ETF_TICKERS``.
+# get added to ``reference_rate.INDEX_ETF_TICKERS`` (single source of truth,
+# shared with the asset_type classification in the Metron reference-rate
+# contract — a ticker added there is simultaneously tagged with this sector
+# label AND reported as ETF, not equity).
 _INDEX_ETF_SECTOR = "Broad Market / Index"
-_INDEX_ETF_TICKERS = frozenset({"SPY", "VOO", "IVV", "SPLG"})
 
 
 def _index_etf_sector(ticker: str) -> str | None:
@@ -191,7 +193,7 @@ def _index_etf_sector(ticker: str) -> str | None:
     substitute), else ``None`` so the caller falls through to the normal
     signals.json / entry-trade / S&P-constituents lookup chain.
     """
-    return _INDEX_ETF_SECTOR if ticker in _INDEX_ETF_TICKERS else None
+    return _INDEX_ETF_SECTOR if ticker in reference_rate.INDEX_ETF_TICKERS else None
 
 
 def _load_predictions_from_s3(bucket: str) -> tuple[dict, str | None]:

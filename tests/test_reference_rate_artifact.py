@@ -100,9 +100,21 @@ def test_build_payload_required_keys_and_shape():
     tickers = {p["ticker"] for p in payload["positions"]}
     assert tickers == {"AMD", "SPY"}
     for p in payload["positions"]:
-        assert set(p) == {"ticker", "shares", "avg_cost", "market_value", "sector"}
+        assert set(p) == {"ticker", "shares", "avg_cost", "market_value", "sector", "asset_type"}
+
+    # SPY is the optimizer's no-conviction ETF fill, not a stock — Metron must never
+    # report it as equity just because it's a Crucible holding like any other ticker.
+    by_ticker = {p["ticker"]: p["asset_type"] for p in payload["positions"]}
+    assert by_ticker["AMD"] == "STK"
+    assert by_ticker["SPY"] == "ETF"
 
     assert payload["nav_history"] == nav_history
+
+
+def test_asset_type_covers_all_index_etf_substitutes():
+    for ticker in reference_rate.INDEX_ETF_TICKERS:
+        assert reference_rate._asset_type_for(ticker) == "ETF"
+    assert reference_rate._asset_type_for("AAPL") == "STK"
 
 
 def test_privacy_no_forbidden_keys_leak():
