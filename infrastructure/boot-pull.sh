@@ -191,9 +191,14 @@ done
 # This restores trades_latest.db from S3 as a safety net.
 RISK_YAML="/home/ec2-user/alpha-engine/config/risk.yaml"
 if [ -f "$RISK_YAML" ]; then
-    # Parse db_path and trades_bucket from risk.yaml
-    DB_PATH=$(grep -E '^\s*db_path:' "$RISK_YAML" | head -1 | sed 's/.*db_path:\s*["]*\([^"]*\)["]*\s*/\1/' | tr -d "'\"")
-    TRADES_BUCKET=$(grep -E '^\s*trades_bucket:' "$RISK_YAML" | head -1 | sed 's/.*trades_bucket:\s*["]*\([^"]*\)["]*\s*/\1/' | tr -d "'\"")
+    # Parse db_path and trades_bucket from risk.yaml. `\s` is a GNU-sed-only
+    # shorthand — the deploy target (Amazon Linux EC2) and CI (ubuntu-latest)
+    # both use GNU sed so this masked the bug there, but BSD sed (macOS, every
+    # local dev machine) treats `\s` as a literal "s", leaving a stray leading
+    # space/trailing quote in the parsed value. `[[:space:]]` is the POSIX
+    # class both sed implementations support identically.
+    DB_PATH=$(grep -E '^\s*db_path:' "$RISK_YAML" | head -1 | sed 's/.*db_path:[[:space:]]*["]*\([^"]*\)["]*[[:space:]]*/\1/' | tr -d "'\"")
+    TRADES_BUCKET=$(grep -E '^\s*trades_bucket:' "$RISK_YAML" | head -1 | sed 's/.*trades_bucket:[[:space:]]*["]*\([^"]*\)["]*[[:space:]]*/\1/' | tr -d "'\"")
 
     if [ -n "$DB_PATH" ] && [ -n "$TRADES_BUCKET" ]; then
         S3_KEY="trades/trades_latest.db"
