@@ -85,9 +85,9 @@ def _scan_file(path: Path, role_names: set[str]) -> list[str]:
 
     Logic: if the file contains BOTH (a) a write-API call (put-role-policy
     or equivalent) and (b) a literal mention of a codified role name —
-    in non-comment lines — flag it. File-scope rather than line-window:
-    deploy scripts often declare `ROLE_NAME=...` at the top and call
-    put-role-policy with a `$ROLE_NAME` reference far below.
+    in non-comment, non-display lines — flag it. File-scope rather than
+    line-window: deploy scripts often declare `ROLE_NAME=...` at the top
+    and call put-role-policy with a `$ROLE_NAME` reference far below.
     """
     findings: list[str] = []
     try:
@@ -109,10 +109,29 @@ def _scan_file(path: Path, role_names: set[str]) -> list[str]:
     # Skip pure comment lines (sh, py, yaml: `#`; tf, js: `//`).
     comment_re = re.compile(r"^\s*(#|//)")
 
+    # Skip pure display/log statements: a role name (or the words
+    # "put-role-policy" etc.) inside an `echo`/`print`/`logging.*` message
+    # is operator-facing prose, not code that can influence which role an
+    # API call targets — e.g. a deploy script's "NOTE: grant X to role Y
+    # via apply.sh" reminder. Only actual identifier usage (a write-API
+    # call's own arguments, or a variable assignment that could feed one)
+    # should count as a role "mention". Without this, config#2493 showed
+    # `check-no-foreign-writers.py` itself producing false positives on
+    # deploy scripts that merely print the codified role's name in an
+    # operator instruction.
+    display_re = re.compile(
+        r"^\s*(echo|printf)\b"  # bash
+        r"|^\s*print\s*\("  # python
+        r"|^\s*(logging|logger)\.(debug|info|warning|error|critical)\s*\("  # python logging
+        r"|^\s*console\.(log|warn|error|info)\s*\("  # js/ts
+    )
+
     write_lines: list[tuple[int, str]] = []
     code_lines: list[str] = []
     for lineno, line in enumerate(text.splitlines(), 1):
         if comment_re.match(line):
+            continue
+        if display_re.match(line):
             continue
         code_lines.append(line)
         if write_re.search(line):
