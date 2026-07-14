@@ -8,10 +8,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from executor.eod_reconcile import (
+    NAV_HARD_GATE_TOLERANCE_NAV_BPS,
+    NAV_HARD_GATE_TOLERANCE_USD_FLOOR,
     _apply_dividend_delta,
+    _check_nav_three_way_hard_gate,
     _compute_daily_return,
     _compute_unattributed_residual_pct,
     _load_constituents_sector_map,
+    _nav_hard_gate_tolerance_usd,
     _resolve_prior_price,
     _synthesize_rationales,
 )
@@ -128,6 +132,139 @@ class TestComputeUnattributedResidualPct:
 
     def test_none_nav_returns_none(self):
         assert _compute_unattributed_residual_pct(50.0, None) is None
+
+
+class TestNavThreeWayHardGate:
+    """config#2457 — NAV three-way reconcile promoted from observational
+    (data_warnings only) to a hard gate that pages flow-doctor.
+
+    `_check_nav_three_way_hard_gate` is the pure decision function `run()`
+    calls; these tests exercise it directly rather than driving all of
+    `run()`'s IO (snapshot/DB/S3 mocking is covered by test_eod_reconcile.py
+    for the parts that need it)."""
+
+    NAV = 1_000_000.0  # tolerance floor is bps-of-NAV dominant at this size
+    # 15bps of $1,000,000 = $1,500, which is below the $2,500 floor, so the
+    # floor governs at this NAV — pick divergences relative to the floor.
+
+    def test_no_breach_within_tolerance_is_silent(self):
+        """A small divergence well inside tolerance returns None — no gate
+        fires, no page. (The pre-existing soft data_warnings entry, appended
+        separately in run(), is unaffected by this function.)"""
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=200.0,
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-07-13",
+        )
+        assert result is None
+
+    def test_no_breach_exactly_at_tolerance_is_silent(self):
+        """Boundary: exactly at tolerance does not breach (strict >)."""
+        tolerance = _nav_hard_gate_tolerance_usd(self.NAV)
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=tolerance,
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-07-13",
+        )
+        assert result is None
+
+    def test_breach_above_tolerance_fires(self):
+        """A divergence beyond the hard-gate tolerance returns a breach dict
+        with the fields run() needs to log + page flow-doctor."""
+        tolerance = _nav_hard_gate_tolerance_usd(self.NAV)
+        breach_amount = tolerance + 500.0
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=breach_amount,
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-07-13",
+        )
+        assert result is not None
+        assert result["run_date"] == "2026-07-13"
+        assert result["pricing_timing_usd"] == pytest.approx(breach_amount)
+        assert result["tolerance_usd"] == pytest.approx(tolerance)
+        assert result["nav"] == self.NAV
+        assert "2026-07-13" in result["message"]
+        assert "NAV three-way reconcile breach" in result["message"]
+
+    def test_breach_fires_on_negative_divergence_too(self):
+        """Sign-agnostic: the broker NAV can be BELOW the settled/system NAV
+        just as easily as above it — abs() comparison, not one-sided."""
+        tolerance = _nav_hard_gate_tolerance_usd(self.NAV)
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=-(tolerance + 1000.0),
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-07-13",
+        )
+        assert result is not None
+        assert result["pricing_timing_usd"] < 0
+
+    def test_pricing_timing_unavailable_does_not_fire(self):
+        """The pricing_timing_available=False fallback path (missing prior
+        snapshot) must NOT page — that's a data-availability gap, not a
+        confirmed divergence, and already gets its own honesty warning in
+        data_warnings (asserted separately in run()'s email-warnings path).
+        A huge pricing_timing_usd value is passed here specifically to prove
+        `available=False` short-circuits before the magnitude check."""
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=1_000_000.0,
+            pricing_timing_available=False,
+            nav=self.NAV,
+            run_date="2026-07-13",
+        )
+        assert result is None
+
+    def test_zero_nav_does_not_fire(self):
+        """Divide-by-zero / degenerate-NAV protection, mirroring
+        _compute_unattributed_residual_pct's zero-nav guard."""
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=10_000.0,
+            pricing_timing_available=True,
+            nav=0.0,
+            run_date="2026-07-13",
+        )
+        assert result is None
+
+    def test_none_nav_does_not_fire(self):
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=10_000.0,
+            pricing_timing_available=True,
+            nav=None,
+            run_date="2026-07-13",
+        )
+        assert result is None
+
+    def test_tolerance_uses_floor_for_small_nav(self):
+        """Below the crossover NAV, the $ floor governs (not bps-of-NAV)."""
+        small_nav = 100_000.0  # 15bps = $150, well under the $2,500 floor
+        assert _nav_hard_gate_tolerance_usd(small_nav) == pytest.approx(
+            NAV_HARD_GATE_TOLERANCE_USD_FLOOR
+        )
+
+    def test_tolerance_uses_bps_for_large_nav(self):
+        """Above the crossover NAV, bps-of-NAV governs (not the $ floor)."""
+        large_nav = 100_000_000.0  # 15bps = $150,000, well over the $2,500 floor
+        expected = NAV_HARD_GATE_TOLERANCE_NAV_BPS / 10000.0 * large_nav
+        assert _nav_hard_gate_tolerance_usd(large_nav) == pytest.approx(expected)
+        assert _nav_hard_gate_tolerance_usd(large_nav) > NAV_HARD_GATE_TOLERANCE_USD_FLOOR
+
+    def test_hard_gate_tolerance_wider_than_soft_warning_threshold(self):
+        """Deliberate design invariant: the hard-gate (paged) tolerance must
+        be wider than the existing soft data_warnings threshold
+        (max($500, 5bps of NAV)) at every NAV level, or the hard gate pages
+        exactly as often as the email already warns — training the operator
+        to ignore it (the config#2145 lesson reconcile_audit.py's
+        PAGE_THRESHOLD_BPS also encodes)."""
+        for nav in (50_000.0, 1_000_000.0, 50_000_000.0):
+            soft_threshold = max(500.0, 0.0005 * nav)
+            hard_threshold = _nav_hard_gate_tolerance_usd(nav)
+            assert hard_threshold > soft_threshold, (
+                f"hard gate tolerance ${hard_threshold} must exceed soft "
+                f"warning threshold ${soft_threshold} at nav=${nav}"
+            )
 
 
 class TestResolvePriorPrice:
