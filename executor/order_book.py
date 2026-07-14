@@ -48,6 +48,23 @@ def _default_book(run_date: str | None = None) -> dict:
     }
 
 
+def _entry_id_for(entry: dict, book_date: str) -> str:
+    """Deterministic per-decision identity for an order-book entry (config#2436).
+
+    Composite of ticker + session date + sizing source — NOT a random id —
+    so regenerating the SAME decision on the SAME day (e.g. a main.py rerun
+    after a full order-book-loss) reproduces the identical entry_id, and a
+    durable trades.db lookup keyed on it recognizes "this exact decision
+    already executed." A genuinely distinct decision for the same ticker on
+    the same day (legacy decider vs. portfolio optimizer vs. intraday
+    redeploy each stamp a different ``sizing_source``) gets its own id, so
+    it is never silently dropped as a false duplicate the way bare-ticker
+    keying would drop it.
+    """
+    sizing_source = entry.get("sizing_source") or "legacy_decider"
+    return f"{entry.get('ticker')}:{book_date}:{sizing_source}"
+
+
 def build_stop_record(
     *,
     ticker: str,
@@ -215,15 +232,22 @@ class OrderBook:
     def add_entry(self, entry: dict) -> None:
         """Add an approved entry to the book.
 
-        Deduplicates by ticker: if a pending entry for the same ticker
-        already exists, the new record is skipped.
+        Deduplicates by ``entry_id`` (ticker + session date + sizing source,
+        config#2436) rather than bare ticker: a literal re-submission of the
+        SAME decision is skipped, but a genuinely distinct decision for an
+        already-pending ticker (e.g. the intraday redeploy solver proposing
+        a second buy alongside a still-pending morning entry) is kept
+        instead of being silently dropped. ``entry_id`` is assigned here if
+        the caller hasn't already stamped one.
         """
-        ticker = entry.get("ticker")
+        entry.setdefault("entry_id", _entry_id_for(entry, self._data.get("date", "")))
+        entry_id = entry["entry_id"]
         existing = self._data.get("approved_entries", [])
         for ex in existing:
-            if ex.get("ticker") == ticker and ex.get("status") == "pending":
+            if ex.get("entry_id") == entry_id and ex.get("status") == "pending":
                 logger.warning(
-                    "Skipping duplicate entry for %s — already pending", ticker,
+                    "Skipping duplicate entry for %s (entry_id=%s) — already pending",
+                    entry.get("ticker"), entry_id,
                 )
                 return
         entry.setdefault("status", "pending")
