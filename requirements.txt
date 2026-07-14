@@ -27,7 +27,7 @@ exchange-calendars~=4.5
 requests~=2.32
 # Real-time polygon.io WebSocket price feed (config#913) — used only when
 # EXECUTOR_PRICE_SOURCE=polygon_ws; the default IB-delayed path doesn't need it.
-websocket-client~=1.8
+websocket-client~=1.9
 # alpha-engine-lib provides setup_logging + BasePreflight. Executor passes
 # exclude_patterns=[r"Error 10197", r"Error 10349"] to suppress benign IB
 # Gateway noise (10197 = iOS app steals live-data session, 10349 = TIF
