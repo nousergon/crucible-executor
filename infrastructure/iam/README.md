@@ -77,7 +77,47 @@ absent ⇒ that axis is skipped for that role).
   `decision_artifacts/_calibration/*`, `decision_artifacts/_spotcheck/*`,
   `_alerts/*`, `robodashboard/*` — no Delete, no full-bucket write; right-sized
   2026-06-09), SSM read, SFN read, SNS, CloudWatch, cyphering SSM read,
-  mnemon S3, trust (`ec2`), `AmazonSSMManagedInstanceCore`.
+  mnemon S3, trust (`ec2`), `AmazonSSMManagedInstanceCore`, plus (consolidated
+  from `alpha-engine-config` here 2026-07-14, config#2340 surface 5 — see
+  "Split-tracking reconciliation" below) `alpha-engine-dashboard-passrole-executor`,
+  `alpha-engine-dashboard-daily-news-write`, `alpha-engine-dashboard-fleet-liveness`,
+  `alpha-engine-dashboard-morning-signal-schedule`, `alpha-engine-dashboard-spot-dispatch`,
+  `alpha-engine-dashboard-metron-sft-putobject`,
+  `alpha-engine-dashboard-changelog-quarantine-writeback` (not yet applied),
+  `alpha-engine-dashboard-ssm-logs-write` (not yet applied).
+
+### Split-tracking reconciliation (2026-07-14, config#2340 surface 5)
+
+`alpha-engine-config` (the private ops-adjacent config repo) had been
+independently tracking a SECOND, divergent, partial set of
+`alpha-engine-dashboard-role` inline policies under its own `iam/` directory
+since 2026-07-03 (8 policies added there, one at a time, each documented
+with a "Live state: applied" note — but **never added here**, so this
+repo's daily `check-drift.py` run never saw them). The result, confirmed
+live in the 2026-07-14 09:30 UTC scheduled run: **7 drift findings** —
+5 policies present on the live role but uncodified here
+(`daily-news-write`, `fleet-liveness`, `morning-signal-schedule`,
+`spot-dispatch`, and the passrole grant under its *actual* live name
+`alpha-engine-dashboard-passrole-executor`, which this repo had codified
+under the wrong name `alpha-engine-passrole-executor` — hence that name
+showing as "codified but not on AWS" in the same run), plus one still
+genuinely unexplained: **`vires-secrets-s3-read`**, live on this role,
+codified NOWHERE (not here, not in `alpha-engine-config`) — likely an
+undocumented manual grant for the Vires secrets bucket; needs an operator
+`aws iam get-role-policy --role-name alpha-engine-dashboard-role
+--policy-name vires-secrets-s3-read` capture into a tracked file (this
+runner holds no AWS credentials to fetch it). Content for the other 8 was
+verified byte-identical (modulo formatting) to what's already live before
+copying, per `alpha-engine-config`'s own "Live state: applied" provenance
+notes.
+
+Going forward: `alpha-engine-dashboard-role` (and any other role this repo
+already tracks) should be codified **here**, not in `alpha-engine-config` —
+this directory is the one with the actual drift-check + apply automation
+the fleet's IAM-as-code epic (config#2340) is standardizing on. The
+`alpha-engine-config` copies are now a stale duplicate; a follow-up should
+either delete them or leave a pointer back to here (tracked separately,
+since that's a different repo's housekeeping call).
 - **`github-actions-iam-drift-check`** — assumed by GitHub Actions via
   OIDC for the daily IAM-drift-check workflow. Single inline policy
   granting `iam:ListRolePolicies` + `iam:GetRolePolicy` + `iam:GetRole` +

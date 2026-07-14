@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DailyNewsPipelineWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/data/news_aggregates_daily/*",
+        "arn:aws:s3:::alpha-engine-research/data/news_articles_daily/*",
+        "arn:aws:s3:::alpha-engine-research/data/news_digest_daily/*"
+      ]
+    }
+  ]
+}
