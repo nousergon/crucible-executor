@@ -345,26 +345,30 @@ def _read_signals(
                 conn.close()
             raise
 
-    # Champion candidate-source adapter (config#2364 / config#2366) — must run
+    # Champion candidate-source adapter (config#2364 / config#2366;
+    # thinktank_coverage arm added config-I2518 / epic I2515) — must run
     # BEFORE the universe/coverage filters below so a synthesized
-    # scanner_predictor_direct buy_candidates list flows through the SAME
-    # gates agentic candidates already pass through. No-op passthrough when
-    # the pointer resolves to agentic (including the S3-404 pre-bootstrap
-    # default) — the champion pointer read + parquet round-trip are live-
-    # trading-arm concerns, so (like the universe/coverage gates below) this
-    # is skipped in simulate mode: the backtester's replay path doesn't
-    # select a live champion arm, and predictor_param_sweep can't afford an
-    # extra S3 round-trip per simulated date.
+    # (scanner_predictor_direct or thinktank_coverage) buy_candidates list
+    # flows through the SAME gates agentic candidates already pass through.
+    # No-op passthrough when the pointer resolves to agentic (including the
+    # S3-404 pre-bootstrap default) — the champion pointer read + arm-feed
+    # round-trip are live-trading-arm concerns, so (like the universe/
+    # coverage gates below) this is skipped in simulate mode: the
+    # backtester's replay path doesn't select a live champion arm, and
+    # predictor_param_sweep can't afford an extra S3 round-trip per
+    # simulated date.
     #
     # The constituents sector_map is only loaded when the pointer actually
-    # resolves to scanner_predictor_direct — on the common (agentic /
-    # pre-bootstrap) path this avoids an extra S3 list_objects_v2 +
-    # get_object round-trip for a value apply_champion_selection would
-    # otherwise discard unused on every trading day. When
-    # scanner_predictor_direct IS active, this is the same sector_map
-    # artifact patch_unknown_sectors_with_constituents loads again a few
-    # lines below — one extra fetch, paid only on the arm that's rarely
-    # active, not on every run.
+    # resolves to a synthesizing arm (scanner_predictor_direct or, since
+    # config-I2518/epic I2515, thinktank_coverage — neither source carries a
+    # sector on its rows, so both need this to stamp synthesized entries) —
+    # on the common (agentic / pre-bootstrap) path this avoids an extra S3
+    # list_objects_v2 + get_object round-trip for a value
+    # apply_champion_selection would otherwise discard unused on every
+    # trading day. When a synthesizing arm IS active, this is the same
+    # sector_map artifact patch_unknown_sectors_with_constituents loads
+    # again a few lines below — one extra fetch, paid only on the arm
+    # that's rarely active, not on every run.
     #
     # ``_champion_injected_predictions`` is applied to ``predictions_by_ticker``
     # AFTER the real GBM ``read_predictions`` load below (that call fully
@@ -376,7 +380,7 @@ def _read_signals(
         from executor.champion import apply_champion_selection, load_champion_pointer
 
         _champion_pointer = load_champion_pointer(signals_bucket)
-        if _champion_pointer["champion"] == "scanner_predictor_direct":
+        if _champion_pointer["champion"] in ("scanner_predictor_direct", "thinktank_coverage"):
             from executor.eod_reconcile import _load_constituents_sector_map
             sector_map = _load_constituents_sector_map(signals_bucket)
         else:
@@ -490,10 +494,11 @@ def _read_signals(
     else:
         predictions_by_ticker = {}
 
-    # Merge champion-synthesized predictions (scanner_predictor_direct only —
-    # empty dict otherwise) in AFTER the real GBM load above so injected rows
-    # for synthesized tickers are visible to the coverage assert below without
-    # being clobbered by (or clobbering) the real predictor's own predictions.
+    # Merge champion-synthesized predictions (scanner_predictor_direct or
+    # thinktank_coverage — empty dict on agentic/pre-bootstrap) in AFTER the
+    # real GBM load above so injected rows for synthesized tickers are
+    # visible to the coverage assert below without being clobbered by (or
+    # clobbering) the real predictor's own predictions.
     if _champion_injected_predictions:
         predictions_by_ticker = {**predictions_by_ticker, **_champion_injected_predictions}
 
@@ -707,10 +712,10 @@ def _write_order_book_summary(
     older call site, or a run that errored before ``_read_signals``
     resolved the pointer). Sourced from ``signals_raw["champion"]`` /
     ``signals_raw["promotion_source"]``, which
-    ``executor.champion.apply_champion_selection`` stamps only on the
-    scanner_predictor_direct path; agentic runs leave both unset (None)
-    here rather than hardcoding "agentic" — the pointer read result is the
-    single source of truth for that label.
+    ``executor.champion.apply_champion_selection`` stamps on the
+    scanner_predictor_direct or thinktank_coverage paths; agentic runs
+    leave both unset (None) here rather than hardcoding "agentic" — the
+    pointer read result is the single source of truth for that label.
     """
     import boto3
 
