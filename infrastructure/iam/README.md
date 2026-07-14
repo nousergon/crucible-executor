@@ -83,11 +83,15 @@ absent ⇒ that axis is skipped for that role).
   granting `iam:ListRolePolicies` + `iam:GetRolePolicy` + `iam:GetRole` +
   `iam:ListAttachedRolePolicies` (the last two added 2026-06-09 for the
   trust/managed coverage axes) scoped to every codified role across
-  alpha-engine + alpha-engine-data + alpha-engine-predictor.
+  alpha-engine + alpha-engine-data + alpha-engine-predictor + (2026-07-14)
+  `alpha-engine-research-role`.
   Trust policy: `repo:nousergon/crucible-executor` + `repo:nousergon/nousergon-data`
   (main + pull_request); widened 2026-05-06 to support alpha-engine-data's
   drift-check workflow when the cross-cutting orchestration roles moved
-  to that repo.
+  to that repo; widened again 2026-07-14 to `repo:nousergon/nous-ergon-ops`
+  (config#2340 surface 1) so that private ops repo's own drift-check
+  workflow for `alpha-engine-research-role` can assume this same OIDC role
+  read-only, rather than standing up a second one.
 
 ## Roles owned elsewhere
 

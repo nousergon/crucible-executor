@@ -14,7 +14,8 @@
                 "StringLike": {
                     "token.actions.githubusercontent.com:sub": [
                         "repo:nousergon/crucible-executor:*",
-                        "repo:nousergon/nousergon-data:*"
+                        "repo:nousergon/nousergon-data:*",
+                        "repo:nousergon/nous-ergon-ops:*"
                     ]
                 }
             }
