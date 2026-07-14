@@ -1065,6 +1065,11 @@ def decide_entries(
         plan.entries_with_meta.append({
             "ticker": ticker,
             "signal": "ENTER",
+            # sizing_source feeds OrderBook.add_entry's entry_id (config#2436)
+            # — distinguishes this legacy-decider decision from a
+            # portfolio-optimizer / intraday-redeploy decision on the same
+            # ticker the same day, so neither silently dedups the other.
+            "sizing_source": "legacy_decider",
             "signal_date": signals_date,
             "prediction_date": predictions_date,
             "shares": sizing["shares"],
