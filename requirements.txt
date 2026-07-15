@@ -16,7 +16,7 @@ pyarrow~=23.0
 # executor and predictor agree on the ATR definition. See executor/price_cache.py
 # load_atr_14_pct. Version range kept loose to avoid pinning pain with the
 # predictor/backtester venvs which share the same S3-backed store.
-arcticdb~=6.12
+arcticdb~=6.18
 # anthropic SDK removed 2026-05-25 — executor has no LLM exposure per
 # [[preference_llm_calls_confined_to_research_module]] hard guardrail.
 # The 10-week EOD-narrative Haiku call site that motivated this dep was
@@ -27,7 +27,7 @@ exchange-calendars~=4.5
 requests~=2.32
 # Real-time polygon.io WebSocket price feed (config#913) — used only when
 # EXECUTOR_PRICE_SOURCE=polygon_ws; the default IB-delayed path doesn't need it.
-websocket-client~=1.8
+websocket-client~=1.9
 # alpha-engine-lib provides setup_logging + BasePreflight. Executor passes
 # exclude_patterns=[r"Error 10197", r"Error 10349"] to suppress benign IB
 # Gateway noise (10197 = iOS app steals live-data session, 10349 = TIF
@@ -79,7 +79,7 @@ nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergo
 # FlowDoctor.last_dispatch_reason()/last_dispatched(), the real per-call
 # dispatch outcome that executor/notifier.py checks instead of trusting a
 # non-None notify_event() report id) — no version bump needed on this line.
-krepis>=0.10.2
+krepis>=0.13.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
