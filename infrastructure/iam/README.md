@@ -82,9 +82,11 @@ absent ⇒ that axis is skipped for that role).
   "Split-tracking reconciliation" below) `alpha-engine-dashboard-passrole-executor`,
   `alpha-engine-dashboard-daily-news-write`, `alpha-engine-dashboard-fleet-liveness`,
   `alpha-engine-dashboard-morning-signal-schedule`, `alpha-engine-dashboard-spot-dispatch`,
-  `alpha-engine-dashboard-metron-sft-putobject`,
+  `alpha-engine-dashboard-metron-sft-putobject` (not yet applied),
   `alpha-engine-dashboard-changelog-quarantine-writeback` (not yet applied),
-  `alpha-engine-dashboard-ssm-logs-write` (not yet applied).
+  `alpha-engine-dashboard-ssm-logs-write` (not yet applied), plus
+  `vires-secrets-s3-read` (pulled live via `aws iam get-role-policy` and
+  codified 2026-07-15 — see "Split-tracking reconciliation" below).
 
 ### Split-tracking reconciliation (2026-07-14, config#2340 surface 5)
 
@@ -100,16 +102,27 @@ live in the 2026-07-14 09:30 UTC scheduled run: **7 drift findings** —
 `spot-dispatch`, and the passrole grant under its *actual* live name
 `alpha-engine-dashboard-passrole-executor`, which this repo had codified
 under the wrong name `alpha-engine-passrole-executor` — hence that name
-showing as "codified but not on AWS" in the same run), plus one still
-genuinely unexplained: **`vires-secrets-s3-read`**, live on this role,
-codified NOWHERE (not here, not in `alpha-engine-config`) — likely an
-undocumented manual grant for the Vires secrets bucket; needs an operator
+showing as "codified but not on AWS" in the same run), plus one genuinely
+unexplained: `vires-secrets-s3-read`, live on this role, codified NOWHERE
+(not here, not in `alpha-engine-config`) — likely an undocumented manual
+grant for the Vires secrets bucket. Content for the other 8 was verified
+byte-identical (modulo formatting) to what's already live before copying,
+per `alpha-engine-config`'s own "Live state: applied" provenance notes.
+
+**`vires-secrets-s3-read` closed 2026-07-15:** pulled live with
 `aws iam get-role-policy --role-name alpha-engine-dashboard-role
---policy-name vires-secrets-s3-read` capture into a tracked file (this
-runner holds no AWS credentials to fetch it). Content for the other 8 was
-verified byte-identical (modulo formatting) to what's already live before
-copying, per `alpha-engine-config`'s own "Live state: applied" provenance
-notes.
+--policy-name vires-secrets-s3-read` (an operator ran this with real AWS
+creds — the CI runner still holds none) and codified byte-identical as
+`alpha-engine-dashboard-role/vires-secrets-s3-read.json` — two statements,
+`s3:GetObject` on `arn:aws:s3:::vires-secrets/*` and `s3:ListBucket` on
+`arn:aws:s3:::vires-secrets`. Re-ran `check-drift.py --role
+alpha-engine-dashboard-role` locally against live AWS afterward: the
+`vires-secrets-s3-read` finding is gone, leaving exactly the 3 expected
+apply.sh-pending residuals (`alpha-engine-dashboard-changelog-quarantine-writeback`,
+`alpha-engine-dashboard-metron-sft-putobject`,
+`alpha-engine-dashboard-ssm-logs-write` — all "codified but not on AWS",
+i.e. this PR's own not-yet-applied additions, expected until `apply.sh`
+is run post-merge).
 
 Going forward: `alpha-engine-dashboard-role` (and any other role this repo
 already tracks) should be codified **here**, not in `alpha-engine-config` —
