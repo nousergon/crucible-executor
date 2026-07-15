@@ -24,6 +24,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from executor.champion import (
+    CHALLENGER_SELECTION_LATEST_KEY,
     CHAMPION_POINTER_KEY,
     RESEARCH_FREE_PARQUET_KEY,
     ChampionPointerError,
@@ -68,6 +69,49 @@ def _parquet_bytes(rows: list[dict]) -> bytes:
     buf = io.BytesIO()
     df.to_parquet(buf)
     return buf.getvalue()
+
+
+def _challenger_selection_bytes(
+    trading_day: str = "2026-07-10",
+    n: int = 5,
+    coverage_complete: bool = True,
+    uncovered_count: int = 0,
+    presorted: bool = True,
+    row_overrides: list[dict] | None = None,
+) -> bytes:
+    """Build a ChallengerSelection-shaped JSON payload (thinktank/
+    challenger_selection/latest.json, crucible-research PR#427). Ratings
+    descend by ticker index so rank order is deterministic; ``presorted``
+    lets a test deliberately scramble the order to exercise the defensive
+    re-sort in ``_apply_thinktank_coverage``."""
+    rows = [
+        {
+            "ticker": f"TKR{i:03d}",
+            "rating": 90 - i * 5,
+            "stance": "attractive",
+            "conviction": 70,
+            "thesis_version": 1,
+            "attractiveness_rank": i + 1,
+        }
+        for i in range(n)
+    ]
+    if row_overrides is not None:
+        rows = row_overrides
+    if not presorted:
+        rows = list(reversed(rows))
+    payload = {
+        "schema_version": 1,
+        "arm": "thinktank_coverage",
+        "trading_day": trading_day,
+        "calendar_date": trading_day,
+        "run_id": "run-test-1",
+        "mode": "daily",
+        "board_date": trading_day,
+        "coverage_complete": coverage_complete,
+        "uncovered_count": uncovered_count,
+        "selections": rows,
+    }
+    return json.dumps(payload).encode()
 
 
 def _cohort_rows(date: str, n: int = 5) -> list[dict]:
@@ -136,6 +180,11 @@ class TestLoadChampionPointer:
         s3 = _FakeS3({CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct")})
         pointer = load_champion_pointer("test-bucket", s3_client=s3)
         assert pointer["champion"] == "scanner_predictor_direct"
+
+    def test_valid_thinktank_coverage_pointer_reads_through(self):
+        s3 = _FakeS3({CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage")})
+        pointer = load_champion_pointer("test-bucket", s3_client=s3)
+        assert pointer["champion"] == "thinktank_coverage"
 
 
 # ── apply_champion_selection: agentic passthrough ───────────────────────
@@ -381,6 +430,296 @@ class TestScannerPredictorDirect:
         assert out_signals["promotion_source"] == "manual_test"
 
 
+# ── apply_champion_selection: thinktank_coverage ────────────────────────
+
+
+class TestThinktankCoverage:
+    def _s3(self, **kwargs):
+        return _FakeS3({
+            CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
+            CHALLENGER_SELECTION_LATEST_KEY: _challenger_selection_bytes(**kwargs),
+        })
+
+    def test_synthesized_entries_route_to_enter(self):
+        signals_raw = {
+            "date": "2026-07-13",
+            "buy_candidates": [],  # empty → falls back to champion_top_n_default
+            "universe": [{"ticker": "HOLDX", "signal": "HOLD", "sector": "Technology"}],
+        }
+        s3 = self._s3(trading_day="2026-07-10", n=3)
+
+        out_signals, out_preds = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=_CONFIG, sector_map={"TKR000": "Technology"}, s3_client=s3,
+        )
+
+        actionable = get_actionable_signals(out_signals)
+        entered_tickers = {s["ticker"] for s in actionable["enter"]}
+        assert entered_tickers == {"TKR000", "TKR001", "TKR002"}
+        for s in actionable["enter"]:
+            assert s["signal"] == "ENTER"
+            assert s["champion_arm"] == "thinktank_coverage"
+
+    def test_coverage_assert_passes_with_injected_predictions(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=4)
+
+        out_signals, out_preds = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=_CONFIG, sector_map={}, s3_client=s3,
+        )
+
+        # Must not raise — every synthesized buy_candidate has a prediction row.
+        assert_predictions_cover_buy_candidates(out_signals, out_preds)
+
+        for pred in out_preds.values():
+            assert pred["prediction_confidence"] == 0.0
+            assert pred["thinktank_coverage"] is True
+            # Deliberately None — no fabricated numeric alpha for a
+            # subjective 0-100 rating (see _apply_thinktank_coverage docstring).
+            assert pred["predicted_alpha"] is None
+            assert pred["predicted_direction"] is None
+
+    def test_universe_left_untouched(self):
+        held = [{"ticker": "HOLDX", "signal": "HOLD", "sector": "Technology"}]
+        signals_raw = {
+            "date": "2026-07-13",
+            "buy_candidates": [{"ticker": "OLD1", "signal": "ENTER", "sector": "Technology"}],
+            "universe": held,
+        }
+        s3 = self._s3(n=1)
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=_CONFIG, sector_map={}, s3_client=s3,
+        )
+
+        assert out_signals["universe"] == held
+        assert out_signals["universe"] is signals_raw["universe"]
+
+    def test_count_match_honored_against_nonempty_buy_candidates(self):
+        signals_raw = {
+            "date": "2026-07-13",
+            "buy_candidates": [
+                {"ticker": "OLD1", "signal": "ENTER", "sector": "Technology"},
+                {"ticker": "OLD2", "signal": "ENTER", "sector": "Technology"},
+            ],
+            "universe": [],
+        }
+        s3 = self._s3(n=5)  # selection has 5, but only 2 buy_candidates → N=2
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=_CONFIG, sector_map={}, s3_client=s3,
+        )
+        assert len(out_signals["buy_candidates"]) == 2
+
+    def test_empty_buy_candidates_uses_top_n_default(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=5)
+        cfg = dict(_CONFIG, champion_top_n_default=3)
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=cfg, sector_map={}, s3_client=s3,
+        )
+        assert len(out_signals["buy_candidates"]) == 3
+
+    def test_n_exceeding_selection_size_returns_all_available(self):
+        """Count parity mirrors the scanner arm's pandas .head(n) semantics:
+        requesting more than the selection has just returns what's there,
+        never an error."""
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=3)
+        cfg = dict(_CONFIG, champion_top_n_default=50)
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=cfg, sector_map={}, s3_client=s3,
+        )
+        assert len(out_signals["buy_candidates"]) == 3
+
+    def test_stale_trading_day_raises(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        # trading_day is 20 days before run_date; max allowed is 8.
+        s3 = self._s3(trading_day="2026-06-23", n=3)
+
+        with pytest.raises(StaleChampionFeedError):
+            apply_champion_selection(
+                signals_raw, {},
+                bucket="test-bucket", run_date="2026-07-13",
+                config=_CONFIG, sector_map={}, s3_client=s3,
+            )
+
+    def test_trading_day_within_freshness_window_does_not_raise(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        # exactly 8 days old — boundary, should be allowed (<=).
+        s3 = self._s3(trading_day="2026-07-05", n=2)
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=_CONFIG, sector_map={}, s3_client=s3,
+        )
+        assert len(out_signals["buy_candidates"]) == 2
+
+    def test_coverage_incomplete_raises(self):
+        """Brian's ruling (config#1580): coverage_complete=False must never
+        trade — same hard-fail loudness as a missing artifact, no fallback
+        to raw signals.json candidates."""
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=5, coverage_complete=False, uncovered_count=7)
+
+        with pytest.raises(ChampionPointerError, match="coverage_complete"):
+            apply_champion_selection(
+                signals_raw, {},
+                bucket="test-bucket", run_date="2026-07-13",
+                config=_CONFIG, sector_map={}, s3_client=s3,
+            )
+
+    def test_missing_artifact_raises(self):
+        """Mirrors the scanner arm's missing-parquet convention exactly:
+        missing challenger-selection artifact → ChampionPointerError, no
+        silent fallback to agentic candidates."""
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = _FakeS3({CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage")})
+
+        with pytest.raises(ChampionPointerError):
+            apply_champion_selection(
+                signals_raw, {},
+                bucket="test-bucket", run_date="2026-07-13",
+                config=_CONFIG, sector_map={}, s3_client=s3,
+            )
+
+    def test_malformed_artifact_json_raises(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = _FakeS3({
+            CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
+            CHALLENGER_SELECTION_LATEST_KEY: b"{not valid json",
+        })
+
+        with pytest.raises(ChampionPointerError):
+            apply_champion_selection(
+                signals_raw, {},
+                bucket="test-bucket", run_date="2026-07-13",
+                config=_CONFIG, sector_map={}, s3_client=s3,
+            )
+
+    def test_missing_required_top_level_key_raises(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        bad_payload = json.dumps({"schema_version": 1, "selections": []}).encode()  # no trading_day/coverage_complete
+        s3 = _FakeS3({
+            CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
+            CHALLENGER_SELECTION_LATEST_KEY: bad_payload,
+        })
+
+        with pytest.raises(ChampionPointerError):
+            apply_champion_selection(
+                signals_raw, {},
+                bucket="test-bucket", run_date="2026-07-13",
+                config=_CONFIG, sector_map={}, s3_client=s3,
+            )
+
+    def test_missing_required_row_key_raises(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=1, row_overrides=[{"ticker": "TKR000"}])  # no rating
+
+        with pytest.raises(ChampionPointerError):
+            apply_champion_selection(
+                signals_raw, {},
+                bucket="test-bucket", run_date="2026-07-13",
+                config=_CONFIG, sector_map={}, s3_client=s3,
+            )
+
+    def test_empty_selections_raises(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=0)
+
+        with pytest.raises(ChampionPointerError):
+            apply_champion_selection(
+                signals_raw, {},
+                bucket="test-bucket", run_date="2026-07-13",
+                config=_CONFIG, sector_map={}, s3_client=s3,
+            )
+
+    def test_sector_map_applied_to_synthesized_entries(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=2)
+        sector_map = {"TKR000": "Health Care", "TKR001": "Financials"}
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=_CONFIG, sector_map=sector_map, s3_client=s3,
+        )
+        by_ticker = {e["ticker"]: e for e in out_signals["buy_candidates"]}
+        assert by_ticker["TKR000"]["sector"] == "Health Care"
+        assert by_ticker["TKR001"]["sector"] == "Financials"
+
+    def test_stamps_champion_and_promotion_source_on_signals_raw(self):
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=1)
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=_CONFIG, sector_map={}, s3_client=s3,
+        )
+        assert out_signals["champion"] == "thinktank_coverage"
+        assert out_signals["promotion_source"] == "manual_test"
+
+    def test_rank_to_score_monotonic_within_selection(self):
+        """Rating→score ordering preserved through decide_entries' score
+        gates, exactly mirroring the scanner arm's rank_fraction contract
+        but scoped to 'within the selection' (see module docstring: there
+        is no larger scored population available for this arm)."""
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=6)
+        cfg = dict(_CONFIG, champion_top_n_default=6)
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=cfg, sector_map={}, s3_client=s3,
+        )
+
+        entries = out_signals["buy_candidates"]
+        scores = [e["score"] for e in entries]
+        # _challenger_selection_bytes generates strictly descending rating by
+        # ticker index, so rank order == ticker order == score order.
+        assert scores == sorted(scores, reverse=True)
+        assert max(scores) <= _CONFIG["champion_score_ceiling"]
+        assert min(scores) >= _CONFIG["champion_score_floor"]
+        assert scores[0] == pytest.approx(_CONFIG["champion_score_ceiling"])
+
+    def test_rank_to_score_ordering_preserved_when_producer_order_is_scrambled(self):
+        """The producer sorts by rating before writing, but this module
+        defensively re-sorts rather than trusting that ordering (mirrors
+        the scanner arm's own defensive sort_values call) — scrambling the
+        input order must not change the resulting rank-based scores."""
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(n=6, presorted=False)
+        cfg = dict(_CONFIG, champion_top_n_default=6)
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw, {},
+            bucket="test-bucket", run_date="2026-07-13",
+            config=cfg, sector_map={}, s3_client=s3,
+        )
+
+        by_ticker = {e["ticker"]: e["score"] for e in out_signals["buy_candidates"]}
+        # TKR000 has the highest rating (90) regardless of input order —
+        # must land at the ceiling.
+        assert by_ticker["TKR000"] == pytest.approx(_CONFIG["champion_score_ceiling"])
+        assert by_ticker["TKR000"] > by_ticker["TKR005"]
+
+
 # ── Regression: _read_signals wiring stays a true no-op on agentic/absent ──
 
 
@@ -574,6 +913,51 @@ class TestReadSignalsChampionRegression:
         # Exactly one call from the champion adapter's own gated load (the
         # patch_unknown_sectors_with_constituents call below it is mocked
         # separately above and doesn't route through this same spy).
+        assert sector_map_calls == ["test-bucket"], (
+            f"expected exactly one sector-map fetch from the champion adapter "
+            f"path, got {sector_map_calls}"
+        )
+        assert signals_raw["buy_candidates"][0]["sector"] == "Technology"
+
+    def test_thinktank_coverage_loads_sector_map_exactly_once_for_champion(self, monkeypatch):
+        """Same wiring guarantee as the scanner arm, for thinktank_coverage
+        (config-I2518 / epic I2515): the challenger-selection artifact
+        carries no sector field, so this arm also needs the champion
+        adapter's own sector-map load."""
+        import executor.main as main_mod
+
+        sector_map_calls = []
+        monkeypatch.setattr(
+            "executor.signal_reader.filter_buy_candidates_to_universe",
+            lambda s, b: s,
+        )
+        monkeypatch.setattr(
+            "executor.eod_reconcile._load_constituents_sector_map",
+            lambda bucket: (sector_map_calls.append(bucket) or {"TKR000": "Technology"}),
+        )
+        monkeypatch.setattr(
+            "executor.signal_reader.patch_unknown_sectors_with_constituents",
+            lambda signals_raw, bucket: 0,
+        )
+        monkeypatch.setattr(
+            "executor.signal_reader.read_predictions",
+            lambda bucket: ({}, "2026-04-24"),
+        )
+        s3 = _FakeS3({
+            CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
+            CHALLENGER_SELECTION_LATEST_KEY: _challenger_selection_bytes(trading_day="2026-04-24", n=1),
+        })
+        monkeypatch.setattr("boto3.client", lambda *a, **kw: s3)
+
+        signals_raw, *_rest = main_mod._read_signals(
+            config={"signals_bucket": "test-bucket", "coverage_admission_enabled": False},
+            signals_bucket="test-bucket",
+            run_date="2026-04-25",
+            simulate=False,
+            signals_override=self._minimal_signals_override(),
+            conn=None,
+        )
+
         assert sector_map_calls == ["test-bucket"], (
             f"expected exactly one sector-map fetch from the champion adapter "
             f"path, got {sector_map_calls}"
