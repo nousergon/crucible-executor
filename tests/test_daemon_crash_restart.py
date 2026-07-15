@@ -1,11 +1,17 @@
-"""Crash-restart double-BUY prevention (config#2328).
+"""Crash-restart double-BUY prevention (config#2328), revised config#2436.
 
 Covers the three defense layers that stop a daemon restarted between an IB
 fill and the order-book save from re-placing the same ENTER:
 
   1. Write-ahead ``executing`` status on the order book (order_book WAL).
   2. Startup seeding of the already-traded set from durable state.
-  3. Pre-BUY broker-truth duplicate guard, symmetric to the SELL cap.
+  3. Pre-BUY broker-truth duplicate guard: refuses a working BUY already at
+     the broker (a live order race). It no longer refuses on bare
+     ``held_shares > 0`` (config#2436) — an existing position is equally
+     consistent with a legitimate portfolio-optimizer top-up of an
+     already-held ticker, so it is not evidence of a duplicate order; layers
+     1+2 (plus ``OrderBook.merge_executed``) already durably answer "was
+     THIS entry already executed today" before this guard ever runs.
 
 plus the startup reconciliation that resolves in-doubt ``executing`` entries.
 """
@@ -18,7 +24,7 @@ from executor.daemon import (
     _reconcile_executing_entries,
 )
 from executor.order_book import OrderBook, _current_session_date, _default_book
-from executor.trade_logger import init_db, get_executed_entry_tickers
+from executor.trade_logger import init_db, get_executed_entry_tickers, get_executed_entry_ids
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -97,11 +103,11 @@ class TestOrderBookExecutingWAL:
 
 
 class TestExecutedEntrySeeding:
-    def _insert_trade(self, conn, ticker, action, date="2026-07-11"):
+    def _insert_trade(self, conn, ticker, action, date="2026-07-11", entry_id=None):
         conn.execute(
-            "INSERT INTO trades (trade_id, date, ticker, action, shares, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (f"{ticker}-{action}-{date}", date, ticker, action, 100, "2026-07-11T10:00:00"),
+            "INSERT INTO trades (trade_id, date, ticker, action, shares, entry_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (f"{ticker}-{action}-{date}", date, ticker, action, 100, entry_id, "2026-07-11T10:00:00"),
         )
         conn.commit()
 
@@ -117,6 +123,28 @@ class TestExecutedEntrySeeding:
         conn = init_db(str(tmp_path / "trades.db"))
         assert get_executed_entry_tickers(conn, "2026-07-11") == set()
 
+    def test_get_executed_entry_ids_keys_on_entry_id_not_ticker(self, tmp_path):
+        """config#2436: two distinct decisions on the same ticker/day (a
+        legacy entry already executed, an optimizer top-up not yet) must be
+        distinguishable — bare-ticker seeding can't tell them apart."""
+        conn = init_db(str(tmp_path / "trades.db"))
+        self._insert_trade(
+            conn, "AMD", "ENTER", entry_id="AMD:2026-07-11:legacy_decider",
+        )
+        assert get_executed_entry_ids(conn, "2026-07-11") == {
+            "AMD:2026-07-11:legacy_decider",
+        }
+        # A same-ticker, same-day optimizer top-up is a DIFFERENT entry_id —
+        # not seeded as already-executed just because the legacy one is.
+        assert "AMD:2026-07-11:portfolio_optimizer" not in get_executed_entry_ids(
+            conn, "2026-07-11",
+        )
+
+    def test_get_executed_entry_ids_empty_when_null(self, tmp_path):
+        conn = init_db(str(tmp_path / "trades.db"))
+        self._insert_trade(conn, "AAPL", "ENTER")  # entry_id=None (legacy row)
+        assert get_executed_entry_ids(conn, "2026-07-11") == set()
+
 
 # ── Layer 3: pre-BUY broker-truth duplicate guard ────────────────────────
 
@@ -126,20 +154,26 @@ class TestValidateBuyNotDuplicate:
         ibkr = _mock_ibkr(positions={}, open_buy=0)
         assert _validate_buy_not_duplicate(ibkr, "AAPL", "daemon_entry") is True
 
-    def test_skips_when_already_holding(self):
+    def test_allows_top_up_when_already_holding_no_working_order(self):
+        """config#2436: a held position is NOT evidence of a duplicate order
+        — it's equally consistent with a legitimate portfolio-optimizer
+        top-up (e.g. AMD 2026-07-13). The guard must not block on this
+        alone; "already executed today" dedup is the order-book WAL's job
+        (TestExecutedEntrySeeding / merge_executed), not this broker check."""
         ibkr = _mock_ibkr(positions={"AAPL": {"shares": 100}}, open_buy=0)
-        assert _validate_buy_not_duplicate(ibkr, "AAPL", "daemon_entry") is False
+        assert _validate_buy_not_duplicate(ibkr, "AAPL", "daemon_entry") is True
 
     def test_skips_when_working_buy_exists(self):
         ibkr = _mock_ibkr(positions={}, open_buy=100)
         assert _validate_buy_not_duplicate(ibkr, "AAPL", "daemon_entry") is False
 
-    def test_fails_closed_on_position_read_error(self):
-        ibkr = _mock_ibkr(positions_raises=True)
+    def test_skips_when_working_buy_exists_even_if_flat(self):
+        """The working-order check is independent of position state."""
+        ibkr = _mock_ibkr(positions={"AAPL": {"shares": 100}}, open_buy=50)
         assert _validate_buy_not_duplicate(ibkr, "AAPL", "daemon_entry") is False
 
     def test_fails_closed_on_open_order_read_error(self):
-        ibkr = _mock_ibkr(positions={}, open_buy_raises=True)
+        ibkr = _mock_ibkr(open_buy_raises=True)
         assert _validate_buy_not_duplicate(ibkr, "AAPL", "daemon_entry") is False
 
 

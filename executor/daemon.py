@@ -271,24 +271,39 @@ def _validate_buy_not_duplicate(
     ticker: str,
     context: str,
 ) -> bool:
-    """Broker-truth backstop against a crash-restart double BUY (config#2328).
+    """Broker-truth backstop against a duplicate in-flight BUY (config#2328,
+    revised config#2436).
 
-    Symmetric to ``_validate_sell_shares``: before placing an ENTER, confirm
-    the broker does not already show a position or a working BUY for this
-    ticker. Returns True if it is safe to place the BUY, False to SKIP it.
+    Refuses the ENTER only if the broker already shows a WORKING BUY order
+    for this ticker — a live order race, e.g. a manual/duplicate submission
+    still in flight at IB. Returns True if it is safe to place the BUY,
+    False to SKIP it.
 
-    The daemon holds at most one position per ticker and its intraday entries
-    are for currently-unheld names, so an existing position or working BUY at
-    this point means the entry already executed (the exact double-buy this
-    guards) — refuse the duplicate.
+    Revised config#2436: this guard USED TO also refuse whenever the broker
+    showed ANY existing position (``held_shares > 0``), on the assumption
+    that the daemon's intraday entries are always for currently-unheld
+    names. That assumption broke when the portfolio-optimizer path started
+    proposing legitimate top-ups of already-held positions (target-weight
+    increase on a held ticker) and the intraday redeploy solver — both
+    build a normal ENTER for a ticker the broker already shows shares for.
+    "Already holding shares" is not evidence "this entry's order was
+    already submitted" — it's equally consistent with a legitimate top-up.
+    The real question, "was THIS entry already executed today," is
+    answered precisely and durably (survives a full order-book loss) by
+    the config#2328 WAL — ``OrderBook`` pending/executing state plus
+    ``executed_tickers`` reseeded from ``executed_today`` /
+    ``executing_entries`` / trades.db — which ``merge_executed`` applies to
+    strip any already-executed ticker's entry from the book BEFORE it ever
+    reaches this function. Re-deriving that answer from bare position count
+    here was both redundant with that WAL and wrong for the top-up case
+    (2026-07-13, AMD BUY skipped despite being a legitimate rebalance).
 
     FAIL-CLOSED: if broker state cannot be read (IB API error), SKIP the buy.
     A blocked entry is recoverable on the next tick / next planner run; a
-    double position is real capital at risk. (Same asymmetry that makes the
+    double order is real capital at risk. (Same asymmetry that makes the
     sell guard cap rather than trust the in-memory view.)
     """
     try:
-        positions = ibkr.get_positions()
         working_buy = ibkr.get_open_buy_shares(ticker)
     except Exception as e:  # noqa: BLE001 — any broker read failure fails closed
         logger.error(
@@ -298,17 +313,6 @@ def _validate_buy_not_duplicate(
         send_daemon_status(
             f"⚠️ *BUY {ticker} SKIPPED*: broker state unreadable — "
             f"failing closed (config#2328)"
-        )
-        return False
-    held = int(positions.get(ticker, {}).get("shares", 0))
-    if held > 0:
-        logger.warning(
-            "SKIP %s BUY %s: already hold %d shares — refusing duplicate entry",
-            context, ticker, held,
-        )
-        send_daemon_status(
-            f"⚠️ *BUY {ticker} SKIPPED*: already hold {held} shares "
-            f"(dup-entry guard, config#2328)"
         )
         return False
     if working_buy > 0:
@@ -2004,11 +2008,12 @@ def _execute_entry(
     if dry_run:
         return
 
-    # Broker-truth pre-BUY duplicate guard (config#2328). Symmetric to the
-    # SELL side's held-minus-in-flight cap: refuse the ENTER if the broker
-    # already shows a position or a working BUY for this ticker \u2014 the
-    # authoritative backstop against a crash-restart re-placing a BUY the
-    # pre-crash process already sent. Fails CLOSED on any broker read error.
+    # Broker-truth pre-BUY duplicate guard (config#2328, revised config#2436):
+    # refuse the ENTER only if the broker already shows a WORKING BUY for
+    # this ticker (a live order race). "Already executed today" is answered
+    # by the entry_id-keyed order-book WAL + merge_executed, not by broker
+    # position count \u2014 a held position is equally consistent with a
+    # legitimate top-up. Fails CLOSED on any broker read error.
     if not _validate_buy_not_duplicate(ibkr, ticker, context="daemon_entry"):
         return
 
@@ -2157,6 +2162,10 @@ def _execute_entry(
         # these fields yet — exit_manager falls through to baseline behavior.
         "stance": entry.get("stance"),
         "catalyst_date": entry.get("catalyst_date"),
+        # Per-decision idempotency key (config#2436) — ticker + session date
+        # + sizing_source, stamped by OrderBook.add_entry. Durably records
+        # which exact decision executed, distinct from bare ticker.
+        "entry_id": entry.get("entry_id"),
     })
 
     # Mark entry as executed in order book

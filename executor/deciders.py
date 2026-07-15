@@ -1065,6 +1065,11 @@ def decide_entries(
         plan.entries_with_meta.append({
             "ticker": ticker,
             "signal": "ENTER",
+            # sizing_source feeds OrderBook.add_entry's entry_id (config#2436)
+            # — distinguishes this legacy-decider decision from a
+            # portfolio-optimizer / intraday-redeploy decision on the same
+            # ticker the same day, so neither silently dedups the other.
+            "sizing_source": "legacy_decider",
             "signal_date": signals_date,
             "prediction_date": predictions_date,
             "shares": sizing["shares"],
@@ -1092,12 +1097,14 @@ def decide_entries(
             "predicted_direction": pred.get("predicted_direction"),
             "prediction_confidence": pred.get("prediction_confidence"),
             "predicted_alpha": pred.get("predicted_alpha"),
-            # Champion-promotion attribution (config#2364 / config#2366):
+            # Champion-promotion attribution (config#2364 / config#2366;
+            # thinktank_coverage arm added config-I2518 / epic I2515):
             # present only on entries synthesized by the
-            # scanner_predictor_direct candidate-source adapter
-            # (executor.champion.apply_champion_selection) — None for
-            # agentic-sourced entries. Denormalized onto the OrderBook entry
-            # so trades are attributable to the arm that selected them.
+            # executor.champion.apply_champion_selection candidate-source
+            # adapter (scanner_predictor_direct or thinktank_coverage) —
+            # None for agentic-sourced entries. Denormalized onto the
+            # OrderBook entry so trades are attributable to the arm that
+            # selected them.
             "champion_arm": sig.get("champion_arm"),
             # Stance taxonomy arc (2026-05-11) — denormalize predictor's
             # stance + catalyst_date onto the OrderBook entry so the daemon
