@@ -92,4 +92,4 @@ krepis>=0.10.2
 # pyarrow / pandas stack already pinned in this repo. Drop the upper bounds
 # only when the rest of the requirements graph moves to numpy 2.
 cvxpy>=1.4,<1.8
-scikit-learn>=1.3,<1.6
+scikit-learn>=1.9.0,<1.10
