@@ -9,7 +9,7 @@ setuptools>=83.0.0
 yfinance~=0.2.54
 numpy<2
 pandas~=2.2
-pyarrow~=23.0
+pyarrow~=25.0
 # arcticdb: reads atr_14_pct from the universe library at morning planner time.
 # Single source of truth for ATR across the executor — pullback trigger scaling,
 # position sizing, and trailing stops all consume the feature-store value so
@@ -24,7 +24,7 @@ arcticdb~=6.18
 # LLM-synthesized output, the call goes in research and produces a
 # frozen artifact executor reads.
 exchange-calendars~=4.5
-requests~=2.32
+requests~=2.34
 # Real-time polygon.io WebSocket price feed (config#913) — used only when
 # EXECUTOR_PRICE_SOURCE=polygon_ws; the default IB-delayed path doesn't need it.
 websocket-client~=1.9
