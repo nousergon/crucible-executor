@@ -145,14 +145,17 @@ for repo in "${REPOS[@]}"; do
         NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
         log "OK   $repo — $(git log --oneline -1)"
 
-        # Deploy gate: syntax check only (no IB Gateway connection needed)
+        # Deploy gate: import smoke test (catches syntax + transitive ImportErrors;
+        # no IB Gateway connection needed). Imports pull the full transitive module
+        # graph, so a broken dependency in any executor module surfaces here pre-
+        # planner, not at runtime.
         if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
             if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
-                log "GATE $repo — running syntax validation..."
-                if .venv/bin/python -c "import ast; ast.parse(open('executor/main.py').read()); ast.parse(open('executor/daemon.py').read()); ast.parse(open('executor/eod_reconcile.py').read())" >> "$LOG" 2>&1; then
-                    log "OK   $repo — syntax check passed"
+                log "GATE $repo — running import smoke test..."
+                if .venv/bin/python -c "import executor.main, executor.daemon, executor.eod_reconcile" >> "$LOG" 2>&1; then
+                    log "OK   $repo — import smoke test passed"
                 else
-                    log "FAIL $repo — syntax check failed, rolling back to $PREV_SHA"
+                    log "FAIL $repo — import smoke test failed, rolling back to $PREV_SHA"
                     git reset --hard "$PREV_SHA" >> "$LOG" 2>&1
                     log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
                 fi
@@ -188,26 +191,110 @@ done
 # This restores trades_latest.db from S3 as a safety net.
 RISK_YAML="/home/ec2-user/alpha-engine/config/risk.yaml"
 if [ -f "$RISK_YAML" ]; then
-    # Parse db_path and trades_bucket from risk.yaml
-    DB_PATH=$(grep -E '^\s*db_path:' "$RISK_YAML" | head -1 | sed 's/.*db_path:\s*["]*\([^"]*\)["]*\s*/\1/' | tr -d "'\"")
-    TRADES_BUCKET=$(grep -E '^\s*trades_bucket:' "$RISK_YAML" | head -1 | sed 's/.*trades_bucket:\s*["]*\([^"]*\)["]*\s*/\1/' | tr -d "'\"")
+    # Parse db_path and trades_bucket from risk.yaml. `\s` is a GNU-sed-only
+    # shorthand — the deploy target (Amazon Linux EC2) and CI (ubuntu-latest)
+    # both use GNU sed so this masked the bug there, but BSD sed (macOS, every
+    # local dev machine) treats `\s` as a literal "s", leaving a stray leading
+    # space/trailing quote in the parsed value. `[[:space:]]` is the POSIX
+    # class both sed implementations support identically.
+    DB_PATH=$(grep -E '^\s*db_path:' "$RISK_YAML" | head -1 | sed 's/.*db_path:[[:space:]]*["]*\([^"]*\)["]*[[:space:]]*/\1/' | tr -d "'\"")
+    TRADES_BUCKET=$(grep -E '^\s*trades_bucket:' "$RISK_YAML" | head -1 | sed 's/.*trades_bucket:[[:space:]]*["]*\([^"]*\)["]*[[:space:]]*/\1/' | tr -d "'\"")
 
     if [ -n "$DB_PATH" ] && [ -n "$TRADES_BUCKET" ]; then
-        # Restore if db doesn't exist or is ≤ 20KB (empty schema only)
-        DB_SIZE=0
-        [ -f "$DB_PATH" ] && DB_SIZE=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
+        S3_KEY="trades/trades_latest.db"
+        RESTORE_NEEDED=false
 
-        if [ "$DB_SIZE" -le 20480 ]; then
-            S3_KEY="trades/trades_latest.db"
-            log "trades.db missing or empty (${DB_SIZE}B) — restoring from s3://${TRADES_BUCKET}/${S3_KEY}"
+        if [ ! -f "$DB_PATH" ]; then
+            log "trades.db missing — restoring from s3://${TRADES_BUCKET}/${S3_KEY}"
+            RESTORE_NEEDED=true
+        else
+            DB_SIZE=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
+            if [ "$DB_SIZE" -le 20480 ]; then
+                log "trades.db empty or minimal (${DB_SIZE}B) — restoring from S3"
+                RESTORE_NEEDED=true
+            else
+                # Check for staleness: compare local max(eod_pnl.date) against the
+                # expected most-recent trading day, not just presence of any row.
+                #
+                # config#2356: the presence-only check ("does eod_pnl have ANY
+                # row") cannot catch a snapshot-restored stale-but-large DB — a
+                # box restored from a 3-week-old EBS snapshot has plenty of
+                # non-null eod_pnl rows (just old ones) and would incorrectly
+                # report "has recent data". Compute the expected floor date via
+                # nousergon_lib.trading_calendar (same helper executor/main.py's
+                # ArcticDB freshness gate and executor/eod_reconcile.py use) and
+                # require LOCAL_MAX_DATE to be within 1 trading day of the last
+                # closed session — that tolerance absorbs the case where today's
+                # EOD ingestion simply hasn't run yet, without masking a
+                # genuinely stale restore (2+ trading days behind triggers
+                # restore).
+                #
+                # AE_VENV_PY must point at the alpha-engine venv set up earlier
+                # in THIS script (the .venv/bin/pip install -r requirements.txt
+                # step above, which runs before this block) so nousergon_lib is
+                # importable — mirrors the FD_VENV precedent below in this same
+                # file. Falls back to bare python3 (best-effort: sqlite parsing
+                # still works without nousergon_lib, only the recency half of
+                # the check is skipped) if the venv isn't present yet.
+                AE_VENV_PY="/home/ec2-user/alpha-engine/.venv/bin/python"
+                if [ ! -x "$AE_VENV_PY" ]; then
+                    AE_VENV_PY="python3"
+                fi
+
+                LOCAL_MAX_DATE=$("$AE_VENV_PY" - "$DB_PATH" <<'PYEOF' 2>/dev/null || echo ""
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+try:
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT MAX(date) FROM eod_pnl")
+    result = c.fetchone()
+    conn.close()
+    print(result[0] if result and result[0] else "")
+except Exception:
+    print("", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+)
+
+                if [ -z "$LOCAL_MAX_DATE" ]; then
+                    log "trades.db has no eod_pnl data — restoring from S3"
+                    RESTORE_NEEDED=true
+                else
+                    # Floor date: last_closed_trading_day() minus 1 trading day
+                    # of tolerance. LOCAL_MAX_DATE older than this floor means
+                    # the DB is missing at least 2 trading days of EOD data —
+                    # the "stale-but-large" snapshot-restore scenario.
+                    STALENESS_FLOOR=$("$AE_VENV_PY" <<'PYEOF' 2>/dev/null || echo ""
+try:
+    from nousergon_lib.trading_calendar import last_closed_trading_day, subtract_trading_days
+    print(subtract_trading_days(last_closed_trading_day(), 1).isoformat())
+except Exception:
+    print("")
+PYEOF
+)
+                    if [ -n "$STALENESS_FLOOR" ] && [ "$LOCAL_MAX_DATE" \< "$STALENESS_FLOOR" ]; then
+                        log "trades.db eod_pnl is stale (max_date=$LOCAL_MAX_DATE < floor=$STALENESS_FLOOR) — restoring from S3"
+                        RESTORE_NEEDED=true
+                    elif [ -z "$STALENESS_FLOOR" ]; then
+                        log "WARN could not compute staleness floor (nousergon_lib.trading_calendar unavailable) — falling back to presence-only check (max_date=$LOCAL_MAX_DATE)"
+                    else
+                        log "trades.db has recent data (max_date=$LOCAL_MAX_DATE, floor=$STALENESS_FLOOR) — no restore needed"
+                    fi
+                fi
+            fi
+        fi
+
+        if [ "$RESTORE_NEEDED" = "true" ]; then
             if aws s3 cp "s3://${TRADES_BUCKET}/${S3_KEY}" "$DB_PATH" >> "$LOG" 2>&1; then
                 NEW_SIZE=$(stat -c%s "$DB_PATH" 2>/dev/null || stat -f%z "$DB_PATH" 2>/dev/null || echo 0)
                 log "OK   trades.db restored (${NEW_SIZE}B)"
             else
                 log "WARN trades.db restore failed — executor will start with empty db"
+                exit 1
             fi
-        else
-            log "OK   trades.db exists (${DB_SIZE}B) — no restore needed"
         fi
     else
         log "WARN could not parse db_path/trades_bucket from risk.yaml"
@@ -224,27 +311,49 @@ fi
 # added in PR #62 sat on disk for days before this was noticed). After a
 # new .timer is copied and daemon-reload'd, it's enabled + started so the
 # next boot picks it up and the current boot activates it immediately.
-SYSTEMD_SRC="/home/ec2-user/alpha-engine/infrastructure/systemd"
-if [ -d "$SYSTEMD_SRC" ]; then
-    CHANGED=false
+#
+# sync_systemd_units_from() (config#2352): factored out so this same
+# install/update/orphan/enable-reconcile logic can run a SECOND pass against
+# nousergon-data's infrastructure/systemd/ below — that repo's
+# metron-intraday.{service,timer} were version-tracked but boot-pull never
+# looked at them, so a merged unit edit silently never took effect until an
+# operator remembered to re-run install-metron-intraday.sh over SSM
+# (2026-07-13 operator ruling: "queue on merge, apply on next boot" — THIS
+# boot-pull pass is that queue's drain point for the trading box, which is
+# off most of the day and can't reliably receive a merge-time SSM push).
+# $1: source dir holding *.service/*.timer. $2+: one or more glob prefixes
+# for orphan reconciliation (keeps each repo's orphan sweep scoped to units
+# IT owns — alpha-engine's sweep must never disable/remove a nousergon-data
+# unit or vice versa; multiple prefixes let one source dir cover unit
+# families that don't share a common prefix, e.g. nousergon-data ships both
+# "metron-intraday.*" and "systemd-unit-drift-check.*").
+sync_systemd_units_from() {
+    local SYSTEMD_SRC="$1"
+    shift
+    local ORPHAN_GLOB_PREFIXES=("$@")
+    [ -d "$SYSTEMD_SRC" ] || return 0
+
+    local CHANGED=false
     for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         [ -f "$unit" ] || continue
+        local name target
         name=$(basename "$unit")
         target="/etc/systemd/system/$name"
         if [ ! -f "$target" ]; then
             sudo cp "$unit" /etc/systemd/system/
-            log "OK   systemd: installed $name (new)"
+            log "OK   systemd: installed $name (new, src=$SYSTEMD_SRC)"
             CHANGED=true
         elif ! diff -q "$unit" "$target" >/dev/null 2>&1; then
             sudo cp "$unit" /etc/systemd/system/
-            log "OK   systemd: updated $name"
+            log "OK   systemd: updated $name (src=$SYSTEMD_SRC)"
             CHANGED=true
         fi
     done
-    # Orphan reconciliation: any /etc/systemd/system/alpha-engine-*.{service,timer}
-    # without a corresponding source in $SYSTEMD_SRC was removed from the
+    # Orphan reconciliation: any installed unit matching $ORPHAN_GLOB_PREFIX
+    # without a corresponding source in $SYSTEMD_SRC was removed from that
     # repo and must be retired here. Disable + remove. Safety: only matches
-    # `alpha-engine-*` prefix, never touches unrelated system units.
+    # the given prefix, never touches unrelated system units (including the
+    # OTHER repo's tracked units — each call site passes its own prefix).
     #
     # 2026-04-28: closes the asymmetry where adding a new timer was
     # self-healing (install/update/enable handled) but retiring one was
@@ -252,15 +361,18 @@ if [ -d "$SYSTEMD_SRC" ]; then
     # after deletion from the repo. After this pass, removing a unit
     # file from `infrastructure/systemd/` is the canonical retirement
     # path: next boot disables + deletes it.
-    for installed in /etc/systemd/system/alpha-engine-*.service /etc/systemd/system/alpha-engine-*.timer; do
-        [ -f "$installed" ] || continue  # glob may match nothing
-        name=$(basename "$installed")
-        if [ ! -f "$SYSTEMD_SRC/$name" ]; then
-            sudo systemctl disable --now "$name" >> "$LOG" 2>&1 || true
-            sudo rm -f "$installed"
-            log "OK   systemd: orphan removed $name (no longer in repo)"
-            CHANGED=true
-        fi
+    for prefix in "${ORPHAN_GLOB_PREFIXES[@]}"; do
+        for installed in /etc/systemd/system/${prefix}*.service /etc/systemd/system/${prefix}*.timer; do
+            [ -f "$installed" ] || continue  # glob may match nothing
+            local oname
+            oname=$(basename "$installed")
+            if [ ! -f "$SYSTEMD_SRC/$oname" ]; then
+                sudo systemctl disable --now "$oname" >> "$LOG" 2>&1 || true
+                sudo rm -f "$installed"
+                log "OK   systemd: orphan removed $oname (no longer in $SYSTEMD_SRC)"
+                CHANGED=true
+            fi
+        done
     done
 
     if $CHANGED; then
@@ -293,14 +405,26 @@ if [ -d "$SYSTEMD_SRC" ]; then
     # for timer-enable drift.
     for unit in "$SYSTEMD_SRC"/*.timer; do
         [ -f "$unit" ] || continue
-        name=$(basename "$unit")
-        if sudo systemctl enable --now "$name" >> "$LOG" 2>&1; then
-            log "OK   systemd: enable reconciled $name"
+        local tname
+        tname=$(basename "$unit")
+        if sudo systemctl enable --now "$tname" >> "$LOG" 2>&1; then
+            log "OK   systemd: enable reconciled $tname"
         else
-            log "WARN systemd: enable reconcile failed: $name"
+            log "WARN systemd: enable reconcile failed: $tname"
         fi
     done
-fi
+}
+
+sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "alpha-engine-"
+
+# nousergon-data's systemd units (metron-intraday.{service,timer} +
+# config#2352's own systemd-unit-drift-check.{service,timer}) — see
+# sync_systemd_units_from's comment above for why this second pass exists.
+# Two orphan prefixes since nousergon-data's unit names don't share a common
+# "alpha-engine-*"-style prefix: glob on the two exact basenames this repo
+# ships instead of a wildcard prefix, so a future unrelated unit hand-placed
+# on this box for debugging is never swept as an "orphan" of this repo.
+sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" "metron-intraday" "systemd-unit-drift-check"
 
 # Config files are now in the alpha-engine-config private repo (pulled above).
 # Each module's config loader searches ~/alpha-engine-config/ first.

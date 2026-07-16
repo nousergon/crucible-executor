@@ -31,8 +31,29 @@ absent ⇒ that axis is skipped for that role).
 ## Roles managed here
 
 - **`alpha-engine-executor-role`** — assumed by the **trading** EC2 instance
-  (`ae-trading`) only. 9 inline policies (trading-scoped: S3, SES, SNS,
-  CloudWatch, SSM read/send, EC2 spot, EOD Step Function). Trust policy
+  (`ae-trading`) AND, via the same `alpha-engine-executor-profile` instance
+  profile, the ephemeral groom-dispatch spot boxes (`groom_spot_bootstrap.sh`
+  — full groom runs and the standalone end-of-SF sweep box both launch under
+  this profile). 11 inline policies (trading-scoped: S3, SES, SNS,
+  CloudWatch, SSM read/send, EC2 spot, EOD Step Function; plus
+  `alpha-engine-stepfunctions-diagnose`, added 2026-07-13 — read-only
+  `states:ListExecutions`/`DescribeExecution`/`DescribeStateMachine` on the
+  three trading-pipeline state machines, so the groom sweep box's
+  deterministic `gate:*-sf` sweep (`gate_sf_run_sweep.py`, config#2397) can
+  check whether a named pipeline has succeeded since a gate was applied,
+  without a cross-role `AssumeRole` hop into the GHA-OIDC-only
+  `saturday-sf-watch-role`; plus `alpha-engine-flow-doctor-dynamodb`, added
+  2026-07-13 — `PutItem`/`GetItem`/`Query`/`Scan`/`DescribeTable` on the
+  shared `flow-doctor-store` table, mirroring the grant `alpha-engine-data-role`
+  already had (nousergon-data-PR790). Without it, the data-spot EC2 instance's
+  `weekly_collector.py` (which assumes this role, not `alpha-engine-data-role`,
+  despite running `alpha-engine-data` code) hard-crashed on
+  `flow_doctor.FlowDoctor.from_config()`'s `DynamoDBStorage.init_schema()`
+  whenever `FLOW_DOCTOR_ENABLED=1` forced strict mode — this took down the
+  entire `ne-postclose-trading-pipeline` EOD reconcile on 2026-07-13 (see
+  alpha-engine-config-I2465 for the deeper `krepis` strict-mode fix still
+  needed so a telemetry-backend hiccup can't crash the producer at all).
+  Trust policy
   (`ec2.amazonaws.com`) and managed attachment (`AmazonSSMManagedInstanceCore`)
   are codified via the reserved files. Until 2026-06-09 this role was also the
   instance profile for the dashboard box and carried dashboard/cyphering/mnemon

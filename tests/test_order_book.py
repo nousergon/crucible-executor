@@ -372,6 +372,46 @@ def test_load_keeps_weekend_book_on_monday(monkeypatch, tmp_path):
     assert loaded.data["approved_entries"][0]["ticker"] == "AAPL"
 
 
+# ── 20. entry_id dedup (config#2436) ─────────────────────────────────────
+
+
+def test_add_entry_stamps_entry_id():
+    book = OrderBook(_default_book(run_date="2026-07-13"))
+    book.add_entry({"ticker": "AMD", "shares": 10, "sizing_source": "portfolio_optimizer"})
+    entry = book.data["approved_entries"][0]
+    assert entry["entry_id"] == "AMD:2026-07-13:portfolio_optimizer"
+
+
+def test_add_entry_defaults_sizing_source_for_entry_id():
+    book = OrderBook(_default_book(run_date="2026-07-13"))
+    book.add_entry({"ticker": "AMD", "shares": 10})
+    assert book.data["approved_entries"][0]["entry_id"] == "AMD:2026-07-13:legacy_decider"
+
+
+def test_add_entry_dedups_literal_resubmission_of_same_decision():
+    """A regenerated identical decision (same ticker/day/sizing_source) is
+    still deduped — the crash-restart-rebuild case config#2328 protects."""
+    book = OrderBook(_default_book(run_date="2026-07-13"))
+    book.add_entry({"ticker": "AMD", "shares": 10, "sizing_source": "portfolio_optimizer"})
+    book.add_entry({"ticker": "AMD", "shares": 10, "sizing_source": "portfolio_optimizer"})
+    assert len(book.data["approved_entries"]) == 1
+
+
+def test_add_entry_keeps_distinct_decisions_same_ticker_same_day():
+    """A held-ticker top-up from the optimizer and a still-pending legacy
+    entry for the same ticker/day are DISTINCT decisions (different
+    sizing_source) — config#2436 must not silently drop either."""
+    book = OrderBook(_default_book(run_date="2026-07-13"))
+    book.add_entry({"ticker": "AMD", "shares": 10, "sizing_source": "legacy_decider"})
+    book.add_entry({"ticker": "AMD", "shares": 5, "sizing_source": "portfolio_optimizer"})
+    assert len(book.data["approved_entries"]) == 2
+    entry_ids = {e["entry_id"] for e in book.data["approved_entries"]}
+    assert entry_ids == {
+        "AMD:2026-07-13:legacy_decider",
+        "AMD:2026-07-13:portfolio_optimizer",
+    }
+
+
 def test_load_discards_book_from_prior_session(monkeypatch, tmp_path):
     """A book from a genuinely earlier session is still discarded — incl.
     a book keyed on the OLD (last-closed / D-1) axis, which is exactly the

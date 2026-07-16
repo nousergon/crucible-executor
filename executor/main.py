@@ -345,6 +345,56 @@ def _read_signals(
                 conn.close()
             raise
 
+    # Champion candidate-source adapter (config#2364 / config#2366;
+    # thinktank_coverage arm added config-I2518 / epic I2515) — must run
+    # BEFORE the universe/coverage filters below so a synthesized
+    # (scanner_predictor_direct or thinktank_coverage) buy_candidates list
+    # flows through the SAME gates agentic candidates already pass through.
+    # No-op passthrough when the pointer resolves to agentic (including the
+    # S3-404 pre-bootstrap default) — the champion pointer read + arm-feed
+    # round-trip are live-trading-arm concerns, so (like the universe/
+    # coverage gates below) this is skipped in simulate mode: the
+    # backtester's replay path doesn't select a live champion arm, and
+    # predictor_param_sweep can't afford an extra S3 round-trip per
+    # simulated date.
+    #
+    # The constituents sector_map is only loaded when the pointer actually
+    # resolves to a synthesizing arm (scanner_predictor_direct or, since
+    # config-I2518/epic I2515, thinktank_coverage — neither source carries a
+    # sector on its rows, so both need this to stamp synthesized entries) —
+    # on the common (agentic / pre-bootstrap) path this avoids an extra S3
+    # list_objects_v2 + get_object round-trip for a value
+    # apply_champion_selection would otherwise discard unused on every
+    # trading day. When a synthesizing arm IS active, this is the same
+    # sector_map artifact patch_unknown_sectors_with_constituents loads
+    # again a few lines below — one extra fetch, paid only on the arm
+    # that's rarely active, not on every run.
+    #
+    # ``_champion_injected_predictions`` is applied to ``predictions_by_ticker``
+    # AFTER the real GBM ``read_predictions`` load below (that call fully
+    # replaces ``predictions_by_ticker`, so merging earlier would be
+    # clobbered) but BEFORE ``assert_predictions_cover_buy_candidates`` so
+    # the coverage assert sees the injected rows for synthesized tickers.
+    _champion_injected_predictions: dict = {}
+    if not simulate:
+        from executor.champion import apply_champion_selection, load_champion_pointer
+
+        _champion_pointer = load_champion_pointer(signals_bucket)
+        if _champion_pointer["champion"] in ("scanner_predictor_direct", "thinktank_coverage"):
+            from executor.eod_reconcile import _load_constituents_sector_map
+            sector_map = _load_constituents_sector_map(signals_bucket)
+        else:
+            sector_map = {}
+        signals_raw, _champion_injected_predictions = apply_champion_selection(
+            signals_raw,
+            {},
+            bucket=signals_bucket,
+            run_date=run_date,
+            config=config,
+            sector_map=sector_map,
+            pointer=_champion_pointer,
+        )
+
     # Defense-in-depth universe filter — drop buy_candidates whose tickers
     # aren't in the ArcticDB universe library. Research's population_selector
     # (alpha-engine-research#41) is the primary guardrail; this catches
@@ -443,6 +493,14 @@ def _read_signals(
             predictions_by_ticker = {}
     else:
         predictions_by_ticker = {}
+
+    # Merge champion-synthesized predictions (scanner_predictor_direct or
+    # thinktank_coverage — empty dict on agentic/pre-bootstrap) in AFTER the
+    # real GBM load above so injected rows for synthesized tickers are
+    # visible to the coverage assert below without being clobbered by (or
+    # clobbering) the real predictor's own predictions.
+    if _champion_injected_predictions:
+        predictions_by_ticker = {**predictions_by_ticker, **_champion_injected_predictions}
 
     # Coverage guard: every buy_candidate must have a prediction row, otherwise
     # the GBM veto gate is structurally unreachable for that ticker and we'd
@@ -643,12 +701,28 @@ def _write_order_book_summary(
     blocked_entries: list[dict] | None,
     signals_bucket: str,
     run_date: str,
+    champion: str | None = None,
+    promotion_source: str | None = None,
 ) -> None:
-    """Write a public-safe order book summary to S3 for the dashboard."""
+    """Write a public-safe order book summary to S3 for the dashboard.
+
+    ``champion``/``promotion_source`` (config#2364 / config#2366) stamp
+    which candidate-source arm produced this order book — additive fields,
+    ``None`` when the caller doesn't have a resolved champion (e.g. an
+    older call site, or a run that errored before ``_read_signals``
+    resolved the pointer). Sourced from ``signals_raw["champion"]`` /
+    ``signals_raw["promotion_source"]``, which
+    ``executor.champion.apply_champion_selection`` stamps on the
+    scanner_predictor_direct or thinktank_coverage paths; agentic runs
+    leave both unset (None) here rather than hardcoding "agentic" — the
+    pointer read result is the single source of truth for that label.
+    """
     import boto3
 
     summary = {
         "date": run_date,
+        "champion": champion,
+        "promotion_source": promotion_source,
         "entries_approved": [
             {"ticker": e["ticker"]} for e in ob.pending_entries()
         ],
@@ -810,6 +884,7 @@ def _write_stops_and_finalize(
     blocked_entries: list[dict] | None = None,
     signals_bucket: str | None = None,
     use_optimizer: bool = False,
+    signals_raw: dict | None = None,
 ) -> None:
     """Write stop records for held positions, detect shorts, save order book, notify.
 
@@ -903,7 +978,11 @@ def _write_stops_and_finalize(
 
     # Write public-safe summary for dashboard
     if signals_bucket:
-        _write_order_book_summary(ob, blocked_entries, signals_bucket, run_date)
+        _write_order_book_summary(
+            ob, blocked_entries, signals_bucket, run_date,
+            champion=(signals_raw or {}).get("champion"),
+            promotion_source=(signals_raw or {}).get("promotion_source"),
+        )
 
     n_entries = len(ob.pending_entries())
     n_urgent = len(ob.pending_urgent_exits())
@@ -1867,7 +1946,7 @@ def run(
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
             try:
-                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer)
+                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer, signals_raw=signals_raw)
             except Exception as e:
                 logger.warning("Failed to write order book: %s", e)
 
@@ -2018,6 +2097,17 @@ def run(
         if fd:
             fd.log_summary(logger)
         logger.info(f"Executor complete | dry_run={dry_run} | simulate={simulate}")
+
+        if not simulate and not dry_run:
+            try:
+                import subprocess
+                subprocess.run(
+                    ["bash", "/home/ec2-user/alpha-engine/infrastructure/emit-heartbeat.sh", "executor-morning"],
+                    check=False,
+                    capture_output=True,
+                )
+            except Exception as _e:
+                logger.warning("Heartbeat emit failed: %s (non-fatal)", _e)
 
         if simulate:
             return orders

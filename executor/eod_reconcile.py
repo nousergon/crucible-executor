@@ -39,6 +39,83 @@ logger = logging.getLogger(__name__)
 
 from executor.config_loader import load_config
 
+# ── NAV three-way reconcile — hard-gate tolerance (config#2457) ────────────
+# `pricing_timing_usd` (mark_basis_today − mark_basis_prior, computed below)
+# is the three-way divergence signal between the broker-reported NAV (IB
+# NetLiquidation, the independent witness) and the system/settled NAV (cash +
+# accrued + Σ settled position market values). It has fed `data_warnings`
+# (EOD email only) since config#1276 at a SOFT threshold of max($500, 5bps of
+# NAV) — appropriate for "a human notices this in the email eventually."
+#
+# A HARD gate that pages flow-doctor (→ Telegram/GitHub/changelog) needs a
+# WIDER band than the soft warning, or it pages exactly as often as the email
+# already flags and trains the operator to ignore it — this is the same
+# lesson reconcile_audit.py's PAGE_THRESHOLD_BPS encodes for the SPY
+# self-heal pass (config#2145: an in-band 1.46bp correction paged identically
+# to a real incident). 3x the soft-warning floor and rate is a deliberate,
+# named choice: routine settlement-lag / mark-timing noise stays inside the
+# existing soft band (email-visible, not paged); only a divergence large
+# enough to plausibly indicate a broken NAV input (bad IB session, stale
+# settled marks, a real reconciliation break) pages.
+NAV_HARD_GATE_TOLERANCE_USD_FLOOR = 2500.0
+NAV_HARD_GATE_TOLERANCE_NAV_BPS = 15.0  # 0.15% of NAV
+
+
+def _nav_hard_gate_tolerance_usd(nav: float) -> float:
+    """Dollar tolerance for the NAV three-way hard gate at this NAV level."""
+    return max(NAV_HARD_GATE_TOLERANCE_USD_FLOOR, NAV_HARD_GATE_TOLERANCE_NAV_BPS / 10000.0 * nav)
+
+
+def _check_nav_three_way_hard_gate(
+    *,
+    pricing_timing_usd: float,
+    pricing_timing_available: bool,
+    nav: float | None,
+    run_date: str,
+) -> dict | None:
+    """NAV three-way reconcile hard-gate decision (config#2457).
+
+    ``pricing_timing_usd`` is the broker-reported-NAV (IB NetLiquidation) vs.
+    settled/system-NAV (cash + accrued + Σ settled position market values)
+    divergence, day-over-day differenced so a constant cash/accrued offset
+    cancels — see the ``nav_reconciliation`` block in ``run()`` for the full
+    derivation.
+
+    Returns ``None`` when the gate does not fire (no data, or within
+    tolerance). Returns a dict describing the breach when it does — the
+    caller (``run()``) is responsible for logging + paging flow-doctor; kept
+    as a pure decision function so it's unit-testable without mocking the
+    rest of ``run()``'s IO (snapshot/DB/S3).
+
+    Deliberately does NOT fire when ``pricing_timing_available`` is False
+    (missing prior snapshot) — that path already gets its own honesty
+    warning in ``data_warnings``, and paging on "we don't have enough data
+    to check" would be a false-alarm generator, not a real divergence
+    signal.
+    """
+    if not pricing_timing_available or not nav:
+        return None
+    tolerance_usd = _nav_hard_gate_tolerance_usd(nav)
+    if abs(pricing_timing_usd) <= tolerance_usd:
+        return None
+    return {
+        "run_date": run_date,
+        "pricing_timing_usd": pricing_timing_usd,
+        "pricing_timing_pct_of_nav": pricing_timing_usd / nav * 100,
+        "tolerance_usd": tolerance_usd,
+        "tolerance_bps": NAV_HARD_GATE_TOLERANCE_NAV_BPS,
+        "nav": nav,
+        "message": (
+            f"NAV three-way reconcile breach for {run_date}: pricing & timing "
+            f"divergence ${pricing_timing_usd:+,.0f} "
+            f"({pricing_timing_usd / nav * 100:+.3f}% of NAV) exceeds hard-gate "
+            f"tolerance ${tolerance_usd:,.0f} ({NAV_HARD_GATE_TOLERANCE_NAV_BPS:.1f}"
+            "bps of NAV). Broker-reported NAV (IB NetLiquidation) vs settled/"
+            "system NAV (cash + accrued + settled position MV) diverged beyond "
+            "tolerance."
+        ),
+    }
+
 
 def _compute_unattributed_residual_pct(
     unattributed_usd: float | None,
@@ -178,9 +255,11 @@ def _load_constituents_sector_map(bucket: str) -> dict[str, str]:
 # rather than "this is the broad-market core." Tag it explicitly so every
 # downstream consumer (public site, private console, sector attribution)
 # inherits a meaningful label. New core ETFs the optimizer may substitute
-# get added to ``_INDEX_ETF_TICKERS``.
+# get added to ``reference_rate.INDEX_ETF_TICKERS`` (single source of truth,
+# shared with the asset_type classification in the Metron reference-rate
+# contract — a ticker added there is simultaneously tagged with this sector
+# label AND reported as ETF, not equity).
 _INDEX_ETF_SECTOR = "Broad Market / Index"
-_INDEX_ETF_TICKERS = frozenset({"SPY", "VOO", "IVV", "SPLG"})
 
 
 def _index_etf_sector(ticker: str) -> str | None:
@@ -191,7 +270,7 @@ def _index_etf_sector(ticker: str) -> str | None:
     substitute), else ``None`` so the caller falls through to the normal
     signals.json / entry-trade / S&P-constituents lookup chain.
     """
-    return _INDEX_ETF_SECTOR if ticker in _INDEX_ETF_TICKERS else None
+    return _INDEX_ETF_SECTOR if ticker in reference_rate.INDEX_ETF_TICKERS else None
 
 
 def _load_predictions_from_s3(bucket: str) -> tuple[dict, str | None]:
@@ -1056,6 +1135,46 @@ def run(
                 "snapshot cash/NAV) — the IB-mark-vs-settled-close basis gap "
                 "stays in Unattributed for this day."
             )
+
+        # ── NAV three-way reconcile — HARD GATE (config#2457) ────────────────
+        # Promotes the pricing/timing signal above from observational
+        # (data_warnings only) to a paged alarm — the three-way check the
+        # parent epic (config#1277) calls "the single most important
+        # portfolio control". Fires IN ADDITION TO the soft data_warnings
+        # entry above, never instead of it — the email-visible warning stays
+        # for the routine/sub-hard-gate band. Decision logic lives in
+        # `_check_nav_three_way_hard_gate` (pure function, unit-tested
+        # directly); this call site owns dispatch (log + page flow-doctor).
+        nav_hard_gate_breach = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=pricing_timing_usd,
+            pricing_timing_available=pricing_timing_available,
+            nav=nav,
+            run_date=run_date,
+        )
+        if nav_hard_gate_breach:
+            logger.error(
+                "NAV three-way reconcile BREACH: pricing&timing=$%+.0f "
+                "(%.3f%% of NAV) exceeds hard-gate tolerance $%.0f "
+                "(%.1fbps of NAV) — broker-reported NAV vs settled/system "
+                "NAV diverged beyond tolerance for run_date=%s.",
+                nav_hard_gate_breach["pricing_timing_usd"],
+                nav_hard_gate_breach["pricing_timing_pct_of_nav"],
+                nav_hard_gate_breach["tolerance_usd"],
+                nav_hard_gate_breach["tolerance_bps"],
+                run_date,
+            )
+            if fd:
+                fd.report(
+                    RuntimeError(nav_hard_gate_breach["message"]),
+                    severity="error",
+                    context={
+                        "site": "nav_three_way_reconcile_hard_gate",
+                        "run_date": run_date,
+                        "pricing_timing_usd": nav_hard_gate_breach["pricing_timing_usd"],
+                        "hard_gate_tolerance_usd": nav_hard_gate_breach["tolerance_usd"],
+                        "nav": nav_hard_gate_breach["nav"],
+                    },
+                )
         # The TRUE residual (after rotation + pricing&timing are lifted out) is
         # what should now be small; warn only when IT is material.
         if nav and abs(unattributed_true_usd) > max(100.0, 0.0005 * nav):

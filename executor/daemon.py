@@ -69,7 +69,10 @@ from executor.order_book import OrderBook, build_stop_record
 from executor.price_monitor import PriceMonitor
 from executor.polygon_price_monitor import make_price_monitor
 from executor.strategies.config import load_strategy_config
-from executor.trade_logger import init_db, log_trade, get_unmatched_entry, log_risk_event
+from executor.trade_logger import (
+    init_db, log_trade, get_unmatched_entry, log_risk_event,
+    get_executed_entry_tickers,
+)
 
 from nousergon_lib.logging import setup_logging, guard_entrypoint
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
@@ -261,6 +264,145 @@ def _validate_sell_shares(
         )
         return available
     return shares
+
+
+def _validate_buy_not_duplicate(
+    ibkr: IBKRClient,
+    ticker: str,
+    context: str,
+) -> bool:
+    """Broker-truth backstop against a duplicate in-flight BUY (config#2328,
+    revised config#2436).
+
+    Refuses the ENTER only if the broker already shows a WORKING BUY order
+    for this ticker — a live order race, e.g. a manual/duplicate submission
+    still in flight at IB. Returns True if it is safe to place the BUY,
+    False to SKIP it.
+
+    Revised config#2436: this guard USED TO also refuse whenever the broker
+    showed ANY existing position (``held_shares > 0``), on the assumption
+    that the daemon's intraday entries are always for currently-unheld
+    names. That assumption broke when the portfolio-optimizer path started
+    proposing legitimate top-ups of already-held positions (target-weight
+    increase on a held ticker) and the intraday redeploy solver — both
+    build a normal ENTER for a ticker the broker already shows shares for.
+    "Already holding shares" is not evidence "this entry's order was
+    already submitted" — it's equally consistent with a legitimate top-up.
+    The real question, "was THIS entry already executed today," is
+    answered precisely and durably (survives a full order-book loss) by
+    the config#2328 WAL — ``OrderBook`` pending/executing state plus
+    ``executed_tickers`` reseeded from ``executed_today`` /
+    ``executing_entries`` / trades.db — which ``merge_executed`` applies to
+    strip any already-executed ticker's entry from the book BEFORE it ever
+    reaches this function. Re-deriving that answer from bare position count
+    here was both redundant with that WAL and wrong for the top-up case
+    (2026-07-13, AMD BUY skipped despite being a legitimate rebalance).
+
+    FAIL-CLOSED: if broker state cannot be read (IB API error), SKIP the buy.
+    A blocked entry is recoverable on the next tick / next planner run; a
+    double order is real capital at risk. (Same asymmetry that makes the
+    sell guard cap rather than trust the in-memory view.)
+    """
+    try:
+        working_buy = ibkr.get_open_buy_shares(ticker)
+    except Exception as e:  # noqa: BLE001 — any broker read failure fails closed
+        logger.error(
+            "SKIP %s BUY %s: broker state unreadable (%s) — failing closed to "
+            "avoid a possible double buy", context, ticker, e,
+        )
+        send_daemon_status(
+            f"⚠️ *BUY {ticker} SKIPPED*: broker state unreadable — "
+            f"failing closed (config#2328)"
+        )
+        return False
+    if working_buy > 0:
+        logger.warning(
+            "SKIP %s BUY %s: %d shares already working at broker — refusing "
+            "duplicate entry", context, ticker, working_buy,
+        )
+        send_daemon_status(
+            f"⚠️ *BUY {ticker} SKIPPED*: {working_buy} shares already "
+            f"working (dup-entry guard, config#2328)"
+        )
+        return False
+    return True
+
+
+def _reconcile_executing_entries(
+    ibkr: IBKRClient,
+    order_book: OrderBook,
+    dry_run: bool,
+) -> None:
+    """Resolve write-ahead ``executing`` entries left by a crash (config#2328).
+
+    An entry in the ``executing`` state means the pre-crash daemon marked its
+    intent, saved the book, then died at or after IB order placement without
+    finalizing. Reconcile each against broker truth:
+
+      * position exists OR a BUY is working  → the order landed; finalize it
+        (``mark_entry_executed``) so it is never re-placed.
+      * no position and no working order      → the order never reached IB;
+        revert to ``pending`` so the legitimate entry re-drives through the
+        guarded path (idempotent — the pre-BUY check re-verifies at placement).
+      * broker state unreadable               → leave ``executing`` (fail-safe);
+        it stays out of ``pending_entries`` so it cannot be re-bought, and
+        surfaces to the operator / EOD reconcile.
+
+    A no-op when there are no executing entries (the common case).
+    """
+    executing = order_book.executing_entries()
+    if not executing:
+        return
+    if dry_run:
+        logger.info(
+            "[DRY RUN] %d executing entries found — leaving untouched", len(executing),
+        )
+        return
+    try:
+        positions = ibkr.get_positions()
+    except Exception as e:  # noqa: BLE001 — fail-safe: cannot verify, touch nothing
+        logger.error(
+            "Startup reconcile: broker positions unreadable (%s) — leaving %d "
+            "executing entries in-doubt (fail-safe, will not re-buy)",
+            e, len(executing),
+        )
+        send_daemon_status(
+            f"⚠️ *Crash-recovery: {len(executing)} in-doubt entries* — "
+            f"broker unreadable, left blocked (config#2328)"
+        )
+        return
+    resolved, reverted, blocked = [], [], []
+    for entry in executing:
+        ticker = entry["ticker"]
+        held = int(positions.get(ticker, {}).get("shares", 0))
+        try:
+            working_buy = ibkr.get_open_buy_shares(ticker)
+        except Exception as e:  # noqa: BLE001 — per-ticker read failure fails safe
+            logger.error(
+                "Startup reconcile %s: open-order read failed (%s) — leaving "
+                "in-doubt", ticker, e,
+            )
+            blocked.append(ticker)
+            continue
+        if held > 0 or working_buy > 0:
+            order_book.mark_entry_executed(
+                ticker, entry.get("trigger_reason", "crash_recovery"),
+            )
+            resolved.append(ticker)
+        else:
+            order_book.revert_entry_to_pending(ticker)
+            reverted.append(ticker)
+    order_book.save()
+    logger.warning(
+        "Startup reconcile of executing WAL: finalized %s, reverted-to-pending "
+        "%s, left-in-doubt %s", resolved or "[]", reverted or "[]", blocked or "[]",
+    )
+    send_daemon_status(
+        f"\U0001f501 *Crash-recovery reconcile (config#2328)*\n"
+        f"Finalized (already at broker): {', '.join(resolved) or 'none'}\n"
+        f"Reverted to pending (never placed): {', '.join(reverted) or 'none'}\n"
+        f"Left in-doubt (unreadable): {', '.join(blocked) or 'none'}"
+    )
 
 
 def _place_order_with_retry(
@@ -667,6 +809,13 @@ def run_daemon(dry_run: bool = False) -> None:
 
     ibkr = _connect_ibkr()
 
+    # Crash-recovery: resolve any write-ahead 'executing' entries left by a
+    # previous daemon that died between order placement and finalization
+    # (config#2328). Must run after IB connects (needs broker truth) and
+    # before executed_tickers is seeded below (may finalize entries into
+    # executed_today). No-op on a clean boot.
+    _reconcile_executing_entries(ibkr, order_book, dry_run)
+
     monitor = make_price_monitor(ibkr.ib)
     exit_mgr = IntradayExitManager(strategy_config)
     entry_engine = EntryTriggerEngine(strategy_config)
@@ -756,7 +905,35 @@ def run_daemon(dry_run: bool = False) -> None:
     )
 
     trades_executed = 0
+    # Rehydrate the already-traded set from durable state so a crash-restart
+    # does not re-place a BUY the pre-crash process already sent (config#2328).
+    # Three unioned sources, each closing a different crash window:
+    #   * order_book.executed_today  — clean executions that reached book save.
+    #   * order_book executing WAL    — orders sent to IB but not finalized;
+    #     _reconcile_executing_entries above already resolved these (finalized
+    #     ones are now in executed_today; unreadable ones stay 'executing' and
+    #     are seeded here so they are never re-bought).
+    #   * trades.db ENTER fills today — belt-and-suspenders: a fill logged to
+    #     trades.db whose following book save never landed.
     executed_tickers: set = set()  # tracks tickers already traded today
+    executed_tickers.update(
+        e["ticker"] for e in order_book.data.get("executed_today", [])
+        if e.get("ticker")
+    )
+    executed_tickers.update(e["ticker"] for e in order_book.executing_entries())
+    if not dry_run:
+        try:
+            executed_tickers.update(get_executed_entry_tickers(conn, run_date))
+        except Exception as _seed_err:  # noqa: BLE001 — seeding is defensive
+            logger.warning(
+                "Could not seed executed_tickers from trades.db (%s) — relying "
+                "on order-book state only", _seed_err,
+            )
+    if executed_tickers:
+        logger.info(
+            "Seeded executed_tickers from durable state (%d): %s",
+            len(executed_tickers), sorted(executed_tickers),
+        )
 
     # Track whether we reached the live trading window so the finally block
     # can decide whether it's safe to fire the EOD pipeline. Pre-market exits
@@ -1831,10 +2008,26 @@ def _execute_entry(
     if dry_run:
         return
 
+    # Broker-truth pre-BUY duplicate guard (config#2328, revised config#2436):
+    # refuse the ENTER only if the broker already shows a WORKING BUY for
+    # this ticker (a live order race). "Already executed today" is answered
+    # by the entry_id-keyed order-book WAL + merge_executed, not by broker
+    # position count \u2014 a held position is equally consistent with a
+    # legitimate top-up. Fails CLOSED on any broker read error.
+    if not _validate_buy_not_duplicate(ibkr, ticker, context="daemon_entry"):
+        return
+
     # Try bracket order if ATR is available in the entry
     atr_value = entry.get("atr_value")
     use_bracket = atr_value and atr_value > 0 and strategy_config.get("bracket_stop_enabled", True)
     bracket_mult = strategy_config.get("bracket_trail_atr_multiple", 2.0) if use_bracket else None
+
+    # Write-ahead the intent to disk BEFORE placing the order (config#2328).
+    # If the daemon crashes anywhere after this point, the entry is durably
+    # 'executing' (not 'pending'), so a restarted daemon will not re-place it
+    # via the naive entry loop \u2014 startup reconciliation resolves it instead.
+    order_book.mark_entry_executing(ticker, trigger_reason)
+    order_book.save()
 
     _t0_order = _time.time()
     order_result = _place_order_with_retry(
@@ -1843,9 +2036,30 @@ def _execute_entry(
         bracket_kwargs={"atr_value": atr_value, "atr_multiple": bracket_mult} if use_bracket else None,
     )
 
-    if order_result["status"] in ("Rejected", "Timeout"):
-        logger.error("ENTER %s FAILED after %d attempts: %s", ticker, MAX_ORDER_RETRIES, order_result["status"])
-        send_daemon_status(f"\u26a0\ufe0f *ENTER {ticker} FAILED*: {order_result['status']}")
+    if order_result["status"] == "Rejected":
+        # Definitive no-fill \u2014 the order was cancelled/rejected at the broker.
+        # Roll the WAL entry back to 'pending' so the legitimate entry can
+        # retry on a later tick.
+        logger.error("ENTER %s REJECTED after %d attempts", ticker, MAX_ORDER_RETRIES)
+        send_daemon_status(f"\u26a0\ufe0f *ENTER {ticker} FAILED*: Rejected")
+        order_book.revert_entry_to_pending(ticker)
+        order_book.save()
+        return
+
+    if order_result["status"] == "Timeout":
+        # In-doubt \u2014 IB never answered, the order may or may not be working.
+        # Leave the entry 'executing' (fail-safe): it stays out of
+        # pending_entries so it is not re-placed, and startup reconciliation /
+        # EOD reconcile resolves it against broker truth.
+        logger.error(
+            "ENTER %s TIMEOUT after %d attempts \u2014 leaving in-doubt (executing), "
+            "will reconcile against broker", ticker, MAX_ORDER_RETRIES,
+        )
+        send_daemon_status(
+            f"\u26a0\ufe0f *ENTER {ticker} TIMEOUT* \u2014 in-doubt, left blocked "
+            f"pending reconcile (config#2328)"
+        )
+        order_book.save()
         return
 
     # Use actual filled quantity (handles PartialFill)
@@ -1948,6 +2162,10 @@ def _execute_entry(
         # these fields yet — exit_manager falls through to baseline behavior.
         "stance": entry.get("stance"),
         "catalyst_date": entry.get("catalyst_date"),
+        # Per-decision idempotency key (config#2436) — ticker + session date
+        # + sizing_source, stamped by OrderBook.add_entry. Durably records
+        # which exact decision executed, distinct from bare ticker.
+        "entry_id": entry.get("entry_id"),
     })
 
     # Mark entry as executed in order book

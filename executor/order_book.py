@@ -48,6 +48,23 @@ def _default_book(run_date: str | None = None) -> dict:
     }
 
 
+def _entry_id_for(entry: dict, book_date: str) -> str:
+    """Deterministic per-decision identity for an order-book entry (config#2436).
+
+    Composite of ticker + session date + sizing source — NOT a random id —
+    so regenerating the SAME decision on the SAME day (e.g. a main.py rerun
+    after a full order-book-loss) reproduces the identical entry_id, and a
+    durable trades.db lookup keyed on it recognizes "this exact decision
+    already executed." A genuinely distinct decision for the same ticker on
+    the same day (legacy decider vs. portfolio optimizer vs. intraday
+    redeploy each stamp a different ``sizing_source``) gets its own id, so
+    it is never silently dropped as a false duplicate the way bare-ticker
+    keying would drop it.
+    """
+    sizing_source = entry.get("sizing_source") or "legacy_decider"
+    return f"{entry.get('ticker')}:{book_date}:{sizing_source}"
+
+
 def build_stop_record(
     *,
     ticker: str,
@@ -215,15 +232,22 @@ class OrderBook:
     def add_entry(self, entry: dict) -> None:
         """Add an approved entry to the book.
 
-        Deduplicates by ticker: if a pending entry for the same ticker
-        already exists, the new record is skipped.
+        Deduplicates by ``entry_id`` (ticker + session date + sizing source,
+        config#2436) rather than bare ticker: a literal re-submission of the
+        SAME decision is skipped, but a genuinely distinct decision for an
+        already-pending ticker (e.g. the intraday redeploy solver proposing
+        a second buy alongside a still-pending morning entry) is kept
+        instead of being silently dropped. ``entry_id`` is assigned here if
+        the caller hasn't already stamped one.
         """
-        ticker = entry.get("ticker")
+        entry.setdefault("entry_id", _entry_id_for(entry, self._data.get("date", "")))
+        entry_id = entry["entry_id"]
         existing = self._data.get("approved_entries", [])
         for ex in existing:
-            if ex.get("ticker") == ticker and ex.get("status") == "pending":
+            if ex.get("entry_id") == entry_id and ex.get("status") == "pending":
                 logger.warning(
-                    "Skipping duplicate entry for %s — already pending", ticker,
+                    "Skipping duplicate entry for %s (entry_id=%s) — already pending",
+                    entry.get("ticker"), entry_id,
                 )
                 return
         entry.setdefault("status", "pending")
@@ -254,14 +278,67 @@ class OrderBook:
         """Add an active stop record."""
         self._data.setdefault("active_stops", []).append(stop)
 
+    def mark_entry_executing(self, ticker: str, trigger_reason: str) -> None:
+        """Stamp a write-ahead ``executing`` status on a pending entry.
+
+        Crash-safety WAL (config#2328): the daemon calls this and ``save()``s
+        BEFORE placing the IB BUY order, so an entry whose order was sent to
+        the broker is durably marked in-doubt on disk. On a crash-restart the
+        entry is no longer ``pending`` (``pending_entries`` excludes it), so
+        the naive entry loop cannot re-place the BUY; startup reconciliation
+        (``executing_entries``) resolves it against broker truth instead.
+
+        Keeps the record in ``approved_entries`` (unlike ``mark_entry_executed``
+        which moves it to ``executed_today``) — the order is not confirmed yet.
+        """
+        for entry in self._data.get("approved_entries", []):
+            if entry["ticker"] == ticker and entry.get("status") == "pending":
+                entry["status"] = "executing"
+                entry["trigger_reason"] = trigger_reason
+                entry["executing_at"] = datetime.now().isoformat()
+                break
+
+    def executing_entries(self) -> list[dict]:
+        """Return entries left in the write-ahead ``executing`` state.
+
+        Non-empty only after a crash between order placement and finalization
+        (config#2328). The daemon reconciles each against the broker at
+        startup: revert to ``pending`` if the order never landed, finalize via
+        ``mark_entry_executed`` if the position/order exists, or leave as-is
+        (fail-safe) if broker state is unreadable.
+        """
+        return [
+            e for e in self._data.get("approved_entries", [])
+            if e.get("status") == "executing"
+        ]
+
+    def revert_entry_to_pending(self, ticker: str) -> None:
+        """Roll a write-ahead ``executing`` entry back to ``pending``.
+
+        Used when reconciliation proves the order never reached the broker
+        (Rejected order, or restart with no matching position/working order),
+        so the legitimate entry can be re-driven through the guarded path.
+        """
+        for entry in self._data.get("approved_entries", []):
+            if entry["ticker"] == ticker and entry.get("status") == "executing":
+                entry["status"] = "pending"
+                entry.pop("executing_at", None)
+                break
+
     def mark_entry_executed(self, ticker: str, trigger_reason: str) -> None:
-        """Mark an entry as executed and move to executed_today."""
+        """Mark an entry as executed and move to executed_today.
+
+        Matches a ``pending`` entry (normal path) OR an ``executing`` one
+        (the write-ahead WAL entry being finalized after its order confirmed,
+        config#2328).
+        """
         entries = self._data.get("approved_entries", [])
         for entry in entries:
-            if entry["ticker"] == ticker and entry.get("status") == "pending":
+            if entry["ticker"] == ticker and entry.get("status") in ("pending", "executing"):
                 entry["status"] = "executed"
                 entry["trigger_reason"] = trigger_reason
                 entry["executed_at"] = datetime.now().isoformat()
+                entry.pop("executing_at", None)
                 self._data.setdefault("executed_today", []).append(entry)
                 break
         self._data["approved_entries"] = [

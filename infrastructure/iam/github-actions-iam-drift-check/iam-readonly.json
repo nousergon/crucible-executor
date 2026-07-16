@@ -16,9 +16,42 @@
                 "arn:aws:iam::711398986525:role/alpha-engine-step-functions-role",
                 "arn:aws:iam::711398986525:role/alpha-engine-eventbridge-sfn-role",
                 "arn:aws:iam::711398986525:role/alpha-engine-predictor-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-data-role",
                 "arn:aws:iam::711398986525:role/github-actions-iam-drift-check",
                 "arn:aws:iam::711398986525:role/github-actions-lambda-deploy"
             ]
+        },
+        {
+            "Sid": "ReadEventBridgeRulesForSfArnDriftCheck",
+            "Effect": "Allow",
+            "Action": [
+                "events:DescribeRule",
+                "events:ListRules"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "DescribeStateMachinesForSfArnDriftCheck",
+            "Effect": "Allow",
+            "Action": "states:DescribeStateMachine",
+            "Resource": [
+                "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+                "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+                "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline",
+                "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-groom-dispatch"
+            ]
+        },
+        {
+            "Sid": "ListStateMachinesForSfArnDriftCheck",
+            "Effect": "Allow",
+            "Action": "states:ListStateMachines",
+            "Resource": "*"
+        },
+        {
+            "Sid": "GetFunctionForSfLambdaExistenceCheck",
+            "Effect": "Allow",
+            "Action": "lambda:GetFunction",
+            "Resource": "*"
         }
     ]
 }

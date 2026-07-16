@@ -143,10 +143,21 @@ class TestSimulateModeSkipsArcticDBFilter:
         is real (TSM/ASML 2026-04-20 incident)."""
         # Use an injected signals_override so we don't need real S3.
         # Mock the filter to a passthrough so we just verify it was called.
+        # Also passthrough the champion adapter (config#2366) — both the
+        # pointer read (_read_signals calls load_champion_pointer directly
+        # to decide whether to pay for a sector-map load) and the adapter
+        # itself are real S3 round-trips unrelated to what this test pins,
+        # and this suite deliberately avoids live AWS calls.
         with patch(
             "executor.signal_reader.filter_buy_candidates_to_universe",
             side_effect=lambda s, b: s,  # passthrough
-        ) as mock_filter:
+        ) as mock_filter, patch(
+            "executor.champion.load_champion_pointer",
+            return_value={"schema_version": 1, "champion": "agentic", "promotion_source": "test"},
+        ), patch(
+            "executor.champion.apply_champion_selection",
+            side_effect=lambda signals_raw, preds, **kw: (signals_raw, preds),
+        ):
             # _read_signals does more in non-simulate (predictions read,
             # stale check, telegram) — conftest's autouse fixtures mock the
             # real S3/telegram side effects, so this runs to completion

@@ -121,6 +121,14 @@ _TRADES_MIGRATIONS = [
     # exit logic falls through to legacy behavior.
     "ALTER TABLE trades ADD COLUMN stance TEXT",
     "ALTER TABLE trades ADD COLUMN catalyst_date TEXT",
+    # ── Per-decision idempotency key (config#2436) ────────────────────────
+    # entry_id = ticker + session date + sizing_source (order_book._entry_id_for),
+    # stamped on ENTER rows only. Durable sibling of the order-book WAL's
+    # entry_id dedup: get_executed_entry_ids() lets a caller ask "did THIS
+    # exact decision already execute today" without conflating it with
+    # "does this ticker have ANY executed entry today" (get_executed_entry_tickers,
+    # too coarse — would also block a legitimate same-day top-up decision).
+    "ALTER TABLE trades ADD COLUMN entry_id TEXT",
 ]
 
 _EOD_MIGRATIONS = [
@@ -323,8 +331,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             spy_return_during_hold, realized_alpha_pct, days_held,
             slippage_vs_signal, trading_day, signal_trading_day,
             signal_date, prediction_date, entry_trigger,
-            stance, catalyst_date, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            stance, catalyst_date, entry_id, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -372,6 +380,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("entry_trigger"),
             trade.get("stance"),
             trade.get("catalyst_date"),
+            trade.get("entry_id"),
             datetime.now(timezone.utc).isoformat(),
         ),
     )
@@ -546,6 +555,41 @@ def get_entry_dates(conn: sqlite3.Connection, tickers: list[str]) -> dict[str, s
         if row:
             entry_dates[ticker] = row[0]
     return entry_dates
+
+
+def get_executed_entry_tickers(conn: sqlite3.Connection, run_date: str) -> set[str]:
+    """Tickers with an ENTER fill logged for ``run_date`` (session axis).
+
+    Crash-restart seeding surface (config#2328): the daemon rehydrates its
+    in-memory ``executed_tickers`` set from this at startup so a restart does
+    not re-place a BUY whose fill already reached trades.db even if the order
+    book save that follows never landed. ``date`` is the session axis =
+    daemon ``run_date`` (see trades schema / _TRADES_MIGRATIONS notes).
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT ticker FROM trades WHERE date=? AND action='ENTER'",
+        (run_date,),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def get_executed_entry_ids(conn: sqlite3.Connection, run_date: str) -> set[str]:
+    """entry_ids with an ENTER fill logged for ``run_date`` (config#2436).
+
+    Precise sibling of ``get_executed_entry_tickers``: keyed on the
+    per-decision ``entry_id`` (ticker + session date + sizing_source)
+    rather than bare ticker, so a caller can ask "did THIS exact decision
+    already execute today" — distinguishing a genuine duplicate replay of
+    the same decision from a legitimate second, distinct decision for the
+    same ticker (e.g. a portfolio-optimizer top-up of an already-held
+    name), which bare-ticker matching cannot tell apart.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT entry_id FROM trades "
+        "WHERE date=? AND action='ENTER' AND entry_id IS NOT NULL",
+        (run_date,),
+    ).fetchall()
+    return {r[0] for r in rows}
 
 
 def get_entry_stance_and_catalyst(

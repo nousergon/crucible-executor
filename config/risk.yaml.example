@@ -472,5 +472,31 @@ portfolio_optimizer:
   # Per-day backstop on re-solves (churn guard).
   intraday_resolve_max_per_day: 5
 
+# ── Champion candidate-source adapter (config#2364 / config#2366) ──────────
+# Reads s3://{signals_bucket}/config/producer_champion.json each run
+# (executor/champion.py). When the pointer resolves to "agentic" (or is
+# absent — pre-bootstrap default), these knobs are unused: the adapter is a
+# pure passthrough. When "scanner_predictor_direct", entries are synthesized
+# from the research-free predictor's outcome parquet instead of research's
+# signals.json buy_candidates; universe (EXIT/REDUCE/HOLD) is untouched.
+#
+# champion_top_n_default: candidate count when signals.json carried zero
+# buy_candidates that trading day (no count to match). When buy_candidates
+# is non-empty, N is count-matched to it instead (preserves entry-budget
+# parity with the measured counterfactual) and this knob is unused.
+champion_top_n_default: 10
+# champion_score_floor / champion_score_ceiling: synthesized entries carry a
+# score rank-mapped from within-cohort predicted_alpha percentile into this
+# band (best name → ceiling, worst selected name → floor) — monotonic
+# stand-in for a research composite score so decide_entries' score gates
+# (min_score_to_enter etc.) still discriminate among champion picks without
+# hand-tuning a score per name.
+champion_score_floor: 60
+champion_score_ceiling: 95
+# champion_freshness_max_days: hard freshness gate on the research-free
+# cohort. run_date - prediction_date beyond this raises (StaleChampionFeedError)
+# rather than trading on a stale champion feed silently.
+champion_freshness_max_days: 8
+
 # ── Paths (adjust to your deployment) ───────────────────────────────────────
 db_path: "/path/to/trades.db"

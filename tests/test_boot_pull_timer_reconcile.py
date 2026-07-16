@@ -76,13 +76,23 @@ def test_no_new_timers_only_enable_path():
 
 
 def test_orphan_removal_loop_exists():
-    """boot-pull.sh must scan /etc/systemd/system for alpha-engine-*
-    units that no longer have a source in the repo, and disable + remove
-    them. Without this pass, retiring a unit requires manual SSM."""
+    """boot-pull.sh must scan /etc/systemd/system for units (scoped by
+    caller-supplied prefix) that no longer have a source in the repo, and
+    disable + remove them. Without this pass, retiring a unit requires
+    manual SSM.
+
+    config#2352: this reconciliation was factored into the
+    sync_systemd_units_from() function (parametrized by source dir + orphan
+    prefixes) so the SAME logic also covers nousergon-data's systemd units
+    (metron-intraday, systemd-unit-drift-check) without duplicating the
+    whole block. The glob is now `/etc/systemd/system/${prefix}*` built
+    from a caller-supplied variable rather than a literal `alpha-engine-*`
+    string — assert the parametrized shape + that the alpha-engine-* call
+    site still exists (see test_orphan_removal_safety_prefix below)."""
     src = _source()
-    assert "/etc/systemd/system/alpha-engine-*" in src, (
-        "boot-pull.sh must iterate /etc/systemd/system/alpha-engine-* "
-        "to find orphaned units."
+    assert "/etc/systemd/system/${prefix}*.service" in src, (
+        "boot-pull.sh must iterate /etc/systemd/system/${prefix}*.service "
+        "(parametrized orphan glob) to find orphaned units."
     )
     assert "systemctl disable --now" in src, (
         "orphan-removal pass must call `systemctl disable --now` to "
@@ -96,14 +106,24 @@ def test_orphan_removal_loop_exists():
 
 
 def test_orphan_removal_safety_prefix():
-    """The orphan loop must only match `alpha-engine-*` units. Removing
-    arbitrary units from /etc/systemd/system would brick the host."""
+    """The orphan loop must only match a caller-supplied prefix — never an
+    unscoped glob. Removing arbitrary units from /etc/systemd/system would
+    brick the host. The alpha-engine repo's own systemd sync must still be
+    called with the "alpha-engine-" prefix (its historical scope)."""
     src = _source()
-    # The glob in the orphan loop must include the alpha-engine prefix —
-    # we never `rm` anything that doesn't start with that prefix.
-    assert "alpha-engine-*.service" in src and "alpha-engine-*.timer" in src, (
-        "orphan-removal globs must be scoped to alpha-engine-* prefix to "
-        "avoid disabling unrelated system units."
+    # The orphan loop must build its glob from a prefix variable, not a
+    # bare wildcard — `${prefix}*.service`/`${prefix}*.timer`, never a
+    # literal `/etc/systemd/system/*.service` that would sweep every unit
+    # on the box.
+    assert "${prefix}*.service" in src and "${prefix}*.timer" in src, (
+        "orphan-removal globs must be built from a scoped $prefix variable, "
+        "never an unscoped wildcard, to avoid disabling unrelated system units."
+    )
+    # alpha-engine's own call site must still pass "alpha-engine-" — the
+    # historical safety scope for THIS repo's units.
+    assert 'sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "alpha-engine-"' in src, (
+        "alpha-engine's systemd sync call site must still scope its orphan "
+        "reconciliation to the alpha-engine- prefix."
     )
 
 
@@ -126,3 +146,30 @@ def test_retired_units_not_shipped():
             f"systemd timer will both fire (duplicate emails / racing "
             f"writes against ArcticDB)."
         )
+
+
+# ── nousergon-data systemd sync (config#2352) ────────────────────────────────
+# metron-intraday.{service,timer} (and this issue's own
+# systemd-unit-drift-check.{service,timer}) live in nousergon-data's
+# infrastructure/systemd/, not this repo's. Prior to config#2352, boot-pull
+# only ever looked at $HOME/alpha-engine/infrastructure/systemd — a merged
+# nousergon-data unit edit silently never took effect (system_state/data.md:
+# "boot-pull does NOT reinstall units"). These tests pin that a future
+# refactor can't silently drop the second sync pass.
+
+
+def test_nousergon_data_systemd_sync_call_site_exists():
+    """boot-pull.sh must run sync_systemd_units_from against
+    nousergon-data's infrastructure/systemd/ dir, scoped to the two unit
+    families it ships (metron-intraday, systemd-unit-drift-check) — not an
+    unscoped/wildcard prefix that could sweep unrelated units."""
+    src = _source()
+    assert (
+        'sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" '
+        '"metron-intraday" "systemd-unit-drift-check"' in src
+    ), (
+        "boot-pull.sh must sync nousergon-data's infrastructure/systemd/ "
+        "(metron-intraday + systemd-unit-drift-check orphan prefixes) — "
+        "without this call, a merged nousergon-data unit-file edit never "
+        "reaches the trading box (config#2352)."
+    )
