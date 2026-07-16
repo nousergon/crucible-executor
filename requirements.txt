@@ -6,7 +6,7 @@ pyyaml~=6.0
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
 # pin exists solely to satisfy the security-audit gate.
 setuptools>=83.0.0
-yfinance~=0.2.54
+yfinance~=1.5.1
 numpy<3
 pandas~=2.2
 pyarrow~=25.0

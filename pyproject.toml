@@ -10,7 +10,7 @@ dependencies = [
     "ib_insync>=0.9.86",
     "boto3>=1.43.48",
     "pyyaml>=6.0.3",
-    "yfinance>=0.2.50",
+    "yfinance>=1.5.1",
     "pandas>=2.0.0",
     "numpy<3",
     "pyarrow>=25.0.0",
