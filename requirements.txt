@@ -7,7 +7,7 @@ pyyaml~=6.0
 # pin exists solely to satisfy the security-audit gate.
 setuptools>=83.0.0
 yfinance~=0.2.54
-numpy<2
+numpy<3
 pandas~=2.2
 pyarrow~=25.0
 # arcticdb: reads atr_14_pct from the universe library at morning planner time.
@@ -86,7 +86,7 @@ krepis>=0.13.0
 # import time — executor/portfolio_optimizer.py raises a clear ImportError if
 # missing, so the legacy 1/n sizing path runs unaffected on environments that
 # haven't pulled these in yet.
-# cvxpy + scikit-learn pins are upper-bounded to stay compatible with numpy<2
+# cvxpy + scikit-learn pins are upper-bounded to stay compatible with numpy<3
 # (line 5). cvxpy 1.8+ uses numpy.lib.array_utils (numpy 2.x only); sklearn 1.6+
 # shipped wheels built against numpy 2.x. Both conflict with the arcticdb /
 # pyarrow / pandas stack already pinned in this repo. Drop the upper bounds
