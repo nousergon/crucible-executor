@@ -8,7 +8,7 @@ pyyaml~=6.0
 setuptools>=83.0.0
 yfinance~=0.2.54
 numpy<2
-pandas~=2.2
+pandas~=3.0
 pyarrow~=25.0
 # arcticdb: reads atr_14_pct from the universe library at morning planner time.
 # Single source of truth for ATR across the executor — pullback trigger scaling,
