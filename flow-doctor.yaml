@@ -40,9 +40,15 @@ notify:
   - type: s3
     bucket: alpha-engine-research
     subsystem: executor
+# DynamoDB, not ephemeral /tmp SQLite: this process runs across separate
+# EC2/spot invocations that don't share a filesystem, so a /tmp-backed store
+# silently resets every time — dedup_cooldown_minutes below can never
+# actually suppress a repeat alert if the dedup state doesn't survive the
+# process that wrote it. DynamoDB gives us a shared store across invocations.
 store:
-  type: sqlite
-  path: /tmp/flow_doctor.db
+  type: dynamodb
+  table_name: flow-doctor-store
+  region: us-east-1
 dedup_cooldown_minutes: 60
 dependencies:
   - predictor-inference
