@@ -80,14 +80,89 @@ def _all_codified_roles(repo_roots: list[Path]) -> dict[str, Path]:
     return home
 
 
+# A shell/python variable REFERENCE on the write call's role argument:
+# `${ROLE_NAME}`, `$ROLE_NAME`, or (already-literal) a bare identifier.
+_VARREF_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+
+# The write call's role argument, across the syntaxes this repo's writers
+# actually use: bash `--role-name X`, boto3 `RoleName=X`, CFN/JSON
+# `"RoleName": X` / `RoleName: X`.
+_ROLE_ARG_RE = re.compile(
+    r'(?:--role-name[= ]+|RoleName["\']?\s*[:=]\s*)["\']?'
+    r'(\$\{?[A-Za-z0-9_]+\}?|[A-Za-z0-9_.\-]+)'
+)
+
+
+def _join_continuations(code_lines: list[str]) -> list[tuple[int, str]]:
+    """Join bash `\\`-continued lines into one logical statement (keeping the
+    FIRST physical line's number), so a write call whose `--role-name` sits
+    on the NEXT physical line (the common multi-line deploy-script style)
+    is still visible to a single regex pass. Non-bash files have no trailing
+    `\\` continuations, so this is a no-op for them."""
+    statements: list[tuple[int, str]] = []
+    i, n = 0, len(code_lines)
+    while i < n:
+        start = i + 1
+        parts = [code_lines[i]]
+        while parts[-1].rstrip().endswith("\\") and i + 1 < n:
+            i += 1
+            parts.append(code_lines[i])
+        statements.append((start, "\n".join(parts)))
+        i += 1
+    return statements
+
+
+def _resolve_role_arg(raw: str, full_code_text: str) -> str | None:
+    """Resolve a write call's role-argument token to its literal value.
+
+    Returns the literal role name, or None if it can't be pinned to a single
+    literal (an unassigned/indirect reference, a terraform resource
+    attribute, etc.) — the caller then falls back to the conservative
+    whole-file heuristic for that one write, rather than silently dropping
+    it (no-silent-fails: an unresolved write must never look identical to a
+    cleared one)."""
+    raw = raw.strip().strip("\"'")
+    m = _VARREF_RE.match(raw)
+    if not m:
+        return raw if re.fullmatch(r"[A-Za-z0-9_\-]+", raw) else None
+    var = m.group(1)
+    assign_re = re.compile(
+        r"^\s*" + re.escape(var) + r"""\s*=\s*['"]?([^'"\n]+?)['"]?\s*$""",
+        re.MULTILINE,
+    )
+    values = assign_re.findall(full_code_text)
+    if not values:
+        return None
+    resolved = values[-1].strip()
+    if "$" in resolved:  # one level of indirection only
+        return None
+    return resolved
+
+
 def _scan_file(path: Path, role_names: set[str]) -> list[str]:
     """Return list of findings for this file.
 
-    Logic: if the file contains BOTH (a) a write-API call (put-role-policy
-    or equivalent) and (b) a literal mention of a codified role name —
-    in non-comment lines — flag it. File-scope rather than line-window:
-    deploy scripts often declare `ROLE_NAME=...` at the top and call
-    put-role-policy with a `$ROLE_NAME` reference far below.
+    For each write-API call, resolve ITS OWN `--role-name`/`RoleName`
+    argument (following one level of variable indirection, e.g. a
+    `ROLE_NAME=...` assignment near the top of a deploy script) and flag
+    only if THAT resolves to a codified role name.
+
+    Why not file-scope substring matching (the original approach): a deploy
+    script legitimately writing its OWN unrelated Lambda-execution role can
+    also mention a DIFFERENT codified role's name elsewhere in the file —
+    e.g. an operator-facing comment/echo about a separate, correctly-codified
+    grant (see alpha-engine-config#2423, the `ssm-liveness-poller/deploy.sh`
+    false positive: the script's `put-role-policy` targets its own
+    `alpha-engine-ssm-liveness-poller-role`, but an unrelated NOTE echo
+    mentioning `alpha-engine-step-functions-role` made the old file-scope
+    check flag it as a foreign writer of THAT role). File-scope matching
+    can't tell those apart; resolving the write's actual target can.
+
+    When a write's role argument can't be resolved to a single literal
+    (unassigned var, terraform resource attribute, double indirection),
+    fall back to the old conservative file-scope heuristic for THAT write
+    only, clearly labeled as unresolved so it isn't mistaken for a confirmed
+    hit — never silently dropped.
     """
     findings: list[str] = []
     try:
@@ -109,32 +184,41 @@ def _scan_file(path: Path, role_names: set[str]) -> list[str]:
     # Skip pure comment lines (sh, py, yaml: `#`; tf, js: `//`).
     comment_re = re.compile(r"^\s*(#|//)")
 
-    write_lines: list[tuple[int, str]] = []
-    code_lines: list[str] = []
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if comment_re.match(line):
+    code_lines = [
+        "" if comment_re.match(line) else line for line in text.splitlines()
+    ]
+    full_code_text = "\n".join(code_lines)
+    statements = _join_continuations(code_lines)
+    write_statements = [(ln, stmt) for ln, stmt in statements if write_re.search(stmt)]
+
+    if not write_statements:
+        return findings
+
+    for write_lineno, stmt in write_statements:
+        display_line = next((s for s in stmt.splitlines() if s.strip()), stmt.strip())[:120]
+        arg_match = _ROLE_ARG_RE.search(stmt)
+        resolved = _resolve_role_arg(arg_match.group(1), full_code_text) if arg_match else None
+
+        if resolved is not None:
+            if resolved in role_names:
+                findings.append(
+                    f"{path}:{write_lineno}: writes codified role '{resolved}'\n"
+                    f"    {display_line.strip()}"
+                )
+            # Resolved to a NON-codified role: definitively this write's own
+            # target, not a violation — no fallback, regardless of what else
+            # the file happens to mention.
             continue
-        code_lines.append(line)
-        if write_re.search(line):
-            write_lines.append((lineno, line))
 
-    if not write_lines:
-        return findings
-
-    # We have at least one non-comment write call. Now check if any codified
-    # role name appears anywhere in the non-comment portion of the file.
-    code_text = "\n".join(code_lines)
-    matched_roles = [role for role in role_names if role in code_text]
-    if not matched_roles:
-        return findings
-
-    # Report each (write line × matched role) pair.
-    for write_lineno, write_line in write_lines:
-        for role in matched_roles:
-            findings.append(
-                f"{path}:{write_lineno}: writes codified role '{role}'\n"
-                f"    {write_line.strip()[:120]}"
-            )
+        # Couldn't resolve to a single literal — fail toward caution.
+        for role in role_names:
+            if role in full_code_text:
+                findings.append(
+                    f"{path}:{write_lineno}: writes UNRESOLVED role target, near "
+                    f"mention of codified role '{role}' (could not statically "
+                    f"resolve this write's role argument — verify manually)\n"
+                    f"    {display_line.strip()}"
+                )
 
     return findings
 
