@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "MorningSignalScheduleRW",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::morning-signal-podcast/schedule/*"
+    },
+    {
+      "Sid": "MorningSignalLlmDecisionsRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::morning-signal-podcast/ops/llm_decisions/*"
+    },
+    {
+      "Sid": "MorningSignalScheduleList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::morning-signal-podcast",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["schedule/*", "ops/llm_decisions/*"] }
+      }
+    }
+  ]
+}
