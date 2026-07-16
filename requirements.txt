@@ -24,7 +24,7 @@ arcticdb~=6.18
 # LLM-synthesized output, the call goes in research and produces a
 # frozen artifact executor reads.
 exchange-calendars~=4.5
-requests~=2.32
+requests~=2.34
 # Real-time polygon.io WebSocket price feed (config#913) — used only when
 # EXECUTOR_PRICE_SOURCE=polygon_ws; the default IB-delayed path doesn't need it.
 websocket-client~=1.9
