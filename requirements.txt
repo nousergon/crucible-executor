@@ -91,5 +91,5 @@ krepis>=0.13.0
 # shipped wheels built against numpy 2.x. Both conflict with the arcticdb /
 # pyarrow / pandas stack already pinned in this repo. Drop the upper bounds
 # only when the rest of the requirements graph moves to numpy 2.
-cvxpy>=1.4,<1.8
+cvxpy>=1.9.2,<1.10
 scikit-learn>=1.9.0,<1.10
