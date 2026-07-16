@@ -1,0 +1,35 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ECREnhancedScanningRegistryConfig",
+            "Effect": "Allow",
+            "Action": [
+                "ecr:GetRegistryScanningConfiguration",
+                "ecr:PutRegistryScanningConfiguration"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "ECRDescribeEvaluatorRepo",
+            "Effect": "Allow",
+            "Action": "ecr:DescribeRepositories",
+            "Resource": "arn:aws:ecr:us-east-1:711398986525:repository/alpha-engine-evaluator"
+        },
+        {
+            "Sid": "SSMPatchBaselineScanOnlyAssociation",
+            "Effect": "Allow",
+            "Action": "ssm:CreateAssociation",
+            "Resource": "arn:aws:ssm:us-east-1::document/AWS-DefaultPatchBaseline"
+        },
+        {
+            "Sid": "SSMPatchComplianceRead",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:DescribePatchBaselines",
+                "ssm:ListComplianceItems"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
