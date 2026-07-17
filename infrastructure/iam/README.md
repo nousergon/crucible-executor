@@ -34,7 +34,7 @@ absent ⇒ that axis is skipped for that role).
   (`ae-trading`) AND, via the same `alpha-engine-executor-profile` instance
   profile, the ephemeral groom-dispatch spot boxes (`groom_spot_bootstrap.sh`
   — full groom runs and the standalone end-of-SF sweep box both launch under
-  this profile). 11 inline policies (trading-scoped: S3, SES, SNS,
+  this profile). 12 inline policies (trading-scoped: S3, SES, SNS,
   CloudWatch, SSM read/send, EC2 spot, EOD Step Function; plus
   `alpha-engine-stepfunctions-diagnose`, added 2026-07-13 — read-only
   `states:ListExecutions`/`DescribeExecution`/`DescribeStateMachine` on the
@@ -52,7 +52,17 @@ absent ⇒ that axis is skipped for that role).
   whenever `FLOW_DOCTOR_ENABLED=1` forced strict mode — this took down the
   entire `ne-postclose-trading-pipeline` EOD reconcile on 2026-07-13 (see
   alpha-engine-config-I2465 for the deeper `krepis` strict-mode fix still
-  needed so a telemetry-backend hiccup can't crash the producer at all).
+  needed so a telemetry-backend hiccup can't crash the producer at all);
+  plus `alpha-engine-vuln-scan-enable`, added 2026-07-16 (alpha-engine-config#2535,
+  Brian's Option A ruling) — `ecr:GetRegistryScanningConfiguration`/
+  `ecr:PutRegistryScanningConfiguration` (registry-level, no resource-level
+  scoping exists for these two actions), `ecr:DescribeRepositories` scoped to
+  the `alpha-engine-evaluator` repo, and `ssm:CreateAssociation` scoped to the
+  `AWS-DefaultPatchBaseline` document plus read-only `ssm:DescribePatchBaselines`/
+  `ssm:ListComplianceItems`, so groom passes running under this role can enable
+  ECR enhanced scanning on the evaluator's Lambda images and a scan-only (never
+  auto-patch) SSM Patch Manager baseline on the EC2 fleet, and read back
+  compliance/scan results, without a human applying the AWS side out-of-band.
   Trust policy
   (`ec2.amazonaws.com`) and managed attachment (`AmazonSSMManagedInstanceCore`)
   are codified via the reserved files. Until 2026-06-09 this role was also the

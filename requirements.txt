@@ -6,10 +6,10 @@ pyyaml~=6.0
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
 # pin exists solely to satisfy the security-audit gate.
 setuptools>=83.0.0
-yfinance~=0.2.54
-numpy<2
+yfinance~=1.5.1
+numpy<3
 pandas~=2.2
-pyarrow~=23.0
+pyarrow~=25.0
 # arcticdb: reads atr_14_pct from the universe library at morning planner time.
 # Single source of truth for ATR across the executor — pullback trigger scaling,
 # position sizing, and trailing stops all consume the feature-store value so
@@ -24,7 +24,7 @@ arcticdb~=6.18
 # LLM-synthesized output, the call goes in research and produces a
 # frozen artifact executor reads.
 exchange-calendars~=4.5
-requests~=2.32
+requests~=2.34
 # Real-time polygon.io WebSocket price feed (config#913) — used only when
 # EXECUTOR_PRICE_SOURCE=polygon_ws; the default IB-delayed path doesn't need it.
 websocket-client~=1.9
@@ -79,14 +79,14 @@ nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergo
 # FlowDoctor.last_dispatch_reason()/last_dispatched(), the real per-call
 # dispatch outcome that executor/notifier.py checks instead of trusting a
 # non-None notify_event() report id) — no version bump needed on this line.
-krepis>=0.13.0
+krepis>=0.14.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
 # import time — executor/portfolio_optimizer.py raises a clear ImportError if
 # missing, so the legacy 1/n sizing path runs unaffected on environments that
 # haven't pulled these in yet.
-# cvxpy + scikit-learn pins are upper-bounded to stay compatible with numpy<2
+# cvxpy + scikit-learn pins are upper-bounded to stay compatible with numpy<3
 # (line 5). cvxpy 1.8+ uses numpy.lib.array_utils (numpy 2.x only); sklearn 1.6+
 # shipped wheels built against numpy 2.x. Both conflict with the arcticdb /
 # pyarrow / pandas stack already pinned in this repo. Drop the upper bounds
