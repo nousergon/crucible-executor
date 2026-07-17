@@ -34,7 +34,7 @@ absent ⇒ that axis is skipped for that role).
   (`ae-trading`) AND, via the same `alpha-engine-executor-profile` instance
   profile, the ephemeral groom-dispatch spot boxes (`groom_spot_bootstrap.sh`
   — full groom runs and the standalone end-of-SF sweep box both launch under
-  this profile). 11 inline policies (trading-scoped: S3, SES, SNS,
+  this profile). 12 inline policies (trading-scoped: S3, SES, SNS,
   CloudWatch, SSM read/send, EC2 spot, EOD Step Function; plus
   `alpha-engine-stepfunctions-diagnose`, added 2026-07-13 — read-only
   `states:ListExecutions`/`DescribeExecution`/`DescribeStateMachine` on the
@@ -52,7 +52,17 @@ absent ⇒ that axis is skipped for that role).
   whenever `FLOW_DOCTOR_ENABLED=1` forced strict mode — this took down the
   entire `ne-postclose-trading-pipeline` EOD reconcile on 2026-07-13 (see
   alpha-engine-config-I2465 for the deeper `krepis` strict-mode fix still
-  needed so a telemetry-backend hiccup can't crash the producer at all).
+  needed so a telemetry-backend hiccup can't crash the producer at all);
+  plus `alpha-engine-vuln-scan-enable`, added 2026-07-16 (alpha-engine-config#2535,
+  Brian's Option A ruling) — `ecr:GetRegistryScanningConfiguration`/
+  `ecr:PutRegistryScanningConfiguration` (registry-level, no resource-level
+  scoping exists for these two actions), `ecr:DescribeRepositories` scoped to
+  the `alpha-engine-evaluator` repo, and `ssm:CreateAssociation` scoped to the
+  `AWS-DefaultPatchBaseline` document plus read-only `ssm:DescribePatchBaselines`/
+  `ssm:ListComplianceItems`, so groom passes running under this role can enable
+  ECR enhanced scanning on the evaluator's Lambda images and a scan-only (never
+  auto-patch) SSM Patch Manager baseline on the EC2 fleet, and read back
+  compliance/scan results, without a human applying the AWS side out-of-band.
   Trust policy
   (`ec2.amazonaws.com`) and managed attachment (`AmazonSSMManagedInstanceCore`)
   are codified via the reserved files. Until 2026-06-09 this role was also the
@@ -77,7 +87,60 @@ absent ⇒ that axis is skipped for that role).
   `decision_artifacts/_calibration/*`, `decision_artifacts/_spotcheck/*`,
   `_alerts/*`, `robodashboard/*` — no Delete, no full-bucket write; right-sized
   2026-06-09), SSM read, SFN read, SNS, CloudWatch, cyphering SSM read,
-  mnemon S3, trust (`ec2`), `AmazonSSMManagedInstanceCore`.
+  mnemon S3, trust (`ec2`), `AmazonSSMManagedInstanceCore`, plus (consolidated
+  from `alpha-engine-config` here 2026-07-14, config#2340 surface 5 — see
+  "Split-tracking reconciliation" below) `alpha-engine-dashboard-passrole-executor`,
+  `alpha-engine-dashboard-daily-news-write`, `alpha-engine-dashboard-fleet-liveness`,
+  `alpha-engine-dashboard-morning-signal-schedule`, `alpha-engine-dashboard-spot-dispatch`,
+  `alpha-engine-dashboard-metron-sft-putobject` (not yet applied),
+  `alpha-engine-dashboard-changelog-quarantine-writeback` (not yet applied),
+  `alpha-engine-dashboard-ssm-logs-write` (not yet applied), plus
+  `vires-secrets-s3-read` (pulled live via `aws iam get-role-policy` and
+  codified 2026-07-15 — see "Split-tracking reconciliation" below).
+
+### Split-tracking reconciliation (2026-07-14, config#2340 surface 5)
+
+`alpha-engine-config` (the private ops-adjacent config repo) had been
+independently tracking a SECOND, divergent, partial set of
+`alpha-engine-dashboard-role` inline policies under its own `iam/` directory
+since 2026-07-03 (8 policies added there, one at a time, each documented
+with a "Live state: applied" note — but **never added here**, so this
+repo's daily `check-drift.py` run never saw them). The result, confirmed
+live in the 2026-07-14 09:30 UTC scheduled run: **7 drift findings** —
+5 policies present on the live role but uncodified here
+(`daily-news-write`, `fleet-liveness`, `morning-signal-schedule`,
+`spot-dispatch`, and the passrole grant under its *actual* live name
+`alpha-engine-dashboard-passrole-executor`, which this repo had codified
+under the wrong name `alpha-engine-passrole-executor` — hence that name
+showing as "codified but not on AWS" in the same run), plus one genuinely
+unexplained: `vires-secrets-s3-read`, live on this role, codified NOWHERE
+(not here, not in `alpha-engine-config`) — likely an undocumented manual
+grant for the Vires secrets bucket. Content for the other 8 was verified
+byte-identical (modulo formatting) to what's already live before copying,
+per `alpha-engine-config`'s own "Live state: applied" provenance notes.
+
+**`vires-secrets-s3-read` closed 2026-07-15:** pulled live with
+`aws iam get-role-policy --role-name alpha-engine-dashboard-role
+--policy-name vires-secrets-s3-read` (an operator ran this with real AWS
+creds — the CI runner still holds none) and codified byte-identical as
+`alpha-engine-dashboard-role/vires-secrets-s3-read.json` — two statements,
+`s3:GetObject` on `arn:aws:s3:::vires-secrets/*` and `s3:ListBucket` on
+`arn:aws:s3:::vires-secrets`. Re-ran `check-drift.py --role
+alpha-engine-dashboard-role` locally against live AWS afterward: the
+`vires-secrets-s3-read` finding is gone, leaving exactly the 3 expected
+apply.sh-pending residuals (`alpha-engine-dashboard-changelog-quarantine-writeback`,
+`alpha-engine-dashboard-metron-sft-putobject`,
+`alpha-engine-dashboard-ssm-logs-write` — all "codified but not on AWS",
+i.e. this PR's own not-yet-applied additions, expected until `apply.sh`
+is run post-merge).
+
+Going forward: `alpha-engine-dashboard-role` (and any other role this repo
+already tracks) should be codified **here**, not in `alpha-engine-config` —
+this directory is the one with the actual drift-check + apply automation
+the fleet's IAM-as-code epic (config#2340) is standardizing on. The
+`alpha-engine-config` copies are now a stale duplicate; a follow-up should
+either delete them or leave a pointer back to here (tracked separately,
+since that's a different repo's housekeeping call).
 - **`github-actions-iam-drift-check`** — assumed by GitHub Actions via
   OIDC for the daily IAM-drift-check workflow. Single inline policy
   granting `iam:ListRolePolicies` + `iam:GetRolePolicy` + `iam:GetRole` +
