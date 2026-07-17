@@ -642,3 +642,109 @@ def test_eod_reconcile_uses_macro_aware_dispatch_for_held_positions():
         "to route reads between universe_lib and macro_lib (mirrors "
         "price_cache.load_price_histories:128-145)."
     )
+
+
+# ── Held-ticker closing-price hard-fail (config#2737) ────────────────────────
+# run()'s "Load closing prices from ArcticDB" block hard-fails when any held
+# ticker has no authoritative close for run_date. SPY's equivalent guard
+# (_spy_close, a standalone function) has dedicated tests above; this block is
+# inlined in run() instead, so exercising it means driving run() itself up to
+# that point — mirroring the bail-out-at-the-first-unmocked-boundary style
+# TestSnapshotContract already uses for run().
+
+
+def _run_up_to_closing_prices(monkeypatch, *, held_ticker="AAPL", read_error=None,
+                               frame=None, run_date="2026-04-28"):
+    """Drive run() through snapshot load + sector enrichment + SPY return up
+    to the held-position closing-price lookup, with one held ticker
+    (`held_ticker`, routed through universe_lib) configured to fail the
+    ArcticDB read per `read_error`/`frame`.
+    """
+    import pandas as pd
+
+    monkeypatch.setattr(
+        "executor.eod_reconcile.now_dual",
+        lambda: SimpleNamespace(trading_day=run_date, calendar_date=run_date),
+    )
+    monkeypatch.setattr(
+        "executor.eod_reconcile.load_config",
+        lambda: {
+            "db_path": "/tmp/x.db",
+            "trades_bucket": "alpha-engine-research",
+            "aws_region": "us-east-1",
+            "email_sender": "x@x.com",
+            "email_recipients": "y@y.com",
+        },
+    )
+    monkeypatch.setattr(
+        "executor.preflight.ExecutorPreflight",
+        lambda **kw: SimpleNamespace(run=lambda: None),
+    )
+    mock_conn = MagicMock()
+    mock_conn.execute.return_value.fetchone.return_value = None  # no prior eod_pnl row
+    monkeypatch.setattr("executor.eod_reconcile.init_db", lambda path: mock_conn)
+    monkeypatch.setattr(
+        "executor.snapshot_capturer.load_snapshot",
+        lambda **kw: {
+            "account": {"net_liquidation": 100_000.0},
+            "positions": {held_ticker: {"qty": 10}},
+            "captured_at": "2026-04-28T21:00:00Z",
+        },
+    )
+    # Sector enrichment is best-effort (wrapped in try/except in run()) —
+    # raising here skips straight past it without needing a real S3 mock.
+    monkeypatch.setattr(
+        "executor.eod_reconcile._load_signals_from_s3",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no signals in test")),
+    )
+    # SPY return is computed via the already-tested _spy_close — stub it so
+    # this test isn't coupled to a second ArcticDB fixture.
+    monkeypatch.setattr("executor.eod_reconcile._spy_close", lambda *a, **kw: 450.0)
+
+    lib = MagicMock()
+    if read_error is not None:
+        lib.read.side_effect = read_error
+    else:
+        lib.read.return_value = SimpleNamespace(data=frame)
+    monkeypatch.setattr("executor.price_cache._open_universe_library", lambda bucket: lib)
+
+
+def test_held_ticker_hard_fails_when_arcticdb_read_fails(monkeypatch):
+    """A held ticker whose ArcticDB read raises must hard-fail run(), naming
+    the ticker, the exception class, and run_date — mirroring
+    test_spy_close_hard_fails_when_symbol_missing for the held-position path."""
+    _run_up_to_closing_prices(
+        monkeypatch, held_ticker="AAPL", read_error=KeyError("no such symbol: AAPL"),
+    )
+    with pytest.raises(RuntimeError, match=r"AAPL \(KeyError\)"):
+        run(run_date="2026-04-28")
+
+
+def test_held_ticker_hard_fails_when_no_row_for_run_date(monkeypatch):
+    """A held ticker whose ArcticDB frame has no row for run_date must
+    hard-fail run() — mirroring test_spy_close_hard_fails_when_date_missing
+    for the held-position path."""
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {"Close": [190.0]},
+        index=pd.to_datetime(["2026-04-27"]),
+    )
+    _run_up_to_closing_prices(monkeypatch, held_ticker="AAPL", frame=frame)
+    with pytest.raises(RuntimeError, match=r"AAPL \(no row for 2026-04-28\)"):
+        run(run_date="2026-04-28")
+
+
+def test_held_ticker_hard_fails_when_close_column_missing(monkeypatch):
+    """A held ticker whose ArcticDB frame has no Close column must hard-fail
+    run() — mirroring test_spy_close_hard_fails_when_close_column_missing
+    for the held-position path."""
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {"Open": [190.0]},
+        index=pd.to_datetime(["2026-04-28"]),
+    )
+    _run_up_to_closing_prices(monkeypatch, held_ticker="AAPL", frame=frame)
+    with pytest.raises(RuntimeError, match=r"AAPL \(no Close column\)"):
+        run(run_date="2026-04-28")
