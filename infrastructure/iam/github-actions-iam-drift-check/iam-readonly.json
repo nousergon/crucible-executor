@@ -43,7 +43,15 @@
                 "arn:aws:iam::711398986525:role/alpha-engine-canary-replay-dispatcher-role",
                 "arn:aws:iam::711398986525:role/alpha-engine-canary-replay-liveness-probe-role",
                 "arn:aws:iam::711398986525:role/alpha-engine-config-runner-dispatcher-role",
-                "arn:aws:iam::711398986525:role/alpha-engine-eod-precondition-probe-role"
+                "arn:aws:iam::711398986525:role/alpha-engine-eod-precondition-probe-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-alert-drain-dispatcher-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-expense-collector-role",
+                "arn:aws:iam::711398986525:role/metron-runner-dispatcher-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-overseer-dispatcher-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-substrate-health-gate-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-sweep-artifact-monitor-role",
+                "arn:aws:iam::711398986525:role/telos-runner-dispatcher-role",
+                "arn:aws:iam::711398986525:role/vires-runner-dispatcher-role"
             ]
         },
         {
