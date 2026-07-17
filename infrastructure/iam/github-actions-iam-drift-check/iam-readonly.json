@@ -39,7 +39,11 @@
                 "arn:aws:iam::711398986525:role/alpha-engine-spot-orphan-reaper-role",
                 "arn:aws:iam::711398986525:role/alpha-engine-ssm-liveness-poller-role",
                 "arn:aws:iam::711398986525:role/alpha-engine-usage-pace-alert-role",
-                "arn:aws:iam::711398986525:role/alpha-engine-weekly-schedule-adjuster-role"
+                "arn:aws:iam::711398986525:role/alpha-engine-weekly-schedule-adjuster-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-canary-replay-dispatcher-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-canary-replay-liveness-probe-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-config-runner-dispatcher-role",
+                "arn:aws:iam::711398986525:role/alpha-engine-eod-precondition-probe-role"
             ]
         },
         {

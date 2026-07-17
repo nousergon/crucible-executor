@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "MetronAdvisorSftCapturePutObject",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/metron/_sft_raw/*"
+    }
+  ]
+}
