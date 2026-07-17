@@ -1667,6 +1667,17 @@ def run_daemon(dry_run: bool = False) -> None:
             conn.close()
         if fd:
             fd.log_summary(logger)
+            # config#646 — emit the end-of-run flow-doctor heartbeat to the
+            # RESEARCH bucket (signals_bucket == alpha-engine-research), which
+            # is what the dashboard System Health consumer reads. Must NOT go
+            # to trades_bucket. Soft-fails internally (returns None, never
+            # raises). The hasattr guard keeps this forward/backward-compatible
+            # during the phased flow-doctor lib rollout: emit_heartbeat only
+            # exists in flow-doctor >=0.6.2, and the 5 producing repos deploy
+            # independently, so a version-skewed deploy (e.g. still on 0.6.0rc3)
+            # must not AttributeError at end-of-run.
+            if hasattr(fd, "emit_heartbeat"):
+                fd.emit_heartbeat(bucket=config.get("signals_bucket", "alpha-engine-research"))
         send_daemon_status(
             f"\u23f9 *Daemon stopped*\n"
             f"Trades executed: {trades_executed}"
