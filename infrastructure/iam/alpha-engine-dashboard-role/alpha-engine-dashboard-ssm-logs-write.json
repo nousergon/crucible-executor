@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SSMLogsHealthCheckWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/_ssm_logs/health-check/*",
+        "arn:aws:s3:::alpha-engine-research/_ssm_logs/substrate-health-check/*",
+        "arn:aws:s3:::alpha-engine-research/_ssm_logs/substrate-health-check-daily/*"
+      ]
+    }
+  ]
+}

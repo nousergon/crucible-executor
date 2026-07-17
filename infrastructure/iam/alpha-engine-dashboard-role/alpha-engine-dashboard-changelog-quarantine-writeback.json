@@ -1,0 +1,14 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ChangelogQuarantineWritebackPutDelete",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject"],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/changelog/entries/*",
+        "arn:aws:s3:::alpha-engine-research/changelog/quarantine/*"
+      ]
+    }
+  ]
+}
