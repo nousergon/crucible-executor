@@ -1,3 +1,4 @@
 [
+    "arn:aws:iam::711398986525:policy/nousergon-alerts-put-events",
     "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 ]
