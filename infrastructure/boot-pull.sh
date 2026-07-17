@@ -311,27 +311,49 @@ fi
 # added in PR #62 sat on disk for days before this was noticed). After a
 # new .timer is copied and daemon-reload'd, it's enabled + started so the
 # next boot picks it up and the current boot activates it immediately.
-SYSTEMD_SRC="/home/ec2-user/alpha-engine/infrastructure/systemd"
-if [ -d "$SYSTEMD_SRC" ]; then
-    CHANGED=false
+#
+# sync_systemd_units_from() (config#2352): factored out so this same
+# install/update/orphan/enable-reconcile logic can run a SECOND pass against
+# nousergon-data's infrastructure/systemd/ below — that repo's
+# metron-intraday.{service,timer} were version-tracked but boot-pull never
+# looked at them, so a merged unit edit silently never took effect until an
+# operator remembered to re-run install-metron-intraday.sh over SSM
+# (2026-07-13 operator ruling: "queue on merge, apply on next boot" — THIS
+# boot-pull pass is that queue's drain point for the trading box, which is
+# off most of the day and can't reliably receive a merge-time SSM push).
+# $1: source dir holding *.service/*.timer. $2+: one or more glob prefixes
+# for orphan reconciliation (keeps each repo's orphan sweep scoped to units
+# IT owns — alpha-engine's sweep must never disable/remove a nousergon-data
+# unit or vice versa; multiple prefixes let one source dir cover unit
+# families that don't share a common prefix, e.g. nousergon-data ships both
+# "metron-intraday.*" and "systemd-unit-drift-check.*").
+sync_systemd_units_from() {
+    local SYSTEMD_SRC="$1"
+    shift
+    local ORPHAN_GLOB_PREFIXES=("$@")
+    [ -d "$SYSTEMD_SRC" ] || return 0
+
+    local CHANGED=false
     for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         [ -f "$unit" ] || continue
+        local name target
         name=$(basename "$unit")
         target="/etc/systemd/system/$name"
         if [ ! -f "$target" ]; then
             sudo cp "$unit" /etc/systemd/system/
-            log "OK   systemd: installed $name (new)"
+            log "OK   systemd: installed $name (new, src=$SYSTEMD_SRC)"
             CHANGED=true
         elif ! diff -q "$unit" "$target" >/dev/null 2>&1; then
             sudo cp "$unit" /etc/systemd/system/
-            log "OK   systemd: updated $name"
+            log "OK   systemd: updated $name (src=$SYSTEMD_SRC)"
             CHANGED=true
         fi
     done
-    # Orphan reconciliation: any /etc/systemd/system/alpha-engine-*.{service,timer}
-    # without a corresponding source in $SYSTEMD_SRC was removed from the
+    # Orphan reconciliation: any installed unit matching $ORPHAN_GLOB_PREFIX
+    # without a corresponding source in $SYSTEMD_SRC was removed from that
     # repo and must be retired here. Disable + remove. Safety: only matches
-    # `alpha-engine-*` prefix, never touches unrelated system units.
+    # the given prefix, never touches unrelated system units (including the
+    # OTHER repo's tracked units — each call site passes its own prefix).
     #
     # 2026-04-28: closes the asymmetry where adding a new timer was
     # self-healing (install/update/enable handled) but retiring one was
@@ -339,15 +361,18 @@ if [ -d "$SYSTEMD_SRC" ]; then
     # after deletion from the repo. After this pass, removing a unit
     # file from `infrastructure/systemd/` is the canonical retirement
     # path: next boot disables + deletes it.
-    for installed in /etc/systemd/system/alpha-engine-*.service /etc/systemd/system/alpha-engine-*.timer; do
-        [ -f "$installed" ] || continue  # glob may match nothing
-        name=$(basename "$installed")
-        if [ ! -f "$SYSTEMD_SRC/$name" ]; then
-            sudo systemctl disable --now "$name" >> "$LOG" 2>&1 || true
-            sudo rm -f "$installed"
-            log "OK   systemd: orphan removed $name (no longer in repo)"
-            CHANGED=true
-        fi
+    for prefix in "${ORPHAN_GLOB_PREFIXES[@]}"; do
+        for installed in /etc/systemd/system/${prefix}*.service /etc/systemd/system/${prefix}*.timer; do
+            [ -f "$installed" ] || continue  # glob may match nothing
+            local oname
+            oname=$(basename "$installed")
+            if [ ! -f "$SYSTEMD_SRC/$oname" ]; then
+                sudo systemctl disable --now "$oname" >> "$LOG" 2>&1 || true
+                sudo rm -f "$installed"
+                log "OK   systemd: orphan removed $oname (no longer in $SYSTEMD_SRC)"
+                CHANGED=true
+            fi
+        done
     done
 
     if $CHANGED; then
@@ -380,14 +405,26 @@ if [ -d "$SYSTEMD_SRC" ]; then
     # for timer-enable drift.
     for unit in "$SYSTEMD_SRC"/*.timer; do
         [ -f "$unit" ] || continue
-        name=$(basename "$unit")
-        if sudo systemctl enable --now "$name" >> "$LOG" 2>&1; then
-            log "OK   systemd: enable reconciled $name"
+        local tname
+        tname=$(basename "$unit")
+        if sudo systemctl enable --now "$tname" >> "$LOG" 2>&1; then
+            log "OK   systemd: enable reconciled $tname"
         else
-            log "WARN systemd: enable reconcile failed: $name"
+            log "WARN systemd: enable reconcile failed: $tname"
         fi
     done
-fi
+}
+
+sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "alpha-engine-"
+
+# nousergon-data's systemd units (metron-intraday.{service,timer} +
+# config#2352's own systemd-unit-drift-check.{service,timer}) — see
+# sync_systemd_units_from's comment above for why this second pass exists.
+# Two orphan prefixes since nousergon-data's unit names don't share a common
+# "alpha-engine-*"-style prefix: glob on the two exact basenames this repo
+# ships instead of a wildcard prefix, so a future unrelated unit hand-placed
+# on this box for debugging is never swept as an "orphan" of this repo.
+sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" "metron-intraday" "systemd-unit-drift-check"
 
 # Config files are now in the alpha-engine-config private repo (pulled above).
 # Each module's config loader searches ~/alpha-engine-config/ first.

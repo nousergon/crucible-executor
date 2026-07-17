@@ -15,6 +15,7 @@
                     "token.actions.githubusercontent.com:sub": [
                         "repo:nousergon/crucible-executor:*",
                         "repo:nousergon/nousergon-data:*",
+                        "repo:nousergon/crucible-predictor:*",
                         "repo:nousergon/nous-ergon-ops:*"
                     ]
                 }

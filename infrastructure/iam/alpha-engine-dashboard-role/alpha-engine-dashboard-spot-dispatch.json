@@ -1,0 +1,76 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SpotDispatchRunInstances",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-east-1:711398986525:instance/*",
+        "arn:aws:ec2:us-east-1:711398986525:volume/*",
+        "arn:aws:ec2:us-east-1:711398986525:network-interface/*",
+        "arn:aws:ec2:us-east-1:711398986525:key-pair/alpha-engine-key",
+        "arn:aws:ec2:us-east-1:711398986525:security-group/sg-03cd3c4bd91e610b0",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-a61ec0fb",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-1e58307a",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-789d3857",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-c670118d",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-7cff7c43",
+        "arn:aws:ec2:us-east-1:711398986525:subnet/subnet-e07166ec",
+        "arn:aws:ec2:us-east-1::image/ami-0c421724a94bba6d6"
+      ]
+    },
+    {
+      "Sid": "SpotDispatchCreateTagsOnLaunch",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:us-east-1:711398986525:instance/*",
+        "arn:aws:ec2:us-east-1:711398986525:volume/*",
+        "arn:aws:ec2:us-east-1:711398986525:network-interface/*"
+      ],
+      "Condition": {
+        "StringEquals": { "ec2:CreateAction": "RunInstances" }
+      }
+    },
+    {
+      "Sid": "SpotDispatchStagingPutObject",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research/tmp/spot_data_weekly/*",
+        "arn:aws:s3:::alpha-engine-research/tmp/spot_train/*",
+        "arn:aws:s3:::alpha-engine-research/tmp/spot_backtest/*",
+        "arn:aws:s3:::alpha-engine-research/ops/daily_data_spot/*",
+        "arn:aws:s3:::alpha-engine-research/_ssm_logs/*",
+        "arn:aws:s3:::alpha-engine-research/_spot_diagnostics/*"
+      ]
+    },
+    {
+      "Sid": "SpotDispatchSsmSendCommand",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand",
+        "ssm:DescribeInstanceInformation",
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SpotDispatchTerminateOwnLaunches",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "ec2:ResourceTag/Name": [
+            "alpha-engine-data-*",
+            "alpha-engine-backtest-*",
+            "alpha-engine-gbm-train-*"
+          ]
+        }
+      }
+    }
+  ]
+}
