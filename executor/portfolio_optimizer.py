@@ -205,7 +205,7 @@ def solve_target_weights(
     except ImportError as e:
         raise ImportError(
             "cvxpy is required for portfolio_optimizer. Install via "
-            "`pip install 'cvxpy>=1.4,<1.8'`. See requirements.txt."
+            "`pip install 'cvxpy>=1.9.2,<1.10'`. See requirements.txt."
         ) from e
 
     sigma_psd = cp.psd_wrap(sigma)

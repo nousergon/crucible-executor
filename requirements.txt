@@ -86,10 +86,24 @@ krepis>=0.14.0
 # import time — executor/portfolio_optimizer.py raises a clear ImportError if
 # missing, so the legacy 1/n sizing path runs unaffected on environments that
 # haven't pulled these in yet.
-# cvxpy + scikit-learn pins are upper-bounded to stay compatible with numpy<3
-# (line 5). cvxpy 1.8+ uses numpy.lib.array_utils (numpy 2.x only); sklearn 1.6+
-# shipped wheels built against numpy 2.x. Both conflict with the arcticdb /
-# pyarrow / pandas stack already pinned in this repo. Drop the upper bounds
-# only when the rest of the requirements graph moves to numpy 2.
-cvxpy>=1.4,<1.8
+# cvxpy: the rest of this stack (arcticdb~=6.18, pyarrow~=25.0, pandas~=2.2)
+# already resolves numpy to the 2.x series today — arcticdb 6.18.x and
+# pyarrow 25.0.x both support numpy 2 (verified via PyPI metadata + a real
+# `pip install -r requirements.txt`, numpy resolved to 2.4.6 even under the
+# old <1.8 ceiling). cvxpy was the lone holdout: cvxpy>=1.8.0 declares
+# `numpy>=2.0.0` in its own metadata (it imports numpy.lib.array_utils,
+# which does not exist before numpy 2.0), so the old <1.8 ceiling here was
+# never actually "for numpy<3 compatibility" as previously stated — numpy
+# was already resolving to 2.x regardless of cvxpy's version. The real
+# constraint cvxpy<1.8 enforced was just "don't hard-require numpy>=2.0.0
+# at cvxpy's own import time," resting on an unverified (and false)
+# assumption that numpy needed to stay <2 elsewhere in this graph. Range
+# below matches what dependabot proposed in crucible-executor#388 (closed
+# via `@dependabot ignore this dependency` pending this migration) so
+# re-enabling dependabot afterward should not immediately re-propose a
+# conflicting bump.
+#
+# scikit-learn pin stays upper-bounded pending separate verification of the
+# 1.10 series; unrelated to the cvxpy/numpy coupling above.
+cvxpy>=1.9.2,<1.10
 scikit-learn>=1.9.0,<1.10
