@@ -548,6 +548,7 @@ def _plan_entries(
     predictions_date: str | None = None,
     regime_intensity_z: float | None = None,
     adv_map: dict | None = None,
+    derisk_multiplier: float = 1.0,
 ) -> tuple[int, list[dict], list[dict], list[dict]]:
     """Live-shell wrapper around ``executor.deciders.decide_entries``.
 
@@ -602,6 +603,7 @@ def _plan_entries(
         predictions_date=predictions_date,
         regime_intensity_z=regime_intensity_z,
         adv_map=adv_map,
+        derisk_multiplier=derisk_multiplier,
     )
 
     # Dispatch decisions to side-effecting layer.
@@ -866,6 +868,39 @@ def _write_hold_book_flag(
     for _key in (
         f"executor/hold_book_flags/{run_date}.json",
         "executor/hold_book_flags/latest.json",
+    ):
+        _s3.put_object(
+            Bucket=bucket, Key=_key, Body=payload.encode(),
+            ContentType="application/json",
+        )
+
+
+def _write_derisk_gate_artifact(gate, bucket: str, run_date: str) -> None:
+    """Persist the expectancy-gated de-risk stance decision for this
+    planning cycle to S3 (config-I2820 deliverable 4: "Log visibility").
+
+    Mirrors ``_write_hold_book_flag``'s dated-artifact + ``latest.json``
+    pointer convention so the dashboard can read the gate state the same
+    way it reads the hold-book flag. Written unconditionally (both
+    active=True and active=False) whenever the gate is ``enabled`` so the
+    operator can see the gate is live and clear, not just when it fires.
+    Best-effort — the caller swallows failures so this audit artifact
+    never blocks the planner.
+    """
+    import boto3 as _boto3
+
+    payload = json.dumps(
+        {
+            "run_date": run_date,
+            "written_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **gate.to_log_dict(),
+        },
+        indent=2,
+    )
+    _s3 = _boto3.client("s3")
+    for _key in (
+        f"executor/derisk_gate/{run_date}.json",
+        "executor/derisk_gate/latest.json",
     ):
         _s3.put_object(
             Bucket=bucket, Key=_key, Body=payload.encode(),
@@ -1393,7 +1428,64 @@ def run(
                     log_risk_event(conn, ev)
                 except Exception as e:
                     logger.debug("risk_event log failed (drawdown): %s", e)
-    
+
+        # ── 2c'. Expectancy-gated de-risk stance (config-I2820 / PR2071) ───────
+        # Standing operator de-risk rule (halt-or-derisk-live-deployment,
+        # config#978 migration): when the signal chain's expectancy metrics
+        # (alpha_vs_spy, information_ratio_ci_lower, sharpe_ratio) breach
+        # their red-lines, cap position sizes to `derisk_sizing_multiplier`
+        # and floor the MVO risk_aversion — independent of, and NOT composed
+        # into, `dd_multiplier` (drawdown is a REALIZED portfolio-loss signal
+        # that also drives drawdown_forced_exit at §2g; expectancy is a
+        # FORWARD-LOOKING signal-chain-quality signal with no forced-exit
+        # side effect — conflating the two would spuriously force-exit held
+        # positions on a pure expectancy breach). Fail-loud BY DESIGN: raises
+        # DeriskGateConfigError (not caught here) when the flag is enabled
+        # but config/ledger is malformed — see executor/derisk_gate.py
+        # module docstring. When the flag is absent/false (default), this is
+        # a zero-cost no-op (bit-identical pre-this-PR behavior).
+        #
+        # Skipped entirely in simulate mode (backtester): mirrors the
+        # regime-substrate read above (§2b') — the backtester pre-loads all
+        # state once at simulate-loop bootstrap and doesn't want a live S3
+        # read per simulated date. `derisk_multiplier` stays at its 1.0
+        # no-op default under simulate, same posture as `regime_intensity_z`
+        # staying None.
+        from executor.derisk_gate import evaluate_derisk_gate
+
+        derisk_multiplier = 1.0
+        derisk_gate = None
+        if not simulate:
+            derisk_gate = evaluate_derisk_gate(config, bucket=signals_bucket)
+            derisk_multiplier = derisk_gate.sizing_multiplier
+            if derisk_gate.active:
+                logger.warning("De-risk gate ACTIVE: %s", derisk_gate.reason)
+        if conn and derisk_gate is not None and derisk_gate.enabled:
+            signals_date_for_events = signals_raw.get("date", run_date) if signals_raw else run_date
+            derisk_event = {
+                "date": run_date,
+                "event_type": "throttle" if derisk_gate.active else "observation",
+                "rule": "derisk_expectancy_gate",
+                "reason": derisk_gate.reason,
+                "value": derisk_gate.sizing_multiplier,
+                "threshold": None,
+                "market_regime": market_regime,
+                "signal_date": signals_date_for_events,
+                "prediction_date": predictions_date,
+                "context": derisk_gate.to_log_dict(),
+            }
+            try:
+                log_risk_event(conn, derisk_event)
+            except Exception as e:
+                logger.debug("risk_event log failed (derisk gate): %s", e)
+        if not simulate and not dry_run and signals_bucket:
+            try:
+                _write_derisk_gate_artifact(derisk_gate, signals_bucket, run_date)
+            except Exception as e:
+                logger.warning(
+                    "de-risk gate decision-artifact write failed (non-blocking): %s", e,
+                )
+
         # ── 2d. Strategy layer: evaluate exit rules on held positions ──────────
         strategy_config = load_strategy_config(config)
     
@@ -1730,6 +1822,7 @@ def run(
                 price_histories=price_histories,
                 atr_map=atr_map,
                 dd_multiplier=dd_multiplier,
+                derisk_multiplier=derisk_multiplier,
                 signal_age_days=signal_age_days,
                 earnings_by_ticker=earnings_by_ticker,
                 vwap_map=vwap_map,

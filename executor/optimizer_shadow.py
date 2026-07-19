@@ -207,6 +207,30 @@ def _build_and_solve(
         # the solver is unchanged until a tuned config exists).
         **_load_auto_tuned_optimizer_cfg(config),
     }
+
+    # ── Expectancy-gated de-risk floor (config-I2820 / PR2071) ───────────────
+    # When the standing de-risk stance is active, the MVO risk_aversion is
+    # floored at configured_risk_aversion / derisk_sizing_multiplier — applied
+    # AFTER the auto-tuned override above so a de-risk breach can only make
+    # the solve MORE conservative than whatever risk_aversion the YAML/tuner
+    # otherwise resolved to (apply_risk_aversion_floor is a max(), never a
+    # decrease). Fail-loud by construction: evaluate_derisk_gate raises
+    # DeriskGateConfigError (propagated, not caught here) when the flag is
+    # enabled but config/ledger is malformed — a live-sizing safety gate must
+    # not silently degrade to an un-floored solve. No-op (1.0x, floor=None)
+    # when the flag is absent/false, so this is bit-identical to pre-this-PR
+    # behavior until an operator opts in.
+    from executor.derisk_gate import apply_risk_aversion_floor, evaluate_derisk_gate
+
+    _derisk_gate = evaluate_derisk_gate(config, bucket=signals_bucket)
+    if _derisk_gate.active:
+        optimizer_cfg["risk_aversion"] = apply_risk_aversion_floor(
+            optimizer_cfg["risk_aversion"], _derisk_gate,
+        )
+        logger.warning(
+            "[derisk_gate] optimizer risk_aversion floored at %.2f (%s)",
+            optimizer_cfg["risk_aversion"], _derisk_gate.reason,
+        )
     tickers = _build_universe(
         signals_raw, predictions_by_ticker, current_positions, price_histories,
     )

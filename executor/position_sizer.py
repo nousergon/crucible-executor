@@ -64,6 +64,7 @@ def compute_position_size(
     current_price: float,
     config: dict,
     drawdown_multiplier: float = 1.0,
+    derisk_multiplier: float = 1.0,
     atr_pct: float | None = None,
     prediction_confidence: float | None = None,
     p_up: float | None = None,
@@ -84,15 +85,20 @@ def compute_position_size(
       3. conviction_adj: rising/stable→1.00, declining→config multiplier
       4. upside_adj: price_target_upside < min_price_target_upside → config multiplier
       5. drawdown_adj: multiplier from graduated drawdown tiers (1.0/0.50/0.25)
-      6. position_weight = min(base * sector * conviction * upside * dd, max_position_pct)
-      7. ADV cap (tradeability arc, config#1401): dollar_size is additionally
+      6. derisk_adj: expectancy-gated de-risk multiplier (config-I2820 / PR2071),
+         1.0 unless the standing de-risk stance is active, in which case it's
+         ``derisk_sizing_multiplier`` (config default 0.50) — independent of
+         and multiplicatively composed with the drawdown adj, not a substitute
+         for it (drawdown = realized loss; de-risk = forward expectancy gate).
+      7. position_weight = min(base * sector * conviction * upside * dd * derisk, max_position_pct)
+      8. ADV cap (tradeability arc, config#1401): dollar_size is additionally
          capped at ``max_pct_adv × adv_usd`` so a single new position can never
          consume more than a configured slice of the name's average daily dollar
          volume — the per-name capacity guardrail that mirrors the optimizer's
          max-%-ADV constraint. Skipped when ``adv_usd`` is missing/≤0 (coverage
          gap → conservative degrade, no cap) or the cap is disabled.
-      8. dollar_size = portfolio_nav * position_weight  (then ADV-capped)
-      9. shares = floor(dollar_size / current_price)
+      9. dollar_size = portfolio_nav * position_weight  (then ADV-capped)
+      10. shares = floor(dollar_size / current_price)
 
     ``adv_usd`` — the name's average daily DOLLAR volume from the scanner
     tradeability artifact (crucible-research#343, ``tradeability.adv_usd``).
@@ -257,7 +263,7 @@ def compute_position_size(
 
     max_pct = config.get("max_position_pct", 0.05)
     raw_weight = (base_weight * sector_adj * conviction_adj * upside_adj
-                  * drawdown_multiplier * atr_adj * confidence_adj
+                  * drawdown_multiplier * derisk_multiplier * atr_adj * confidence_adj
                   * staleness_adj * earnings_adj * coverage_adj
                   * stance_adj * regime_adj * barrier_win_prob_adj)
     position_weight = min(raw_weight, max_pct)
@@ -266,7 +272,7 @@ def compute_position_size(
     # multipliers. If ATR sizing reduced the weight, the final weight should
     # not exceed what ATR alone would have allowed.
     if config.get("atr_sizing_enabled", True) and atr_adj < 1.0:
-        atr_only_weight = base_weight * atr_adj * drawdown_multiplier
+        atr_only_weight = base_weight * atr_adj * drawdown_multiplier * derisk_multiplier
         position_weight = min(position_weight, atr_only_weight, max_pct)
 
     dollar_size = portfolio_nav * position_weight
@@ -312,7 +318,7 @@ def compute_position_size(
     logger.debug(
         f"{ticker} sizing: n={n} base={base_weight:.3f} sector_adj={sector_adj} "
         f"conviction_adj={conviction_adj} upside_adj={upside_adj} "
-        f"dd_mult={drawdown_multiplier} atr_adj={atr_adj} "
+        f"dd_mult={drawdown_multiplier} derisk_mult={derisk_multiplier} atr_adj={atr_adj} "
         f"confidence_adj={confidence_adj} staleness_adj={staleness_adj} "
         f"earnings_adj={earnings_adj} coverage_adj={coverage_adj} "
         f"stance_adj={stance_adj} regime_adj={regime_adj} "
@@ -329,6 +335,7 @@ def compute_position_size(
         "conviction_adj": conviction_adj,
         "upside_adj": upside_adj,
         "dd_multiplier": drawdown_multiplier,
+        "derisk_multiplier": derisk_multiplier,
         "atr_adj": atr_adj,
         "confidence_adj": confidence_adj,
         "staleness_adj": staleness_adj,
