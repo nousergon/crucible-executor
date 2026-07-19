@@ -221,6 +221,57 @@ class TestComputePositionSize:
         assert result["position_pct"] == 0.02
         assert result["dd_multiplier"] == 0.50
 
+    def test_derisk_multiplier_reduces_sizing(self):
+        """Passing derisk_multiplier=0.50 (config-I2820 expectancy gate)
+        should halve the position, independent of drawdown_multiplier."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(),
+            derisk_multiplier=0.50,
+        )
+        # 0.04 * 0.50 = 0.02
+        assert result["position_pct"] == 0.02
+        assert result["derisk_multiplier"] == 0.50
+
+    def test_derisk_and_drawdown_multipliers_compose(self):
+        """The two multipliers compose multiplicatively — a de-risk breach
+        during an ALSO-active drawdown tier compounds, it doesn't override."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(),
+            drawdown_multiplier=0.50,
+            derisk_multiplier=0.50,
+        )
+        # 0.04 * 0.50 * 0.50 = 0.01
+        assert result["position_pct"] == 0.01
+
+    def test_derisk_multiplier_default_is_noop(self):
+        """Omitting derisk_multiplier preserves legacy sizing (1.0x, no-op)."""
+        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+        result = compute_position_size(
+            ticker="AAPL",
+            portfolio_nav=100_000,
+            enter_signals=enter_signals,
+            signal=_base_signal(),
+            sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(),
+        )
+        assert result["derisk_multiplier"] == 1.0
+        assert result["position_pct"] == 0.04
+
     def test_shares_floor_division(self):
         """Shares should be floor(dollar_size / price)."""
         result = compute_position_size(

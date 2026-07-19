@@ -503,6 +503,7 @@ def decide_entries(
     predictions_date: str | None = None,
     regime_intensity_z: float | None = None,
     adv_map: dict | None = None,
+    derisk_multiplier: float = 1.0,
 ) -> EntryPlan:
     """Pure decision pipeline for ENTER signals.
 
@@ -516,6 +517,15 @@ def decide_entries(
       7. GBM veto from `predictions_by_ticker[ticker]['gbm_veto']`
       8. Risk guard (`check_order` — score, sector, equity, drawdown,
          correlation gates)
+
+    ``derisk_multiplier`` (config-I2820 / PR2071): expectancy-gated de-risk
+    sizing multiplier, resolved once per planning cycle by
+    ``executor.derisk_gate.evaluate_derisk_gate`` and threaded straight
+    through to ``compute_position_size`` — 1.0 (no-op) unless the gate is
+    both enabled and active. Deliberately independent of ``dd_multiplier``:
+    drawdown is a realized-loss signal that also drives
+    ``drawdown_forced_exit``; expectancy is a forward-looking signal-chain
+    quality gate with no forced-exit side effect on held positions.
 
     Returns an ``EntryPlan`` with ``orders`` (executable), ``blocked``
     (shadow book), ``n_entered`` (count), and ``entries_with_meta``
@@ -803,6 +813,7 @@ def decide_entries(
             current_price=current_price,
             config=config,
             drawdown_multiplier=dd_multiplier,
+            derisk_multiplier=derisk_multiplier,
             atr_pct=atr_pct,
             prediction_confidence=pred_confidence,
             p_up=pred_data.get("p_up"),

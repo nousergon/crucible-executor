@@ -219,6 +219,30 @@ regime_min_score_cap: 10.0       # max absolute adjustment in score points
 regime_min_score_floor: 50.0     # clamp lower bound on adjusted threshold
 regime_min_score_ceil:  90.0     # clamp upper bound on adjusted threshold
 
+# ── Expectancy-gated de-risk stance (alpha-engine #1259 / config-I2820) ─────
+# Off by default (absent key ↔ False); ships dormant until
+# alpha-engine-config-PR2071 codifies these blocks in the live private
+# risk.yaml AND an operator has reviewed the standing de-risk rule. When ON,
+# executor/derisk_gate.py reads the signal chain's expectancy metrics from
+# the latest director/carryover_ledger.json (S3, updated weekly Saturday SF)
+# and, if ANY red-line is breached, caps position sizing to
+# derisk_sizing_multiplier of nominal AND floors the MVO portfolio_optimizer
+# risk_aversion at (configured risk_aversion / derisk_sizing_multiplier) —
+# held until the metrics clear. FAIL-LOUD when enabled: a missing/malformed
+# threshold block or an unreadable/malformed ledger raises
+# DeriskGateConfigError rather than silently falling back to full sizing —
+# see the module docstring for the complete contract. Independent of (never
+# composed with) the graduated-drawdown multiplier above: drawdown is a
+# REALIZED portfolio-loss signal that also drives drawdown_forced_exit;
+# this gate is a FORWARD-LOOKING signal-chain-quality gate with no
+# forced-exit side effect on held positions.
+derisk_on_expectancy_enabled: false   # gate-off by default; flip only after PR2071 + operator review
+derisk_sizing_multiplier: 0.50        # position sizing cap (0, 1] applied when gate is active
+derisk_expectancy_thresholds:
+  alpha_vs_spy: -0.05                 # must be >= this; below → gate active
+  information_ratio_ci_lower: -7      # must be >= this (CI lower bound); below → gate active
+  sharpe_ratio: 0.5                   # must be >= this; below → gate active
+
 # ── IBKR connection ─────────────────────────────────────────────────────────
 ibkr_host: "127.0.0.1"
 ibkr_port: 4002                  # 4002 = paper trading, 4001 = live
