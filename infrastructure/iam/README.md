@@ -63,6 +63,16 @@ absent ⇒ that axis is skipped for that role).
   ECR enhanced scanning on the evaluator's Lambda images and a scan-only (never
   auto-patch) SSM Patch Manager baseline on the EC2 fleet, and read back
   compliance/scan results, without a human applying the AWS side out-of-band.
+  Extended 2026-07-19 (alpha-engine-config#2535 follow-up): live execution of
+  the two remaining calls surfaced permissions AWS requires beyond what the
+  2026-07-16 grant covered — `ecr:PutRegistryScanningConfiguration` with
+  `scanType: ENHANCED` also activates Inspector2 under the hood and needs
+  `inspector2:Enable`/`inspector2:BatchGetAccountStatus` (`Resource: "*"`, no
+  resource-level scoping exists), and `ssm:CreateAssociation` requires
+  permission on the target EC2 instance ARN in addition to the document ARN —
+  added the `alpha-engine-executor`/trading-box (`i-018eb3307a21329bf`) and
+  `alpha-engine-dashboard` (`i-09b539c844515d549`) instance ARNs to that
+  statement's `Resource` list.
   Trust policy
   (`ec2.amazonaws.com`) and managed attachment (`AmazonSSMManagedInstanceCore`)
   are codified via the reserved files. Until 2026-06-09 this role was also the

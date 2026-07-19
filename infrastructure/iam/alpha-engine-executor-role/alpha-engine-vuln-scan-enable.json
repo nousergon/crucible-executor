@@ -20,7 +20,11 @@
             "Sid": "SSMPatchBaselineScanOnlyAssociation",
             "Effect": "Allow",
             "Action": "ssm:CreateAssociation",
-            "Resource": "arn:aws:ssm:us-east-1::document/AWS-DefaultPatchBaseline"
+            "Resource": [
+                "arn:aws:ssm:us-east-1::document/AWS-DefaultPatchBaseline",
+                "arn:aws:ec2:us-east-1:711398986525:instance/i-018eb3307a21329bf",
+                "arn:aws:ec2:us-east-1:711398986525:instance/i-09b539c844515d549"
+            ]
         },
         {
             "Sid": "SSMPatchComplianceRead",
@@ -28,6 +32,15 @@
             "Action": [
                 "ssm:DescribePatchBaselines",
                 "ssm:ListComplianceItems"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "InspectorEnableForECREnhancedScanning",
+            "Effect": "Allow",
+            "Action": [
+                "inspector2:Enable",
+                "inspector2:BatchGetAccountStatus"
             ],
             "Resource": "*"
         }
