@@ -1,12 +1,11 @@
 """Unit tests for executor.risk_guard — pure logic, no IBKR/S3 calls."""
+
 import pandas as pd
-import pytest
-from unittest.mock import patch
 
 from executor.risk_guard import (
-    compute_drawdown_multiplier,
-    check_order,
     check_correlation,
+    check_order,
+    compute_drawdown_multiplier,
 )
 
 
@@ -157,19 +156,19 @@ class TestCheckOrder:
 
     def _call(self, **kwargs):
         """Call check_order with sensible defaults, allowing overrides."""
-        defaults = dict(
-            ticker="AAPL",
-            action="ENTER",
-            dollar_size=4000,
-            portfolio_nav=100_000,
-            peak_nav=100_000,
-            current_positions={},
-            sector="Technology",
-            market_regime="neutral",
-            signal=_base_signal(),
-            config=_base_config(),
-            price_histories=None,
-        )
+        defaults = {
+            "ticker": "AAPL",
+            "action": "ENTER",
+            "dollar_size": 4000,
+            "portfolio_nav": 100_000,
+            "peak_nav": 100_000,
+            "current_positions": {},
+            "sector": "Technology",
+            "market_regime": "neutral",
+            "signal": _base_signal(),
+            "config": _base_config(),
+            "price_histories": None,
+        }
         defaults.update(kwargs)
         return check_order(**defaults)
 

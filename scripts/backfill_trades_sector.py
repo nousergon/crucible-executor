@@ -36,6 +36,7 @@ import logging
 import os
 import sqlite3
 import sys
+from datetime import UTC
 
 # Resolve `executor.*` imports when invoked as `python scripts/...` from the
 # repo root — same pattern as executor/main.py:34. Lets the script be run
@@ -147,10 +148,11 @@ def _backup_db_to_s3(db_path: str, bucket: str) -> None:
     """Mirror the corrected trades.db to S3. Optional — the next EOD
     reconcile will re-export trades_full.csv from the local DB anyway,
     which is the consumer-facing artifact."""
+    from datetime import datetime
+
     import boto3
-    from datetime import datetime, timezone
     s3 = boto3.client("s3")
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     key = f"trades/backups/trades.db.{ts}.post-sector-backfill"
     with open(db_path, "rb") as f:
         s3.put_object(Bucket=bucket, Key=key, Body=f.read())

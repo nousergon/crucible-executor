@@ -20,7 +20,6 @@ refactor doesn't re-introduce the enable-only-on-new-install bug.
 
 from pathlib import Path
 
-
 _BOOT_PULL = Path(__file__).parent.parent / "infrastructure" / "boot-pull.sh"
 
 

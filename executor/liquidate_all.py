@@ -15,9 +15,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
-
-import yaml
 
 from ibkr import IBKRClient
 from trade_logger import backup_to_s3, init_db, log_trade
@@ -29,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from executor.config_loader import load_config
+from executor.config_loader import load_config  # noqa: E402 -- must follow logging.basicConfig above
 
 
 def liquidate(execute: bool, skip_confirm: bool) -> None:

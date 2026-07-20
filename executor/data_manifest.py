@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import boto3
 
@@ -31,7 +31,7 @@ def write_data_manifest(
     payload = {
         "module": module_name,
         "run_date": run_date,
-        "written_at": datetime.now(timezone.utc).isoformat(),
+        "written_at": datetime.now(UTC).isoformat(),
         **manifest,
     }
     try:
@@ -68,11 +68,11 @@ def verify_s3_object_fresh(
             f"s3://{bucket}/{key} not found — upstream did not run or failed."
         ) from exc
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     if run_date != today:
         return  # backfill: skip freshness
 
-    age = datetime.now(timezone.utc) - resp["LastModified"]
+    age = datetime.now(UTC) - resp["LastModified"]
     age_hours = age.total_seconds() / 3600
     if age_hours > max_age_hours:
         raise RuntimeError(

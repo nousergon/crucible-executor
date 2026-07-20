@@ -5,7 +5,7 @@ The guard refuses to size positions when buy_candidates has tickers missing
 from predictions.json — otherwise the GBM veto gate is unreachable for those
 tickers, routing position sizing around a risk control.
 """
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -13,7 +13,6 @@ from executor.signal_reader import (
     UnscoredBuyCandidatesError,
     assert_predictions_cover_buy_candidates,
 )
-
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 

@@ -17,27 +17,33 @@ from datetime import date, timedelta
 
 import boto3
 import pandas as pd
-import yaml
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from nousergon_lib.dates import now_dual
+from nousergon_lib.logging import guard_entrypoint, setup_logging
+from nousergon_lib.trading_calendar import previous_trading_day
 
 from executor import reference_rate
 from executor.eod_emailer import send_eod_email
 from executor.eod_report import build_eod_report, write_eod_report
 from executor.trade_logger import (
-    init_db, log_eod, backup_to_s3, get_entry_trade, get_todays_trades,
+    backup_to_s3,
+    get_entry_trade,
+    get_todays_trades,
+    init_db,
+    log_eod,
 )
 
-from nousergon_lib.dates import now_dual
-from nousergon_lib.trading_calendar import previous_trading_day
-from nousergon_lib.logging import setup_logging, guard_entrypoint
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 from executor.config_loader import get_flow_doctor_yaml_path  # noqa: E402 (must precede setup_logging)
+
 _FLOW_DOCTOR_YAML = get_flow_doctor_yaml_path()  # experiment-package-first (config#1042)
 setup_logging("eod", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
 
-from executor.config_loader import load_config
+from executor.config_loader import load_config  # noqa: E402 -- must follow setup_logging above
 
 # ── NAV three-way reconcile — hard-gate tolerance (config#2457) ────────────
 # `pricing_timing_usd` (mark_basis_today − mark_basis_prior, computed below)
@@ -197,7 +203,8 @@ def _load_signals_from_s3(bucket: str, run_date: str, max_lookback: int = 14) ->
             if days_back > 0:
                 logger.info("No signals for %s — using %s (%d day(s) old)", run_date, dt, days_back)
             return json.loads(obj["Body"].read()), None
-        except Exception:
+        except Exception as e:
+            logger.debug("No signals.json for %s (%s) — trying prior day", dt, e)
             continue
     # WARNING not ERROR: EOD reconcile degrades gracefully on absent signals
     # (returns {} + a warning the caller surfaces in the EOD report). The
@@ -452,8 +459,8 @@ def _compute_daily_return(
     current_price: float,
     shares: float,
     prior_close: float | None,
-    prior_close_date: "date | None",
-    expected_prev_td: "date",
+    prior_close_date: date | None,
+    expected_prev_td: date,
     add_entry_px: float | None = None,
 ) -> tuple[float, float, float | None, str | None]:
     """Gap-aware per-position daily return.
@@ -850,9 +857,9 @@ def run(
     # need the macro-lib dispatch. Mirror `price_cache.load_price_histories`
     # (executor/price_cache.py, `_MACRO_SYMBOLS`).
     from executor.price_cache import (
-        _open_universe_library,
-        _open_macro_library,
         _MACRO_SYMBOLS,
+        _open_macro_library,
+        _open_universe_library,
     )
     universe_lib = _open_universe_library(trades_bucket)
     macro_lib = None  # lazy-open only if a macro-routed held ticker appears
@@ -1284,7 +1291,7 @@ def run(
     # unrealized, which has no relationship to the day's return).
     sector_attribution = {}
     if positions and nav > 0:
-        for ticker, pos in positions.items():
+        for _ticker, pos in positions.items():
             sector = pos.get("sector", "Unknown")
             mv = pos.get("market_value", 0)
             weight = mv / nav

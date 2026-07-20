@@ -26,8 +26,8 @@ import json
 import logging
 import os
 import re
+from collections.abc import Iterable
 from datetime import date, datetime, time
-from typing import Iterable
 
 import pytz
 
@@ -177,7 +177,7 @@ def collect_uptime(
         logger.warning("uptime_tracker: log not found at %s", log_path)
         return compute_metrics([], day, tick_cadence)
 
-    with open(log_path, "r", errors="replace") as f:
+    with open(log_path, errors="replace") as f:
         ticks = parse_tick_lines(f, day)
 
     logger.info("uptime_tracker: parsed %d ticks for %s", len(ticks), day)

@@ -13,7 +13,7 @@ releases the book on the 2026-06-29 class (gate-flagged but alpha differentiated
 """
 from __future__ import annotations
 
-from executor.main import _should_hold_book, HOLD_BOOK_ALPHA_STDEV_FLOOR
+from executor.main import HOLD_BOOK_ALPHA_STDEV_FLOOR, _should_hold_book
 
 
 def _gate(passed: bool, check: str = "unique_p_up") -> dict:

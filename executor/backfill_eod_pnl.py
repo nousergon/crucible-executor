@@ -55,7 +55,7 @@ import argparse
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import boto3
 
@@ -295,7 +295,7 @@ def synthesize_snapshot(
     nav = cash + positions_mv
     return {
         "run_date": run_date,
-        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "captured_at": datetime.now(UTC).isoformat(),
         "schema_version": schema_version,
         "synthesized": True,  # audit marker — this is a ledger-synthesized row
         "account": {
@@ -317,9 +317,9 @@ def _read_closes_for_date(trades_bucket: str, tickers: list[str], run_date: str)
     import pandas as pd
 
     from executor.price_cache import (
-        _open_universe_library,
-        _open_macro_library,
         _MACRO_SYMBOLS,
+        _open_macro_library,
+        _open_universe_library,
     )
 
     universe_lib = _open_universe_library(trades_bucket)

@@ -126,7 +126,7 @@ def place_bracket_with_stop(
         stop.totalQuantity = filled_shares
         stop.auxPrice = trail_amount
 
-        stop_trade = ib.placeOrder(contract, stop)
+        ib.placeOrder(contract, stop)
         stop_order_id = stop.orderId
         logger.info(
             f"Trailing stop placed: SELL {filled_shares} {ticker} "

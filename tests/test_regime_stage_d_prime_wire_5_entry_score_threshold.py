@@ -16,13 +16,10 @@ See ``~/Development/alpha-engine-docs/private/regime-v3-260514.md``
 """
 from __future__ import annotations
 
-import pytest
-
 from executor.risk_guard import (
     check_order,
     regime_conditional_min_score,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────
 # regime_conditional_min_score — pure math

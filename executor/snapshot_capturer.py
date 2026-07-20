@@ -42,20 +42,21 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import boto3
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from executor.config_loader import load_config
-from executor.ibkr import IBKRClient
-
 from nousergon_lib.dates import now_dual
 from nousergon_lib.logging import setup_logging
 
+from executor.config_loader import load_config
+from executor.ibkr import IBKRClient
+
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 from executor.config_loader import get_flow_doctor_yaml_path  # noqa: E402 (must precede setup_logging)
+
 _FLOW_DOCTOR_YAML = get_flow_doctor_yaml_path()  # experiment-package-first (config#1042)
 setup_logging(
     "snapshot",
@@ -120,7 +121,7 @@ def run(run_date: str | None = None) -> None:
 
     payload = {
         "run_date": run_date,
-        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "captured_at": datetime.now(UTC).isoformat(),
         "schema_version": SCHEMA_VERSION,
         "account": account,
         "positions": positions,

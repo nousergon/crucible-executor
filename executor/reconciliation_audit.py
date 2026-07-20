@@ -45,8 +45,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 import pandas as pd
 
@@ -67,7 +67,7 @@ _NON_FILL_STATUSES = frozenset(
 _RECON_TOLERANCE_SHARES = 0  # exact share parity; whole-share equities
 
 
-def _effective_trade_date(row: dict[str, Any]) -> Optional[str]:
+def _effective_trade_date(row: dict[str, Any]) -> str | None:
     """The calendar date a trade row should be attributed to for a
     day-level ledger-vs-IB comparison: the ACTUAL fill timestamp's calendar
     date when available, else the ledger's ``date`` tag (legacy rows with no
@@ -124,7 +124,7 @@ def _shares_contributed(row: dict[str, Any]) -> int:
 
 
 def reconstruct_ledger_positions(
-    conn, *, as_of_date: Optional[str] = None, on_date: Optional[str] = None
+    conn, *, as_of_date: str | None = None, on_date: str | None = None
 ) -> dict[str, int]:
     """Net shares per ticker reconstructed from the ``trades`` ledger.
 
@@ -366,11 +366,11 @@ def build_reconciliation_audit(
     conn,
     *,
     today_positions: dict[str, Any],
-    prior_positions: Optional[dict[str, Any]],
+    prior_positions: dict[str, Any] | None,
     run_date: str,
-    ib_nav: Optional[float] = None,
-    generated_at: Optional[str] = None,
-    corporate_actions: Optional[dict[str, float]] = None,
+    ib_nav: float | None = None,
+    generated_at: str | None = None,
+    corporate_actions: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build the reconciliation-audit payload (pure — no I/O).
 
@@ -459,7 +459,7 @@ def build_reconciliation_audit(
     payload: dict[str, Any] = {
         "schema_version": 2,
         "date": run_date,
-        "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at or datetime.now(UTC).isoformat(),
         # Headline metric consumed by the evaluator reconciliation_integrity grader.
         "reconciliation_match_rate": match_rate,
         "anchored": anchored,

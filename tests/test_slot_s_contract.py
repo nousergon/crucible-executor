@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from executor.strategies.conformance.scenarios import golden_scenarios, _ctx, _ohlc
+from executor.strategies.conformance.scenarios import _ctx, _ohlc, golden_scenarios
 from executor.strategies.contract import (
     ExitContext,
     ExitDecision,
@@ -21,7 +21,6 @@ from executor.strategies.contract import (
     stock_registry,
 )
 from executor.strategies.exit_manager import _evaluate_single_position
-
 
 # ── ExitDecision validation ─────────────────────────────────────────────────
 

@@ -208,9 +208,14 @@ class TestCheckDeployDrift:
             got = pf_mod._read_deployed_git_sha(root)
 
         assert got == head
-        assert captured and captured[0] == [
-            "git", "-c", f"safe.directory={root}", "rev-parse", "HEAD",
+        # git is resolved to an absolute path via shutil.which() (S607
+        # hardening, config#2532) rather than passed as the bare literal
+        # "git" — assert the invocation shape (flags + args), not the
+        # exact argv[0] string.
+        assert captured and captured[0][1:] == [
+            "-c", f"safe.directory={root}", "rev-parse", "HEAD",
         ]
+        assert captured[0][0].endswith("git")
 
 
 class TestCheckDeployDriftPinnedSha:

@@ -1,0 +1,38 @@
+name: Ruff lint
+
+# Blocking ruff lint (config#2532) — this repo's SAST-lite layer for a
+# private repo where CodeQL isn't free. Includes the flake8-bandit "S"
+# ruleset alongside the usual E/W/F/I/UP/B/C4 baseline (see pyproject.toml
+# [tool.ruff.lint] for the exact selection + per-file-ignores + the S603
+# rationale). No path filter: ruff runs over the whole tree in well under a
+# second, so there's no need for a path-filtered pair — this check always
+# reports, on every PR and every push to main.
+#
+# `ruff format --check` is NOT gated here (only .pre-commit-config.yaml runs
+# ruff-format, and only on files actually being committed) — the existing
+# tree isn't ruff-format-clean yet, and reformatting the whole repo as a
+# drive-by of the lint rollout is out of this issue's scope.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install ruff
+        # Pinned to the identical version pre-commit uses (.pre-commit-config.yaml
+        # rev) — config#2532's explicit ask, to avoid CI/pre-commit formatter drift.
+        run: python -m pip install --quiet ruff==0.14.14
+      - name: Ruff check
+        run: ruff check .

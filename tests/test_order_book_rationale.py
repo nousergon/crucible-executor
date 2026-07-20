@@ -9,6 +9,7 @@ sidecar, round-trippable via the lib's load_latest_eval_artifact).
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -28,7 +29,6 @@ from executor.order_book_rationale import (
     build_order_book_rationale,
     write_order_book_rationale,
 )
-
 
 # ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -113,24 +113,24 @@ def scenario():
         {"ticker": "AMD", "event_type": "veto", "rule": "stance_gate",
          "value": 0.71, "threshold": 0.6, "reason": "predictor DOWN veto"},
     ]
-    return dict(
-        signals=signals,
-        predictions_by_ticker=predictions,
-        order_book_data=order_book,
-        blocked_entries=blocked,
-        risk_events=risk_events,
-        market_regime="neutral",
-        run_date="2026-05-15",
-        signal_date="2026-05-15",
-        prediction_date="2026-05-15",
-        calendar_date="2026-05-15",
-        trading_day="2026-05-15",
-        run_id="2605151400",
+    return {
+        "signals": signals,
+        "predictions_by_ticker": predictions,
+        "order_book_data": order_book,
+        "blocked_entries": blocked,
+        "risk_events": risk_events,
+        "market_regime": "neutral",
+        "run_date": "2026-05-15",
+        "signal_date": "2026-05-15",
+        "prediction_date": "2026-05-15",
+        "calendar_date": "2026-05-15",
+        "trading_day": "2026-05-15",
+        "run_id": "2605151400",
         # KO is the held ticker — must come from portfolio truth, not
         # the research `hold` bucket (research HOLD on a non-held ticker
         # is a recommendation that wasn't acted on, not a held state).
-        current_positions={"KO": {"mkt_val": 1000}},
-    )
+        "current_positions": {"KO": {"mkt_val": 1000}},
+    }
 
 
 # ── builder: terminal-state resolution ───────────────────────────────────
@@ -396,22 +396,22 @@ class TestOptimizerShadowLogSynthesis:
             "optimizer_cfg": {"min_score_to_enter": 57.0},
             "diagnostics": {"status": "optimal"},
         }
-        return dict(
-            signals=signals,
-            predictions_by_ticker=predictions,
-            order_book_data=order_book,
-            blocked_entries=[],   # legacy path skipped
-            risk_events=[],       # legacy path skipped
-            market_regime="neutral",
-            run_date="2026-05-15",
-            signal_date="2026-05-15",
-            prediction_date="2026-05-15",
-            calendar_date="2026-05-15",
-            trading_day="2026-05-15",
-            run_id="2605151400",
-            optimizer_shadow_log=shadow_log,
-            current_positions={"KO": {"mkt_val": 1000}},
-        )
+        return {
+            "signals": signals,
+            "predictions_by_ticker": predictions,
+            "order_book_data": order_book,
+            "blocked_entries": [],   # legacy path skipped
+            "risk_events": [],       # legacy path skipped
+            "market_regime": "neutral",
+            "run_date": "2026-05-15",
+            "signal_date": "2026-05-15",
+            "prediction_date": "2026-05-15",
+            "calendar_date": "2026-05-15",
+            "trading_day": "2026-05-15",
+            "run_id": "2605151400",
+            "optimizer_shadow_log": shadow_log,
+            "current_positions": {"KO": {"mkt_val": 1000}},
+        }
 
     def test_optimizer_rejected_tickers_surface_in_rationale(self):
         scenario = self._optimizer_scenario()
@@ -545,8 +545,9 @@ class TestOptimizerShadowLogSynthesis:
         # Sanity: the field name the producer reads matches what
         # optimizer_shadow.py emits. Pins the contract between the two
         # modules so a rename of either side is caught.
-        from executor.optimizer_shadow import _build_eligibility
         import numpy as np
+
+        from executor.optimizer_shadow import _build_eligibility
         elig, reasons = _build_eligibility(
             tickers=["AAA", "BBB", "SPY", "CASH"],
             signals_by_ticker={"AAA": {"score": 80, "signal": "ENTER"},
@@ -748,6 +749,7 @@ def test_obr_write_failure_publishes_alert_not_silent_swallow():
     at CI time.
     """
     import inspect
+
     import executor.main as main_mod
 
     src = inspect.getsource(main_mod)
@@ -800,19 +802,19 @@ class TestDeadSignalFiltering:
         }
 
     def _base_kwargs(self) -> dict[str, Any]:
-        return dict(
-            order_book_data=self._empty_books(),
-            blocked_entries=[],
-            risk_events=[],
-            market_regime="neutral",
-            run_date="2026-05-27",
-            signal_date="2026-05-27",
-            prediction_date="2026-05-27",
-            calendar_date="2026-05-27",
-            trading_day="2026-05-27",
-            run_id="2605271400",
-            current_positions={},
-        )
+        return {
+            "order_book_data": self._empty_books(),
+            "blocked_entries": [],
+            "risk_events": [],
+            "market_regime": "neutral",
+            "run_date": "2026-05-27",
+            "signal_date": "2026-05-27",
+            "prediction_date": "2026-05-27",
+            "calendar_date": "2026-05-27",
+            "trading_day": "2026-05-27",
+            "run_id": "2605271400",
+            "current_positions": {},
+        }
 
     def test_research_hold_on_non_position_filtered_out(self):
         payload = build_order_book_rationale(
@@ -868,19 +870,19 @@ class TestNoActionSubStates:
         }
 
     def _base_kwargs(self) -> dict[str, Any]:
-        return dict(
-            order_book_data=self._empty_books(),
-            blocked_entries=[],
-            risk_events=[],
-            market_regime="neutral",
-            run_date="2026-05-27",
-            signal_date="2026-05-27",
-            prediction_date="2026-05-27",
-            calendar_date="2026-05-27",
-            trading_day="2026-05-27",
-            run_id="2605271400",
-            current_positions={},
-        )
+        return {
+            "order_book_data": self._empty_books(),
+            "blocked_entries": [],
+            "risk_events": [],
+            "market_regime": "neutral",
+            "run_date": "2026-05-27",
+            "signal_date": "2026-05-27",
+            "prediction_date": "2026-05-27",
+            "calendar_date": "2026-05-27",
+            "trading_day": "2026-05-27",
+            "run_id": "2605271400",
+            "current_positions": {},
+        }
 
     def test_research_enter_optimizer_zero_target_classified_optimizer_zero(self):
         # The load-bearing operator case: research said ENTER, the
@@ -1010,21 +1012,21 @@ class TestBookStatus:
         }
 
     def _base_kwargs(self, **over) -> dict[str, Any]:
-        base = dict(
-            signals={"enter": [], "exit": [], "reduce": [], "hold": []},
-            predictions_by_ticker={},
-            order_book_data=self._empty_books(),
-            blocked_entries=[],
-            risk_events=[],
-            market_regime="neutral",
-            run_date="2026-06-30",
-            signal_date="2026-06-30",
-            prediction_date="2026-06-30",
-            calendar_date="2026-06-30",
-            trading_day="2026-06-30",
-            run_id="2606301400",
-            current_positions={},
-        )
+        base = {
+            "signals": {"enter": [], "exit": [], "reduce": [], "hold": []},
+            "predictions_by_ticker": {},
+            "order_book_data": self._empty_books(),
+            "blocked_entries": [],
+            "risk_events": [],
+            "market_regime": "neutral",
+            "run_date": "2026-06-30",
+            "signal_date": "2026-06-30",
+            "prediction_date": "2026-06-30",
+            "calendar_date": "2026-06-30",
+            "trading_day": "2026-06-30",
+            "run_id": "2606301400",
+            "current_positions": {},
+        }
         base.update(over)
         return base
 

@@ -69,7 +69,8 @@ class TestAuditWindow:
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=?, spy_return_pct=?, daily_alpha_pct=? WHERE date=?",
                          (734.30, 0.098, 1.41, d))
-            conn.commit(); conn.close()
+            conn.commit()
+            conn.close()
 
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
              patch.object(reconcile_audit, "eod_run", side_effect=fake_run) as run_mock, \
@@ -128,7 +129,8 @@ class TestAuditWindow:
             calls.append(d)
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_return_pct=? WHERE date=?", (-0.7231, d))
-            conn.commit(); conn.close()
+            conn.commit()
+            conn.close()
 
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
              patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
@@ -182,7 +184,8 @@ class TestAuditWindow:
         def fake_run(d, *, send_email, run_audit):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (751.71, d))
-            conn.commit(); conn.close()
+            conn.commit()
+            conn.close()
 
         fd_mock = MagicMock()
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
@@ -209,7 +212,8 @@ class TestAuditWindow:
         def fake_run(d, *, send_email, run_audit):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (734.30, d))
-            conn.commit(); conn.close()
+            conn.commit()
+            conn.close()
 
         fd_mock = MagicMock()
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
@@ -232,7 +236,8 @@ class TestAuditWindow:
         def fake_run(d, *, send_email, run_audit):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (settled[d], d))
-            conn.commit(); conn.close()
+            conn.commit()
+            conn.close()
 
         fd_mock = MagicMock()
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
@@ -250,7 +255,7 @@ class TestAuditWindow:
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
 
         def raise_missing(d, c):
-            raise RuntimeError("ArcticDB has no SPY close for %s" % d)
+            raise RuntimeError(f"ArcticDB has no SPY close for {d}")
 
         with patch.object(reconcile_audit, "_spy_close", side_effect=raise_missing), \
              patch.object(reconcile_audit, "eod_run") as run_mock, \

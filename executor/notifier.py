@@ -124,8 +124,8 @@ def send_daemon_status(message: str) -> bool:
             if rid is None:
                 return False
             return fd.last_dispatched()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("flow-doctor notify_event failed, falling back to send_message: %s", e)
     return send_message(message)
 
 

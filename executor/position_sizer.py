@@ -12,8 +12,8 @@ Graduated drawdown multiplier (added 2026-03-14):
 
 from __future__ import annotations
 
-import math
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 

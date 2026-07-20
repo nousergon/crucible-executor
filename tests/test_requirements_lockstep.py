@@ -191,16 +191,27 @@ def test_pyproject_has_all_direct_dependencies():
         "scikit-learn",
     ]
 
+    # direct_packages is a hand-maintained allowlist (see module docstring) —
+    # cross-check it's still honest against the actual requirements.txt so a
+    # stale entry (renamed/removed package) doesn't silently pass the loop
+    # below by checking a name that's no longer a real requirement.
+    stale = [pkg for pkg in direct_packages if pkg not in requirements_deps]
+    assert len(stale) == 0, (
+        "direct_packages lists package(s) no longer present in "
+        "requirements.txt (stale allowlist entry?):\n"
+        + "\n".join(f"  {pkg}" for pkg in stale)
+    )
+
     missing = []
     for pkg in direct_packages:
         if pkg not in pyproject_deps:
             missing.append(pkg)
 
     assert len(missing) == 0, (
-        f"pyproject.toml is missing direct dependencies that are in "
-        f"requirements.txt:\n"
+        "pyproject.toml is missing direct dependencies that are in "
+        "requirements.txt:\n"
         + "\n".join(f"  {pkg}" for pkg in missing)
-        + f"\n\nThese packages are required for executor runtime. Add them to "
-        f"pyproject.toml [project] dependencies so `pip install -e .` yields "
-        f"the same environment as `pip install -r requirements.txt`."
+        + "\n\nThese packages are required for executor runtime. Add them to "
+        "pyproject.toml [project] dependencies so `pip install -e .` yields "
+        "the same environment as `pip install -r requirements.txt`."
     )

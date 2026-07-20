@@ -1,12 +1,10 @@
 """Tests for executor.price_monitor — delayed market-data subscriber + tick aggregator."""
 
-import math
 from unittest.mock import MagicMock
 
 import pytest
 
 from executor.price_monitor import PriceMonitor, _finite
-
 
 # ── _finite helper ──────────────────────────────────────────────────────────
 

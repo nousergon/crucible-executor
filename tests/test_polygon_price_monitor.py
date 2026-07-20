@@ -5,7 +5,6 @@ tests pin the pure parsing logic that feeds entry-trigger evaluation, the
 status-frame auth handling, and the source-selection factory. No live socket.
 """
 
-import os
 
 import pytest
 
