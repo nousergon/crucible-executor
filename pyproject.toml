@@ -34,3 +34,14 @@ include = ["executor*"]
 # plus any stray nested repo copies, causing sys.path collisions and spurious
 # ImportErrors for modules that exist only in the current tree.
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["executor"]
+
+[tool.coverage.report]
+# Ratchet floor (config#2533): measured coverage at introduction was 75.23%
+# (`pytest tests/ --cov=executor`, 1622 passed, 4 skipped). Floor rounded
+# down to the nearest integer so today's suite passes with headroom; raise
+# opportunistically as coverage grows. This gates regression, not a target.
+fail_under = 75
+show_missing = true
