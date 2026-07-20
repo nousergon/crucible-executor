@@ -34,7 +34,16 @@ absent ⇒ that axis is skipped for that role).
   (`ae-trading`) AND, via the same `alpha-engine-executor-profile` instance
   profile, the ephemeral groom-dispatch spot boxes (`groom_spot_bootstrap.sh`
   — full groom runs and the standalone end-of-SF sweep box both launch under
-  this profile). 12 inline policies (trading-scoped: S3, SES, SNS,
+  this profile), **AND** (documented 2026-07-20, alpha-engine-config#3018 —
+  IAM-as-code surface 4 of the fleet audit config#2340) `crucible-backtester`'s
+  `infrastructure/spot_backtest.sh`, which launches its weekly spot backtest
+  box under this same profile (`IAM_PROFILE="alpha-engine-executor-profile"`)
+  purely as a launch attribute — the `ReadWriteBacktestResults` S3 statement
+  below exists specifically for that consumer. Backtester carries no IAM code
+  of its own; this directory is its policy's sole source of truth, already
+  covered by this repo's `apply.sh` / `check-drift.py` / daily
+  `iam-drift-check.yml` / `check-no-foreign-writers.py` (which already scans
+  `crucible-backtester` as a sibling repo). 12 inline policies (trading-scoped: S3, SES, SNS,
   CloudWatch, SSM read/send, EC2 spot, EOD Step Function; plus
   `alpha-engine-stepfunctions-diagnose`, added 2026-07-13 — read-only
   `states:ListExecutions`/`DescribeExecution`/`DescribeStateMachine` on the
