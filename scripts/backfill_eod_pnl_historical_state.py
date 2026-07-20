@@ -64,12 +64,11 @@ import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # arcticdb must import before pandas on macOS (see price_cache.py comment).
 import arcticdb as _arcticdb  # noqa: F401
-
 import boto3
 import pandas as pd
 import yaml
@@ -77,7 +76,11 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from executor.price_cache import _open_universe_library, _open_macro_library, _MACRO_SYMBOLS
+from executor.price_cache import (  # noqa: E402 -- must follow sys.path.insert above
+    _MACRO_SYMBOLS,
+    _open_macro_library,
+    _open_universe_library,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -398,7 +401,7 @@ def validate(plan: list[dict], max_drift: float) -> tuple[bool, list[str]]:
 # ── Apply ───────────────────────────────────────────────────────────────────
 
 def snapshot_db_to_s3(db_path: str, trades_bucket: str) -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%S")
     key = f"trades/trades_{stamp}.pre-cash-backfill.db"
     s3 = boto3.client("s3")
     with open(db_path, "rb") as f:

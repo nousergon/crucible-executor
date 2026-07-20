@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -387,7 +387,7 @@ class IntradayNavSeriesWriter:
         # Refuse the mis-keyed point (skipped write; severity depends on
         # whether this is post-close wind-down vs a true stale-label bug)
         # rather than raising into the order loop's fire-and-forget except.
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         try:
             from nousergon_lib.dates import assert_within_session
             assert_within_session(now_utc, trading_day)

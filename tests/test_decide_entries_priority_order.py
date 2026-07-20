@@ -17,8 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from executor.deciders import _entry_priority_key, decide_entries
-
+from executor.deciders import _days_until, _entry_priority_key, _entry_urgency_score, decide_entries
 
 # ── _entry_priority_key (pure ordering) ──────────────────────────────────────
 
@@ -108,8 +107,6 @@ class TestEntryPriorityKey:
 
 
 # ── urgency-weighted entry ranking (config#676 Phase 1, opt-in) ──────────────
-
-from executor.deciders import _entry_urgency_score, _days_until
 
 
 class TestUrgencyWeightedEntryRanking:
@@ -301,11 +298,11 @@ class TestDecideEntriesProcessesInPriorityOrder:
             portfolio_nav=1_000_000.0,
             peak_nav=1_000_000.0,
             current_positions={},
-            prices_now={t: 100.0 for t in all_tickers},
+            prices_now=dict.fromkeys(all_tickers, 100.0),
             price_histories={t: _df_history() for t in all_tickers},
-            atr_map={t: 0.02 for t in all_tickers},
-            vwap_map={t: 100.0 for t in all_tickers},
-            coverage_map={t: 1.0 for t in all_tickers},
+            atr_map=dict.fromkeys(all_tickers, 0.02),
+            vwap_map=dict.fromkeys(all_tickers, 100.0),
+            coverage_map=dict.fromkeys(all_tickers, 1.0),
             dd_multiplier=1.0,
             signal_age_days=0,
             earnings_by_ticker={},
@@ -353,11 +350,11 @@ class TestDecideEntriesProcessesInPriorityOrder:
             portfolio_nav=1_000_000.0,
             peak_nav=1_000_000.0,
             current_positions={},
-            prices_now={t: 100.0 for t in all_tickers},
+            prices_now=dict.fromkeys(all_tickers, 100.0),
             price_histories={t: _df_history() for t in all_tickers},
-            atr_map={t: 0.02 for t in all_tickers},
-            vwap_map={t: 100.0 for t in all_tickers},
-            coverage_map={t: 1.0 for t in all_tickers},
+            atr_map=dict.fromkeys(all_tickers, 0.02),
+            vwap_map=dict.fromkeys(all_tickers, 100.0),
+            coverage_map=dict.fromkeys(all_tickers, 1.0),
             dd_multiplier=1.0,
             signal_age_days=0,
             earnings_by_ticker={},
@@ -399,11 +396,11 @@ class TestDecideEntriesProcessesInPriorityOrder:
             portfolio_nav=1_000_000.0,
             peak_nav=1_000_000.0,
             current_positions={},
-            prices_now={t: 100.0 for t in all_tickers},
+            prices_now=dict.fromkeys(all_tickers, 100.0),
             price_histories={t: _df_history() for t in all_tickers},
-            atr_map={t: 0.02 for t in all_tickers},
-            vwap_map={t: 100.0 for t in all_tickers},
-            coverage_map={t: 1.0 for t in all_tickers},
+            atr_map=dict.fromkeys(all_tickers, 0.02),
+            vwap_map=dict.fromkeys(all_tickers, 100.0),
+            coverage_map=dict.fromkeys(all_tickers, 1.0),
             dd_multiplier=1.0,
             signal_age_days=0,
             earnings_by_ticker={},

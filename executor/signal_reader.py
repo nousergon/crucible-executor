@@ -10,7 +10,6 @@ from datetime import date, timedelta
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
-
 from nousergon_lib.eval_artifacts import load_latest_eval_artifact
 from nousergon_lib.universe import filter_to_universe
 

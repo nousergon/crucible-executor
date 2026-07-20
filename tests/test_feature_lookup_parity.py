@@ -20,6 +20,7 @@ at one point; FeatureLookup builds the full series.
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import numpy as np
@@ -28,7 +29,6 @@ import pytest
 
 from executor.feature_lookup import (
     DEFAULT_ATR_PERIOD,
-    DEFAULT_MOMENTUM_LOOKBACK,
     DEFAULT_RSI_PERIOD,
     DEFAULT_SUPPORT_LOOKBACK,
     FeatureLookup,
@@ -224,7 +224,7 @@ class TestFrozenSafety:
         df = _make_ohlcv(30, seed=70)
         lookup = FeatureLookup.from_ohlcv_by_ticker({"AAPL": df})
         # Frozen → assigning a top-level field raises
-        with pytest.raises(Exception):  # FrozenInstanceError
+        with pytest.raises(dataclasses.FrozenInstanceError):
             lookup.atr_dollar = {}  # type: ignore[misc]
 
 

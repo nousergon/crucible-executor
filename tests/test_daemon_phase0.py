@@ -1,17 +1,15 @@
 """Unit tests for daemon helpers extracted in Phase 1-2: validate, retry, cleanup."""
-import pytest
 from unittest.mock import MagicMock, patch
 
 from executor.daemon import (
-    _validate_sell_shares,
+    MAX_ORDER_RETRIES,
+    ORDER_RETRY_DELAYS,
     _cleanup_connections,
     _enqueue_cover_for_unintended_shorts,
     _place_order_with_retry,
-    MAX_ORDER_RETRIES,
-    ORDER_RETRY_DELAYS,
+    _validate_sell_shares,
 )
 from executor.order_book import OrderBook, _default_book
-
 
 # ── _validate_sell_shares ────────────────────────────────────────────────────
 
@@ -365,6 +363,7 @@ class TestPhase0UrgentExitsActionLabel:
 
     def test_phase0_urgent_exit_passes_semantic_action_not_side(self):
         import inspect
+
         import executor.daemon as daemon
 
         src = inspect.getsource(daemon)
@@ -474,6 +473,7 @@ class TestRationaleJsonEnrichmentSourceShape:
 
     def test_urgent_exit_rationale_carries_signal_context_and_retry_audit(self):
         import inspect
+
         import executor.daemon as daemon
 
         src = inspect.getsource(daemon)
@@ -492,6 +492,7 @@ class TestRationaleJsonEnrichmentSourceShape:
 
     def test_enter_rationale_carries_signal_context_and_retry_audit(self):
         import inspect
+
         import executor.daemon as daemon
 
         src = inspect.getsource(daemon)

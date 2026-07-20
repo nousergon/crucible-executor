@@ -29,12 +29,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
-from typing import Any, Iterable
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import Any
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
-
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ def build_open_orders_snapshot(
     """
     ts = written_at_utc
     if ts is None:
-        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     records: list[dict[str, Any]] = []
     for t in open_trades:

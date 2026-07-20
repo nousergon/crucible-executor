@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import time as _time  # aliased to avoid shadowing by local 'time' variables
 from datetime import date, datetime
@@ -38,6 +39,9 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from nousergon_lib.logging import guard_entrypoint, setup_logging
+
+from executor.daemon_state_logger import get_logger as _get_decision_logger
 from executor.decision_capture import (
     DecisionCaptureWriteError,
     capture_entry_trigger,
@@ -61,23 +65,25 @@ from executor.intraday_snapshot import (
     IntradaySnapshotWriter,
     compute_surveillance_universe,
 )
-from executor.open_orders_artifact import OpenOrdersSnapshotWriter
-from executor.daemon_state_logger import get_logger as _get_decision_logger
 from executor.market_hours import is_market_hours
 from executor.notifier import send_daemon_status, send_trade_alert
+from executor.open_orders_artifact import OpenOrdersSnapshotWriter
 from executor.order_book import OrderBook, build_stop_record
-from executor.price_monitor import PriceMonitor
 from executor.polygon_price_monitor import make_price_monitor
+from executor.price_monitor import PriceMonitor
 from executor.strategies.config import load_strategy_config
 from executor.trade_logger import (
-    init_db, log_trade, get_unmatched_entry, log_risk_event,
     get_executed_entry_tickers,
+    get_unmatched_entry,
+    init_db,
+    log_risk_event,
+    log_trade,
 )
 
-from nousergon_lib.logging import setup_logging, guard_entrypoint
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 from executor.config_loader import get_flow_doctor_yaml_path  # noqa: E402 (must precede setup_logging)
+
 _FLOW_DOCTOR_YAML = get_flow_doctor_yaml_path()  # experiment-package-first (config#1042)
 setup_logging("daemon", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
@@ -86,7 +92,7 @@ logger = logging.getLogger(__name__)
 #   "status" — IB order execution status: "Filled", "Rejected", "Timeout", etc.
 #   "signal" — trading action type from Research/strategy: "ENTER", "EXIT", "REDUCE", "COVER"
 
-from executor.config_loader import get_config_path
+from executor.config_loader import get_config_path  # noqa: E402 -- must follow setup_logging above
 
 # Order retry policy — applied uniformly to all order types (urgent exits, intraday exits, entries)
 MAX_ORDER_RETRIES = 3
@@ -143,7 +149,8 @@ DEFAULT_CONNECT_BACKOFF_BASE = 30
 
 # Exception types that indicate a dropped IB Gateway connection
 try:
-    from asyncio import IncompleteReadError, TimeoutError as AsyncTimeoutError
+    from asyncio import IncompleteReadError
+    from asyncio import TimeoutError as AsyncTimeoutError
     asyncio_exceptions = (IncompleteReadError, AsyncTimeoutError)
 except ImportError:
     asyncio_exceptions = ()
@@ -159,8 +166,8 @@ def _handle_signal(signum, frame):
 
 
 def _cleanup_connections(
-    monitor: "PriceMonitor | None",
-    ibkr: "IBKRClient | None",
+    monitor: PriceMonitor | None,
+    ibkr: IBKRClient | None,
 ) -> None:
     """Best-effort cleanup of IB connections."""
     if monitor:
@@ -177,8 +184,8 @@ def _cleanup_connections(
 
 def _reconnect(
     ibkr: IBKRClient,
-    monitor: "PriceMonitor",
-    order_book: "OrderBook",
+    monitor: PriceMonitor,
+    order_book: OrderBook,
     config: dict,
     client_id: int,
     max_reconnect_attempts: int = 10,
@@ -476,7 +483,7 @@ def _place_order_with_retry(
 
 def _enqueue_cover_for_unintended_shorts(
     positions: dict,
-    order_book: "OrderBook",
+    order_book: OrderBook,
     run_date: str,
 ) -> list[str]:
     """Scan IB positions; enqueue an URGENT COVER for any short.
@@ -545,7 +552,7 @@ def _refresh_surveillance_universe(
     *,
     config: dict,
     run_date: str,
-    order_book: "OrderBook",
+    order_book: OrderBook,
     ibkr,
     dry_run: bool,
     last_fingerprint: str | None,
@@ -805,7 +812,10 @@ def run_daemon(dry_run: bool = False) -> None:
                     raise
                 _time.sleep(wait)
                 if _shutdown_requested:
-                    raise KeyboardInterrupt("Shutdown during reconnect")
+                    # Deliberate new exception (shutdown signal), not a
+                    # re-raise of the connection failure `e` — `from None`
+                    # makes that explicit instead of implying `e` caused it.
+                    raise KeyboardInterrupt("Shutdown during reconnect") from None
 
     ibkr = _connect_ibkr()
 
@@ -1800,13 +1810,13 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
 
 def _execute_exit(
     ibkr: IBKRClient,
-    conn: "sqlite3.Connection",
+    conn: sqlite3.Connection,
     order_book: OrderBook,
     exit_signal: dict,
     price_state: dict,
     run_date: str,
     dry_run: bool,
-    monitor: "PriceMonitor | None" = None,
+    monitor: PriceMonitor | None = None,
 ) -> None:
     """Execute an intraday exit (SELL or REDUCE)."""
     ticker = exit_signal["ticker"]
@@ -1984,7 +1994,7 @@ def _execute_exit(
 
 def _execute_entry(
     ibkr: IBKRClient,
-    conn: "sqlite3.Connection",
+    conn: sqlite3.Connection,
     order_book: OrderBook,
     entry: dict,
     price_state: dict,
@@ -1992,7 +2002,7 @@ def _execute_entry(
     run_date: str,
     strategy_config: dict,
     dry_run: bool,
-    monitor: "PriceMonitor | None" = None,
+    monitor: PriceMonitor | None = None,
     use_optimizer: bool = False,
 ) -> None:
     """Execute an intraday entry (BUY) with bracket stop.

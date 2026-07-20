@@ -73,8 +73,9 @@ def test_send_daemon_status_true_when_dispatched():
 
 @patch("executor.notifier.get_flow_doctor", return_value=None)
 def test_publish_ops_alert_sns_only_when_flow_doctor_inactive(_mock_fd):
-    from executor.notifier import publish_ops_alert
     from nousergon_lib import alerts
+
+    from executor.notifier import publish_ops_alert
 
     with patch.object(alerts, "publish") as publish_mock:
         publish_ops_alert(
@@ -90,8 +91,9 @@ def test_publish_ops_alert_sns_only_when_flow_doctor_inactive(_mock_fd):
 
 @patch("executor.notifier.get_flow_doctor")
 def test_publish_ops_alert_routes_telegram_via_flow_doctor(mock_get_fd):
-    from executor.notifier import publish_ops_alert
     from nousergon_lib import alerts
+
+    from executor.notifier import publish_ops_alert
 
     mock_fd = MagicMock()
     mock_fd.notify_event.return_value = "rid-1"

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -25,7 +24,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from executor.trade_logger import init_db, log_trade
-
 
 # ── init_db idempotence + column presence ───────────────────────────────────
 

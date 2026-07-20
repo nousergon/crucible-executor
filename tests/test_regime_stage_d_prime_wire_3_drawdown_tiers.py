@@ -25,7 +25,6 @@ from executor.risk_guard import (
     regime_conditional_threshold_scale,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────
 # regime_conditional_threshold_scale — pure math
 # ─────────────────────────────────────────────────────────────────────

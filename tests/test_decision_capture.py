@@ -14,9 +14,7 @@ Plan doc: ``~/Development/alpha-engine-docs/private/executor-decision-capture-26
 from __future__ import annotations
 
 import json
-import os
-from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -37,7 +35,6 @@ from executor.decision_capture import (
     capture_risk_guard,
     is_decision_capture_enabled,
 )
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 

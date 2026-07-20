@@ -33,20 +33,20 @@ def _ohlc(closes: list[float], start: str = "2026-04-01") -> pd.DataFrame:
 
 
 def _ctx(**overrides) -> ExitContext:
-    base = dict(
-        ticker="TEST",
-        position={"avg_cost": 100.0, "sector": "Technology", "shares": 10},
-        research_action="HOLD",
-        current_price=105.0,
-        price_history=_ohlc([100 + 0.2 * i for i in range(45)]),
-        sector_etf_histories={"XLK": _ohlc([200 + 0.1 * i for i in range(45)]),
+    base = {
+        "ticker": "TEST",
+        "position": {"avg_cost": 100.0, "sector": "Technology", "shares": 10},
+        "research_action": "HOLD",
+        "current_price": 105.0,
+        "price_history": _ohlc([100 + 0.2 * i for i in range(45)]),
+        "sector_etf_histories": {"XLK": _ohlc([200 + 0.1 * i for i in range(45)]),
                               "SPY": _ohlc([400 + 0.1 * i for i in range(45)])},
-        config=load_strategy_config({}),  # stock defaults, no risk.yaml needed
-        catalyst_date=None,
-        entry_date=ENTRY_DATE,
-        run_date=RUN_DATE,
-        feature_lookup=None,
-    )
+        "config": load_strategy_config({}),  # stock defaults, no risk.yaml needed
+        "catalyst_date": None,
+        "entry_date": ENTRY_DATE,
+        "run_date": RUN_DATE,
+        "feature_lookup": None,
+    }
     base.update(overrides)
     return ExitContext(**base)
 

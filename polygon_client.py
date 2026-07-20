@@ -25,11 +25,9 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
-
 from nousergon_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
@@ -77,7 +75,7 @@ class PolygonClient:
         """Make a rate-limited GET request. Handles 429 with retry."""
         self._wait_for_slot()
         url = f"{_BASE_URL}{path}"
-        for attempt in range(3):
+        for _attempt in range(3):
             resp = self._session.get(url, params=params or {}, timeout=30)
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 15))

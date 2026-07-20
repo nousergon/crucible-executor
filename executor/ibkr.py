@@ -13,10 +13,9 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from datetime import datetime
 
-from ib_insync import IB, Stock, MarketOrder
+from ib_insync import IB, MarketOrder, Stock
 
 from executor.retry import retry
 
@@ -203,8 +202,8 @@ class IBKRClient:
             # accumulate streaming lines toward IB's market-data line cap.
             try:
                 self.ib.cancelMktData(contract)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("cancelMktData failed for %s (non-fatal): %s", contract, e)
 
         if price is None:
             logger.warning(

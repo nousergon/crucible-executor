@@ -34,3 +34,49 @@ include = ["executor*"]
 # plus any stray nested repo copies, causing sys.path collisions and spurious
 # ImportErrors for modules that exist only in the current tree.
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+# py311 matches this package's actual runtime floor (`requires-python =
+# ">=3.11"` above) — ruff's target-version controls which syntax UP-rules
+# are allowed to assume is available. Targeting a newer CI-matrix ceiling
+# would let UP-fixes rewrite code into syntax that breaks on the floor this
+# package still has to run on.
+target-version = "py311"
+
+[tool.ruff.lint]
+# Baseline mirrors the fleet's established ruff selection (metron:
+# E, W, F, I, UP, B, C4) plus S (flake8-bandit) — config#2532 propagates the
+# S ruleset as a SAST-lite layer for private repos where CodeQL isn't free.
+select = ["E", "W", "F", "I", "UP", "B", "C4", "S"]
+# E501: line length is a formatter concern, not correctness — deferred to ruff-format.
+# S603 (subprocess-untrusted-input) is deliberately NOT ignored file-by-file — it is
+# excluded from selection fleet-wide, following alpha-engine-config's precedent
+# (config#2532, PR#2643). Verified empirically (ruff 0.14.14): S603 fires on ANY
+# non-inline-literal subprocess argv, including a shutil.which()-resolved,
+# None-checked absolute path assigned to a variable one line above the call (ruff has
+# no data-flow analysis for this rule; see astral-sh/ruff#4045, upstream bandit B603
+# docs: "even if you validate user input, this check will still report"). Selecting a
+# rule that a fail-loud/no-noqa policy cannot satisfy by any code change would force a
+# blanket suppression at every call site, which is worse than not selecting it. S607
+# (partial-executable-path) IS selected and enforced for real — that is the rule that
+# maps to an actual root-cause fix (resolve the binary to an absolute path via
+# shutil.which() and fail loudly if missing), and every producer-path finding under it
+# is fixed, not suppressed.
+ignore = ["E501", "S603"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files: assert is the point (S101); dummy credential-shaped literals
+# passed as fixture args (S106) or bound to names like GH_TOKEN/API_KEY
+# (S105) are fixture noise, not real secrets; seeded random.Random(...)
+# calls (S311) exercise deterministic-sampling code under test, never
+# security-sensitive. Fail-loud rule (config#2532) is scoped to
+# producer/writer paths — these are not those. S108 (hardcoded /tmp path)
+# and S607 (partial-path subprocess) are fixture setup noise here (git/bash
+# invocations to build throwaway test repos, literal /tmp DB paths in mocked
+# config dicts), not real producer-path risk.
+"tests/**" = ["S101", "S105", "S106", "S311", "S108", "S607"]
+# Second pytest-collected test tree outside tests/ (the Slot S exit-rule
+# conformance kit — see executor/strategies/conformance/README.md); only its
+# actual test_*.py file, not the kit.py/scenarios.py reusable helpers.
+"executor/strategies/conformance/test_conformance.py" = ["S101"]

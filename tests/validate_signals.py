@@ -89,8 +89,9 @@ def main():
     if args.s3:
         import os
         os.environ.setdefault("PATH", "/opt/homebrew/bin:" + os.environ.get("PATH", ""))
-        import boto3
         from datetime import date
+
+        import boto3
         d = args.s3 if args.s3 != "today" else str(date.today())
         bucket = "alpha-engine-research"
         key = f"signals/{d}/signals.json"
