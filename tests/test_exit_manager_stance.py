@@ -14,11 +14,9 @@ evaluate_exits end-to-end.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
 from unittest.mock import MagicMock
 
 import pandas as pd
-import pytest
 
 from executor.strategies.exit_manager import (
     STANCE_EXIT_OVERRIDES,
@@ -26,7 +24,6 @@ from executor.strategies.exit_manager import (
     check_catalyst_hard_exit,
     evaluate_exits,
 )
-
 
 # ── _resolve_strategy_config_for_stance ──────────────────────────────────
 

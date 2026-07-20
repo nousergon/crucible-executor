@@ -15,7 +15,7 @@ names bound in its namespace.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -104,7 +104,7 @@ def test_execute_on_weekend_keys_trades_on_prior_trading_day(stub_env, monkeypat
     import nousergon_lib.dates as dates_mod
     from nousergon_lib.dates import now_dual
 
-    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)  # 8 AM ET Sat
+    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)  # 8 AM ET Sat
     monkeypatch.setattr(dates_mod, "now_dual", lambda: now_dual(now=saturday))
 
     client = _mock_client(positions={"AAPL": {"shares": 10, "market_value": 1500.0}})

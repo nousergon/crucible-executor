@@ -45,7 +45,7 @@ from __future__ import annotations
 import io
 import json
 import logging
-from datetime import date, timedelta
+from datetime import date
 
 import boto3
 import pandas as pd
@@ -593,7 +593,6 @@ def _apply_thinktank_coverage(
     injected_predictions: dict[str, dict] = {}
     for rank, row in enumerate(top_n):
         ticker = row["ticker"]
-        rating = float(row["rating"])
         # rank_fraction: 0.0 for the best-rated name, approaching 1.0 for
         # the worst — computed WITHIN the selection (see docstring: there is
         # no larger scored population to rank against for this arm).

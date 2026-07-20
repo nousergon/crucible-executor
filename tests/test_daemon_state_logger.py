@@ -259,6 +259,7 @@ class TestDaemonCallSites:
 
     def test_daemon_records_urgent_exits(self):
         import inspect
+
         import executor.daemon as daemon
 
         src = inspect.getsource(daemon)
@@ -271,6 +272,7 @@ class TestDaemonCallSites:
 
     def test_daemon_records_intraday_exits(self):
         import inspect
+
         import executor.daemon as daemon
 
         src = inspect.getsource(daemon)
@@ -284,6 +286,7 @@ class TestDaemonCallSites:
 
     def test_daemon_records_entry_triggers(self):
         import inspect
+
         import executor.daemon as daemon
 
         src = inspect.getsource(daemon)
@@ -296,6 +299,7 @@ class TestDaemonCallSites:
 
     def test_daemon_finally_flushes_to_s3(self):
         import inspect
+
         import executor.daemon as daemon
 
         src = inspect.getsource(daemon)

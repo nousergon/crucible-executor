@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
 import pytest
 import yaml
+from nousergon_lib.artifact_freshness import check_freshness
 
 from executor.upstream_artifact_gate import (
     EXECUTOR_UPSTREAM_SPECS,
     check_upstream_deliverables,
 )
-from nousergon_lib.artifact_freshness import check_freshness
 
 
 class _ClientError404(Exception):
@@ -44,15 +44,15 @@ def _fake_s3(objects: dict[str, datetime]):
 
 
 def _health_ok(hours_ago: float = 1.0) -> dict:
-    last = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+    last = (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat()
     return {"module": "x", "status": "ok", "last_success": last}
 
 
 # Monday 2026-06-23 14:00 UTC — weekday pre-open, after the 13:00 UTC SF tick.
-_MONDAY_PREOPEN = datetime(2026, 6, 23, 14, 0, tzinfo=timezone.utc)
-_FRIDAY = datetime(2026, 6, 20, 13, 30, tzinfo=timezone.utc)
-_SATURDAY = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
-_ANCIENT = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+_MONDAY_PREOPEN = datetime(2026, 6, 23, 14, 0, tzinfo=UTC)
+_FRIDAY = datetime(2026, 6, 20, 13, 30, tzinfo=UTC)
+_SATURDAY = datetime(2026, 6, 21, 12, 0, tzinfo=UTC)
+_ANCIENT = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
 
 
 class TestCheckUpstreamDeliverables:

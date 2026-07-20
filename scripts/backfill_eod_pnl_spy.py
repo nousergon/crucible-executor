@@ -35,17 +35,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import io
 import logging
 import os
 import sqlite3
 import sys
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 # arcticdb must import before pandas on macOS (see price_cache.py comment).
 import arcticdb as _arcticdb  # noqa: F401
-
 import boto3
 import pandas as pd
 import yaml
@@ -53,7 +51,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from executor.price_cache import _open_macro_library
+from executor.price_cache import _open_macro_library  # noqa: E402 -- must follow sys.path.insert above
 
 logging.basicConfig(
     level=logging.INFO,
@@ -219,7 +217,7 @@ def print_plan(plan: list[dict]) -> None:
 
 def snapshot_db_to_s3(db_path: str, trades_bucket: str) -> str:
     """Upload a pre-backfill copy of trades.db to S3. Returns the S3 key."""
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d")
     key = f"trades/trades_{stamp}.pre-backfill.db"
     s3 = boto3.client("s3")
     with open(db_path, "rb") as f:

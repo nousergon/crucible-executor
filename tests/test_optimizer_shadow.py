@@ -25,14 +25,11 @@ import pandas as pd
 import pytest
 
 from executor.optimizer_shadow import (
-    _build_alpha_hat,
     _build_alpha_uncertainty,
     _build_eligibility,
-    _build_sectors,
     _build_stance_caps,
     _build_universe,
     _build_w_prev,
-    _compute_trade_deltas,
     _extract_universe_tickers,
     run_shadow_optimizer,
 )
@@ -289,9 +286,9 @@ def test_exit_signal_makes_ticker_ineligible():
         inputs["predictions_by_ticker"], inputs["current_positions"],
         inputs["config"], spy_idx, cash_idx,
     )
-    assert eligibility[aapl_idx] == False, "EXIT signal must zero eligibility"
-    assert eligibility[spy_idx] == True
-    assert eligibility[cash_idx] == True
+    assert not eligibility[aapl_idx], "EXIT signal must zero eligibility"
+    assert eligibility[spy_idx]
+    assert eligibility[cash_idx]
 
 
 def test_gbm_veto_makes_ticker_ineligible():
@@ -311,7 +308,7 @@ def test_gbm_veto_makes_ticker_ineligible():
         inputs["predictions_by_ticker"], inputs["current_positions"],
         inputs["config"], spy_idx, cash_idx,
     )
-    assert eligibility[aapl_idx] == False
+    assert not eligibility[aapl_idx]
 
 
 def test_w_prev_reflects_current_positions():
@@ -583,7 +580,7 @@ class TestLoadAutoTunedOptimizerCfg:
         assert out == {"risk_aversion": 4.0, "tcost_bps": 3.0}
 
     def test_out_of_band_value_is_reclamped(self):
-        from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg, _AUTO_TUNED_BOUNDS
+        from executor.optimizer_shadow import _AUTO_TUNED_BOUNDS, _load_auto_tuned_optimizer_cfg
         s3 = _s3_returning({"risk_aversion": 999.0, "tcost_bps": -5.0})
         out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
         assert out["risk_aversion"] == _AUTO_TUNED_BOUNDS["risk_aversion"][1]  # hi

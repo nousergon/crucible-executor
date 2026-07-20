@@ -275,7 +275,6 @@ def check_time_decay(
 
     entry_dt = date.fromisoformat(entry_date)
     run_dt = date.fromisoformat(run_date)
-    calendar_days = (run_dt - entry_dt).days
 
     # Approximate trading days (exclude weekends): ~5 trading days per 7 calendar days
     trading_days = _approx_trading_days(entry_dt, run_dt)
@@ -936,7 +935,6 @@ def _compute_atr(price_history: pd.DataFrame, period: int = 14) -> float | None:
     if len(tr) == period:
         return sma_seed
 
-    smoothed = pd.Series(tr[period:]).ewm(alpha=1.0 / period, adjust=False).mean()
     # Re-seed the EWM with sma_seed by treating the first smoothed value
     # as ``sma_seed * (1 - alpha) + tr[period] * alpha``. pandas.ewm seeds
     # with the first sample, so we manually walk the first step here.

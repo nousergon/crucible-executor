@@ -756,7 +756,6 @@ class TestReadSignalsChampionRegression:
         """Passthrough every OTHER S3-touching call _read_signals makes in
         live mode, isolating the champion pointer as the only boundary this
         test actually exercises."""
-        import executor.main as main_mod
 
         monkeypatch.setattr(
             "executor.signal_reader.filter_buy_candidates_to_universe",

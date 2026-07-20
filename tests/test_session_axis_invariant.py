@@ -17,11 +17,10 @@ capturer's guard relies on them coinciding post-close.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
-
 from nousergon_lib.dates import (
     last_closed_trading_day,
     now_dual,
@@ -69,6 +68,7 @@ class TestSessionAxisInvariant:
         reading it intraday — the freshness match that forces main.py and
         daemon.py onto the same axis."""
         import nousergon_lib.dates as dates_mod
+
         from executor.order_book import OrderBook, _default_book
 
         book = _default_book(run_date=_planner_run_date(PREOPEN))

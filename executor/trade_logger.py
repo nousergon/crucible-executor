@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import boto3
 
@@ -304,6 +304,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
     if _fill_time and trade.get("date"):
         try:
             from datetime import datetime as _dt
+
             from nousergon_lib.dates import assert_within_session
             assert_within_session(
                 _dt.fromisoformat(str(_fill_time).replace("Z", "+00:00")),
@@ -314,8 +315,9 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
                 "trades.date session mis-key (row inserted anyway): %s",
                 _axis_err,
             )
-        except Exception:
-            pass  # lib not yet bumped / unparseable fill_time — best-effort
+        except Exception as _e:
+            # lib not yet bumped / unparseable fill_time — best-effort
+            logger.debug("session axis check skipped (best-effort): %s", _e)
     conn.execute(
         """
         INSERT INTO trades (
@@ -381,7 +383,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("stance"),
             trade.get("catalyst_date"),
             trade.get("entry_id"),
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
         ),
     )
     conn.commit()
@@ -422,7 +424,7 @@ def log_shadow_book_block(conn: sqlite3.Connection, entry: dict) -> str:
             entry.get("current_price"),
             entry.get("portfolio_nav"),
             entry.get("market_regime"),
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
         ),
     )
     conn.commit()
@@ -478,7 +480,7 @@ def log_risk_event(conn: sqlite3.Connection, event: dict) -> str:
             event.get("signal_date"),
             event.get("prediction_date"),
             context_json,
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
         ),
     )
     conn.commit()
@@ -532,7 +534,7 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             eod.get("dividend_usd"),
             eod.get("unattributed_usd"),
             eod.get("unattributed_residual_pct"),
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
         ),
     )
     conn.commit()

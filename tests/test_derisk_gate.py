@@ -24,7 +24,6 @@ from botocore.exceptions import ClientError
 from executor.derisk_gate import (
     CARRYOVER_LEDGER_KEY,
     DeriskGateConfigError,
-    DeriskGateState,
     apply_risk_aversion_floor,
     evaluate_derisk_gate,
 )

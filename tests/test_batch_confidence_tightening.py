@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,8 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from executor.deciders import (
     _apply_batch_confidence_tightening,
     _batch_confidence_mean,
+    decide_entries,
 )
-
 
 # ── _batch_confidence_mean ────────────────────────────────────────────────
 
@@ -185,9 +186,6 @@ class TestApplyBatchConfidenceTightening:
 
 # ── Integration with decide_entries ──────────────────────────────────────
 
-import pandas as pd
-from executor.deciders import decide_entries
-
 
 def _df_history(base: float = 100.0):
     closes = [base * (1 + 0.001 * i) for i in range(40)]
@@ -250,7 +248,6 @@ class TestDecideEntriesAppliesTightening:
             "universe": [sig],
             "buy_candidates": [sig],
         }
-        all_tickers = ["MARG"]
         plan = decide_entries(
             enter_signals=[sig],
             signals_raw=signals_raw,

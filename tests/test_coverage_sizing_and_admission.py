@@ -16,7 +16,7 @@ Two invariants (2026-04-22):
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 

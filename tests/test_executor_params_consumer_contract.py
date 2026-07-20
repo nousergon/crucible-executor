@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from executor import main
 
-
 # Params the producer (backtester optimizer assembler) can emit for the
 # executor to APPLY — PIPELINE_CONTRACT.yaml "applied" sections.
 PRODUCER_APPLIED_PARAMS = {

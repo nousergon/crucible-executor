@@ -27,7 +27,7 @@ import json
 import logging
 import math
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ def _apply_message(prices: dict[str, dict], msg: dict) -> str | None:
         "low": min(low or price, prev.get("low", price)),
         "close": close if close is not None else prev.get("close"),
         "volume": volume if volume is not None else prev.get("volume"),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
     return symbol
 
@@ -215,8 +215,8 @@ class PolygonPriceMonitor:
         if ws is not None:
             try:
                 ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("PolygonPriceMonitor: ws.close() failed (non-fatal): %s", e)
         if self._thread is not None:
             self._thread.join(timeout=5)
         self._tickers = []
@@ -281,5 +281,5 @@ class PolygonPriceMonitor:
                 try:
                     if self._ws is not None:
                         self._ws.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("PolygonPriceMonitor: ws.close() in reconnect loop failed (non-fatal): %s", e)

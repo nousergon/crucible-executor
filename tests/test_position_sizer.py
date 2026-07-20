@@ -3,7 +3,6 @@ import pytest
 
 from executor.position_sizer import compute_position_size
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
