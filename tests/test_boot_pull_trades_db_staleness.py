@@ -87,7 +87,7 @@ def _make_db(path: Path, dates: list[str] | None) -> None:
     # Filler to push the file comfortably past the 20480B minimal-size gate,
     # which is a separate branch from the recency check under test here.
     c.execute("CREATE TABLE filler (blob TEXT)")
-    for i in range(2000):
+    for _i in range(2000):
         c.execute("INSERT INTO filler VALUES (?)", ("x" * 100,))
     conn.commit()
     conn.close()

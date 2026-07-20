@@ -522,7 +522,7 @@ def test_ewma_estimator_integrates_with_solve_target_weights():
 
 def test_ewma_composes_with_sigma_horizon_days():
     """EWMA Σ at H=21 = 21 × EWMA Σ at H=1 — composition with A.1."""
-    from executor.portfolio_optimizer import _estimate_covariance, OPTIMIZER_CONFIG_DEFAULTS
+    from executor.portfolio_optimizer import OPTIMIZER_CONFIG_DEFAULTS, _estimate_covariance
 
     rng = np.random.default_rng(3)
     returns = rng.normal(0, 0.01, size=(300, 4))
@@ -565,7 +565,7 @@ def test_default_estimator_unchanged_after_ewma_addition():
 
 def test_oas_estimator_produces_valid_psd_matrix():
     """OAS Σ must be symmetric PSD; same shape as input."""
-    from executor.portfolio_optimizer import _estimate_covariance, OPTIMIZER_CONFIG_DEFAULTS
+    from executor.portfolio_optimizer import OPTIMIZER_CONFIG_DEFAULTS, _estimate_covariance
 
     rng = np.random.default_rng(5)
     returns = rng.normal(0, 0.01, size=(252, 5))
@@ -596,7 +596,7 @@ def test_oas_estimator_integrates_with_solve_target_weights():
 
 def test_oas_composes_with_sigma_horizon_days():
     """OAS Σ at H=21 = 21 × OAS Σ at H=1 — composition with A.1."""
-    from executor.portfolio_optimizer import _estimate_covariance, OPTIMIZER_CONFIG_DEFAULTS
+    from executor.portfolio_optimizer import OPTIMIZER_CONFIG_DEFAULTS, _estimate_covariance
 
     rng = np.random.default_rng(7)
     returns = rng.normal(0, 0.01, size=(252, 4))
@@ -619,7 +619,7 @@ def test_oas_distinct_from_lw_on_correlated_small_sample():
     to scaled-identity. Need data with real correlation structure so the
     intensity formulas (which differ between LW and OAS) yield distinct Σ.
     Confirms OAS is actually wired (not silently aliasing to LW)."""
-    from executor.portfolio_optimizer import _estimate_covariance, OPTIMIZER_CONFIG_DEFAULTS
+    from executor.portfolio_optimizer import OPTIMIZER_CONFIG_DEFAULTS, _estimate_covariance
 
     rng = np.random.default_rng(11)
     N = 10
@@ -1022,7 +1022,7 @@ class TestTurnoverGovernor:
     def test_large_target_is_capped_to_max_daily_turnover(self):
         # From all-cash (w_prev=0) the MVO target is a ~0.5 turnover jump;
         # the governor must scale executed one-way turnover down to the cap.
-        N = 3  # T0, SPY, CASH
+        # (Universe: T0, SPY, CASH.)
         result = self._solve_from_prev(cap=0.20)
         d = result.diagnostics
         assert d["turnover_capped"] is True
@@ -1032,14 +1032,12 @@ class TestTurnoverGovernor:
 
     def test_capped_weights_stay_feasible(self):
         # Scaled step = convex combo of two feasible points → Σw=1 preserved.
-        N = 3
         result = self._solve_from_prev(cap=0.20)
         assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
         assert np.all(result.weights >= -1e-9)
 
     def test_large_requested_move_sets_flag(self):
         # Requested turnover ~0.5 > 0.35 flag → flagged (but still capped).
-        N = 3
         result = self._solve_from_prev(cap=0.20, flag=0.35)
         assert result.diagnostics["large_move_flagged"] is True
         assert result.diagnostics["turnover_capped"] is True  # cap independent of flag
@@ -1047,14 +1045,12 @@ class TestTurnoverGovernor:
     def test_flag_without_cap_does_not_scale(self):
         # flag set, cap disabled → flagged but weights untouched (cap is the
         # only thing that scales; flagging never bypasses or replaces it).
-        N = 3
         result = self._solve_from_prev(cap=None, flag=0.35)
         assert result.diagnostics["large_move_flagged"] is True
         assert result.diagnostics["turnover_capped"] is False
 
     def test_governor_disabled_is_bit_identical(self):
         # max_daily_turnover=None → no governor; turnover_capped False, no scale.
-        N = 3
         result = self._solve_from_prev(cap=None, flag=None)
         assert result.diagnostics["turnover_capped"] is False
         assert result.diagnostics["large_move_flagged"] is False

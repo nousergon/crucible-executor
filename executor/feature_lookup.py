@@ -100,7 +100,7 @@ class FeatureLookup:
         rsi_period: int = DEFAULT_RSI_PERIOD,
         momentum_lookback: int = DEFAULT_MOMENTUM_LOOKBACK,
         support_lookback: int = DEFAULT_SUPPORT_LOOKBACK,
-    ) -> "FeatureLookup":
+    ) -> FeatureLookup:
         """Bulk vectorized precompute across all (ticker, date) pairs.
 
         Each ticker's DataFrame must have ``[open, high, low, close]``
@@ -165,7 +165,7 @@ class FeatureLookup:
         cls,
         price_histories: dict,
         **kwargs,
-    ) -> "FeatureLookup":
+    ) -> FeatureLookup:
         """Sparse precompute for the live-executor path.
 
         ``price_histories`` is the same shape as ``ohlcv_by_ticker``
@@ -181,7 +181,7 @@ class FeatureLookup:
     # ── Lookups ─────────────────────────────────────────────────────
 
     def atr_dollar_at(
-        self, ticker: str, date: "pd.Timestamp | str",
+        self, ticker: str, date: pd.Timestamp | str,
     ) -> float | None:
         """Wilder ATR(period) at ``date`` for ``ticker``, in dollar units.
 
@@ -192,26 +192,26 @@ class FeatureLookup:
         return _series_value_at(self.atr_dollar.get(ticker), date)
 
     def rsi_at(
-        self, ticker: str, date: "pd.Timestamp | str",
+        self, ticker: str, date: pd.Timestamp | str,
     ) -> float | None:
         return _series_value_at(self.rsi.get(ticker), date)
 
     def momentum_20d_pct_at(
-        self, ticker: str, date: "pd.Timestamp | str",
+        self, ticker: str, date: pd.Timestamp | str,
     ) -> float | None:
         return _series_value_at(self.momentum_20d_pct.get(ticker), date)
 
     def support_20_low_at(
-        self, ticker: str, date: "pd.Timestamp | str",
+        self, ticker: str, date: pd.Timestamp | str,
     ) -> float | None:
         return _series_value_at(self.support_20_low.get(ticker), date)
 
     def returns_window(
         self,
         ticker: str,
-        end_date: "pd.Timestamp | str",
+        end_date: pd.Timestamp | str,
         n: int,
-    ) -> "np.ndarray | None":
+    ) -> np.ndarray | None:
         """N consecutive daily returns ending at ``end_date``.
 
         Returns None if ticker isn't tracked or fewer than n returns
@@ -231,7 +231,7 @@ class FeatureLookup:
         return slice_.iloc[-n:].to_numpy(dtype=float, copy=False)
 
     def has_data(
-        self, ticker: str, date: "pd.Timestamp | str",
+        self, ticker: str, date: pd.Timestamp | str,
     ) -> bool:
         """True if any tracked feature has a non-NaN value for
         ``(ticker, date)``. Used by deciders to short-circuit when a
@@ -257,7 +257,7 @@ class FeatureLookup:
 # ── Internal helpers ────────────────────────────────────────────────
 
 
-def _compute_atr_series(df: pd.DataFrame, period: int) -> "pd.Series | None":
+def _compute_atr_series(df: pd.DataFrame, period: int) -> pd.Series | None:
     """Wilder ATR(period) as a Series indexed by ``df.index``.
 
     Returns None if ``df`` has fewer than ``period + 1`` rows.
@@ -314,7 +314,7 @@ def _compute_atr_series(df: pd.DataFrame, period: int) -> "pd.Series | None":
     return pd.Series(atr_arr, index=df.index, name="atr")
 
 
-def _compute_rsi_series(df: pd.DataFrame, period: int) -> "pd.Series | None":
+def _compute_rsi_series(df: pd.DataFrame, period: int) -> pd.Series | None:
     """Wilder RSI(period) as a Series indexed by ``df.index``.
 
     Matches scalar ``_compute_rsi`` byte-for-byte at the final bar.
@@ -357,7 +357,7 @@ def _rsi_from_avgs(avg_gain: float, avg_loss: float) -> float:
 
 
 def _series_value_at(
-    series: "pd.Series | None", date: "pd.Timestamp | str",
+    series: pd.Series | None, date: pd.Timestamp | str,
 ) -> float | None:
     """Look up a series value as-of ``date``, returning None for
     missing/NaN.

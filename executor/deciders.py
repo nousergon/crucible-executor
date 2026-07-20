@@ -694,7 +694,6 @@ def decide_entries(
                 # Predictor-side veto is authoritative. ``momentum_20d``
                 # in the prediction is a decimal (matches feature
                 # engineering's ``close/close.shift(20) - 1``).
-                veto_source = "predictor"
                 if isinstance(predictor_momentum_20d, (int, float)):
                     momentum_20d_decimal = float(predictor_momentum_20d)
                 if predictor_momentum_veto:
@@ -722,7 +721,6 @@ def decide_entries(
                 # for this ticker. Fall through to the inline calc.
                 ticker_history = price_histories.get(ticker)
                 if ticker_history is not None and len(ticker_history) >= 21:
-                    veto_source = "executor_fallback"
                     close = ticker_history["close"]
                     momentum_20d_decimal = (
                         float(close.iloc[-1]) / float(close.iloc[-21]) - 1

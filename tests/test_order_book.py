@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta, timezone
-
-import pytest
+from datetime import UTC, date, datetime, timedelta
 
 from executor.order_book import OrderBook, _current_session_date, _default_book
-
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -315,7 +312,7 @@ def test_current_session_date_maps_weekend_to_next_session(monkeypatch):
     """On a Saturday, _current_session_date() resolves to the NEXT session
     (Monday) — a weekend-built book is for Monday, not the closed Friday.
     (Sat 2026-04-25 → session 2026-04-27.)"""
-    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)  # 8 AM ET Sat
+    saturday = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)  # 8 AM ET Sat
     _patch_session(monkeypatch, saturday)
 
     assert _current_session_date() == "2026-04-27"
@@ -326,7 +323,7 @@ def test_current_session_date_is_physical_session_intraday(monkeypatch):
     """Intraday, the session is TODAY — not the last closed session (D-1).
     This is the config#1610 incident shape: a daemon started 2026-07-02
     intraday must key its artifacts 2026-07-02, not 2026-07-01."""
-    intraday = datetime(2026, 7, 2, 13, 31, tzinfo=timezone.utc)  # 9:31 ET
+    intraday = datetime(2026, 7, 2, 13, 31, tzinfo=UTC)  # 9:31 ET
     _patch_session(monkeypatch, intraday)
 
     assert _current_session_date() == "2026-07-02"
@@ -334,7 +331,7 @@ def test_current_session_date_is_physical_session_intraday(monkeypatch):
 
 def test_default_book_keys_on_next_session_when_offsession(monkeypatch):
     """A fresh book built on a weekend keys `date` to the next session."""
-    sunday = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc)
+    sunday = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
     _patch_session(monkeypatch, sunday)
 
     book = _default_book()
@@ -345,7 +342,7 @@ def test_load_keeps_preopen_book_intraday_same_session(monkeypatch, tmp_path):
     """The freshness match both #1016 and #1610 protect: a book the morning
     batch wrote pre-open for session D must NOT be discarded as 'stale' by
     the daemon reading it later the same session."""
-    intraday = datetime(2026, 7, 2, 14, 0, tzinfo=timezone.utc)  # 10 AM ET
+    intraday = datetime(2026, 7, 2, 14, 0, tzinfo=UTC)  # 10 AM ET
     _patch_session(monkeypatch, intraday)
 
     book_data = _default_book(run_date="2026-07-02")  # written pre-open
@@ -360,7 +357,7 @@ def test_load_keeps_preopen_book_intraday_same_session(monkeypatch, tmp_path):
 def test_load_keeps_weekend_book_on_monday(monkeypatch, tmp_path):
     """A Saturday operator book (keyed to Monday's session) survives the
     Monday pre-open read — same session on both sides."""
-    monday_preopen = datetime(2026, 4, 27, 13, 0, tzinfo=timezone.utc)  # 9 ET
+    monday_preopen = datetime(2026, 4, 27, 13, 0, tzinfo=UTC)  # 9 ET
     _patch_session(monkeypatch, monday_preopen)
 
     book_data = _default_book(run_date="2026-04-27")  # written Saturday
@@ -416,7 +413,7 @@ def test_load_discards_book_from_prior_session(monkeypatch, tmp_path):
     """A book from a genuinely earlier session is still discarded — incl.
     a book keyed on the OLD (last-closed / D-1) axis, which is exactly the
     stale state the fix leaves behind on the box at cutover."""
-    intraday = datetime(2026, 7, 2, 14, 0, tzinfo=timezone.utc)
+    intraday = datetime(2026, 7, 2, 14, 0, tzinfo=UTC)
     _patch_session(monkeypatch, intraday)
 
     stale = _default_book(run_date="2026-07-01")  # D-1 (old-axis key)

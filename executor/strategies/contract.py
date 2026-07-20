@@ -43,8 +43,9 @@ post-2026-06-13 per the issue's runtime-refactor gate.
 from __future__ import annotations
 
 import keyword
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 CONTRACT_VERSION = 1
 
@@ -142,7 +143,7 @@ class RuleOutcome:
     flag: str | None = None
 
     @classmethod
-    def none(cls) -> "RuleOutcome":
+    def none(cls) -> RuleOutcome:
         return cls()
 
 

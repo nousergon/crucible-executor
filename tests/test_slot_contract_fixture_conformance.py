@@ -23,7 +23,7 @@ contracts = pytest.importorskip(
     reason="needs alpha-engine-lib[contracts] >= 0.59.1",
 )
 
-from tests.test_signal_reader_consumer_contract import _complete_signals
+from tests.test_signal_reader_consumer_contract import _complete_signals  # noqa: E402 -- must follow importorskip above
 
 
 def _complete_predictions() -> dict:

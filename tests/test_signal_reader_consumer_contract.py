@@ -33,7 +33,6 @@ from executor.signal_reader import (
     read_signals,
 )
 
-
 # ── signals.json boundary (research → executor) ──────────────────────────────
 
 # Per-ticker fields get_actionable_signals relies on (PIPELINE_CONTRACT `signals`).

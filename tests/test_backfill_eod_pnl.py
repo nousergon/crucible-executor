@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from executor.backfill_eod_pnl import (
+    _prior_eod_row,
     backfill,
     check_position_divergence,
     day_cash_flow,
@@ -17,7 +18,6 @@ from executor.backfill_eod_pnl import (
     replay_positions,
     synthesize_positions,
     synthesize_snapshot,
-    _prior_eod_row,
 )
 from executor.trade_logger import init_db
 

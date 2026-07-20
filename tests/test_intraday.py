@@ -4,17 +4,17 @@ market_hours, notifier, retry.
 All pure-logic tests — no IB Gateway or S3 dependencies.
 """
 
-from datetime import date, datetime, time
-from unittest.mock import MagicMock, patch
+from datetime import date, datetime
+from unittest.mock import patch
 
-import pytz
 import pytest
+import pytz
 
 from executor.entry_triggers import EntryTriggerEngine
 from executor.intraday_exit_manager import IntradayExitManager
 from executor.market_hours import is_market_hours, is_trading_day
-from executor.order_book import build_stop_record
 from executor.notifier import send_daemon_status, send_trade_alert
+from executor.order_book import build_stop_record
 from executor.retry import retry
 
 _ET = pytz.timezone("US/Eastern")
@@ -215,9 +215,6 @@ class TestIntradayExitManager:
 
     def test_should_update_trail_tightens_after_days(self):
         mgr = self._mgr()
-        old_date = (date.today().isoformat()[:8] + "01").replace(
-            date.today().isoformat()[:8], (date.today().replace(day=1) if date.today().day > 5 else date.today()).isoformat()[:8]
-        )
         # Use a date 10 days ago
         from datetime import timedelta
         entry = (date.today() - timedelta(days=10)).isoformat()
@@ -357,11 +354,11 @@ class TestBuildStopRecord:
     """
 
     def _kwargs(self, **overrides):
-        base = dict(
-            ticker="WDAY", entry_price=146.48, current_stop=132.0,
-            trail_atr=4.0, atr_multiple=2.0, high_water=146.48,
-            entry_date="2026-06-05", shares=306,
-        )
+        base = {
+            "ticker": "WDAY", "entry_price": 146.48, "current_stop": 132.0,
+            "trail_atr": 4.0, "atr_multiple": 2.0, "high_water": 146.48,
+            "entry_date": "2026-06-05", "shares": 306,
+        }
         base.update(overrides)
         return base
 

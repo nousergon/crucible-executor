@@ -129,7 +129,7 @@ class OrderBook:
         self._path = path
 
     @classmethod
-    def load(cls, path: Path = _ORDER_BOOK_PATH) -> "OrderBook":
+    def load(cls, path: Path = _ORDER_BOOK_PATH) -> OrderBook:
         """Load order book from disk (with file lock). Returns empty book if missing or stale."""
         import fcntl
 

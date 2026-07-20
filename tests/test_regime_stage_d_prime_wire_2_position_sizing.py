@@ -30,7 +30,6 @@ from executor.signal_reader import (
     read_regime_substrate,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────
 # regime_conditional_size_multiplier — pure math
 # ─────────────────────────────────────────────────────────────────────

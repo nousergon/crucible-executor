@@ -16,7 +16,6 @@ import pytest
 
 from executor.snapshot_capturer import _snapshot_key, load_snapshot, run
 
-
 # ── _snapshot_key ────────────────────────────────────────────────────────────
 
 

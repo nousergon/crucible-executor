@@ -1,4 +1,19 @@
+# config#2532: ruff lint (incl. flake8-bandit "S" ruleset) + ruff-format,
+# pinned to the identical version CI uses (.github/workflows/ruff.yml) to
+# avoid formatter/linter drift between local commits and CI.
+#
+# ruff-format only touches files staged in the commit — it does not require
+# the whole tree to already be reformatted (the existing tree predates this
+# hook and isn't ruff-format-clean yet; see ruff.yml's comment for why a
+# whole-repo reformat is out of scope here).
 repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.14
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.24.0
     hooks:

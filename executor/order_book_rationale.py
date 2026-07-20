@@ -40,9 +40,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
-
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -886,7 +886,7 @@ def write_order_book_rationale(
             "schema_version": payload["schema_version"],
             "market_regime": payload.get("market_regime"),
             "n_considered": payload.get("summary", {}).get("n_considered"),
-            "written_at": datetime.now(timezone.utc)
+            "written_at": datetime.now(UTC)
             .isoformat()
             .replace("+00:00", "Z"),
         }

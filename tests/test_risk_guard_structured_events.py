@@ -63,19 +63,19 @@ def _base_signal(**overrides):
 
 
 def _call(events=None, **kwargs):
-    defaults = dict(
-        ticker="AAPL",
-        action="ENTER",
-        dollar_size=4000,
-        portfolio_nav=100_000,
-        peak_nav=100_000,
-        current_positions={},
-        sector="Technology",
-        market_regime="neutral",
-        signal=_base_signal(),
-        config=_base_config(),
-        price_histories=None,
-    )
+    defaults = {
+        "ticker": "AAPL",
+        "action": "ENTER",
+        "dollar_size": 4000,
+        "portfolio_nav": 100_000,
+        "peak_nav": 100_000,
+        "current_positions": {},
+        "sector": "Technology",
+        "market_regime": "neutral",
+        "signal": _base_signal(),
+        "config": _base_config(),
+        "price_histories": None,
+    }
     defaults.update(kwargs)
     return check_order(**defaults, events=events)
 
@@ -292,7 +292,7 @@ class TestCheckCorrelationEvents:
         assert ev["sector"] == "Technology"
         # Per-ticker breakdown is preserved
         assert isinstance(ev["context"]["per_ticker"], list)
-        per_t = {t: c for t, c in ev["context"]["per_ticker"]}
+        per_t = dict(ev["context"]["per_ticker"])
         assert "MSFT" in per_t and "GOOG" in per_t
 
     def test_no_event_when_passing(self):

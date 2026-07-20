@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 
 import pytz
 
 from executor import uptime_tracker as ut
-
 
 _ET = pytz.timezone("US/Eastern")
 _UTC = pytz.utc

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import boto3
@@ -179,7 +179,7 @@ def run_shadow_optimizer(
             "run_date": run_date,
             "shadow_status": "failed",
             "error": repr(e),
-            "written_at_utc": datetime.now(timezone.utc).isoformat(),
+            "written_at_utc": datetime.now(UTC).isoformat(),
         }
         try:
             _write_shadow_log_to_s3(sentinel, signals_bucket, run_date, s3_client)
@@ -354,7 +354,7 @@ def _build_and_solve(
 
     out: dict = {
         "run_date": run_date,
-        "written_at_utc": datetime.now(timezone.utc).isoformat(),
+        "written_at_utc": datetime.now(UTC).isoformat(),
         "shadow_status": "ok",
         "portfolio_nav": float(portfolio_nav),
         "n_tickers": N,
