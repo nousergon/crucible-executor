@@ -1,16 +1,15 @@
 """Unit tests for executor.strategies.exit_manager — pure exit logic, no IBKR/S3."""
-import pandas as pd
-import pytest
 from datetime import date, timedelta
+
+import pandas as pd
 
 from executor.strategies.exit_manager import (
     check_atr_trailing_stop,
-    check_time_decay,
-    check_profit_take,
     check_fallback_stop,
+    check_profit_take,
     check_sector_relative_veto,
+    check_time_decay,
 )
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -373,10 +372,10 @@ class TestSectorRelativeVeto:
 # ── Position loss floor (MAE stop) — L4549a ──────────────────────────────────
 
 from executor.strategies.exit_manager import (  # noqa: E402
-    check_position_loss_floor,
+    STANCE_EXIT_OVERRIDES,  # noqa: E402
     _evaluate_single_position,
+    check_position_loss_floor,
 )
-from executor.strategies.exit_manager import STANCE_EXIT_OVERRIDES  # noqa: E402
 
 
 class TestPositionLossFloor:

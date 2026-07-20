@@ -25,12 +25,12 @@ from __future__ import annotations
 
 import copy
 
+from executor.strategies.conformance.scenarios import golden_scenarios
 from executor.strategies.contract import (
     ALLOWED_ACTIONS,
     ExitRule,
     RuleOutcome,
 )
-from executor.strategies.conformance.scenarios import golden_scenarios
 
 
 def _outcome_repr(outcome: RuleOutcome) -> tuple:

@@ -48,16 +48,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 import boto3
-
-from executor.config_loader import load_config
-from executor.eod_reconcile import _spy_close, run as eod_run
-from executor.trade_logger import init_db
 from nousergon_lib.dates import now_dual
 from nousergon_lib.logging import get_flow_doctor
 from nousergon_lib.trading_calendar import previous_trading_day
+
+from executor.config_loader import load_config
+from executor.eod_reconcile import _spy_close
+from executor.eod_reconcile import run as eod_run
+from executor.trade_logger import init_db
 
 logger = logging.getLogger(__name__)
 
@@ -342,7 +343,7 @@ def audit_window(
             "before": before,
             "after": after,
             "source": "arcticdb_macro",
-            "corrected_at": datetime.now(timezone.utc).isoformat(),
+            "corrected_at": datetime.now(UTC).isoformat(),
         }
         _write_audit_record(trades_bucket=trades_bucket, run_date=d, record=record, region=region)
         correction_message = (

@@ -11,10 +11,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from executor.portfolio_optimizer import (
-    OPTIMIZER_CONFIG_DEFAULTS,
-    _estimate_covariance_daily,
-)
 from executor.intraday_resolve import (
     available_redeploy_cash,
     build_conviction_map,
@@ -23,6 +19,10 @@ from executor.intraday_resolve import (
     select_forced_exits,
     solve_redeploy,
     w_prev_from_live,
+)
+from executor.portfolio_optimizer import (
+    OPTIMIZER_CONFIG_DEFAULTS,
+    _estimate_covariance_daily,
 )
 
 

@@ -16,7 +16,6 @@ from unittest.mock import MagicMock, patch
 
 import executor.daemon as daemon
 
-
 # signals_bucket is the RESEARCH bucket in this repo (risk.yaml:
 # signals_bucket == alpha-engine-research); trades_bucket is a distinct
 # executor/trades bucket that the heartbeat must NOT be written to.

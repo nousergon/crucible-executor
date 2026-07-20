@@ -151,8 +151,8 @@ class PriceMonitor:
         for ticker_data in self._subscriptions:
             try:
                 self._ib.cancelMktData(ticker_data.contract)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("cancelMktData failed for %s (non-fatal): %s", ticker_data.contract, e)
         self._subscriptions.clear()
         self._contracts.clear()
         self._sub_by_symbol.clear()

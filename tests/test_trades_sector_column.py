@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from executor.trade_logger import init_db, log_trade, get_entry_trade
+from executor.trade_logger import get_entry_trade, init_db, log_trade
 
 
 def _columns(db_path: Path) -> set[str]:

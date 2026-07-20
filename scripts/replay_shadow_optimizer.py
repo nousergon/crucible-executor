@@ -25,20 +25,22 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-import boto3
-import yaml
+# All imports below must follow sys.path.insert above (script run standalone,
+# not installed — needs REPO_ROOT on sys.path to resolve the executor.* imports).
+import boto3  # noqa: E402
+import yaml  # noqa: E402
 
-from executor.ibkr import IBKRClient
-from executor.optimizer_shadow import _build_and_solve
-from executor.price_cache import load_price_histories
-from executor.signal_reader import read_predictions, read_signals_with_fallback
-from executor.strategies.exit_manager import SECTOR_ETF_MAP
+from executor.ibkr import IBKRClient  # noqa: E402
+from executor.optimizer_shadow import _build_and_solve  # noqa: E402
+from executor.price_cache import load_price_histories  # noqa: E402
+from executor.signal_reader import read_predictions, read_signals_with_fallback  # noqa: E402
+from executor.strategies.exit_manager import SECTOR_ETF_MAP  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,7 +133,7 @@ def main() -> int:
         legacy_orders=[],
     )
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     replay_key = f"predictor/optimizer_shadow/replays/{run_date}_replay_{ts}.json"
     body = json.dumps(log, default=str, indent=2).encode("utf-8")
     boto3.client("s3").put_object(
@@ -145,7 +147,7 @@ def main() -> int:
     diag = log.get("diagnostics", {})
     tickers = log.get("tickers", [])
     weights = log.get("target_weights", [])
-    w_by_ticker = dict(zip(tickers, weights))
+    w_by_ticker = dict(zip(tickers, weights, strict=True))
     n_trades = len(log.get("would_be_trades", []))
     print("")
     print("── Shadow optimizer replay summary ──")

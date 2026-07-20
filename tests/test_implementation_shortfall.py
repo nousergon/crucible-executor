@@ -13,7 +13,6 @@ from executor.implementation_shortfall import (
     order_shortfall,
 )
 
-
 # ── Per-order math ─────────────────────────────────────────────────────────
 
 

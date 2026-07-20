@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-
 from nousergon_lib.flow_doctor_fleet import (
     EXECUTOR_FLOW_DOCTOR_TELEGRAM_TOPICS,
     fleet_telegram_notifier_dicts,

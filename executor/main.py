@@ -25,7 +25,7 @@ import logging
 import os
 import sys
 import time as _time
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,17 +33,10 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from nousergon_lib.logging import guard_entrypoint, setup_logging
+
 from executor.ibkr import IBKRClient, SimulatedIBKRClient
 from executor.order_book import OrderBook, build_stop_record
-from executor.position_sizer import compute_position_size
-from executor.risk_guard import check_order, compute_drawdown_multiplier
-from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
-from executor.strategies.config import load_strategy_config
-from executor.strategies.exit_manager import (
-    evaluate_exits,
-    check_position_loss_floor,
-    SECTOR_ETF_MAP,
-)
 from executor.price_cache import (
     _MACRO_SYMBOLS,
     load_atr_14_pct,
@@ -51,16 +44,22 @@ from executor.price_cache import (
     load_feature_coverage,
     load_price_histories,
 )
+from executor.risk_guard import compute_drawdown_multiplier
+from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
+from executor.strategies.config import load_strategy_config
+from executor.strategies.exit_manager import (
+    SECTOR_ETF_MAP,
+    check_position_loss_floor,
+    evaluate_exits,
+)
 from executor.trade_logger import (
     backup_to_s3,
     get_entry_dates,
     init_db,
     log_risk_event,
     log_shadow_book_block,
-    log_trade,
 )
 
-from nousergon_lib.logging import setup_logging, guard_entrypoint
 # Suppress benign IB Error codes that don't represent real failures:
 #   10197 — "No market data during competing live session". The daemon
 #     keeps receiving delayed ticks via the delayedLast fallback in
@@ -73,11 +72,12 @@ from nousergon_lib.logging import setup_logging, guard_entrypoint
 # fire through the shared handler.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
 from executor.config_loader import get_flow_doctor_yaml_path  # noqa: E402 (must precede setup_logging)
+
 _FLOW_DOCTOR_YAML = get_flow_doctor_yaml_path()  # experiment-package-first (config#1042)
 setup_logging("main", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
 
-from executor.config_loader import get_config_path
+from executor.config_loader import get_config_path  # noqa: E402 -- must follow setup_logging above
 
 # S3-delivered executor params (loaded once per cold-start)
 _executor_params_cache: dict | None = None
@@ -183,6 +183,7 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
 
     try:
         import json
+
         import boto3
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
@@ -425,8 +426,8 @@ def _read_signals(
     # only, not to unwinding existing exposure. Skipped in simulate mode
     # to preserve backtester replay parity against historical signals.
     if not simulate and config.get("coverage_admission_enabled", True):
-        from executor.signal_reader import filter_buy_candidates_by_coverage
         from executor.price_cache import load_feature_coverage
+        from executor.signal_reader import filter_buy_candidates_by_coverage
 
         buy_tickers = [
             e.get("ticker") for e in (signals_raw.get("buy_candidates") or [])
@@ -860,7 +861,7 @@ def _write_hold_book_flag(
             "reason": gate.get("reason"),
             "failed_check": gate.get("failed_check"),
             "gate_metrics": gate.get("metrics"),
-            "written_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "written_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         },
         indent=2,
     )
@@ -892,7 +893,7 @@ def _write_derisk_gate_artifact(gate, bucket: str, run_date: str) -> None:
     payload = json.dumps(
         {
             "run_date": run_date,
-            "written_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "written_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             **gate.to_log_dict(),
         },
         indent=2,
@@ -1164,8 +1165,9 @@ def run(
         # are read.
         try:
             import pandas as _pd
-            from executor.price_cache import _open_macro_library
             from nousergon_lib.trading_calendar import last_closed_trading_day
+
+            from executor.price_cache import _open_macro_library
             _macro = _open_macro_library(signals_bucket)
             _spy_df = _macro.read("SPY").data
             _expected_min = _pd.Timestamp(last_closed_trading_day()).normalize()
@@ -1235,7 +1237,7 @@ def run(
         }
         for ticker, pos in current_positions.items():
             pos["sector"] = universe_sectors.get(ticker, "")
-    
+
         # ── 2b. Enrich positions with entry_date from trades.db ──────────────────
         # Also pulls stance + catalyst_date (stance taxonomy arc 2026-05-11):
         # exit_manager.evaluate_exits reads pos["stance"] / pos["catalyst_date"]
@@ -1255,7 +1257,7 @@ def run(
                 pos["stance"] = stance_info.get("stance")
                 pos["catalyst_date"] = stance_info.get("catalyst_date")
             logger.info(f"Entry dates resolved for {len(entry_dates)}/{len(current_positions)} positions")
-    
+
         # ── 2b'. Resolve regime substrate ONCE per planning cycle ──────────────
         # Used by Wire 2 (position_sizer regime multiplier) AND Wire 3
         # (regime-aware drawdown tiers). Gated by either flag so the
@@ -1488,21 +1490,21 @@ def run(
 
         # ── 2d. Strategy layer: evaluate exit rules on held positions ──────────
         strategy_config = load_strategy_config(config)
-    
+
         # Build signals lookup for exit manager
         signals_by_ticker = {}
         for s in (signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])):
             t = s.get("ticker")
             if t and t not in signals_by_ticker:
                 signals_by_ticker[t] = s
-    
+
         # Load price histories from predictor S3 cache (unless injected by backtester)
         # Include ENTER tickers for ATR sizing, momentum gate, and correlation check
         if price_histories is None:
             enter_tickers = [s["ticker"] for s in signals.get("enter", [])]
             all_tickers = list(set(list(current_positions.keys()) + enter_tickers))
             # Also load sector ETF histories for sector-relative exit veto
-            held_sectors = set(pos.get("sector", "") for pos in current_positions.values())
+            held_sectors = {pos.get("sector", "") for pos in current_positions.values()}
             etf_tickers = [SECTOR_ETF_MAP.get(s, "SPY") for s in held_sectors if s]
             etf_tickers = list(set(etf_tickers))
             all_tickers_with_etfs = list(set(all_tickers + etf_tickers))
@@ -1602,7 +1604,7 @@ def run(
         # Also include SPY as fallback
         if "SPY" in (price_histories or {}):
             sector_etf_histories["SPY"] = price_histories["SPY"]
-    
+
         # Resolve the optimizer-authority flags once, early. Under
         # ``use_portfolio_optimizer`` the optimizer is the SOLE authority for
         # portfolio-level exits — it emits target-0 / scale-down SELLs in
@@ -1718,7 +1720,6 @@ def run(
                     if cal is not None and not cal.empty:
                         next_date = cal.iloc[0, 0] if hasattr(cal, 'iloc') else None
                         if next_date is not None:
-                            from datetime import datetime as dt_mod
                             if hasattr(next_date, 'date'):
                                 next_date = next_date.date()
                             elif isinstance(next_date, str):
@@ -1738,11 +1739,11 @@ def run(
                 forced_exit_count = strategy_config.get("drawdown_forced_exit_tier2_count", 1)
 
             if forced_exit_count > 0 and current_positions:
-                existing_exit_tickers = set(
+                existing_exit_tickers = {
                     s["ticker"] for s in signals.get("exit", [])
-                ) | set(
+                } | {
                     s["ticker"] for s in strategy_exits if s["action"] == "EXIT"
-                )
+                }
 
                 def _conviction_rank(ticker_pos):
                     t, pos = ticker_pos
@@ -2053,9 +2054,9 @@ def run(
         if not simulate and not dry_run and signals_bucket:
             try:
                 import boto3
-
                 from nousergon_lib.dates import now_dual
                 from nousergon_lib.eval_artifacts import new_eval_run_id
+
                 from executor.order_book_rationale import (
                     build_order_book_rationale,
                     write_order_book_rationale,
@@ -2193,9 +2194,13 @@ def run(
 
         if not simulate and not dry_run:
             try:
+                import shutil
                 import subprocess
+                bash_bin = shutil.which("bash")
+                if not bash_bin:
+                    raise RuntimeError("bash not found on PATH")
                 subprocess.run(
-                    ["bash", "/home/ec2-user/alpha-engine/infrastructure/emit-heartbeat.sh", "executor-morning"],
+                    [bash_bin, "/home/ec2-user/alpha-engine/infrastructure/emit-heartbeat.sh", "executor-morning"],
                     check=False,
                     capture_output=True,
                 )
@@ -2253,12 +2258,17 @@ if __name__ == "__main__":
         try:
             config = load_config()
             bucket = config.get("signals_bucket", "alpha-engine-research")
-            from executor.price_cache import load_price_histories
             import json
+            import shutil
             import subprocess
+
+            from executor.price_cache import load_price_histories
             # Read signals to know which tickers to price
+            aws_bin = shutil.which("aws")
+            if not aws_bin:
+                raise RuntimeError("aws CLI not found on PATH")
             result = subprocess.run(
-                ["aws", "s3", "cp", f"s3://{bucket}/signals/{date.today()}/signals.json", "-"],
+                [aws_bin, "s3", "cp", f"s3://{bucket}/signals/{date.today()}/signals.json", "-"],
                 capture_output=True, text=True,
             )
             if result.returncode == 0:

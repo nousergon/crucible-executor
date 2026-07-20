@@ -47,8 +47,6 @@ on a clean CI runner with no real risk.yaml).
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pandas as pd
 import pytest
 
@@ -215,10 +213,10 @@ def test_signal_to_dryrun_plan_full_run(fake_risk_yaml):
     enter_tickers = [s["ticker"] for s in enter]
     all_tickers = list(set(enter_tickers + _SECTOR_ETFS))
     price_histories = {t: _df_history(base=100 + i) for i, t in enumerate(all_tickers)}
-    atr_map = {t: 0.02 for t in all_tickers}
-    vwap_map = {t: 100.0 for t in all_tickers}
-    coverage_map = {t: 1.0 for t in all_tickers}
-    prices_now = {t: 100.0 for t in all_tickers}
+    atr_map = dict.fromkeys(all_tickers, 0.02)
+    vwap_map = dict.fromkeys(all_tickers, 100.0)
+    coverage_map = dict.fromkeys(all_tickers, 1.0)
+    prices_now = dict.fromkeys(all_tickers, 100.0)
 
     sim_client = SimulatedIBKRClient(prices=prices_now, nav=1_000_000.0)
 
@@ -312,11 +310,11 @@ def test_inference_veto_blocks_entry():
         portfolio_nav=1_000_000.0,
         peak_nav=1_000_000.0,
         current_positions={},
-        prices_now={t: 100.0 for t in all_tickers},
+        prices_now=dict.fromkeys(all_tickers, 100.0),
         price_histories=price_histories,
-        atr_map={t: 0.02 for t in all_tickers},
-        vwap_map={t: 100.0 for t in all_tickers},
-        coverage_map={t: 1.0 for t in all_tickers},
+        atr_map=dict.fromkeys(all_tickers, 0.02),
+        vwap_map=dict.fromkeys(all_tickers, 100.0),
+        coverage_map=dict.fromkeys(all_tickers, 1.0),
         dd_multiplier=1.0,
         signal_age_days=0,
         earnings_by_ticker={},

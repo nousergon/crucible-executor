@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -114,7 +114,7 @@ def build_payload(
     return {
         "schema_version": SCHEMA_VERSION,
         "as_of": run_date,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "label": LABEL,
         "disclaimer": DISCLAIMER,
         "base_currency": "USD",

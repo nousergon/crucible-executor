@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 import boto3
@@ -66,11 +66,11 @@ def check_upstream_deliverables(
     s3_client: Any | None = None,
 ) -> list[str]:
     """Probe required upstream deliverables; return failure lines (empty ⇒ pass)."""
-    now_utc = now or datetime.now(timezone.utc)
+    now_utc = now or datetime.now(UTC)
     if now_utc.tzinfo is None:
-        now_utc = now_utc.replace(tzinfo=timezone.utc)
+        now_utc = now_utc.replace(tzinfo=UTC)
     else:
-        now_utc = now_utc.astimezone(timezone.utc)
+        now_utc = now_utc.astimezone(UTC)
 
     client = s3_client or boto3.client("s3")
     failures: list[str] = []

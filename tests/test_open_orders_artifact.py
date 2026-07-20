@@ -19,7 +19,6 @@ from executor.open_orders_artifact import (
     build_open_orders_snapshot,
 )
 
-
 # ── fixtures ─────────────────────────────────────────────────────────────
 
 

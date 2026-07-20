@@ -13,14 +13,13 @@ reaches production.
 from __future__ import annotations
 
 import pandas as pd
-import pytest
 
 from executor.deciders import (
     decide_entries,
     decide_exits_and_reduces,
 )
 from executor.ibkr import SimulatedIBKRClient
-from executor.main import _plan_entries, _plan_exits_and_reduces
+from executor.main import _plan_entries
 from executor.order_book import OrderBook
 
 
@@ -112,9 +111,9 @@ def _build_inputs(n_signals: int = 3):
                    "XLRE", "XLB", "XLI", "XLC"]
     all_tickers = list(set(tickers + sector_etfs))
     price_histories = {t: _df_history(base=100 + i) for i, t in enumerate(all_tickers)}
-    atr_map = {t: 0.02 for t in all_tickers}
-    vwap_map = {t: 100.0 for t in all_tickers}
-    coverage_map = {t: 1.0 for t in all_tickers}
+    atr_map = dict.fromkeys(all_tickers, 0.02)
+    vwap_map = dict.fromkeys(all_tickers, 100.0)
+    coverage_map = dict.fromkeys(all_tickers, 1.0)
 
     return {
         "enter_signals": enter,
@@ -149,7 +148,7 @@ class TestDecideEntriesParity:
 
     def test_orders_match_under_simulate(self):
         inputs = _build_inputs(n_signals=3)
-        prices_now = {t: 100.0 for t in inputs["all_tickers"]}
+        prices_now = dict.fromkeys(inputs["all_tickers"], 100.0)
 
         # Path A — direct decider call
         plan_a = decide_entries(
@@ -216,7 +215,7 @@ class TestDecideEntriesParity:
 
     def test_already_held_skipped_consistently(self):
         inputs = _build_inputs(n_signals=3)
-        prices_now = {t: 100.0 for t in inputs["all_tickers"]}
+        prices_now = dict.fromkeys(inputs["all_tickers"], 100.0)
         # Hold one of the enter tickers
         held_ticker = inputs["enter_signals"][0]["ticker"]
         current_positions = {

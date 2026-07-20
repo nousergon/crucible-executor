@@ -7,7 +7,7 @@ deployment or IB Gateway restart to verify connectivity:
     python executor/connection_test.py
 """
 
-from ib_insync import *
+from ib_insync import IB
 
 ib = IB()
 ib.connect('127.0.0.1', 4002, clientId=1)
