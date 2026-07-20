@@ -18,7 +18,7 @@ dependencies = [
     "exchange-calendars>=4.5",
     "requests>=2.34.2",
     "websocket-client>=1.9.0",
-    "nousergon-lib[flow-doctor,contracts]>=0.86.0",
+    "nousergon-lib[flow-doctor,contracts]==0.86.0",
     "krepis>=0.14.0",
     "cvxpy>=1.9.2,<1.10",
     "scikit-learn>=1.9.0,<1.10",
