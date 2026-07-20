@@ -80,3 +80,14 @@ ignore = ["E501", "S603"]
 # conformance kit — see executor/strategies/conformance/README.md); only its
 # actual test_*.py file, not the kit.py/scenarios.py reusable helpers.
 "executor/strategies/conformance/test_conformance.py" = ["S101"]
+
+[tool.coverage.run]
+source = ["executor"]
+
+[tool.coverage.report]
+# Ratchet floor (config#2533): measured coverage at introduction was 75.23%
+# (`pytest tests/ --cov=executor`, 1622 passed, 4 skipped). Floor rounded
+# down to the nearest integer so today's suite passes with headroom; raise
+# opportunistically as coverage grows. This gates regression, not a target.
+fail_under = 75
+show_missing = true
