@@ -15,11 +15,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
-
-import yaml
+from datetime import UTC, datetime
 
 from executor.ibkr import IBKRClient
 from executor.trade_logger import backup_to_s3, init_db, log_trade
@@ -31,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from executor.config_loader import load_config as _load_config
+from executor.config_loader import load_config as _load_config  # noqa: E402 -- must follow logging.basicConfig above
 
 
 def emergency_shutdown(execute: bool, stop_instance: bool) -> None:
@@ -131,7 +130,11 @@ def emergency_shutdown(execute: bool, stop_instance: bool) -> None:
     # ── Step 3: Stop the daemon ────────────────────────────────────────
     logger.info("Step 3: Stopping daemon...")
     try:
-        subprocess.run(["sudo", "systemctl", "stop", "alpha-engine-daemon"],
+        sudo_bin = shutil.which("sudo")
+        systemctl_bin = shutil.which("systemctl")
+        if not sudo_bin or not systemctl_bin:
+            raise RuntimeError("sudo/systemctl not found on PATH")
+        subprocess.run([sudo_bin, systemctl_bin, "stop", "alpha-engine-daemon"],
                        timeout=30, capture_output=True)
         logger.info("Daemon stopped")
     except Exception as e:
@@ -156,7 +159,7 @@ def emergency_shutdown(execute: bool, stop_instance: bool) -> None:
             TopicArn=topic_arn,
             Subject="Alpha Engine — EMERGENCY SHUTDOWN EXECUTED",
             Message=(
-                f"Emergency shutdown completed at {datetime.now(timezone.utc).isoformat()}\n\n"
+                f"Emergency shutdown completed at {datetime.now(UTC).isoformat()}\n\n"
                 f"Actions taken:\n"
                 f"  - Cancelled all open orders\n"
                 f"  - Closed {len(positions)} positions\n"
@@ -175,19 +178,32 @@ def emergency_shutdown(execute: bool, stop_instance: bool) -> None:
         try:
             import boto3
             ec2 = boto3.client("ec2", region_name="us-east-1")
-            # Get this instance's ID from metadata
+            # Get this instance's ID from metadata. The EC2 IMDS endpoint is
+            # link-local and http-only by design (no TLS on 169.254.169.254),
+            # so the usual "require https" S310 guard doesn't apply here —
+            # instead pin the exact expected host so a redirected/hijacked
+            # target (e.g. env/DNS tampering) can't smuggle in an arbitrary
+            # URL through this code path.
             import urllib.request
+            _IMDS_HOST = "169.254.169.254"
+
+            def _imds_urlopen(req, **kwargs):
+                url = req.full_url if isinstance(req, urllib.request.Request) else req
+                if not url.startswith(f"http://{_IMDS_HOST}/"):
+                    raise ValueError(f"refusing non-IMDS URL: {url!r}")
+                return urllib.request.urlopen(req, **kwargs)  # noqa: S310 -- host validated above
+
             token_req = urllib.request.Request(
-                "http://169.254.169.254/latest/api/token",
+                f"http://{_IMDS_HOST}/latest/api/token",
                 headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
                 method="PUT",
             )
-            token = urllib.request.urlopen(token_req, timeout=2).read().decode()
+            token = _imds_urlopen(token_req, timeout=2).read().decode()
             id_req = urllib.request.Request(
-                "http://169.254.169.254/latest/meta-data/instance-id",
+                f"http://{_IMDS_HOST}/latest/meta-data/instance-id",
                 headers={"X-aws-ec2-metadata-token": token},
             )
-            instance_id = urllib.request.urlopen(id_req, timeout=2).read().decode()
+            instance_id = _imds_urlopen(id_req, timeout=2).read().decode()
             ec2.stop_instances(InstanceIds=[instance_id])
             logger.info("EC2 stop-instances sent for %s", instance_id)
         except Exception as e:

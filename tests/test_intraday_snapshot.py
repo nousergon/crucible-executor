@@ -7,6 +7,7 @@ Pure-logic + mocked-S3 tests; no real boto3 or IB calls.
 from __future__ import annotations
 
 import json
+from datetime import UTC
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,7 +23,6 @@ from executor.intraday_snapshot import (
     IntradaySnapshotWriter,
     compute_surveillance_universe,
 )
-
 
 # ── compute_surveillance_universe ──────────────────────────────────────────
 
@@ -412,12 +412,12 @@ class TestNavSeriesSessionRefusalLogging:
     def test_stale_label_logs_error(self, caplog):
         """D-1 label during a live session is a true mis-key — ERROR."""
         import logging
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import MagicMock, patch
         from zoneinfo import ZoneInfo
 
         ET = ZoneInfo("America/New_York")
-        intraday = datetime(2026, 7, 7, 10, 0, tzinfo=ET).astimezone(timezone.utc)
+        intraday = datetime(2026, 7, 7, 10, 0, tzinfo=ET).astimezone(UTC)
         stale_label = "2026-07-06"  # D-1 relative to the live Tue session
 
         mock_s3 = MagicMock()
@@ -439,12 +439,12 @@ class TestNavSeriesSessionRefusalLogging:
     def test_post_close_wind_down_logs_info(self, caplog):
         """Frozen run_date after 16:00 ET on session day — INFO, not ERROR."""
         import logging
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import MagicMock, patch
         from zoneinfo import ZoneInfo
 
         ET = ZoneInfo("America/New_York")
-        post_close = datetime(2026, 7, 6, 16, 6, tzinfo=ET).astimezone(timezone.utc)
+        post_close = datetime(2026, 7, 6, 16, 6, tzinfo=ET).astimezone(UTC)
         labeled = "2026-07-06"
 
         mock_s3 = MagicMock()

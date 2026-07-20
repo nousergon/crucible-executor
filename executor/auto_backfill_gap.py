@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import boto3
 import pandas as pd
@@ -136,9 +136,9 @@ def _authoritative_closes(trades_bucket: str, tickers: list[str], gap_date: str)
     Returns only the tickers that resolved; the caller checks completeness
     against the full held-ticker set to enforce gate (c) strictly."""
     from executor.price_cache import (
-        _open_universe_library,
-        _open_macro_library,
         _MACRO_SYMBOLS,
+        _open_macro_library,
+        _open_universe_library,
     )
 
     universe_lib = _open_universe_library(trades_bucket)
@@ -290,7 +290,7 @@ def build_reconstructed_snapshot(
 
     return {
         "run_date": gap_date,
-        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "captured_at": datetime.now(UTC).isoformat(),
         "schema_version": schema_version,
         "_reconstructed": {
             "method": "verified_zero_fill_carry_forward_reprice",
@@ -301,7 +301,7 @@ def build_reconstructed_snapshot(
                 "prior_snapshot_exists": True,
                 "authoritative_closes_complete": True,
             },
-            "reconstructed_at": datetime.now(timezone.utc).isoformat(),
+            "reconstructed_at": datetime.now(UTC).isoformat(),
         },
         "account": {
             "net_liquidation": nav,

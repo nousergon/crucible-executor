@@ -39,7 +39,6 @@ import ``get_config_path`` and resolve inline.
 import os
 
 import yaml
-
 from nousergon_lib.config import resolve_experiment_config
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(__file__))

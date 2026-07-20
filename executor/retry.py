@@ -32,7 +32,7 @@ def retry(max_attempts=3, backoff_base=2, retryable=(Exception,), label=None,
                         raise
                     delay = backoff_base ** attempt
                     if jitter:
-                        delay += random.uniform(0, delay)
+                        delay += random.uniform(0, delay)  # noqa: S311 -- retry-backoff jitter, not security-sensitive
                     _logger.warning("[retry:%s] Attempt %d/%d failed: %s — retrying in %.1fs", tag, attempt, max_attempts, e, delay)
                     time.sleep(delay)
         return wrapper

@@ -41,8 +41,7 @@ import json
 import logging
 import sqlite3
 import sys
-from datetime import date, datetime, timezone
-from typing import Optional
+from datetime import UTC, date, datetime
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +87,7 @@ def _ensure_columns_exist(conn: sqlite3.Connection) -> None:
 # ── trading_day backfill (from fill_time / created_at) ──────────────────────
 
 
-def _trading_day_for_row(row: dict, session_for_timestamp) -> Optional[str]:
+def _trading_day_for_row(row: dict, session_for_timestamp) -> str | None:
     """Compute trading_day for a row from its existing timestamp columns.
 
     Prefers fill_time (when the IB fill landed) and falls back to
@@ -103,7 +102,7 @@ def _trading_day_for_row(row: dict, session_for_timestamp) -> Optional[str]:
         try:
             ts = datetime.fromisoformat(val.replace("Z", "+00:00"))
             if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
+                ts = ts.replace(tzinfo=UTC)
             return session_for_timestamp(ts)
         except (ValueError, TypeError) as exc:
             logger.warning(
@@ -205,7 +204,7 @@ class _SignalIndex:
                     tickers.add(t)
         return tickers
 
-    def lookup(self, ticker: str, trade_date: str) -> Optional[str]:
+    def lookup(self, ticker: str, trade_date: str) -> str | None:
         """Return the most recent signal_trading_day ≤ trade_date for ticker."""
         if not self._loaded:
             try:
@@ -294,10 +293,15 @@ def backfill(
             stats["non_enter_skipped"] += 1
 
         if updates and not dry_run:
-            set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+            # S608 false positive: `updates` keys are always one of the two
+            # hardcoded literals "trading_day"/"signal_trading_day" set above
+            # in this function (never derived from row/user data), and every
+            # actual value is passed through the `?` parameter placeholders
+            # below — no untrusted data reaches the query text.
+            set_clause = ", ".join(f"{k} = ?" for k in updates.keys())  # noqa: S608
             params = list(updates.values()) + [row_d["trade_id"]]
             conn.execute(
-                f"UPDATE trades SET {set_clause} WHERE trade_id = ?",
+                f"UPDATE trades SET {set_clause} WHERE trade_id = ?",  # noqa: S608
                 params,
             )
             stats["writes_committed"] += 1

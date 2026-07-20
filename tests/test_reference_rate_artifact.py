@@ -9,7 +9,6 @@ producer-side-contract pattern (test_executor_params_consumer_contract.py).
 import json
 
 import pandas as pd
-import pytest
 
 from executor import reference_rate
 

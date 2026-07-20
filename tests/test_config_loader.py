@@ -1,6 +1,5 @@
 """Tests for executor.config_loader — risk.yaml resolution with no silent fallback."""
 
-import importlib
 import os
 
 import pytest

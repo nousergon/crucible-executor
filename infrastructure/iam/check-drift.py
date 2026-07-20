@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -58,8 +59,12 @@ RESERVED_STEMS = {Path(TRUST_FILENAME).stem, Path(MANAGED_FILENAME).stem}
 
 def _aws_iam(*args: str) -> dict | list | str:
     """Call aws iam ... and return the parsed JSON output."""
+    aws_bin = shutil.which("aws")
+    if not aws_bin:
+        sys.stderr.write("AWS CLI not found on PATH\n")
+        sys.exit(1)
     result = subprocess.run(
-        ["aws", "iam", *args, "--output", "json"],
+        [aws_bin, "iam", *args, "--output", "json"],
         capture_output=True,
         text=True,
         check=False,
@@ -153,8 +158,10 @@ def _check_role(role_dir: Path) -> list[str]:
             f"(run apply.sh to push)"
         )
     for p in sorted(extra_in_aws):
+        # S608 false positive: this builds a human-readable findings message,
+        # not a SQL query — there is no database access anywhere in this file.
         findings.append(
-            f"{role_name}/{p}: present on AWS role but not codified "
+            f"{role_name}/{p}: present on AWS role but not codified "  # noqa: S608
             f"(add JSON file or delete from AWS)"
         )
 

@@ -1,13 +1,11 @@
 """Tests for executor.bracket_orders.place_bracket_with_stop — market BUY + trailing stop."""
 
 from datetime import datetime
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from executor.bracket_orders import place_bracket_with_stop
-
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 

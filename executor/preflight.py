@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -270,6 +271,12 @@ def _read_deployed_git_sha(repo_root: Path) -> str:
             f"the repo (or the volume is wrong). Cannot verify deployed SHA; "
             f"refusing to proceed."
         )
+    git_bin = shutil.which("git")
+    if not git_bin:
+        raise RuntimeError(
+            "Deploy drift: `git` executable not found on PATH — cannot verify "
+            "deployed SHA; refusing to proceed."
+        )
     try:
         # The executor runs as root via SSM, but the checkout is owned by
         # ec2-user — git's dubious-ownership guard (CVE-2022-24765) then
@@ -279,7 +286,7 @@ def _read_deployed_git_sha(repo_root: Path) -> str:
         # making the deploy-drift read immune to who runs it on any box
         # (host-independent — does not rely on /etc/gitconfig state).
         result = subprocess.run(
-            ["git", "-c", f"safe.directory={repo_root}", "rev-parse", "HEAD"],
+            [git_bin, "-c", f"safe.directory={repo_root}", "rev-parse", "HEAD"],
             cwd=str(repo_root),
             capture_output=True,
             text=True,

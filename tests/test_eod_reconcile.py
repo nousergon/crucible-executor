@@ -1,22 +1,28 @@
 """Unit tests for executor.eod_reconcile — P&L math and data helpers."""
+from __future__ import annotations
+
 import json
 import sys
-from types import SimpleNamespace
-import pytest
-from unittest.mock import patch, MagicMock
+from datetime import date
 from io import BytesIO
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+if TYPE_CHECKING:
+    import pandas as pd  # noqa: F401 -- only used in a quoted type annotation below
 
 from executor.eod_reconcile import (
-    _spy_close,
-    _load_signals_from_s3,
-    _load_predictions_from_s3,
     _build_position_contexts,
     _compute_daily_return,
+    _load_predictions_from_s3,
+    _load_signals_from_s3,
+    _spy_close,
     run,
 )
 from executor.eod_report import _buy_entry_prices
-from datetime import date
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -46,14 +52,15 @@ def _make_prediction(ticker, direction="UP", confidence=0.75, alpha=0.02):
 # ── _spy_close ───────────────────────────────────────────────────────────────
 
 
-def _mock_universe_with(symbols: dict[str, "pd.DataFrame"]):
+def _mock_universe_with(symbols: dict[str, pd.DataFrame]):
     """Build a mock ArcticDB universe library.
 
     symbols maps ticker → DataFrame. universe.read(ticker) returns a
     SimpleNamespace with .data = the frame. Missing tickers raise.
     """
-    import pandas as pd  # noqa: F401 — used by caller's frames
     from types import SimpleNamespace
+
+    import pandas as pd  # noqa: F401 — used by caller's frames
 
     lib = MagicMock()
 
@@ -660,7 +667,6 @@ def _run_up_to_closing_prices(monkeypatch, *, held_ticker="AAPL", read_error=Non
     (`held_ticker`, routed through universe_lib) configured to fail the
     ArcticDB read per `read_error`/`frame`.
     """
-    import pandas as pd
 
     monkeypatch.setattr(
         "executor.eod_reconcile.now_dual",

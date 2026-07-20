@@ -40,7 +40,6 @@ class IntradayExitManager:
             Exit signal dict if triggered, else None.
             {ticker, action, shares, reason, detail}
         """
-        ticker = stop["ticker"]
         current_price = price_state.get("last")
         if not current_price or current_price <= 0:
             return None

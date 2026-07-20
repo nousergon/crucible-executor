@@ -32,7 +32,6 @@ from pathlib import Path
 
 from executor import main as executor_main
 
-
 _MAIN_PY = Path(__file__).parent.parent / "executor" / "main.py"
 
 
@@ -171,7 +170,7 @@ def test_atr_load_not_called_outside_gate():
     ]
     assert len(call_lines) == 1, (
         f"Expected exactly 1 load_atr_14_pct call site in main.py; "
-        f"found {len(call_lines)} at lines {[l+1 for l in call_lines]}. "
+        f"found {len(call_lines)} at lines {[line + 1 for line in call_lines]}. "
         "A second call would bypass the atr_map kwarg gate."
     )
 

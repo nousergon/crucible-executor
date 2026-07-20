@@ -12,6 +12,9 @@ ArcticDB layout:
 
 from __future__ import annotations
 
+import logging
+from datetime import UTC, date, datetime, timedelta
+
 # arcticdb MUST be imported before pandas on macOS to prime its bundled
 # aws-c-common allocator before pyarrow (pulled in by pandas) loads its
 # own copy. The two copies otherwise collide and arcticdb's S3Storage
@@ -21,11 +24,6 @@ from __future__ import annotations
 # is a hard dep of the executor as of 2026-04-16 via requirements.txt;
 # no fallback path, no optional import — feedback_no_silent_fails.
 import arcticdb as _arcticdb  # noqa: F401  (kept for its side effect on import ordering)
-
-import logging
-import os
-from datetime import date, datetime, timedelta, timezone
-
 import pandas as pd
 
 from executor.market_hours import is_trading_day
@@ -91,7 +89,7 @@ def _open_macro_library(signals_bucket: str):
 def load_price_histories(
     tickers: list[str],
     signals_bucket: str,
-) -> dict[str, "pd.DataFrame"]:
+) -> dict[str, pd.DataFrame]:
     """Load OHLCV histories for a list of tickers from ArcticDB.
 
     Routes per ticker: single-stock watchlist symbols are read from the
@@ -126,7 +124,7 @@ def load_price_histories(
 
     universe = _open_universe_library(signals_bucket)
     macro = None  # lazy-open only if a macro-routed ticker appears
-    histories: dict[str, "pd.DataFrame"] = {}
+    histories: dict[str, pd.DataFrame] = {}
     read_errors: list[str] = []
     empty: list[str] = []
 
@@ -225,7 +223,7 @@ def load_atr_14_pct(
 
     universe = _open_universe_library(signals_bucket)
 
-    ref = reference_date or datetime.now(timezone.utc).date()
+    ref = reference_date or datetime.now(UTC).date()
     staleness_cutoff = _n_trading_days_back(ref, max_staleness_trading_days)
 
     atr_map: dict[str, float] = {}

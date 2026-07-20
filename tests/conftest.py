@@ -5,8 +5,8 @@ Pins ``ALPHA_ENGINE_SECRETS_SOURCE=env`` for the test process so
 migration, PR 6 of the arc) reads from monkeypatched env vars only —
 never the real SSM Parameter Store.
 """
-import sys
 import os
+import sys
 from unittest.mock import MagicMock
 
 import pytest

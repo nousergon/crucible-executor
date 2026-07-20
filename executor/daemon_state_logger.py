@@ -64,7 +64,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ class DaemonDecisionLogger:
         """
         try:
             entry = {
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "timestamp_utc": datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 "trading_day": trading_day,
                 "decision_type": decision_type,
                 "ticker": ticker,
