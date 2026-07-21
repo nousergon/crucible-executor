@@ -32,8 +32,32 @@ class TestComputeSurveillanceUniverse:
         assert compute_surveillance_universe(None) == ["SPY"]
 
     def test_signals_only(self):
-        sig = {"signals": {"AAPL": {}, "MSFT": {}}, "buy_candidates": ["NVDA"]}
+        sig = {
+            "signals": {"AAPL": {"signal": "ENTER"}, "MSFT": {"signal": "EXIT"}},
+            "buy_candidates": ["NVDA"],
+        }
         assert compute_surveillance_universe(sig) == ["AAPL", "MSFT", "NVDA", "SPY"]
+
+    def test_hold_signals_excluded(self):
+        # Regression: config-I3200-adjacent incident (2026-07-20/21) — the
+        # weekly-scan population (~900 tickers, virtually all HOLD) was being
+        # unioned wholesale into the surveillance universe, blowing through
+        # IBKR's concurrent market-data-line cap (error 101 cascade). Only
+        # ENTER/EXIT/REDUCE are actionable surveillance signals.
+        sig = {
+            "signals": {
+                "AAPL": {"signal": "HOLD"},
+                "MSFT": {"signal": "ENTER"},
+                "GOOG": {"signal": "HOLD"},
+            },
+        }
+        assert compute_surveillance_universe(sig) == ["MSFT", "SPY"]
+
+    def test_signals_entries_missing_signal_field_excluded(self):
+        # Defensive: a record with no 'signal' field is treated as non-action,
+        # not accidentally included.
+        sig = {"signals": {"AAPL": {}}}
+        assert compute_surveillance_universe(sig) == ["SPY"]
 
     def test_order_book_only(self):
         result = compute_surveillance_universe(None, order_book_tickers=["AAPL", "MSFT"])
@@ -44,7 +68,10 @@ class TestComputeSurveillanceUniverse:
         assert result == ["GOOG", "SPY"]
 
     def test_full_union_dedups_and_sorts(self):
-        sig = {"signals": {"AAPL": {}, "MSFT": {}}, "buy_candidates": ["MSFT", "NVDA"]}
+        sig = {
+            "signals": {"AAPL": {"signal": "ENTER"}, "MSFT": {"signal": "EXIT"}},
+            "buy_candidates": ["MSFT", "NVDA"],
+        }
         result = compute_surveillance_universe(
             sig,
             order_book_tickers=["AAPL", "TSLA"],
@@ -54,7 +81,7 @@ class TestComputeSurveillanceUniverse:
         assert result == ["AAPL", "GOOG", "MSFT", "NVDA", "SPY", "TSLA"]
 
     def test_include_spy_false_omits_spy(self):
-        sig = {"signals": {"AAPL": {}}}
+        sig = {"signals": {"AAPL": {"signal": "ENTER"}}}
         result = compute_surveillance_universe(sig, include_spy=False)
         assert result == ["AAPL"]
 
@@ -68,7 +95,7 @@ class TestComputeSurveillanceUniverse:
         assert compute_surveillance_universe(sig) == ["AAPL", "SPY"]
 
     def test_handles_non_list_buy_candidates(self):
-        sig = {"signals": {"AAPL": {}}, "buy_candidates": "not-a-list"}
+        sig = {"signals": {"AAPL": {"signal": "ENTER"}}, "buy_candidates": "not-a-list"}
         assert compute_surveillance_universe(sig) == ["AAPL", "SPY"]
 
     def test_filters_non_string_buy_candidates(self):
@@ -79,13 +106,15 @@ class TestComputeSurveillanceUniverse:
 
     def test_filters_empty_string_tickers(self):
         result = compute_surveillance_universe(
-            None, order_book_tickers=["AAPL", ""], current_positions=[""],
+            None,
+            order_book_tickers=["AAPL", ""],
+            current_positions=[""],
         )
         assert "" not in result
         assert "AAPL" in result
 
     def test_spy_in_signals_no_double(self):
-        sig = {"signals": {"SPY": {}, "AAPL": {}}}
+        sig = {"signals": {"SPY": {"signal": "ENTER"}, "AAPL": {"signal": "HOLD"}}}
         result = compute_surveillance_universe(sig)
         assert result.count("SPY") == 1
 
@@ -141,10 +170,7 @@ class TestIntradaySnapshotWriterHappyPath:
             ib_connected=True,
             subscribed_tickers=["AAPL", "SPY"],
         )
-        prices_call = next(
-            c for c in mock_s3.put_object.call_args_list
-            if c.kwargs["Key"] == LATEST_PRICES_KEY
-        )
+        prices_call = next(c for c in mock_s3.put_object.call_args_list if c.kwargs["Key"] == LATEST_PRICES_KEY)
         body = json.loads(prices_call.kwargs["Body"].decode("utf-8"))
         assert "timestamp" in body
         assert body["prices"] == {"AAPL": {"last": 150.0, "high": 152.0}}
@@ -155,10 +181,7 @@ class TestIntradaySnapshotWriterHappyPath:
             ib_connected=True,
             subscribed_tickers=["AAPL", "MSFT", "SPY"],
         )
-        hb_call = next(
-            c for c in mock_s3.put_object.call_args_list
-            if c.kwargs["Key"] == HEARTBEAT_KEY
-        )
+        hb_call = next(c for c in mock_s3.put_object.call_args_list if c.kwargs["Key"] == HEARTBEAT_KEY)
         body = json.loads(hb_call.kwargs["Body"].decode("utf-8"))
         assert body["ib_connected"] is True
         assert body["daemon_pid"] == 12345
@@ -168,10 +191,7 @@ class TestIntradaySnapshotWriterHappyPath:
 
     def test_ib_disconnected_stamped_on_heartbeat(self, writer, mock_s3):
         writer.write(prices={}, ib_connected=False, subscribed_tickers=[])
-        hb_call = next(
-            c for c in mock_s3.put_object.call_args_list
-            if c.kwargs["Key"] == HEARTBEAT_KEY
-        )
+        hb_call = next(c for c in mock_s3.put_object.call_args_list if c.kwargs["Key"] == HEARTBEAT_KEY)
         body = json.loads(hb_call.kwargs["Body"].decode("utf-8"))
         assert body["ib_connected"] is False
 
@@ -186,7 +206,9 @@ class TestIntradaySnapshotWriterFailureSwallowing:
             operation_name="PutObject",
         )
         writer = IntradaySnapshotWriter(
-            bucket="test-bucket", daemon_pid=1, s3_client=mock_s3,
+            bucket="test-bucket",
+            daemon_pid=1,
+            s3_client=mock_s3,
         )
         assert writer.write(prices={}, ib_connected=True, subscribed_tickers=[]) is False
 
@@ -200,7 +222,9 @@ class TestIntradaySnapshotWriterFailureSwallowing:
             ),
         ]
         writer = IntradaySnapshotWriter(
-            bucket="test-bucket", daemon_pid=1, s3_client=mock_s3,
+            bucket="test-bucket",
+            daemon_pid=1,
+            s3_client=mock_s3,
         )
         assert writer.write(prices={}, ib_connected=True, subscribed_tickers=[]) is False
 
@@ -212,10 +236,7 @@ class TestDaemonPidDefault:
     def test_defaults_to_os_getpid(self, mock_s3):
         writer = IntradaySnapshotWriter(bucket="b", s3_client=mock_s3)
         writer.write(prices={}, ib_connected=True, subscribed_tickers=[])
-        hb_call = next(
-            c for c in mock_s3.put_object.call_args_list
-            if c.kwargs["Key"] == HEARTBEAT_KEY
-        )
+        hb_call = next(c for c in mock_s3.put_object.call_args_list if c.kwargs["Key"] == HEARTBEAT_KEY)
         body = json.loads(hb_call.kwargs["Body"].decode("utf-8"))
         # Just confirm it's an int — actual value is the test runner's pid.
         assert isinstance(body["daemon_pid"], int)
@@ -326,9 +347,7 @@ def live_session() -> str:
 
 class TestIntradayNavSeriesWriter:
     def test_key_format(self):
-        assert IntradayNavSeriesWriter.key_for("2026-06-18") == (
-            NAV_SERIES_PREFIX + "2026-06-18.json"
-        )
+        assert IntradayNavSeriesWriter.key_for("2026-06-18") == (NAV_SERIES_PREFIX + "2026-06-18.json")
 
     def test_first_tick_starts_new_series(self, series_writer, mock_s3, live_session):
         mock_s3.get_object.side_effect = _no_such_key()
@@ -375,9 +394,7 @@ class TestIntradayNavSeriesWriter:
         mock_s3.put_object.assert_not_called()
 
     def test_max_points_trims_oldest(self, mock_s3, live_session):
-        writer = IntradayNavSeriesWriter(
-            bucket="test-bucket", s3_client=mock_s3, max_points=3
-        )
+        writer = IntradayNavSeriesWriter(bucket="test-bucket", s3_client=mock_s3, max_points=3)
         prior = {
             "trading_day": live_session,
             "points": [
@@ -431,9 +448,7 @@ class TestNavSeriesSessionRefusalLogging:
             assert writer.write(stale_label, _ACCT, spy_last=740.0) is False
 
         assert any("nav_series point refused" in r.message for r in caplog.records)
-        assert any(
-            r.levelno == logging.ERROR and "nav_series" in r.message for r in caplog.records
-        )
+        assert any(r.levelno == logging.ERROR and "nav_series" in r.message for r in caplog.records)
         mock_s3.get_object.assert_not_called()
 
     def test_post_close_wind_down_logs_info(self, caplog):
@@ -458,7 +473,5 @@ class TestNavSeriesSessionRefusalLogging:
             assert writer.write(labeled, _ACCT, spy_last=740.0) is False
 
         assert any("nav_series point skipped (post-close)" in r.message for r in caplog.records)
-        assert not any(
-            r.levelno == logging.ERROR and "nav_series" in r.message for r in caplog.records
-        )
+        assert not any(r.levelno == logging.ERROR and "nav_series" in r.message for r in caplog.records)
         mock_s3.get_object.assert_not_called()

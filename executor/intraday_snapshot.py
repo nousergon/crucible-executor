@@ -12,11 +12,14 @@ S3 on every poll tick during market hours:
   this file as a first-class daemon-down alert.
 
 **Surveillance universe.** :func:`compute_surveillance_universe` returns
-the union ``signals.signals ∪ signals.buy_candidates ∪ current_positions``
+the union of actionable (``ENTER``/``EXIT``/``REDUCE``) tickers from
+``signals.signals`` ∪ ``signals.buy_candidates`` ∪ ``current_positions``
 that both producers (the daemon publishing snapshots) and consumers (the
 surveillance Lambda) compute identically from canonical artifacts. Universe
 consistency is enforced by construction, not by discipline — there is no
-``watchlist.yaml`` to drift.
+``watchlist.yaml`` to drift. ``HOLD`` entries (the bulk of the ~900-ticker
+weekly-scan population) are excluded — see :func:`compute_surveillance_universe`
+for the incident that made this filter load-bearing.
 
 **Failure semantics.** S3 writes are fire-and-forget — failures are logged
 at WARNING and never raise. A failed snapshot write must never interrupt
@@ -69,11 +72,7 @@ def _log_nav_series_session_refusal(trading_day: str, axis_err: ValueError, now_
         labeled = date.fromisoformat(trading_day)
         actual = session_date(now_utc)
         now_et = now_utc.astimezone(_ET)
-        post_close_wind_down = (
-            actual != labeled
-            and now_et.date() == labeled
-            and now_et.time() > _NYSE_CLOSE_ET
-        )
+        post_close_wind_down = actual != labeled and now_et.date() == labeled and now_et.time() > _NYSE_CLOSE_ET
     except (ImportError, ValueError):
         post_close_wind_down = False
 
@@ -102,9 +101,10 @@ def _put_json_to_s3(s3: Any, bucket: str, key: str, payload: dict) -> bool:
         return True
     except (ClientError, BotoCoreError) as e:
         logger.warning(
-            "intraday write to s3://%s/%s failed (%s) — surveillance Lambda "
-            "will see heartbeat staleness",
-            bucket, key, type(e).__name__,
+            "intraday write to s3://%s/%s failed (%s) — surveillance Lambda will see heartbeat staleness",
+            bucket,
+            key,
+            type(e).__name__,
         )
         return False
 
@@ -129,10 +129,11 @@ def _get_json_from_s3(s3: Any, bucket: str, key: str) -> tuple[dict | None, str]
         logger.warning("intraday read s3://%s/%s failed (%s)", bucket, key, code)
         return None, "error"
     except (BotoCoreError, ValueError) as e:
-        logger.warning(
-            "intraday read s3://%s/%s failed (%s)", bucket, key, type(e).__name__
-        )
+        logger.warning("intraday read s3://%s/%s failed (%s)", bucket, key, type(e).__name__)
         return None, "error"
+
+
+_ACTIONABLE_SIGNALS = frozenset({"ENTER", "EXIT", "REDUCE"})
 
 
 def compute_surveillance_universe(
@@ -144,14 +145,22 @@ def compute_surveillance_universe(
 ) -> list[str]:
     """Compute the union of tickers the surveillance layer should watch.
 
-    Universe = ``signals.signals.keys() ∪ signals.buy_candidates ∪
-    order_book_tickers ∪ current_positions``. Sorted deterministic output.
-    Pre-population scanner output deliberately excluded — non-action there
-    isn't a surveillance signal.
+    Universe = actionable entries of ``signals.signals`` (``ENTER``/``EXIT``/
+    ``REDUCE`` only — ``HOLD`` is explicitly non-action, per the
+    ``signals.json`` contract's ``signal`` field) ∪ ``signals.buy_candidates``
+    ∪ ``order_book_tickers`` ∪ ``current_positions``. Sorted deterministic
+    output. Pre-population scanner output (the ~900-ticker weekly-scan
+    population, virtually all ``HOLD``) is deliberately excluded — non-action
+    there isn't a surveillance signal, and requesting live IB market-data
+    lines for the full population blows through the account's concurrent
+    market-data-line cap (incident 2026-07-20/21, IBKR error 101 "Max number
+    of tickers has been reached" cascading across every alphabetically-later
+    symbol once the cap was hit).
 
     :param signals: The ``signals.json`` payload as a dict (or None on read
-        failure). Keys read: ``signals`` (dict of ticker → rec) and
-        ``buy_candidates`` (list of ticker strings).
+        failure). Keys read: ``signals`` (dict of ticker → rec, each with a
+        ``signal`` field) and ``buy_candidates`` (list of ticker strings,
+        already actionable by construction — included unconditionally).
     :param order_book_tickers: Tickers the daemon's order book is tracking
         (held positions + active candidates). Optional; defaults to empty.
     :param current_positions: Current IB position tickers. Optional;
@@ -166,7 +175,11 @@ def compute_surveillance_universe(
     if signals:
         signals_map = signals.get("signals")
         if isinstance(signals_map, dict):
-            universe.update(signals_map.keys())
+            universe.update(
+                t
+                for t, rec in signals_map.items()
+                if isinstance(rec, dict) and rec.get("signal") in _ACTIONABLE_SIGNALS
+            )
         buy_cands = signals.get("buy_candidates")
         if isinstance(buy_cands, list):
             universe.update(t for t in buy_cands if isinstance(t, str))
@@ -390,6 +403,7 @@ class IntradayNavSeriesWriter:
         now_utc = datetime.now(UTC)
         try:
             from nousergon_lib.dates import assert_within_session
+
             assert_within_session(now_utc, trading_day)
         except ValueError as _axis_err:
             _log_nav_series_session_refusal(trading_day, _axis_err, now_utc)
@@ -412,7 +426,7 @@ class IntradayNavSeriesWriter:
         now_iso = now_utc.replace(tzinfo=None).isoformat() + "Z"
         points.append({"t": now_iso, "nav": nav, "spy": spy_last})
         if len(points) > self._max_points:
-            points = points[-self._max_points:]
+            points = points[-self._max_points :]
 
         payload = {
             # Historical field name; holds the SESSION the curve belongs to
