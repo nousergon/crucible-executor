@@ -119,10 +119,13 @@ def test_orphan_removal_safety_prefix():
         "never an unscoped wildcard, to avoid disabling unrelated system units."
     )
     # alpha-engine's own call site must still pass "alpha-engine-" — the
-    # historical safety scope for THIS repo's units.
-    assert 'sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "alpha-engine-"' in src, (
+    # historical safety scope for THIS repo's units. config#1768 added an
+    # EXCLUDE_BASENAMES second positional arg to sync_systemd_units_from
+    # (empty string here — alpha-engine's own sync has nothing to exclude).
+    assert 'sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "" "alpha-engine-"' in src, (
         "alpha-engine's systemd sync call site must still scope its orphan "
-        "reconciliation to the alpha-engine- prefix."
+        "reconciliation to the alpha-engine- prefix (with an empty "
+        "EXCLUDE_BASENAMES arg, config#1768)."
     )
 
 
@@ -159,16 +162,55 @@ def test_retired_units_not_shipped():
 
 def test_nousergon_data_systemd_sync_call_site_exists():
     """boot-pull.sh must run sync_systemd_units_from against
-    nousergon-data's infrastructure/systemd/ dir, scoped to the two unit
-    families it ships (metron-intraday, systemd-unit-drift-check) — not an
+    nousergon-data's infrastructure/systemd/ dir, excluding metron-intraday
+    (moved to ae-dashboard, config#1768) and scoped to
+    systemd-unit-drift-check for orphan reconciliation — not an
     unscoped/wildcard prefix that could sweep unrelated units."""
     src = _source()
     assert (
         'sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" '
-        '"metron-intraday" "systemd-unit-drift-check"' in src
+        '"metron-intraday.service metron-intraday.timer" "systemd-unit-drift-check"' in src
     ), (
         "boot-pull.sh must sync nousergon-data's infrastructure/systemd/ "
-        "(metron-intraday + systemd-unit-drift-check orphan prefixes) — "
-        "without this call, a merged nousergon-data unit-file edit never "
-        "reaches the trading box (config#2352)."
+        "(systemd-unit-drift-check orphan prefix) while excluding "
+        "metron-intraday.service/.timer by exact basename — without this "
+        "call, a merged nousergon-data unit-file edit never reaches the "
+        "trading box (config#2352), and without the exclude, trading would "
+        "keep re-installing metron-intraday after its move to ae-dashboard "
+        "(config#1768)."
+    )
+
+
+# ── metron-intraday retired from trading (config#1768 Phase 1) ──────────────
+# metron-intraday moved to ae-dashboard; these tests lock the trading-side
+# retirement so a future refactor can't silently re-enable it here.
+
+
+def test_metron_intraday_excluded_from_trading_sync():
+    """The nousergon-data sync call must exclude BOTH metron-intraday unit
+    basenames by exact name, not merely omit it from the orphan-prefix list
+    (orphan-removal alone cannot retire it — the unit is still present in
+    the shared source dir for ae-dashboard's own sync pass to consume)."""
+    src = _source()
+    assert "metron-intraday.service metron-intraday.timer" in src, (
+        "metron-intraday's two unit basenames must be passed as an explicit "
+        "EXCLUDE_BASENAMES arg to sync_systemd_units_from — without this, "
+        "the install loop's unconditional *.service/*.timer glob would "
+        "re-install + re-enable metron-intraday on trading from "
+        "nousergon-data's shared systemd source dir."
+    )
+
+
+def test_metron_intraday_one_time_disable_cleanup_exists():
+    """boot-pull.sh must self-heal a box that already had metron-intraday
+    installed+enabled before the exclude existed — the exclude only stops
+    FUTURE install/enable, it doesn't retroactively touch an already-present
+    unit. `systemctl disable --now` on both unit names, guarded to run only
+    if actually installed, `|| true` so it can never fail boot-pull itself."""
+    src = _source()
+    assert "systemctl disable --now metron-intraday.timer metron-intraday.service" in src, (
+        "boot-pull.sh must explicitly disable+stop any already-installed "
+        "metron-intraday unit on trading as a one-time/idempotent cleanup "
+        "step (config#1768: moved to ae-dashboard, closes-when requires "
+        "`systemctl is-active metron-intraday` inactive/masked on ae-trading)."
     )
