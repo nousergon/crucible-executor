@@ -20,12 +20,35 @@ nousergon-lib[flow-doctor] pin) instead of trusting a non-None report id.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
+import pytz
 from nousergon_lib.flow_doctor_fleet import trade_alert_dedup_key
 from nousergon_lib.logging import get_flow_doctor
 from nousergon_lib.telegram import send_message
 
 logger = logging.getLogger(__name__)
+
+_ET = pytz.timezone("US/Eastern")
+
+
+def _format_fill_time(fill_time: str | None) -> str:
+    """Render a trade's execution timestamp in US/Eastern for the alert.
+
+    Falls back to "now" (ET) when ``fill_time`` is missing or unparseable —
+    e.g. a bracket-order fill that didn't populate IB's execution time.
+    """
+    if fill_time:
+        try:
+            dt = datetime.fromisoformat(str(fill_time).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = pytz.utc.localize(dt)
+            dt = dt.astimezone(_ET)
+        except ValueError:
+            dt = datetime.now(_ET)
+    else:
+        dt = datetime.now(_ET)
+    return dt.strftime("%Y-%m-%d %H:%M:%S ET")
 
 
 def _format_trade_message(
@@ -35,16 +58,30 @@ def _format_trade_message(
     price: float,
     trigger: str,
     source: str,
+    fill_time: str | None = None,
+    realized_pnl: float | None = None,
+    realized_return_pct: float | None = None,
+    realized_alpha_pct: float | None = None,
+    days_held: int | None = None,
 ) -> str:
-    emoji = {"BUY": "\U0001f7e2", "SELL": "\U0001f534", "REDUCE": "\U0001f7e1"}.get(
-        action, "⚪"
-    )
-    return (
-        f"{emoji} *{action} {ticker}*\n"
-        f"Shares: {shares} @ ${price:.2f}\n"
-        f"Trigger: {trigger}\n"
-        f"Source: {source}"
-    )
+    emoji = {"BUY": "\U0001f7e2", "SELL": "\U0001f534", "REDUCE": "\U0001f7e1"}.get(action, "⚪")
+    lines = [
+        f"{emoji} *{action} {ticker}*",
+        f"Shares: {shares} @ ${price:.2f}",
+        f"Time: {_format_fill_time(fill_time)}",
+        f"Trigger: {trigger}",
+        f"Source: {source}",
+    ]
+    # Realized P&L only applies to closing/reducing trades (EXIT/REDUCE/
+    # COVER) — an ENTER/BUY has no prior fill to compare against, so
+    # realized_pnl stays None and this block is skipped for entries.
+    if realized_pnl is not None:
+        pct_str = f" ({realized_return_pct:+.1f}%)" if realized_return_pct is not None else ""
+        lines.append(f"Realized P&L: ${realized_pnl:+,.2f}{pct_str}")
+    if realized_alpha_pct is not None:
+        held_str = f" | Held: {days_held}d" if days_held is not None else ""
+        lines.append(f"Alpha vs SPY: {realized_alpha_pct:+.1f}%{held_str}")
+    return "\n".join(lines)
 
 
 def send_trade_alert(
@@ -54,9 +91,26 @@ def send_trade_alert(
     price: float,
     trigger: str = "",
     source: str = "daemon",
+    fill_time: str | None = None,
+    realized_pnl: float | None = None,
+    realized_return_pct: float | None = None,
+    realized_alpha_pct: float | None = None,
+    days_held: int | None = None,
 ) -> bool:
     """Send a Telegram push notification for a trade execution."""
-    msg = _format_trade_message(action, ticker, shares, price, trigger, source)
+    msg = _format_trade_message(
+        action,
+        ticker,
+        shares,
+        price,
+        trigger,
+        source,
+        fill_time=fill_time,
+        realized_pnl=realized_pnl,
+        realized_return_pct=realized_return_pct,
+        realized_alpha_pct=realized_alpha_pct,
+        days_held=days_held,
+    )
     fd = get_flow_doctor()
     if fd is not None:
         try:
@@ -71,6 +125,10 @@ def send_trade_alert(
                     "price": price,
                     "trigger": trigger,
                     "source": source,
+                    "realized_pnl": realized_pnl,
+                    "realized_return_pct": realized_return_pct,
+                    "realized_alpha_pct": realized_alpha_pct,
+                    "days_held": days_held,
                 },
                 dedup_key=trade_alert_dedup_key(action, ticker, shares, price),
             )

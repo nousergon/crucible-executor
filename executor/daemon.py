@@ -129,9 +129,11 @@ def _load_optimizer_shadow_log(bucket: str) -> dict | None:
     re-solve is load-bearing; it never silently no-ops as if it succeeded)."""
     try:
         import boto3
+
         s3 = boto3.client("s3")
         obj = s3.get_object(
-            Bucket=bucket, Key="predictor/optimizer_shadow/latest.json",
+            Bucket=bucket,
+            Key="predictor/optimizer_shadow/latest.json",
         )
         return json.loads(obj["Body"].read())
     except Exception as e:
@@ -151,6 +153,7 @@ DEFAULT_CONNECT_BACKOFF_BASE = 30
 try:
     from asyncio import IncompleteReadError
     from asyncio import TimeoutError as AsyncTimeoutError
+
     asyncio_exceptions = (IncompleteReadError, AsyncTimeoutError)
 except ImportError:
     asyncio_exceptions = ()
@@ -197,9 +200,7 @@ def _reconnect(
     """
     _cleanup_connections(monitor, ibkr)
 
-    send_daemon_status(
-        "\u26a0\ufe0f *IB Gateway connection lost* — attempting reconnect..."
-    )
+    send_daemon_status("\u26a0\ufe0f *IB Gateway connection lost* — attempting reconnect...")
 
     for attempt in range(1, max_reconnect_attempts + 1):
         if _shutdown_requested:
@@ -261,13 +262,23 @@ def _validate_sell_shares(
     if available <= 0:
         logger.warning(
             "SKIP %s %s %s: hold %d shares, in-flight SELL %d — no capacity",
-            context, action, ticker, held, pending_sell_shares,
+            context,
+            action,
+            ticker,
+            held,
+            pending_sell_shares,
         )
         return None
     if shares > available:
         logger.warning(
             "CAPPING %s %s %s: requested %d but available %d (held %d minus in-flight SELL %d)",
-            context, action, ticker, shares, available, held, pending_sell_shares,
+            context,
+            action,
+            ticker,
+            shares,
+            available,
+            held,
+            pending_sell_shares,
         )
         return available
     return shares
@@ -314,22 +325,22 @@ def _validate_buy_not_duplicate(
         working_buy = ibkr.get_open_buy_shares(ticker)
     except Exception as e:  # noqa: BLE001 — any broker read failure fails closed
         logger.error(
-            "SKIP %s BUY %s: broker state unreadable (%s) — failing closed to "
-            "avoid a possible double buy", context, ticker, e,
+            "SKIP %s BUY %s: broker state unreadable (%s) — failing closed to avoid a possible double buy",
+            context,
+            ticker,
+            e,
         )
-        send_daemon_status(
-            f"⚠️ *BUY {ticker} SKIPPED*: broker state unreadable — "
-            f"failing closed (config#2328)"
-        )
+        send_daemon_status(f"⚠️ *BUY {ticker} SKIPPED*: broker state unreadable — failing closed (config#2328)")
         return False
     if working_buy > 0:
         logger.warning(
-            "SKIP %s BUY %s: %d shares already working at broker — refusing "
-            "duplicate entry", context, ticker, working_buy,
+            "SKIP %s BUY %s: %d shares already working at broker — refusing duplicate entry",
+            context,
+            ticker,
+            working_buy,
         )
         send_daemon_status(
-            f"⚠️ *BUY {ticker} SKIPPED*: {working_buy} shares already "
-            f"working (dup-entry guard, config#2328)"
+            f"⚠️ *BUY {ticker} SKIPPED*: {working_buy} shares already working (dup-entry guard, config#2328)"
         )
         return False
     return True
@@ -362,7 +373,8 @@ def _reconcile_executing_entries(
         return
     if dry_run:
         logger.info(
-            "[DRY RUN] %d executing entries found — leaving untouched", len(executing),
+            "[DRY RUN] %d executing entries found — leaving untouched",
+            len(executing),
         )
         return
     try:
@@ -371,11 +383,11 @@ def _reconcile_executing_entries(
         logger.error(
             "Startup reconcile: broker positions unreadable (%s) — leaving %d "
             "executing entries in-doubt (fail-safe, will not re-buy)",
-            e, len(executing),
+            e,
+            len(executing),
         )
         send_daemon_status(
-            f"⚠️ *Crash-recovery: {len(executing)} in-doubt entries* — "
-            f"broker unreadable, left blocked (config#2328)"
+            f"⚠️ *Crash-recovery: {len(executing)} in-doubt entries* — broker unreadable, left blocked (config#2328)"
         )
         return
     resolved, reverted, blocked = [], [], []
@@ -386,14 +398,16 @@ def _reconcile_executing_entries(
             working_buy = ibkr.get_open_buy_shares(ticker)
         except Exception as e:  # noqa: BLE001 — per-ticker read failure fails safe
             logger.error(
-                "Startup reconcile %s: open-order read failed (%s) — leaving "
-                "in-doubt", ticker, e,
+                "Startup reconcile %s: open-order read failed (%s) — leaving in-doubt",
+                ticker,
+                e,
             )
             blocked.append(ticker)
             continue
         if held > 0 or working_buy > 0:
             order_book.mark_entry_executed(
-                ticker, entry.get("trigger_reason", "crash_recovery"),
+                ticker,
+                entry.get("trigger_reason", "crash_recovery"),
             )
             resolved.append(ticker)
         else:
@@ -401,8 +415,10 @@ def _reconcile_executing_entries(
             reverted.append(ticker)
     order_book.save()
     logger.warning(
-        "Startup reconcile of executing WAL: finalized %s, reverted-to-pending "
-        "%s, left-in-doubt %s", resolved or "[]", reverted or "[]", blocked or "[]",
+        "Startup reconcile of executing WAL: finalized %s, reverted-to-pending %s, left-in-doubt %s",
+        resolved or "[]",
+        reverted or "[]",
+        blocked or "[]",
     )
     send_daemon_status(
         f"\U0001f501 *Crash-recovery reconcile (config#2328)*\n"
@@ -462,15 +478,18 @@ def _place_order_with_retry(
             logger.info("Retry %d/%d: %s %s", attempt + 1, MAX_ORDER_RETRIES, label, ticker)
         if use_bracket and bracket_kwargs:
             from executor.bracket_orders import place_bracket_with_stop
+
             order_result = place_bracket_with_stop(ibkr, ticker, shares, **bracket_kwargs)
         else:
             order_result = ibkr.place_market_order(ticker, side, shares)
-        attempts.append({
-            "attempt": attempt + 1,
-            "status": order_result.get("status"),
-            "ib_order_id": order_result.get("ib_order_id"),
-            "retry_reason": retry_reason,
-        })
+        attempts.append(
+            {
+                "attempt": attempt + 1,
+                "status": order_result.get("status"),
+                "ib_order_id": order_result.get("ib_order_id"),
+                "retry_reason": retry_reason,
+            }
+        )
         if order_result["status"] not in ("Rejected", "Timeout"):
             break
     # Embed the audit trail on the returned dict so log_trade callers
@@ -509,16 +528,20 @@ def _enqueue_cover_for_unintended_shorts(
         qty = abs(shares)
         logger.error(
             "AUTO-COVER %s: detected short position %d — enqueuing URGENT COVER %d",
-            ticker, shares, qty,
+            ticker,
+            shares,
+            qty,
         )
-        order_book.add_urgent_exit({
-            "ticker": ticker,
-            "signal": "COVER",
-            "shares": qty,
-            "reason": "auto_cover_unintended_short",
-            "detail": f"position={shares} at Phase 0 open; allow_shorts=False",
-            "date": run_date,
-        })
+        order_book.add_urgent_exit(
+            {
+                "ticker": ticker,
+                "signal": "COVER",
+                "shares": qty,
+                "reason": "auto_cover_unintended_short",
+                "detail": f"position={shares} at Phase 0 open; allow_shorts=False",
+                "date": run_date,
+            }
+        )
         covered.append(ticker)
     return covered
 
@@ -540,9 +563,7 @@ def _signals_fingerprint(signals: dict | None) -> str | None:
     if not signals:
         return None
     try:
-        return hashlib.sha256(
-            json.dumps(signals, sort_keys=True, default=str).encode()
-        ).hexdigest()
+        return hashlib.sha256(json.dumps(signals, sort_keys=True, default=str).encode()).hexdigest()
     except (TypeError, ValueError):  # unserializable payload — treat as opaque
         return None
 
@@ -573,12 +594,13 @@ def _refresh_surveillance_universe(
     """
     try:
         from executor.signal_reader import read_signals_with_fallback
+
         signals = read_signals_with_fallback(config["signals_bucket"], run_date)
     except Exception as sig_err:  # noqa: BLE001
         logger.warning(
-            "surveillance refresh: read_signals_with_fallback failed (%s) — "
-            "keeping current universe (%d tickers)",
-            sig_err, len(current_tickers),
+            "surveillance refresh: read_signals_with_fallback failed (%s) — keeping current universe (%d tickers)",
+            sig_err,
+            len(current_tickers),
         )
         return current_tickers, last_fingerprint
 
@@ -609,9 +631,10 @@ def _refresh_surveillance_universe(
 
     added, removed = monitor.resubscribe(new_tickers)
     logger.info(
-        "surveillance universe refreshed mid-session (config#897): "
-        "+%s -%s → %d tickers",
-        sorted(added) or "[]", sorted(removed) or "[]", len(new_tickers),
+        "surveillance universe refreshed mid-session (config#897): +%s -%s → %d tickers",
+        sorted(added) or "[]",
+        sorted(removed) or "[]",
+        len(new_tickers),
     )
     return new_tickers, fingerprint
 
@@ -630,11 +653,13 @@ def run_daemon(dry_run: bool = False) -> None:
     # primitive on the returned preflight instance is reused after IBKRClient
     # connects below (replaces the inline live-account SAFETY HALT).
     from executor.preflight import ExecutorPreflight
+
     preflight = ExecutorPreflight(bucket=config["signals_bucket"], mode="daemon")
     preflight.run()
 
     # Flow Doctor: retrieve the shared instance set up at module import
     from nousergon_lib.logging import get_flow_doctor
+
     fd = get_flow_doctor()
 
     global _allow_shorts
@@ -663,6 +688,7 @@ def run_daemon(dry_run: bool = False) -> None:
     # through the close, and the post-close shutdown path can't drift onto
     # the next session.
     from nousergon_lib.dates import session_date
+
     try:
         run_date = session_date(strict=True).isoformat()
     except ValueError as _axis_err:
@@ -686,9 +712,9 @@ def run_daemon(dry_run: bool = False) -> None:
     resolve_min_freed_pct = float(_opt_cfg.get("intraday_resolve_min_freed_cash_pct", 0.01))
     resolve_cutoff_et = str(_opt_cfg.get("intraday_resolve_cutoff_et", "15:30"))
     resolve_max_per_day = int(_opt_cfg.get("intraday_resolve_max_per_day", 5))
-    _stopped_out_today: set[str] = set()   # gap-stopped + dd-forced names (no same-day rebuy)
-    _dd_forced_today: set[str] = set()     # subset force-exited by the drawdown overlay
-    _hard_risk_exit_seen = False           # event flag: a hard-risk exit freed cash → re-solve
+    _stopped_out_today: set[str] = set()  # gap-stopped + dd-forced names (no same-day rebuy)
+    _dd_forced_today: set[str] = set()  # subset force-exited by the drawdown overlay
+    _hard_risk_exit_seen = False  # event flag: a hard-risk exit freed cash → re-solve
     _resolve_count = 0
     _shadow_log_cache: dict | None = None
     # Per-position catastrophic-gap-stop-watch cohort (config#846): worst
@@ -701,12 +727,17 @@ def run_daemon(dry_run: bool = False) -> None:
         logger.info(
             "Intraday reconcile ENABLED — drawdown overlay + event-driven "
             "re-solve (min_freed=%.1f%% NAV, cutoff=%s ET, max/day=%d)",
-            resolve_min_freed_pct * 100, resolve_cutoff_et, resolve_max_per_day,
+            resolve_min_freed_pct * 100,
+            resolve_cutoff_et,
+            resolve_max_per_day,
         )
 
     logger.info(
         "Intraday daemon starting | date=%s | dry_run=%s | clientId=%d | poll=%ds",
-        run_date, dry_run, client_id, poll_interval,
+        run_date,
+        dry_run,
+        client_id,
+        poll_interval,
     )
 
     # Wait for order book — polls every 2 minutes until one appears or market closes.
@@ -721,7 +752,9 @@ def run_daemon(dry_run: bool = False) -> None:
         now_et = datetime.now(_ET)
 
         # Notify once at market open that we have no order book
-        if not notified_no_order_book and (now_et.hour > MARKET_OPEN_HOUR or (now_et.hour == MARKET_OPEN_HOUR and now_et.minute >= MARKET_OPEN_MINUTE)):
+        if not notified_no_order_book and (
+            now_et.hour > MARKET_OPEN_HOUR or (now_et.hour == MARKET_OPEN_HOUR and now_et.minute >= MARKET_OPEN_MINUTE)
+        ):
             send_daemon_status(
                 "\u26a0\ufe0f *No order book at market open*\n"
                 f"Date: {run_date}\n"
@@ -730,11 +763,11 @@ def run_daemon(dry_run: bool = False) -> None:
             notified_no_order_book = True
 
         # Give up once market session ends (4:15 PM ET, accounts for 15-min data delay)
-        if not is_market_hours(now_et) and (now_et.hour > MARKET_OPEN_HOUR or (now_et.hour == MARKET_OPEN_HOUR and now_et.minute >= MARKET_OPEN_MINUTE)):
+        if not is_market_hours(now_et) and (
+            now_et.hour > MARKET_OPEN_HOUR or (now_et.hour == MARKET_OPEN_HOUR and now_et.minute >= MARKET_OPEN_MINUTE)
+        ):
             send_daemon_status(
-                "\u274c *No order book received today*\n"
-                f"Date: {run_date}\n"
-                "Market closed — daemon exiting."
+                f"\u274c *No order book received today*\nDate: {run_date}\nMarket closed — daemon exiting."
             )
             logger.info("Order book never arrived and market has closed — exiting.")
             return
@@ -795,7 +828,8 @@ def run_daemon(dry_run: bool = False) -> None:
                 except Exception as e:
                     logger.error(
                         "Paper account verification failed on attempt %d: %s — will retry",
-                        attempt, e,
+                        attempt,
+                        e,
                     )
                     client.disconnect()
                     raise  # let outer retry loop reconnect and re-verify
@@ -806,7 +840,10 @@ def run_daemon(dry_run: bool = False) -> None:
                 wait = min(connect_backoff_base * attempt, MAX_RECONNECT_BACKOFF_SECS)
                 logger.warning(
                     "IB Gateway connection attempt %d/%d failed: %s — retrying in %ds",
-                    attempt, max_connect_attempts, e, wait,
+                    attempt,
+                    max_connect_attempts,
+                    e,
+                    wait,
                 )
                 if attempt == max_connect_attempts:
                     raise
@@ -838,20 +875,19 @@ def run_daemon(dry_run: bool = False) -> None:
     # daemon still trades the order book even if signals are unreadable.
     try:
         from executor.signal_reader import read_signals_with_fallback
+
         signals_for_surveillance = read_signals_with_fallback(
-            config["signals_bucket"], run_date,
+            config["signals_bucket"],
+            run_date,
         )
     except Exception as _sig_err:  # noqa: BLE001
         logger.warning(
-            "surveillance: read_signals_with_fallback failed (%s) — "
-            "universe degrades to order_book + positions only",
+            "surveillance: read_signals_with_fallback failed (%s) — universe degrades to order_book + positions only",
             _sig_err,
         )
         signals_for_surveillance = None
     try:
-        positions_for_surveillance = (
-            list(ibkr.get_positions().keys()) if not dry_run else []
-        )
+        positions_for_surveillance = list(ibkr.get_positions().keys()) if not dry_run else []
     except Exception as _pos_err:  # noqa: BLE001
         logger.warning("surveillance: get_positions failed (%s) — universe degrades", _pos_err)
         positions_for_surveillance = []
@@ -926,23 +962,21 @@ def run_daemon(dry_run: bool = False) -> None:
     #   * trades.db ENTER fills today — belt-and-suspenders: a fill logged to
     #     trades.db whose following book save never landed.
     executed_tickers: set = set()  # tracks tickers already traded today
-    executed_tickers.update(
-        e["ticker"] for e in order_book.data.get("executed_today", [])
-        if e.get("ticker")
-    )
+    executed_tickers.update(e["ticker"] for e in order_book.data.get("executed_today", []) if e.get("ticker"))
     executed_tickers.update(e["ticker"] for e in order_book.executing_entries())
     if not dry_run:
         try:
             executed_tickers.update(get_executed_entry_tickers(conn, run_date))
         except Exception as _seed_err:  # noqa: BLE001 — seeding is defensive
             logger.warning(
-                "Could not seed executed_tickers from trades.db (%s) — relying "
-                "on order-book state only", _seed_err,
+                "Could not seed executed_tickers from trades.db (%s) — relying on order-book state only",
+                _seed_err,
             )
     if executed_tickers:
         logger.info(
             "Seeded executed_tickers from durable state (%d): %s",
-            len(executed_tickers), sorted(executed_tickers),
+            len(executed_tickers),
+            sorted(executed_tickers),
         )
 
     # Track whether we reached the live trading window so the finally block
@@ -978,13 +1012,12 @@ def run_daemon(dry_run: bool = False) -> None:
         # retry-duplicate incident 2026-04-22.
         if not dry_run:
             auto_covered = _enqueue_cover_for_unintended_shorts(
-                _phase0_positions, order_book, run_date,
+                _phase0_positions,
+                order_book,
+                run_date,
             )
             if auto_covered:
-                send_daemon_status(
-                    f"⚠️ *AUTO-COVER enqueued for unintended shorts*\n"
-                    f"Tickers: {', '.join(auto_covered)}"
-                )
+                send_daemon_status(f"⚠️ *AUTO-COVER enqueued for unintended shorts*\nTickers: {', '.join(auto_covered)}")
                 order_book.save()
 
         for urgent in order_book.pending_urgent_exits():
@@ -1009,7 +1042,11 @@ def run_daemon(dry_run: bool = False) -> None:
                     except Exception as exc:
                         logger.warning("get_open_sell_shares(%s) failed: %s — treating as 0", ticker, exc)
                 validated = _validate_sell_shares(
-                    _phase0_positions, ticker, shares, action, "URGENT",
+                    _phase0_positions,
+                    ticker,
+                    shares,
+                    action,
+                    "URGENT",
                     pending_sell_shares=pending,
                 )
                 if validated is None:
@@ -1020,13 +1057,23 @@ def run_daemon(dry_run: bool = False) -> None:
             logger.info(
                 "%sURGENT %s %s: %s %d shares | reason: %s",
                 "[DRY RUN] " if dry_run else "",
-                action, ticker, side, shares, reason,
+                action,
+                ticker,
+                side,
+                shares,
+                reason,
             )
 
             if not dry_run:
                 order_result = _place_order_with_retry(ibkr, ticker, side, shares, f"URGENT {action}")
                 if order_result["status"] in ("Rejected", "Timeout"):
-                    logger.error("URGENT %s %s FAILED after %d attempts: %s", action, ticker, MAX_ORDER_RETRIES, order_result["status"])
+                    logger.error(
+                        "URGENT %s %s FAILED after %d attempts: %s",
+                        action,
+                        ticker,
+                        MAX_ORDER_RETRIES,
+                        order_result["status"],
+                    )
                     send_daemon_status(
                         f"\u26a0\ufe0f *URGENT {action} {ticker} FAILED*\n"
                         f"Status: {order_result['status']} after {MAX_ORDER_RETRIES} retries\n"
@@ -1039,7 +1086,10 @@ def run_daemon(dry_run: bool = False) -> None:
                 if actual_shares != shares:
                     logger.warning(
                         "URGENT %s %s partial fill: requested %d, filled %d",
-                        action, ticker, shares, actual_shares,
+                        action,
+                        ticker,
+                        shares,
+                        actual_shares,
                     )
 
                 fill_price = order_result.get("fill_price") or ibkr.get_current_price(ticker) or 0
@@ -1060,68 +1110,73 @@ def run_daemon(dry_run: bool = False) -> None:
                 _ralpha = (_rpct - _spy_ret) if (_rpct is not None and _spy_ret is not None) else None
                 _dheld = (date.fromisoformat(run_date) - date.fromisoformat(_entry_date)).days if _entry_date else None
 
-                log_trade(conn, {
-                    "date": run_date,
-                    "ticker": ticker,
-                    "action": action,
-                    "shares": actual_shares,
-                    "price_at_order": fill_price,
-                    "portfolio_nav_at_order": None,
-                    "position_pct": None,
-                    "ib_order_id": order_result.get("ib_order_id"),
-                    "fill_price": fill_price,
-                    "fill_time": order_result.get("fill_time"),
-                    "filled_shares": order_result.get("filled_shares"),
-                    "status": order_result.get("status"),
-                    "research_score": urgent.get("research_score"),
-                    "research_conviction": urgent.get("research_conviction"),
-                    "research_rating": urgent.get("research_rating"),
-                    "sector_rating": urgent.get("sector_rating"),
-                    "market_regime": urgent.get("market_regime"),
-                    "predicted_direction": urgent.get("predicted_direction"),
-                    "prediction_confidence": urgent.get("prediction_confidence"),
-                    "exit_reason": reason,
-                    "rationale_json": json.dumps({
+                log_trade(
+                    conn,
+                    {
+                        "date": run_date,
+                        "ticker": ticker,
                         "action": action,
+                        "shares": actual_shares,
+                        "price_at_order": fill_price,
+                        "portfolio_nav_at_order": None,
+                        "position_pct": None,
+                        "ib_order_id": order_result.get("ib_order_id"),
+                        "fill_price": fill_price,
+                        "fill_time": order_result.get("fill_time"),
+                        "filled_shares": order_result.get("filled_shares"),
+                        "status": order_result.get("status"),
+                        "research_score": urgent.get("research_score"),
+                        "research_conviction": urgent.get("research_conviction"),
+                        "research_rating": urgent.get("research_rating"),
+                        "sector_rating": urgent.get("sector_rating"),
+                        "market_regime": urgent.get("market_regime"),
+                        "predicted_direction": urgent.get("predicted_direction"),
+                        "prediction_confidence": urgent.get("prediction_confidence"),
                         "exit_reason": reason,
-                        "exit_detail": urgent.get("detail", ""),
-                        "source": "intraday_daemon",
-                        "phase": "urgent",
-                        # L133 — universal context on every exit, not
-                        # just edge cases. Closes home endnote bullet 3.
-                        "signal_context": {
-                            "research_score": urgent.get("research_score"),
-                            "research_rating": urgent.get("research_rating"),
-                            "research_conviction": urgent.get("research_conviction"),
-                            "sector": urgent.get("sector"),
-                            "sector_rating": urgent.get("sector_rating"),
-                            "market_regime": urgent.get("market_regime"),
-                            "predicted_direction": urgent.get("predicted_direction"),
-                            "prediction_confidence": urgent.get("prediction_confidence"),
-                        },
-                        # L133 — retry chain audit trail from
-                        # _place_order_with_retry. retry_count=0 +
-                        # single-entry attempts list = first-attempt
-                        # success.
-                        "retry_count": order_result.get("retry_count", 0),
-                        "attempts": order_result.get("attempts", []),
-                    }),
-                    "entry_trade_id": _entry_id,
-                    "trigger_price": fill_price,
-                    "trigger_type": reason,
-                    "spy_price_at_order": _spy_now,
-                    "realized_pnl": _rpnl,
-                    "realized_return_pct": _rpct,
-                    "spy_return_during_hold": _spy_ret,
-                    "realized_alpha_pct": _ralpha,
-                    "days_held": _dheld,
-                    # Phase 2 lineage — signal_date / prediction_date are
-                    # the artifact filename dates the urgent_exits_with_meta
-                    # record sourced from. Both default to None for COVER
-                    # orders generated outside the deciders path.
-                    "signal_date": urgent.get("signal_date"),
-                    "prediction_date": urgent.get("prediction_date"),
-                })
+                        "rationale_json": json.dumps(
+                            {
+                                "action": action,
+                                "exit_reason": reason,
+                                "exit_detail": urgent.get("detail", ""),
+                                "source": "intraday_daemon",
+                                "phase": "urgent",
+                                # L133 — universal context on every exit, not
+                                # just edge cases. Closes home endnote bullet 3.
+                                "signal_context": {
+                                    "research_score": urgent.get("research_score"),
+                                    "research_rating": urgent.get("research_rating"),
+                                    "research_conviction": urgent.get("research_conviction"),
+                                    "sector": urgent.get("sector"),
+                                    "sector_rating": urgent.get("sector_rating"),
+                                    "market_regime": urgent.get("market_regime"),
+                                    "predicted_direction": urgent.get("predicted_direction"),
+                                    "prediction_confidence": urgent.get("prediction_confidence"),
+                                },
+                                # L133 — retry chain audit trail from
+                                # _place_order_with_retry. retry_count=0 +
+                                # single-entry attempts list = first-attempt
+                                # success.
+                                "retry_count": order_result.get("retry_count", 0),
+                                "attempts": order_result.get("attempts", []),
+                            }
+                        ),
+                        "entry_trade_id": _entry_id,
+                        "trigger_price": fill_price,
+                        "trigger_type": reason,
+                        "spy_price_at_order": _spy_now,
+                        "realized_pnl": _rpnl,
+                        "realized_return_pct": _rpct,
+                        "spy_return_during_hold": _spy_ret,
+                        "realized_alpha_pct": _ralpha,
+                        "days_held": _dheld,
+                        # Phase 2 lineage — signal_date / prediction_date are
+                        # the artifact filename dates the urgent_exits_with_meta
+                        # record sourced from. Both default to None for COVER
+                        # orders generated outside the deciders path.
+                        "signal_date": urgent.get("signal_date"),
+                        "prediction_date": urgent.get("prediction_date"),
+                    },
+                )
 
                 order_book.mark_urgent_executed(ticker, action)
                 if action == "EXIT":
@@ -1149,6 +1204,11 @@ def run_daemon(dry_run: bool = False) -> None:
                     price=fill_price,
                     trigger=f"urgent_{reason}",
                     source="daemon",
+                    fill_time=order_result.get("fill_time"),
+                    realized_pnl=_rpnl,
+                    realized_return_pct=_rpct,
+                    realized_alpha_pct=_ralpha,
+                    days_held=_dheld,
                 )
 
                 # L139(a) — daemon-stage intraday replay capture. The
@@ -1157,10 +1217,7 @@ def run_daemon(dry_run: bool = False) -> None:
                 # entry point into the intraday decision stream for
                 # eventual gate-enforcement (L139b).
                 _get_decision_logger().record(
-                    decision_type=(
-                        "phase0_auto_cover" if action == "COVER"
-                        else "urgent_exit"
-                    ),
+                    decision_type=("phase0_auto_cover" if action == "COVER" else "urgent_exit"),
                     ticker=ticker,
                     action=action,
                     trading_day=run_date,
@@ -1293,7 +1350,8 @@ def run_daemon(dry_run: bool = False) -> None:
                     )
             except Exception as _oo_err:  # noqa: BLE001
                 logger.warning(
-                    "open-orders snapshot writer raised: %s", _oo_err,
+                    "open-orders snapshot writer raised: %s",
+                    _oo_err,
                 )
 
             # ── Mid-day backup (noon ET) ─────────────────────────────
@@ -1302,6 +1360,7 @@ def run_daemon(dry_run: bool = False) -> None:
             if not _midday_backup_done and _now_bk.hour == 12 and _now_bk.minute < 5:
                 try:
                     from executor.trade_logger import backup_to_s3 as _midday_bk
+
                     _midday_bk(db_path, _now_bk.strftime("%Y-%m-%d"), config["signals_bucket"])
                     logger.info("Mid-day trades.db backup completed")
                     _midday_backup_done = True
@@ -1333,7 +1392,8 @@ def run_daemon(dry_run: bool = False) -> None:
                             "stop_kind=%r under optimizer authority for %s — "
                             "forcing catastrophic_gap_only (producer did not "
                             "stamp the record; failing safe toward no-churn)",
-                            stop_kind, ticker,
+                            stop_kind,
+                            ticker,
                         )
                     exit_signal = exit_mgr.check_catastrophic_gap(stop, price_state)
                     # Accumulate the gap-stop-watch cohort (config#846): the
@@ -1362,7 +1422,8 @@ def run_daemon(dry_run: bool = False) -> None:
                             _w["fired"] = _w["fired"] or _gap["fired"]
                     except Exception:  # noqa: BLE001
                         logger.debug(
-                            "gap-watch accumulation failed for %s", ticker,
+                            "gap-watch accumulation failed for %s",
+                            ticker,
                             exc_info=True,
                         )
                 else:
@@ -1374,7 +1435,9 @@ def run_daemon(dry_run: bool = False) -> None:
                         order_book.save()
                         logger.debug(
                             "Trail updated %s: high=$%.2f stop=$%.2f",
-                            ticker, new_high, new_stop,
+                            ticker,
+                            new_high,
+                            new_stop,
                         )
 
                     # Check exit rules
@@ -1382,8 +1445,14 @@ def run_daemon(dry_run: bool = False) -> None:
                 if exit_signal:
                     try:
                         _execute_exit(
-                            ibkr, conn, order_book, exit_signal, price_state,
-                            run_date, dry_run, monitor=monitor,
+                            ibkr,
+                            conn,
+                            order_book,
+                            exit_signal,
+                            price_state,
+                            run_date,
+                            dry_run,
+                            monitor=monitor,
                         )
                         if not dry_run:
                             trades_executed += 1
@@ -1417,17 +1486,18 @@ def run_daemon(dry_run: bool = False) -> None:
                                         "for EXIT %s — continuing daemon "
                                         "(capture is observability, not "
                                         "load-bearing): %s",
-                                        exit_signal.get("ticker"), _cap_exc,
+                                        exit_signal.get("ticker"),
+                                        _cap_exc,
                                     )
                                 except Exception:  # noqa: BLE001
                                     logger.exception(
-                                        "decision_capture raised unexpected "
-                                        "exception for EXIT %s — continuing "
-                                        "daemon",
+                                        "decision_capture raised unexpected exception for EXIT %s — continuing daemon",
                                         exit_signal.get("ticker"),
                                     )
                     except (ConnectionError, OSError, asyncio_exceptions) as e:
-                        logger.warning("Connection lost during exit %s: %s — reconnecting", exit_signal.get("ticker"), e)
+                        logger.warning(
+                            "Connection lost during exit %s: %s — reconnecting", exit_signal.get("ticker"), e
+                        )
                         ibkr, monitor = _reconnect(ibkr, monitor, order_book, config, client_id)
                         break
 
@@ -1463,15 +1533,15 @@ def run_daemon(dry_run: bool = False) -> None:
                     # smallest-position-first (the prior conservative behavior).
                     if overlay["forced_exit_count"] > 0:
                         for fx in select_forced_exits(
-                            positions, forced_exit_signals_by_ticker,
+                            positions,
+                            forced_exit_signals_by_ticker,
                             _stopped_out_today | _dd_forced_today,
                             overlay["forced_exit_count"],
                         ):
                             ps = monitor.get_price(fx["ticker"])
                             if not ps:
                                 continue
-                            _execute_exit(ibkr, conn, order_book, fx, ps, run_date,
-                                          dry_run, monitor=monitor)
+                            _execute_exit(ibkr, conn, order_book, fx, ps, run_date, dry_run, monitor=monitor)
                             _dd_forced_today.add(fx["ticker"])
                             _stopped_out_today.add(fx["ticker"])
                             _hard_risk_exit_seen = True
@@ -1479,7 +1549,8 @@ def run_daemon(dry_run: bool = False) -> None:
                             executed_tickers.add(fx["ticker"])
                             logger.warning(
                                 "INTRADAY DRAWDOWN FORCED EXIT: %s (%s)",
-                                fx["ticker"], overlay["tier_desc"],
+                                fx["ticker"],
+                                overlay["tier_desc"],
                             )
 
                     # (b) Redeploy freed cash — only when NOT de-risking, only in
@@ -1500,8 +1571,11 @@ def run_daemon(dry_run: bool = False) -> None:
                                 for e in order_book.pending_entries()
                             )
                             avail = available_redeploy_cash(
-                                _shadow_log_cache["tickers"], positions, nav,
-                                sleeve, pending_dollars,
+                                _shadow_log_cache["tickers"],
+                                positions,
+                                nav,
+                                sleeve,
+                                pending_dollars,
                             )
                             if avail > resolve_min_freed_pct * nav:
                                 res = solve_redeploy(
@@ -1520,7 +1594,8 @@ def run_daemon(dry_run: bool = False) -> None:
                                     logger.error(
                                         "Intraday re-solve status=%r — NOT redeploying; "
                                         "~$%.0f freed cash left idle for next planner",
-                                        res["status"], avail,
+                                        res["status"],
+                                        avail,
                                     )
                                 else:
                                     for b in res["buys"]:
@@ -1533,17 +1608,26 @@ def run_daemon(dry_run: bool = False) -> None:
                                         sh = int(b["delta_dollars"] // px)
                                         if sh <= 0:
                                             continue
-                                        order_book.add_entry(build_redeploy_entry(
-                                            b["ticker"], sh, px, b["target_weight"], run_date,
-                                            pullback_pct=strategy_config.get("intraday_pullback_pct", 0.02),
-                                        ))
+                                        order_book.add_entry(
+                                            build_redeploy_entry(
+                                                b["ticker"],
+                                                sh,
+                                                px,
+                                                b["target_weight"],
+                                                run_date,
+                                                pullback_pct=strategy_config.get("intraday_pullback_pct", 0.02),
+                                            )
+                                        )
                                         n_enq += 1
                                     if n_enq:
                                         order_book.save()
                                     logger.info(
                                         "Intraday re-solve #%d: enqueued %d redeploy buy(s) "
                                         "for ~$%.0f freed cash (vol_ann=%s)",
-                                        _resolve_count, n_enq, avail, res.get("vol_ann"),
+                                        _resolve_count,
+                                        n_enq,
+                                        avail,
+                                        res.get("vol_ann"),
                                     )
                                 # Log the cash-resolution event (config#846) so the
                                 # intraday_resolve_* thresholds can be tuned offline
@@ -1551,27 +1635,28 @@ def run_daemon(dry_run: bool = False) -> None:
                                 # status, redeploy count, and the window/cap params
                                 # in effect. Best-effort observability.
                                 try:
-                                    log_risk_event(conn, {
-                                        "date": run_date,
-                                        "event_type": "intraday_resolve",
-                                        "rule": "intraday_resolve",
-                                        "value": round(float(avail), 2),
-                                        "threshold": round(float(resolve_min_freed_pct * nav), 2),
-                                        "reason": res.get("status"),
-                                        "context": {
-                                            "resolve_count": _resolve_count,
-                                            "n_redeployed": n_enq,
-                                            "solve_status": res.get("status"),
-                                            "vol_ann": res.get("vol_ann"),
-                                            "nav": round(float(nav), 2),
-                                            "min_freed_cash_pct": resolve_min_freed_pct,
-                                            "cutoff_et": resolve_cutoff_et,
-                                            "max_per_day": resolve_max_per_day,
-                                            "redeploy_tickers": [
-                                                b["ticker"] for b in res.get("buys", [])
-                                            ],
+                                    log_risk_event(
+                                        conn,
+                                        {
+                                            "date": run_date,
+                                            "event_type": "intraday_resolve",
+                                            "rule": "intraday_resolve",
+                                            "value": round(float(avail), 2),
+                                            "threshold": round(float(resolve_min_freed_pct * nav), 2),
+                                            "reason": res.get("status"),
+                                            "context": {
+                                                "resolve_count": _resolve_count,
+                                                "n_redeployed": n_enq,
+                                                "solve_status": res.get("status"),
+                                                "vol_ann": res.get("vol_ann"),
+                                                "nav": round(float(nav), 2),
+                                                "min_freed_cash_pct": resolve_min_freed_pct,
+                                                "cutoff_et": resolve_cutoff_et,
+                                                "max_per_day": resolve_max_per_day,
+                                                "redeploy_tickers": [b["ticker"] for b in res.get("buys", [])],
+                                            },
                                         },
-                                    })
+                                    )
                                 except Exception:  # noqa: BLE001
                                     logger.debug(
                                         "intraday_resolve event log failed",
@@ -1579,8 +1664,9 @@ def run_daemon(dry_run: bool = False) -> None:
                                     )
                 except Exception as _rec_err:
                     logger.error(
-                        "Intraday reconcile error (freed cash may stay idle until "
-                        "the next morning planner): %s", _rec_err, exc_info=True,
+                        "Intraday reconcile error (freed cash may stay idle until the next morning planner): %s",
+                        _rec_err,
+                        exc_info=True,
                     )
 
             # ── Check entries ────────────────────────────────────────
@@ -1595,8 +1681,16 @@ def run_daemon(dry_run: bool = False) -> None:
                     if should_enter:
                         try:
                             _execute_entry(
-                                ibkr, conn, order_book, entry, price_state, reason,
-                                run_date, strategy_config, dry_run, monitor=monitor,
+                                ibkr,
+                                conn,
+                                order_book,
+                                entry,
+                                price_state,
+                                reason,
+                                run_date,
+                                strategy_config,
+                                dry_run,
+                                monitor=monitor,
                                 use_optimizer=use_optimizer,
                             )
                             if not dry_run:
@@ -1610,8 +1704,9 @@ def run_daemon(dry_run: bool = False) -> None:
     except Exception as _exc:
         logger.exception("Daemon error")
         if fd:
-            fd.report(_exc, severity="critical", context={
-                "site": "daemon_main", "dry_run": dry_run, "run_date": run_date})
+            fd.report(
+                _exc, severity="critical", context={"site": "daemon_main", "dry_run": dry_run, "run_date": run_date}
+            )
         send_daemon_status("\u274c *Daemon crashed* — check logs")
         raise
     finally:
@@ -1631,6 +1726,7 @@ def run_daemon(dry_run: bool = False) -> None:
         # ── Data manifest ──────────────────────────────────────────────────
         try:
             from executor.data_manifest import write_data_manifest
+
             write_data_manifest(
                 bucket=config.get("signals_bucket", "alpha-engine-research"),
                 module_name="daemon",
@@ -1652,24 +1748,29 @@ def run_daemon(dry_run: bool = False) -> None:
         if conn is not None and _gap_watch:
             for _tk, _w in _gap_watch.items():
                 try:
-                    log_risk_event(conn, {
-                        "date": run_date,
-                        "event_type": "catastrophic_gap_watch",
-                        "rule": "catastrophic_gap_stop",
-                        "ticker": _tk,
-                        "value": round(float(_w["max_drop"]), 6),
-                        "threshold": round(float(_w["threshold"]), 6),
-                        "reason": "fired" if _w["fired"] else "watched",
-                        "context": {
-                            "max_drop": _w["max_drop"],
-                            "reference_price": _w["reference_price"],
-                            "price_at_max_drop": _w["price_at_max_drop"],
-                            "fired": _w["fired"],
+                    log_risk_event(
+                        conn,
+                        {
+                            "date": run_date,
+                            "event_type": "catastrophic_gap_watch",
+                            "rule": "catastrophic_gap_stop",
+                            "ticker": _tk,
+                            "value": round(float(_w["max_drop"]), 6),
+                            "threshold": round(float(_w["threshold"]), 6),
+                            "reason": "fired" if _w["fired"] else "watched",
+                            "context": {
+                                "max_drop": _w["max_drop"],
+                                "reference_price": _w["reference_price"],
+                                "price_at_max_drop": _w["price_at_max_drop"],
+                                "fired": _w["fired"],
+                            },
                         },
-                    })
+                    )
                 except Exception:  # noqa: BLE001
                     logger.debug(
-                        "gap-watch flush failed for %s", _tk, exc_info=True,
+                        "gap-watch flush failed for %s",
+                        _tk,
+                        exc_info=True,
                     )
 
         _cleanup_connections(monitor, ibkr)
@@ -1688,10 +1789,7 @@ def run_daemon(dry_run: bool = False) -> None:
             # must not AttributeError at end-of-run.
             if hasattr(fd, "emit_heartbeat"):
                 fd.emit_heartbeat(bucket=config.get("signals_bucket", "alpha-engine-research"))
-        send_daemon_status(
-            f"\u23f9 *Daemon stopped*\n"
-            f"Trades executed: {trades_executed}"
-        )
+        send_daemon_status(f"\u23f9 *Daemon stopped*\nTrades executed: {trades_executed}")
         logger.info("Daemon shutdown complete | trades=%d", trades_executed)
 
         # Trigger EOD pipeline Step Function only when two conditions hold
@@ -1717,7 +1815,8 @@ def run_daemon(dry_run: bool = False) -> None:
         elif not dry_run:
             logger.warning(
                 "Skipping EOD pipeline trigger: market_opened=%s market_open_now=%s",
-                market_opened, is_market_hours(),
+                market_opened,
+                is_market_hours(),
             )
 
 
@@ -1750,6 +1849,7 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
     """
     try:
         import boto3 as _b3_sf
+
         sfn = _b3_sf.client("stepfunctions", region_name="us-east-1")
         state_machine_arn = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
         trading_instance_id = "i-018eb3307a21329bf"
@@ -1759,21 +1859,24 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
             "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         )
         import json as _json_sf
+
         sfn.start_execution(
             stateMachineArn=state_machine_arn,
             name=f"eod-{run_date}-{int(__import__('time').time())}",
-            input=_json_sf.dumps({
-                "trading_instance_id": [trading_instance_id],
-                "ec2_instance_id": [dashboard_instance_id],
-                "sns_topic_arn": sns_topic_arn,
-                "run_date": run_date,
-                "triggered_by": "daemon_shutdown",
-                # pipeline_role tag (Option-D 2026-05-25) — page 25 filters
-                # EOD section to role="eod" by default. Operator-initiated
-                # EOD replays MUST set their own pipeline_role per the
-                # taxonomy in pipeline-reporting-revamp-260524.md §6.
-                "pipeline_role": "eod",
-            }),
+            input=_json_sf.dumps(
+                {
+                    "trading_instance_id": [trading_instance_id],
+                    "ec2_instance_id": [dashboard_instance_id],
+                    "sns_topic_arn": sns_topic_arn,
+                    "run_date": run_date,
+                    "triggered_by": "daemon_shutdown",
+                    # pipeline_role tag (Option-D 2026-05-25) — page 25 filters
+                    # EOD section to role="eod" by default. Operator-initiated
+                    # EOD replays MUST set their own pipeline_role per the
+                    # taxonomy in pipeline-reporting-revamp-260524.md §6.
+                    "pipeline_role": "eod",
+                }
+            ),
         )
         logger.info("EOD pipeline triggered: %s", state_machine_arn)
     except Exception as exc:
@@ -1784,17 +1887,21 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
         # not raise — daemon shutdown has already done its job.
         try:
             import boto3 as _b3_cw
+
             _b3_cw.client("cloudwatch", region_name="us-east-1").put_metric_data(
                 Namespace="AlphaEngine/Executor",
-                MetricData=[{
-                    "MetricName": "eod_trigger_failure",
-                    "Value": 1.0,
-                    "Unit": "Count",
-                }],
+                MetricData=[
+                    {
+                        "MetricName": "eod_trigger_failure",
+                        "Value": 1.0,
+                        "Unit": "Count",
+                    }
+                ],
             )
         except Exception as _metric_exc:
             logger.warning(
-                "CloudWatch eod_trigger_failure metric failed: %s", _metric_exc,
+                "CloudWatch eod_trigger_failure metric failed: %s",
+                _metric_exc,
             )
         try:
             send_daemon_status(
@@ -1804,7 +1911,8 @@ def _trigger_eod_pipeline(config: dict, run_date: str) -> None:
             )
         except Exception as _notify_exc:
             logger.warning(
-                "Telegram EOD-trigger-failure alert failed: %s", _notify_exc,
+                "Telegram EOD-trigger-failure alert failed: %s",
+                _notify_exc,
             )
 
 
@@ -1834,7 +1942,11 @@ def _execute_exit(
         except Exception as exc:
             logger.warning("get_open_sell_shares(%s) failed: %s — treating as 0", ticker, exc)
         validated = _validate_sell_shares(
-            positions, ticker, shares, action, "intraday",
+            positions,
+            ticker,
+            shares,
+            action,
+            "intraday",
             pending_sell_shares=pending,
         )
         if validated is None:
@@ -1846,7 +1958,11 @@ def _execute_exit(
     logger.info(
         "%s%s %s: %d shares @ ~$%.2f | %s",
         "[DRY RUN] " if dry_run else "",
-        action, ticker, shares, current_price, exit_signal.get("detail", ""),
+        action,
+        ticker,
+        shares,
+        current_price,
+        exit_signal.get("detail", ""),
     )
 
     if dry_run:
@@ -1863,7 +1979,10 @@ def _execute_exit(
     if actual_shares != shares:
         logger.warning(
             "%s %s partial fill: requested %d, filled %d",
-            action, ticker, shares, actual_shares,
+            action,
+            ticker,
+            shares,
+            actual_shares,
         )
 
     fill_price = order_result.get("fill_price") or current_price
@@ -1885,54 +2004,59 @@ def _execute_exit(
     _ralpha = (_rpct - _spy_ret) if (_rpct is not None and _spy_ret is not None) else None
     _dheld = (date.fromisoformat(run_date) - date.fromisoformat(_entry_date)).days if _entry_date else None
 
-    log_trade(conn, {
-        "date": run_date,
-        "ticker": ticker,
-        "action": action,
-        "shares": actual_shares,
-        "price_at_order": current_price,
-        "portfolio_nav_at_order": None,
-        "position_pct": None,
-        "ib_order_id": order_result.get("ib_order_id"),
-        "fill_price": fill_price,
-        "fill_time": order_result.get("fill_time"),
-        "filled_shares": order_result.get("filled_shares"),
-        "status": order_result.get("status"),
-        "exit_reason": exit_signal.get("reason"),
-        "rationale_json": json.dumps({
+    log_trade(
+        conn,
+        {
+            "date": run_date,
+            "ticker": ticker,
             "action": action,
+            "shares": actual_shares,
+            "price_at_order": current_price,
+            "portfolio_nav_at_order": None,
+            "position_pct": None,
+            "ib_order_id": order_result.get("ib_order_id"),
+            "fill_price": fill_price,
+            "fill_time": order_result.get("fill_time"),
+            "filled_shares": order_result.get("filled_shares"),
+            "status": order_result.get("status"),
             "exit_reason": exit_signal.get("reason"),
-            "exit_detail": exit_signal.get("detail"),
-            "source": "intraday_daemon",
-            # L133 — signal context at exit time + retry chain audit.
-            # ``exit_signal`` carries scores the intraday exit_manager
-            # used to decide (profit-take threshold, time-decay tier,
-            # ATR multiplier, etc.); pass through verbatim so trades.db
-            # records WHY this specific exit fired, not just THAT it did.
-            "signal_context": {
-                "research_score": exit_signal.get("research_score"),
-                "research_rating": exit_signal.get("research_rating"),
-                "research_conviction": exit_signal.get("research_conviction"),
-                "sector": exit_signal.get("sector"),
-                "sector_rating": exit_signal.get("sector_rating"),
-                "market_regime": exit_signal.get("market_regime"),
-                "predicted_direction": exit_signal.get("predicted_direction"),
-                "prediction_confidence": exit_signal.get("prediction_confidence"),
-                "exit_gate": exit_signal.get("gate"),  # e.g. "atr_trail", "time_decay", "profit_take"
-            },
-            "retry_count": order_result.get("retry_count", 0),
-            "attempts": order_result.get("attempts", []),
-        }),
-        "entry_trade_id": _entry_id,
-        "trigger_price": current_price,
-        "trigger_type": exit_signal.get("reason"),
-        "spy_price_at_order": _spy_now,
-        "realized_pnl": _rpnl,
-        "realized_return_pct": _rpct,
-        "spy_return_during_hold": _spy_ret,
-        "realized_alpha_pct": _ralpha,
-        "days_held": _dheld,
-    })
+            "rationale_json": json.dumps(
+                {
+                    "action": action,
+                    "exit_reason": exit_signal.get("reason"),
+                    "exit_detail": exit_signal.get("detail"),
+                    "source": "intraday_daemon",
+                    # L133 — signal context at exit time + retry chain audit.
+                    # ``exit_signal`` carries scores the intraday exit_manager
+                    # used to decide (profit-take threshold, time-decay tier,
+                    # ATR multiplier, etc.); pass through verbatim so trades.db
+                    # records WHY this specific exit fired, not just THAT it did.
+                    "signal_context": {
+                        "research_score": exit_signal.get("research_score"),
+                        "research_rating": exit_signal.get("research_rating"),
+                        "research_conviction": exit_signal.get("research_conviction"),
+                        "sector": exit_signal.get("sector"),
+                        "sector_rating": exit_signal.get("sector_rating"),
+                        "market_regime": exit_signal.get("market_regime"),
+                        "predicted_direction": exit_signal.get("predicted_direction"),
+                        "prediction_confidence": exit_signal.get("prediction_confidence"),
+                        "exit_gate": exit_signal.get("gate"),  # e.g. "atr_trail", "time_decay", "profit_take"
+                    },
+                    "retry_count": order_result.get("retry_count", 0),
+                    "attempts": order_result.get("attempts", []),
+                }
+            ),
+            "entry_trade_id": _entry_id,
+            "trigger_price": current_price,
+            "trigger_type": exit_signal.get("reason"),
+            "spy_price_at_order": _spy_now,
+            "realized_pnl": _rpnl,
+            "realized_return_pct": _rpct,
+            "spy_return_during_hold": _spy_ret,
+            "realized_alpha_pct": _ralpha,
+            "days_held": _dheld,
+        },
+    )
 
     # Update order book
     if action == "EXIT":
@@ -1956,6 +2080,11 @@ def _execute_exit(
         price=fill_price,
         trigger=exit_signal.get("reason", ""),
         source="daemon",
+        fill_time=order_result.get("fill_time"),
+        realized_pnl=_rpnl,
+        realized_return_pct=_rpct,
+        realized_alpha_pct=_ralpha,
+        days_held=_dheld,
     )
 
     # L139(a) — intraday exit decision capture for replay parity.
@@ -2023,7 +2152,10 @@ def _execute_entry(
     logger.info(
         "%sBUY %s: %d shares @ ~$%.2f | trigger: %s",
         "[DRY RUN] " if dry_run else "",
-        ticker, shares, current_price, trigger_reason,
+        ticker,
+        shares,
+        current_price,
+        trigger_reason,
     )
 
     if dry_run:
@@ -2052,7 +2184,11 @@ def _execute_entry(
 
     _t0_order = _time.time()
     order_result = _place_order_with_retry(
-        ibkr, ticker, "BUY", shares, "ENTER",
+        ibkr,
+        ticker,
+        "BUY",
+        shares,
+        "ENTER",
         use_bracket=bool(use_bracket),
         bracket_kwargs={"atr_value": atr_value, "atr_multiple": bracket_mult} if use_bracket else None,
     )
@@ -2073,12 +2209,12 @@ def _execute_entry(
         # pending_entries so it is not re-placed, and startup reconciliation /
         # EOD reconcile resolves it against broker truth.
         logger.error(
-            "ENTER %s TIMEOUT after %d attempts \u2014 leaving in-doubt (executing), "
-            "will reconcile against broker", ticker, MAX_ORDER_RETRIES,
+            "ENTER %s TIMEOUT after %d attempts \u2014 leaving in-doubt (executing), will reconcile against broker",
+            ticker,
+            MAX_ORDER_RETRIES,
         )
         send_daemon_status(
-            f"\u26a0\ufe0f *ENTER {ticker} TIMEOUT* \u2014 in-doubt, left blocked "
-            f"pending reconcile (config#2328)"
+            f"\u26a0\ufe0f *ENTER {ticker} TIMEOUT* \u2014 in-doubt, left blocked pending reconcile (config#2328)"
         )
         order_book.save()
         return
@@ -2088,14 +2224,16 @@ def _execute_entry(
     if actual_shares != shares:
         logger.warning(
             "ENTER %s partial fill: requested %d, filled %d",
-            ticker, shares, actual_shares,
+            ticker,
+            shares,
+            actual_shares,
         )
 
     fill_price = order_result.get("fill_price") or current_price
 
     # ── Roundtrip fields for entry ──
     _signal_price = entry.get("current_price")  # morning plan price
-    _trigger_price = current_price               # price at trigger time
+    _trigger_price = current_price  # price at trigger time
     _spy_now = None
     if monitor:
         _spy_state = monitor.get_price("SPY")
@@ -2104,90 +2242,95 @@ def _execute_entry(
     _slippage = ((fill_price - _signal_price) / _signal_price) if _signal_price else None
     _latency_ms = int((_time.time() - _t0_order) * 1000)
 
-    trade_id = log_trade(conn, {
-        "date": run_date,
-        "ticker": ticker,
-        "action": "ENTER",
-        "shares": actual_shares,
-        "price_at_order": current_price,
-        "portfolio_nav_at_order": None,
-        "position_pct": entry.get("position_pct"),
-        "ib_order_id": order_result.get("ib_order_id"),
-        "fill_price": fill_price,
-        "fill_time": order_result.get("fill_time"),
-        "filled_shares": order_result.get("filled_shares"),
-        "status": order_result.get("status"),
-        "research_score": entry.get("research_score"),
-        "research_conviction": entry.get("research_conviction"),
-        "research_rating": entry.get("research_rating"),
-        "sector": entry.get("sector"),
-        "sector_rating": entry.get("sector_rating"),
-        "market_regime": entry.get("market_regime"),
-        "price_target_upside": entry.get("price_target_upside"),
-        "predicted_direction": entry.get("predicted_direction"),
-        "prediction_confidence": entry.get("prediction_confidence"),
-        "rationale_json": json.dumps({
+    trade_id = log_trade(
+        conn,
+        {
+            "date": run_date,
+            "ticker": ticker,
             "action": "ENTER",
-            "trigger_reason": trigger_reason,
-            "source": "intraday_daemon",
-            "planned_price": _signal_price,
-            "sizing_factors": entry.get("sizing_factors"),
-            "predicted_alpha": entry.get("predicted_alpha"),
-            # L133 — full signal context on every ENTER so the
-            # trade-by-trade audit log can answer "why did we enter
-            # AAPL today?" without joining with signals.json + the
-            # predictor archive at review time.
-            "signal_context": {
-                "research_score": entry.get("research_score"),
-                "research_rating": entry.get("research_rating"),
-                "research_conviction": entry.get("research_conviction"),
-                "sector": entry.get("sector"),
-                "sector_rating": entry.get("sector_rating"),
-                "market_regime": entry.get("market_regime"),
-                "price_target_upside": entry.get("price_target_upside"),
-                "predicted_direction": entry.get("predicted_direction"),
-                "prediction_confidence": entry.get("prediction_confidence"),
-                "position_pct": entry.get("position_pct"),
-            },
-            # L133 retry chain audit — see _place_order_with_retry docstring.
-            "retry_count": order_result.get("retry_count", 0),
-            "attempts": order_result.get("attempts", []),
-        }),
-        "execution_latency_ms": _latency_ms,
-        "signal_price": _signal_price,
-        "trigger_price": _trigger_price,
-        "trigger_type": trigger_reason,
-        # entry_trigger duplicates trigger_reason here intentionally —
-        # see _TRADES_MIGRATIONS for the canonical-name rationale (the
-        # substrate inventory expects entry_trigger; trigger_type is
-        # also populated on exits with the exit reason, so the two
-        # cannot be merged).
-        "entry_trigger": trigger_reason,
-        "spy_price_at_order": _spy_now,
-        "slippage_vs_signal": _slippage,
-        # Date-convention dual-tracking. trading_day is the last completed
-        # NYSE session at fill time (populated by log_trade fallback if
-        # omitted); signal_trading_day links back to the signals.json that
-        # originated this entry — threaded through OrderBook from main.py's
-        # _read_signals(). See alpha-engine-docs/private/DATE_CONVENTIONS.md.
-        # signal_date and prediction_date are the artifact filename dates
-        # (Phase 2 transparency-inventory; ROADMAP entry 2026-05-05).
-        "signal_trading_day": entry.get("signal_date"),
-        "signal_date": entry.get("signal_date"),
-        "prediction_date": entry.get("prediction_date"),
-        # Stance taxonomy arc (2026-05-11) — denormalize stance + catalyst_date
-        # onto the trade row so exit_manager.evaluate_exits can read them via
-        # trade_logger.get_entry_stance_and_catalyst at exit time. Stance routes
-        # ATR-multiplier override, time-decay disable, and catalyst hard exit.
-        # NULL on entries from planners that haven't been bumped to surface
-        # these fields yet — exit_manager falls through to baseline behavior.
-        "stance": entry.get("stance"),
-        "catalyst_date": entry.get("catalyst_date"),
-        # Per-decision idempotency key (config#2436) — ticker + session date
-        # + sizing_source, stamped by OrderBook.add_entry. Durably records
-        # which exact decision executed, distinct from bare ticker.
-        "entry_id": entry.get("entry_id"),
-    })
+            "shares": actual_shares,
+            "price_at_order": current_price,
+            "portfolio_nav_at_order": None,
+            "position_pct": entry.get("position_pct"),
+            "ib_order_id": order_result.get("ib_order_id"),
+            "fill_price": fill_price,
+            "fill_time": order_result.get("fill_time"),
+            "filled_shares": order_result.get("filled_shares"),
+            "status": order_result.get("status"),
+            "research_score": entry.get("research_score"),
+            "research_conviction": entry.get("research_conviction"),
+            "research_rating": entry.get("research_rating"),
+            "sector": entry.get("sector"),
+            "sector_rating": entry.get("sector_rating"),
+            "market_regime": entry.get("market_regime"),
+            "price_target_upside": entry.get("price_target_upside"),
+            "predicted_direction": entry.get("predicted_direction"),
+            "prediction_confidence": entry.get("prediction_confidence"),
+            "rationale_json": json.dumps(
+                {
+                    "action": "ENTER",
+                    "trigger_reason": trigger_reason,
+                    "source": "intraday_daemon",
+                    "planned_price": _signal_price,
+                    "sizing_factors": entry.get("sizing_factors"),
+                    "predicted_alpha": entry.get("predicted_alpha"),
+                    # L133 — full signal context on every ENTER so the
+                    # trade-by-trade audit log can answer "why did we enter
+                    # AAPL today?" without joining with signals.json + the
+                    # predictor archive at review time.
+                    "signal_context": {
+                        "research_score": entry.get("research_score"),
+                        "research_rating": entry.get("research_rating"),
+                        "research_conviction": entry.get("research_conviction"),
+                        "sector": entry.get("sector"),
+                        "sector_rating": entry.get("sector_rating"),
+                        "market_regime": entry.get("market_regime"),
+                        "price_target_upside": entry.get("price_target_upside"),
+                        "predicted_direction": entry.get("predicted_direction"),
+                        "prediction_confidence": entry.get("prediction_confidence"),
+                        "position_pct": entry.get("position_pct"),
+                    },
+                    # L133 retry chain audit — see _place_order_with_retry docstring.
+                    "retry_count": order_result.get("retry_count", 0),
+                    "attempts": order_result.get("attempts", []),
+                }
+            ),
+            "execution_latency_ms": _latency_ms,
+            "signal_price": _signal_price,
+            "trigger_price": _trigger_price,
+            "trigger_type": trigger_reason,
+            # entry_trigger duplicates trigger_reason here intentionally —
+            # see _TRADES_MIGRATIONS for the canonical-name rationale (the
+            # substrate inventory expects entry_trigger; trigger_type is
+            # also populated on exits with the exit reason, so the two
+            # cannot be merged).
+            "entry_trigger": trigger_reason,
+            "spy_price_at_order": _spy_now,
+            "slippage_vs_signal": _slippage,
+            # Date-convention dual-tracking. trading_day is the last completed
+            # NYSE session at fill time (populated by log_trade fallback if
+            # omitted); signal_trading_day links back to the signals.json that
+            # originated this entry — threaded through OrderBook from main.py's
+            # _read_signals(). See alpha-engine-docs/private/DATE_CONVENTIONS.md.
+            # signal_date and prediction_date are the artifact filename dates
+            # (Phase 2 transparency-inventory; ROADMAP entry 2026-05-05).
+            "signal_trading_day": entry.get("signal_date"),
+            "signal_date": entry.get("signal_date"),
+            "prediction_date": entry.get("prediction_date"),
+            # Stance taxonomy arc (2026-05-11) — denormalize stance + catalyst_date
+            # onto the trade row so exit_manager.evaluate_exits can read them via
+            # trade_logger.get_entry_stance_and_catalyst at exit time. Stance routes
+            # ATR-multiplier override, time-decay disable, and catalyst hard exit.
+            # NULL on entries from planners that haven't been bumped to surface
+            # these fields yet — exit_manager falls through to baseline behavior.
+            "stance": entry.get("stance"),
+            "catalyst_date": entry.get("catalyst_date"),
+            # Per-decision idempotency key (config#2436) — ticker + session date
+            # + sizing_source, stamped by OrderBook.add_entry. Durably records
+            # which exact decision executed, distinct from bare ticker.
+            "entry_id": entry.get("entry_id"),
+        },
+    )
 
     # Mark entry as executed in order book
     order_book.mark_entry_executed(ticker, trigger_reason)
@@ -2215,12 +2358,13 @@ def _execute_entry(
             logger.warning(
                 "decision_capture S3 write failed for ENTER %s — continuing "
                 "trade flow (capture is observability, not load-bearing): %s",
-                ticker, _cap_exc,
+                ticker,
+                _cap_exc,
             )
         except Exception:  # noqa: BLE001 — capture must never kill trading
             logger.exception(
-                "decision_capture raised unexpected exception for ENTER %s "
-                "— continuing trade flow", ticker,
+                "decision_capture raised unexpected exception for ENTER %s — continuing trade flow",
+                ticker,
             )
 
     # Add stop record for the new position (skip if ATR unavailable)
@@ -2228,18 +2372,20 @@ def _execute_entry(
     atr_mult = strategy_config.get("intraday_trailing_stop_atr_multiple", 2.0)
     if trail_atr and trail_atr > 0:
         stop_price = round(fill_price - trail_atr * atr_mult, 2)
-        order_book.add_stop(build_stop_record(
-            ticker=ticker,
-            entry_price=fill_price,
-            current_stop=stop_price,
-            trail_atr=trail_atr,
-            atr_multiple=atr_mult,
-            high_water=fill_price,
-            entry_date=run_date,
-            shares=actual_shares,
-            use_optimizer=use_optimizer,
-            entry_trade_id=trade_id,
-        ))
+        order_book.add_stop(
+            build_stop_record(
+                ticker=ticker,
+                entry_price=fill_price,
+                current_stop=stop_price,
+                trail_atr=trail_atr,
+                atr_multiple=atr_mult,
+                high_water=fill_price,
+                entry_date=run_date,
+                shares=actual_shares,
+                use_optimizer=use_optimizer,
+                entry_trade_id=trade_id,
+            )
+        )
     else:
         fallback_enabled = strategy_config.get("fallback_stop_enabled", True)
         fallback_pct = strategy_config.get("fallback_stop_pct", 0.10)
@@ -2247,20 +2393,24 @@ def _execute_entry(
             stop_price = round(fill_price * (1 - fallback_pct), 2)
             logger.warning(
                 "No ATR for %s — using %.0f%% fallback stop at $%.2f",
-                ticker, fallback_pct * 100, stop_price,
+                ticker,
+                fallback_pct * 100,
+                stop_price,
             )
-            order_book.add_stop(build_stop_record(
-                ticker=ticker,
-                entry_price=fill_price,
-                current_stop=stop_price,
-                trail_atr=0,
-                atr_multiple=0,
-                high_water=fill_price,
-                entry_date=run_date,
-                shares=actual_shares,
-                use_optimizer=use_optimizer,
-                entry_trade_id=trade_id,
-            ))
+            order_book.add_stop(
+                build_stop_record(
+                    ticker=ticker,
+                    entry_price=fill_price,
+                    current_stop=stop_price,
+                    trail_atr=0,
+                    atr_multiple=0,
+                    high_water=fill_price,
+                    entry_date=run_date,
+                    shares=actual_shares,
+                    use_optimizer=use_optimizer,
+                    entry_trade_id=trade_id,
+                )
+            )
         else:
             logger.warning("No ATR for %s — fallback stop disabled, position has no stop", ticker)
     order_book.save()
@@ -2272,6 +2422,7 @@ def _execute_entry(
         price=fill_price,
         trigger=trigger_reason,
         source="daemon",
+        fill_time=order_result.get("fill_time"),
     )
 
     # L139(a) — entry trigger decision capture for replay parity.
