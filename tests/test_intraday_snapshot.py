@@ -31,9 +31,12 @@ class TestComputeSurveillanceUniverse:
     def test_empty_inputs_returns_spy_only(self):
         assert compute_surveillance_universe(None) == ["SPY"]
 
-    def test_signals_only(self):
+    def test_universe_only(self):
         sig = {
-            "signals": {"AAPL": {"signal": "ENTER"}, "MSFT": {"signal": "EXIT"}},
+            "universe": [
+                {"ticker": "AAPL", "signal": "ENTER"},
+                {"ticker": "MSFT", "signal": "EXIT"},
+            ],
             "buy_candidates": ["NVDA"],
         }
         assert compute_surveillance_universe(sig) == ["AAPL", "MSFT", "NVDA", "SPY"]
@@ -45,18 +48,18 @@ class TestComputeSurveillanceUniverse:
         # IBKR's concurrent market-data-line cap (error 101 cascade). Only
         # ENTER/EXIT/REDUCE are actionable surveillance signals.
         sig = {
-            "signals": {
-                "AAPL": {"signal": "HOLD"},
-                "MSFT": {"signal": "ENTER"},
-                "GOOG": {"signal": "HOLD"},
-            },
+            "universe": [
+                {"ticker": "AAPL", "signal": "HOLD"},
+                {"ticker": "MSFT", "signal": "ENTER"},
+                {"ticker": "GOOG", "signal": "HOLD"},
+            ],
         }
         assert compute_surveillance_universe(sig) == ["MSFT", "SPY"]
 
     def test_signals_entries_missing_signal_field_excluded(self):
         # Defensive: a record with no 'signal' field is treated as non-action,
         # not accidentally included.
-        sig = {"signals": {"AAPL": {}}}
+        sig = {"universe": [{"ticker": "AAPL"}]}
         assert compute_surveillance_universe(sig) == ["SPY"]
 
     def test_order_book_only(self):
@@ -69,7 +72,10 @@ class TestComputeSurveillanceUniverse:
 
     def test_full_union_dedups_and_sorts(self):
         sig = {
-            "signals": {"AAPL": {"signal": "ENTER"}, "MSFT": {"signal": "EXIT"}},
+            "universe": [
+                {"ticker": "AAPL", "signal": "ENTER"},
+                {"ticker": "MSFT", "signal": "EXIT"},
+            ],
             "buy_candidates": ["MSFT", "NVDA"],
         }
         result = compute_surveillance_universe(
@@ -81,7 +87,7 @@ class TestComputeSurveillanceUniverse:
         assert result == ["AAPL", "GOOG", "MSFT", "NVDA", "SPY", "TSLA"]
 
     def test_include_spy_false_omits_spy(self):
-        sig = {"signals": {"AAPL": {"signal": "ENTER"}}}
+        sig = {"universe": [{"ticker": "AAPL", "signal": "ENTER"}]}
         result = compute_surveillance_universe(sig, include_spy=False)
         assert result == ["AAPL"]
 
@@ -89,9 +95,9 @@ class TestComputeSurveillanceUniverse:
         # signals.json with neither 'signals' nor 'buy_candidates' fields.
         assert compute_surveillance_universe({}) == ["SPY"]
 
-    def test_handles_non_dict_signals_field(self):
-        # Defensive: a malformed signals.signals field shouldn't crash.
-        sig = {"signals": "not-a-dict", "buy_candidates": ["AAPL"]}
+    def test_handles_non_dict_universe_field(self):
+        # Defensive: a malformed signals.universe field shouldn't crash.
+        sig = {"universe": "not-a-list", "buy_candidates": ["AAPL"]}
         assert compute_surveillance_universe(sig) == ["AAPL", "SPY"]
 
     def test_handles_non_list_buy_candidates(self):
