@@ -18,7 +18,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version-file: .python-version
 
       - name: Install dependencies
         run: |
@@ -40,12 +40,37 @@ jobs:
           fi
           pip-audit "${IGNORE_ARGS[@]}"
 
+  # Lockfile compile-target guard (mirrors alpha-engine-dashboard,
+  # alpha-engine-config#2791): requirements.txt is a uv-compiled lockfile.
+  # This re-resolves requirements.in with uv, pinned to .python-version, and
+  # fails if that resolution can't be installed under the same interpreter —
+  # so a lockfile compiled against the wrong Python (or one that's drifted
+  # from requirements.in) fails PRE-merge instead of silently deploying.
+  lockfile-python-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Dry-run install compiled lockfile under SSoT Python
+        run: |
+          PYVER="$(cat .python-version)"
+          echo "Verifying requirements.txt installs cleanly under Python $PYVER"
+          uv venv --python "$PYVER" /tmp/lockfile-parity-venv
+          uv pip install --python /tmp/lockfile-parity-venv/bin/python -r requirements.txt
+
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
   # branch. PR-branch reds (mid-fix commits, cross-repo lib-tag merge-order
   # races) stay silent. Reusable workflow + transport in nousergon-lib.
   # See alpha-engine-config#1128.
   notify-main-failure:
-    needs: [test]
+    needs: [test, lockfile-python-parity]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
     secrets: inherit
