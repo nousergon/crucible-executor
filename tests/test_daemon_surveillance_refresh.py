@@ -11,6 +11,7 @@ client): new signals tickers get subscribed, dropped ones get cancelled, an
 unchanged signals.json produces zero churn, and order_book / positions still
 contribute to the universe.
 """
+
 from unittest.mock import MagicMock, patch
 
 from executor.daemon import _refresh_surveillance_universe, _signals_fingerprint
@@ -51,11 +52,15 @@ def _make_ibkr(positions):
 
 
 def _signals(*tickers):
-    return {"signals": {t: {"score": 1.0} for t in tickers}, "buy_candidates": []}
+    return {
+        "signals": {t: {"score": 1.0, "signal": "ENTER"} for t in tickers},
+        "buy_candidates": [],
+    }
 
 
-def _refresh(monitor, signals, *, order_book_tickers=(), positions=(),
-             last_fingerprint=None, current_tickers=None, dry_run=False):
+def _refresh(
+    monitor, signals, *, order_book_tickers=(), positions=(), last_fingerprint=None, current_tickers=None, dry_run=False
+):
     """Drive _refresh_surveillance_universe with signals returned from the reader."""
     order_book = _make_order_book(order_book_tickers)
     ibkr = _make_ibkr(positions)
