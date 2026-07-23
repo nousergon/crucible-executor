@@ -168,6 +168,32 @@ _EXECUTOR_PARAMS_KNOWN_METADATA_KEYS = (
     "stance_sizing_updated_at", "stance_sizing_alpha_spread",
 )
 
+# config#2891: the Saturday Evaluator (backtester weight_optimizer.apply)
+# writes config/executor_params.json weekly; a silently-failed or stalled
+# write leaves this cold-start reading an arbitrarily old tuned config with
+# no signal. WARN (never block trading) once the pointer is older than 2
+# weekly cycles — mirrors ARTIFACT_REGISTRY.yaml's own default
+# grace_period_cycles=2 for the central config_executor_params freshness-
+# monitor row this assertion complements as an independent consumer-side
+# signal (config#1724 doctrine), not a replacement for it.
+_EXECUTOR_PARAMS_STALE_HOURS = 24 * 7 * 2
+
+
+def _check_executor_params_staleness(last_modified: datetime | None) -> None:
+    """Best-effort WARN when ``last_modified`` is older than
+    ``_EXECUTOR_PARAMS_STALE_HOURS``. Never raises, never blocks trading."""
+    if last_modified is None:
+        return
+    age_hours = (datetime.now(UTC) - last_modified).total_seconds() / 3600.0
+    if age_hours > _EXECUTOR_PARAMS_STALE_HOURS:
+        logger.error(
+            "STALE config/executor_params.json: last modified %.1fh ago "
+            "(> %dh / 2 weekly cycles) — the Saturday Evaluator may have "
+            "silently failed or stalled; executor may be trading on stale "
+            "tuned params (config#2891)",
+            age_hours, _EXECUTOR_PARAMS_STALE_HOURS,
+        )
+
 
 def _load_executor_params_from_s3(bucket: str) -> dict | None:
     """Read config/executor_params.json from S3. Cache per cold-start.
@@ -187,6 +213,7 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
         import boto3
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
+        _check_executor_params_staleness(obj.get("LastModified"))
         data = json.loads(obj["Body"].read())
         # Advisory schema validation (log warnings, never block)
         _unknown_keys = [
