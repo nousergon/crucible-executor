@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 # docstring), irrelevant to this module's own logic under test.
 sys.modules.setdefault("arcticdb", MagicMock())
 
-from executor import main
+from executor import main  # noqa: E402 -- must follow the arcticdb stub above
 
 
 def _make_s3_response(body: dict, last_modified) -> dict:
