@@ -43,7 +43,7 @@ absent ⇒ that axis is skipped for that role).
   of its own; this directory is its policy's sole source of truth, already
   covered by this repo's `apply.sh` / `check-drift.py` / daily
   `iam-drift-check.yml` / `check-no-foreign-writers.py` (which already scans
-  `crucible-backtester` as a sibling repo). 12 inline policies (trading-scoped: S3, SES, SNS,
+  `crucible-backtester` as a sibling repo). 14 inline policies (trading-scoped: S3, SES, SNS,
   CloudWatch, SSM read/send, EC2 spot, EOD Step Function; plus
   `alpha-engine-stepfunctions-diagnose`, added 2026-07-13 — read-only
   `states:ListExecutions`/`DescribeExecution`/`DescribeStateMachine` on the
@@ -82,6 +82,24 @@ absent ⇒ that axis is skipped for that role).
   added the `alpha-engine-executor`/trading-box (`i-018eb3307a21329bf`) and
   `alpha-engine-dashboard` (`i-09b539c844515d549`) instance ARNs to that
   statement's `Resource` list.
+  Added `alpha-engine-groom-llm-provider-flip`, 2026-07-22
+  (alpha-engine-config#1658, Brian's 2026-07-15 + 2026-07-17 + 2026-07-21
+  "Option A" console rulings, ratified three times) — `ssm:GetParameter`/
+  `ssm:GetParametersByPath`/`ssm:PutParameter` scoped to
+  `parameter/vires/llm/*` and `parameter/metron/llm/*` only (NOT the whole
+  `/vires/*` or `/metron/*` trees — those products' non-LLM config stays
+  outside this trading role's reach). Every groom pass since 2026-07-16 hit
+  `AccessDeniedException` attempting the vires-coach/metron-advisor
+  OpenRouter-provider flips this epic's runbook calls for
+  (`aws ssm put-parameter --name /vires/llm/coach ...` /
+  `--name /metron/llm/advisor ...`) — this role had `ssm:PutParameter`
+  nowhere outside `parameter/alpha-engine/*` (`alpha-engine-ssm-read.json`
+  above is also read-only). This box holds no `iam:PutRolePolicy` on
+  itself (verified: `iam:GetRolePolicy`/`iam:SimulatePrincipalPolicy` both
+  self-deny), so codifying this file is the groom pass's complete write
+  mandate here — a human with real IAM creds must run `apply.sh --role
+  alpha-engine-executor-role --policy alpha-engine-groom-llm-provider-flip`
+  post-merge before the flips can execute unattended.
   Trust policy
   (`ec2.amazonaws.com`) and managed attachment (`AmazonSSMManagedInstanceCore`)
   are codified via the reserved files. Until 2026-06-09 this role was also the
