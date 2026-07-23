@@ -101,11 +101,11 @@ class TestComputeSurveillanceUniverse:
         assert compute_surveillance_universe(sig) == ["AAPL", "SPY"]
 
     def test_handles_non_list_buy_candidates(self):
-        sig = {"signals": {"AAPL": {"signal": "ENTER"}}, "buy_candidates": "not-a-list"}
+        sig = {"universe": [{"ticker": "AAPL", "signal": "ENTER"}], "buy_candidates": "not-a-list"}
         assert compute_surveillance_universe(sig) == ["AAPL", "SPY"]
 
     def test_filters_non_string_buy_candidates(self):
-        sig = {"signals": {}, "buy_candidates": ["AAPL", None, 123, "MSFT"]}
+        sig = {"universe": [], "buy_candidates": ["AAPL", None, 123, "MSFT"]}
         result = compute_surveillance_universe(sig)
         assert "AAPL" in result and "MSFT" in result
         assert None not in result and 123 not in result
@@ -120,7 +120,7 @@ class TestComputeSurveillanceUniverse:
         assert "AAPL" in result
 
     def test_spy_in_signals_no_double(self):
-        sig = {"signals": {"SPY": {"signal": "ENTER"}, "AAPL": {"signal": "HOLD"}}}
+        sig = {"universe": [{"ticker": "SPY", "signal": "ENTER"}, {"ticker": "AAPL", "signal": "HOLD"}]}
         result = compute_surveillance_universe(sig)
         assert result.count("SPY") == 1
 
