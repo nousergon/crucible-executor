@@ -1,0 +1,109 @@
+ib_insync~=0.9.86
+boto3~=1.43
+pyyaml~=6.0
+# setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
+# started failing 2026-07-14 against the default 79.0.1 bundled by the
+# GH Actions Python 3.11 image). Not a build-backend requirement here — direct
+# pin exists solely to satisfy the security-audit gate.
+setuptools>=83.0.0
+yfinance~=1.5.1
+numpy<3
+pandas~=2.2
+pyarrow~=25.0
+# arcticdb: reads atr_14_pct from the universe library at morning planner time.
+# Single source of truth for ATR across the executor — pullback trigger scaling,
+# position sizing, and trailing stops all consume the feature-store value so
+# executor and predictor agree on the ATR definition. See executor/price_cache.py
+# load_atr_14_pct. Version range kept loose to avoid pinning pain with the
+# predictor/backtester venvs which share the same S3-backed store.
+arcticdb~=6.18
+# anthropic SDK removed 2026-05-25 — executor has no LLM exposure per
+# [[preference_llm_calls_confined_to_research_module]] hard guardrail.
+# The 10-week EOD-narrative Haiku call site that motivated this dep was
+# deleted outright in the same PR; if a future surface genuinely needs
+# LLM-synthesized output, the call goes in research and produces a
+# frozen artifact executor reads.
+exchange-calendars~=4.5
+requests~=2.34
+# Real-time polygon.io WebSocket price feed (config#913) — used only when
+# EXECUTOR_PRICE_SOURCE=polygon_ws; the default IB-delayed path doesn't need it.
+websocket-client~=1.9
+# alpha-engine-lib provides setup_logging + BasePreflight. Executor passes
+# exclude_patterns=[r"Error 10197", r"Error 10349"] to suppress benign IB
+# Gateway noise (10197 = iOS app steals live-data session, 10349 = TIF
+# coerced to DAY per order preset — order still placed). See daemon.py /
+# main.py / eod_reconcile.py.
+#
+# v0.2.4 is the minimum that bundles flow-doctor>=0.4.0, which adds the
+# `s3` notifier type required by `flow-doctor.yaml`. v0.2.2 + flow-doctor
+# 0.3.0 crashed the daemon at `setup_logging` with
+# `ConfigError: notify[2] (type=s3): unknown notifier type 's3'`
+# (2026-05-11 incident — 205 systemd restarts before stop).
+# v0.10.0 adds DecisionArtifact schema_version=2 with optional
+# model_metadata + full_prompt_context, enabling deterministic executor
+# decision capture (L2308 — executor:entry_triggers / position_sizer /
+# risk_guard / exit_rules artifacts emitted from daemon + planner).
+# v0.16.0 adds load_latest_eval_artifact + list_eval_artifacts for the
+# canonical eval-artifact partition shape (YYMMDDHHMM run_id + sidecar);
+# required by signal_reader.read_regime_substrate (Stage D' Wire 2).
+# v0.17.0 seeds flow-doctor ${VAR} secrets via get_secret() inside
+# setup_logging()/_attach_flow_doctor() before flow_doctor.init() reads
+# os.environ — closes the PR 9g systemd-entrypoint env gap upstream for
+# all repos (replaces the executor-local secrets_bootstrap.py approach).
+# Executor uses setup_logging/secrets/dates/eval_artifacts/alerts/universe/
+# telegram/decision_capture/preflight/trading_calendar surfaces. The
+# cost-telemetry primitives are NOT consumed here (executor has no LLM
+# exposure per [[preference_llm_calls_confined_to_research_module]]) but the
+# lib pin stays current.
+# v0.60.2 (2026-06-18): SSM-authoritative seed + alpha_engine_lib alias resource-loading shim fix; earlier v0.60.1 flow-doctor secret seed when deployed
+# — overwrites a stale sourced FLOW_DOCTOR_GITHUB_TOKEN with the live SSM value
+# so the github_issue notifier stops 403ing on the EOD/executor path (config#1148).
+# NOTE: the flow-doctor extra MUST be hyphenated — setuptools normalizes
+# pyproject's `flow_doctor` to `Provides-Extra: flow-doctor`, and older pip
+# does NOT normalize underscore->hyphen, so `[flow_doctor]` silently drops the
+# extra (leaving flow-doctor stale/absent). `[flow-doctor]` is the PEP 685
+# canonical form and resolves on every pip version (config#1178).
+# v0.83.0 floor (config#1741): fleet forum-topic Telegram config
+# (nousergon_lib.flow_doctor_fleet) + flow-doctor notify_event routing.
+# v0.75.0 added canonical √-impact TransactionCostModel (ARCHITECTURE §15/§43).
+nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.86.0
+# krepis (MIT foundation) — direct pin: eod_emailer.py now imports the lifted
+# console deep-link chokepoint `krepis.console.console_url` (config#1300, krepis
+# v0.4.0 added it). nousergon-lib pulls krepis transitively, but the direct
+# import warrants the direct pin documenting the minimum.
+# >=0.10.2 floor (config#1741): flow-doctor>=0.8.1 pin for notify_event + forum
+# topic routing; krepis telegram explicit-credential overrides.
+# >=0.8.0 added session axis (config#1610): session_date() + assert_within_session().
+# krepis's own flow-doctor extra pin (flow-doctor[diagnosis,s3]>=0.8.1,<0.9,
+# see krepis pyproject.toml) already covers flow-doctor>=0.8.3 (config#1813:
+# FlowDoctor.last_dispatch_reason()/last_dispatched(), the real per-call
+# dispatch outcome that executor/notifier.py checks instead of trusting a
+# non-None notify_event() report id) — no version bump needed on this line.
+krepis>=0.14.0
+# portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
+# constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
+# scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
+# import time — executor/portfolio_optimizer.py raises a clear ImportError if
+# missing, so the legacy 1/n sizing path runs unaffected on environments that
+# haven't pulled these in yet.
+# cvxpy: the rest of this stack (arcticdb~=6.18, pyarrow~=25.0, pandas~=2.2)
+# already resolves numpy to the 2.x series today — arcticdb 6.18.x and
+# pyarrow 25.0.x both support numpy 2 (verified via PyPI metadata + a real
+# `pip install -r requirements.txt`, numpy resolved to 2.4.6 even under the
+# old <1.8 ceiling). cvxpy was the lone holdout: cvxpy>=1.8.0 declares
+# `numpy>=2.0.0` in its own metadata (it imports numpy.lib.array_utils,
+# which does not exist before numpy 2.0), so the old <1.8 ceiling here was
+# never actually "for numpy<3 compatibility" as previously stated — numpy
+# was already resolving to 2.x regardless of cvxpy's version. The real
+# constraint cvxpy<1.8 enforced was just "don't hard-require numpy>=2.0.0
+# at cvxpy's own import time," resting on an unverified (and false)
+# assumption that numpy needed to stay <2 elsewhere in this graph. Range
+# below matches what dependabot proposed in crucible-executor#388 (closed
+# via `@dependabot ignore this dependency` pending this migration) so
+# re-enabling dependabot afterward should not immediately re-propose a
+# conflicting bump.
+#
+# scikit-learn pin stays upper-bounded pending separate verification of the
+# 1.10 series; unrelated to the cvxpy/numpy coupling above.
+cvxpy>=1.9.2,<1.10
+scikit-learn>=1.9.0,<1.10

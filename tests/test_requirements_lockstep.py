@@ -1,32 +1,41 @@
-"""Ensure pyproject.toml and requirements.txt dependencies are synchronized.
+"""Ensure pyproject.toml and requirements.in dependencies are synchronized.
 
-The executor ships with both pyproject.toml (for `pip install -e .`) and
-requirements.txt (for production/Docker deploys). A divergence class has bitten
-the organization multiple times:
+The executor ships with pyproject.toml (for `pip install -e .`),
+requirements.in (the hand-maintained direct-dependency source), and
+requirements.txt (a `uv pip compile`-generated lockfile — the full pinned
+transitive closure, deployed via `pip install -r requirements.txt`). A
+divergence class has bitten the organization multiple times:
 
   - pyproject.toml lists only 5 packages: ib_insync, boto3, pyyaml, yfinance, pandas.
-  - requirements.txt pins 11+ packages including arcticdb, krepis, nousergon-lib,
+  - requirements.in declares 11+ packages including arcticdb, krepis, nousergon-lib,
     exchange-calendars, cvxpy, scikit-learn, etc. — the actual runtime dependencies.
   - `pip install -e .` from pyproject.toml yields a silently broken environment
     (import errors, missing optional deps) that drifts independently until the
     moment a dev tries to run the executor or tests locally.
 
 This test re-greps both sources on every CI run to enforce lockstep: all
-requirements.txt packages (except transitive) must appear in pyproject.toml
-dependencies, and pinned versions must match (or be compatible within declared
-ranges).
+requirements.in packages (the direct/non-transitive set) must appear in
+pyproject.toml dependencies, and pinned versions must match (or be compatible
+within declared ranges). This deliberately reads requirements.in, not the
+compiled requirements.txt — requirements.txt now also lists every transitive
+dependency (noise for a "direct dependency" check) and resolves VCS refs to
+opaque commit SHAs (see below), neither of which requirements.in has.
 
 A second, narrower divergence class survives even when presence is enforced:
-requirements.txt pins some packages to an exact git tag (e.g.
+requirements.in pins some packages to an exact git tag (e.g.
 `nousergon-lib @ git+https://...@v0.86.0`) for the production/Docker deploy,
 while pyproject.toml only declares an open-ended floor for the same package
 (e.g. `nousergon-lib>=0.86.0`). `pip install -e .` reads only pyproject.toml,
 so it is free to resolve any version satisfying the floor — it is not
-provably the same artifact as the exact git tag requirements.txt pins.
+provably the same artifact as the exact git tag requirements.in pins.
 `test_git_pinned_deps_match_pyproject_exactly` closes that gap: for every
-requirements.txt dependency pinned to an exact git tag, pyproject.toml's
+requirements.in dependency pinned to an exact git tag, pyproject.toml's
 specifier for that package must be an exact-equals (`==`) pin at the same
-version, not merely a compatible range.
+version, not merely a compatible range. This must read requirements.in rather
+than requirements.txt: `uv pip compile` resolves a VCS tag ref to its exact
+commit SHA in the compiled lockfile (correct — a tag can be force-moved, a
+commit SHA cannot), so the tag string this test needs to compare against
+pyproject.toml no longer exists in requirements.txt at all once compiled.
 """
 
 from __future__ import annotations
@@ -37,8 +46,24 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _normalize_pkg_name(name: str) -> str:
+    """PEP 503 name normalization.
+
+    pip/PyPI treat ``ib_insync``, ``ib-insync``, and ``IB.Insync`` as the
+    identical package — comparing raw literal strings would false-fail on a
+    purely cosmetic naming difference. This bit in practice: uv's compiled
+    ``requirements.txt`` writes the PyPI-canonical hyphenated form
+    (``ib-insync``) while ``pyproject.toml`` kept the historical underscored
+    spelling (``ib_insync``); both refer to the same package.
+    """
+    return re.sub(r"[-_.]+", "-", name).lower().strip()
+
+
 def _parse_pyproject_deps() -> dict[str, str]:
-    """Extract dependencies from pyproject.toml [project] section."""
+    """Extract dependencies from pyproject.toml [project] section.
+
+    Keyed by PEP 503-normalized package name (see ``_normalize_pkg_name``).
+    """
     text = (_REPO_ROOT / "pyproject.toml").read_text()
     deps = {}
     in_deps = False
@@ -54,14 +79,22 @@ def _parse_pyproject_deps() -> dict[str, str]:
             if match:
                 dep_spec = match.group(1)
                 # Extract package name and version spec
-                pkg_name = re.split(r'[><=!@\[]', dep_spec)[0]
-                deps[pkg_name] = dep_spec
+                pkg_name = re.split(r"[><=!@\[]", dep_spec)[0]
+                deps[_normalize_pkg_name(pkg_name)] = dep_spec
     return deps
 
 
 def _parse_requirements() -> dict[str, str]:
-    """Extract top-level dependencies from requirements.txt (skip comments/comments)."""
-    text = (_REPO_ROOT / "requirements.txt").read_text()
+    """Extract direct dependencies from requirements.in (skip comments).
+
+    requirements.in is the hand-maintained direct-dependency source (loose
+    specs, still-readable git tags) — requirements.txt is the compiled
+    lockfile (full transitive closure, VCS refs resolved to commit SHAs) and
+    is deliberately NOT read here; see module docstring.
+
+    Keyed by PEP 503-normalized package name (see ``_normalize_pkg_name``).
+    """
+    text = (_REPO_ROOT / "requirements.in").read_text()
     deps = {}
     for line in text.split("\n"):
         line = line.strip()
@@ -70,13 +103,13 @@ def _parse_requirements() -> dict[str, str]:
         # Handle git-pinned deps like: nousergon-lib[...] @ git+https://...
         if "@" in line:
             pkg_part = line.split("@")[0].strip()
-            pkg_name = re.split(r'[\[\]]', pkg_part)[0]
-            deps[pkg_name] = line
+            pkg_name = re.split(r"[\[\]]", pkg_part)[0]
+            deps[_normalize_pkg_name(pkg_name)] = line
         else:
             # Regular version specifiers like: ib_insync~=0.9.86
-            pkg_name = re.split(r'[><=!~\[]', line)[0]
+            pkg_name = re.split(r"[><=!~\[]", line)[0]
             if pkg_name:
-                deps[pkg_name] = line
+                deps[_normalize_pkg_name(pkg_name)] = line
     return deps
 
 
@@ -195,16 +228,16 @@ def test_pyproject_has_all_direct_dependencies():
     # cross-check it's still honest against the actual requirements.txt so a
     # stale entry (renamed/removed package) doesn't silently pass the loop
     # below by checking a name that's no longer a real requirement.
-    stale = [pkg for pkg in direct_packages if pkg not in requirements_deps]
+    normalized_direct = [_normalize_pkg_name(pkg) for pkg in direct_packages]
+    stale = [pkg for pkg, norm in zip(direct_packages, normalized_direct, strict=True) if norm not in requirements_deps]
     assert len(stale) == 0, (
         "direct_packages lists package(s) no longer present in "
-        "requirements.txt (stale allowlist entry?):\n"
-        + "\n".join(f"  {pkg}" for pkg in stale)
+        "requirements.txt (stale allowlist entry?):\n" + "\n".join(f"  {pkg}" for pkg in stale)
     )
 
     missing = []
-    for pkg in direct_packages:
-        if pkg not in pyproject_deps:
+    for pkg, norm in zip(direct_packages, normalized_direct, strict=True):
+        if norm not in pyproject_deps:
             missing.append(pkg)
 
     assert len(missing) == 0, (
