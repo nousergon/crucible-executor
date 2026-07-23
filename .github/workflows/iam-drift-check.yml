@@ -9,10 +9,16 @@ name: IAM Drift Check
 #      (check-no-foreign-writers.py — pure source scan, no AWS auth)
 #
 # Triggers:
-#   - Every PR that touches infrastructure/iam/** (catches code changes
-#     that forgot to apply, or applies that forgot to commit, before merge)
+#   - Every PR that touches infrastructure/iam/** — but the drift-check job
+#     itself SKIPS on pull_request (config#3495: a PR that codifies new IAM
+#     is, by definition, ahead of live AWS pre-apply, so comparing
+#     codified-vs-live here is guaranteed drift on every IAM PR — see
+#     iam-drift-post-merge.yml for the actual reconciliation, which runs
+#     AFTER merge via apply.sh). foreign-writers-check is a pure source
+#     scan unaffected by that circularity and still runs on every PR.
 #   - Daily at 09:30 UTC (catches out-of-band manual IAM edits + new
-#     foreign writers landed in sibling repos)
+#     foreign writers landed in sibling repos — by now any merged PR's
+#     apply.sh has already run, so live AWS should match codified)
 #   - Manual via workflow_dispatch
 #
 # AWS auth: OIDC → github-actions-iam-drift-check role (read-only:
@@ -33,6 +39,7 @@ permissions:
 
 jobs:
   drift-check:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
