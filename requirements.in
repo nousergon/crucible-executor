@@ -6,7 +6,7 @@ pyyaml~=6.0
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
 # pin exists solely to satisfy the security-audit gate.
 setuptools>=83.0.0
-yfinance~=1.5.1
+yfinance~=1.5.2
 numpy<3
 pandas~=2.2
 pyarrow~=25.0
@@ -79,7 +79,7 @@ nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergo
 # FlowDoctor.last_dispatch_reason()/last_dispatched(), the real per-call
 # dispatch outcome that executor/notifier.py checks instead of trusting a
 # non-None notify_event() report id) — no version bump needed on this line.
-krepis>=0.14.0
+krepis>=0.18.0
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
