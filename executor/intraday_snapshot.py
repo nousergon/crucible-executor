@@ -158,7 +158,7 @@ def compute_surveillance_universe(
     symbol once the cap was hit).
 
     :param signals: The ``signals.json`` payload as a dict (or None on read
-        failure). Keys read: ``signals`` (dict of ticker → rec, each with a
+        failure). Keys read: ``universe`` (dict of ticker → rec, each with a
         ``signal`` field) and ``buy_candidates`` (list of ticker strings,
         already actionable by construction — included unconditionally).
     :param order_book_tickers: Tickers the daemon's order book is tracking
@@ -173,12 +173,12 @@ def compute_surveillance_universe(
     universe: set[str] = set()
 
     if signals:
-        signals_map = signals.get("signals")
-        if isinstance(signals_map, dict):
+        signals_list = signals.get("universe")
+        if isinstance(signals_list, list):
             universe.update(
-                t
-                for t, rec in signals_map.items()
-                if isinstance(rec, dict) and rec.get("signal") in _ACTIONABLE_SIGNALS
+                rec.get("ticker")
+                for rec in signals_list
+                if isinstance(rec, dict) and rec.get("signal") in _ACTIONABLE_SIGNALS and rec.get("ticker")
             )
         buy_cands = signals.get("buy_candidates")
         if isinstance(buy_cands, list):

@@ -53,7 +53,7 @@ def _make_ibkr(positions):
 
 def _signals(*tickers):
     return {
-        "signals": {t: {"score": 1.0, "signal": "ENTER"} for t in tickers},
+        "universe": [{"ticker": t, "score": 1.0, "signal": "ENTER"} for t in tickers],
         "buy_candidates": [],
     }
 
