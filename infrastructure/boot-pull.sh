@@ -173,11 +173,34 @@ for repo in "${REPOS[@]}"; do
     # install (pip install -e /home/ec2-user/flow-doctor) has been
     # removed so boot doesn't silently overwrite the lib-provided copy
     # with a local dev branch.
-    if [ -f ".venv/bin/pip" ] && [ -f "requirements.txt" ]; then
-        if .venv/bin/pip install --quiet -r requirements.txt >> "$LOG" 2>&1; then
-            log "OK   $repo — deps updated"
+    #
+    # alpha-engine-data-config#1768 Phase 1: trading no longer runs the heavy
+    # weekday/EOD data phases at all (those moved to ephemeral EC2 spot boxes
+    # in config#1767 Phase 2, nousergon-data#643) — the ONLY thing this box's
+    # alpha-engine-data checkout still needs a working venv for is the
+    # metron-intraday collector (systemd timer, see the sync_systemd_units_from
+    # call below), plus a manual/emergency SSM fallback of morning_enrich /
+    # daily_append if ever needed. nousergon-data's own
+    # infrastructure/data-trading-requirements.txt is the traced minimal
+    # subset for exactly that scope (excludes arcticdb's RAG/backfill/
+    # weekly-feature-engineer-only siblings: voyageai, edgartools, embit,
+    # jsonschema, beautifulsoup4, feedparser — see that file's header for the
+    # full trace) — full requirements.txt (~1.5GB, RAG + backfill + weekly
+    # feature_engineer deps this box never runs) stays reserved for repos
+    # that actually need it. REQUIREMENTS_FILE keyed on $repo rather than a
+    # generic lookup table since alpha-engine-data is (for now) the only repo
+    # in $REPOS with a non-default requirements filename; extend this
+    # if/elif (not a full map) only if a second repo needs the same
+    # treatment.
+    REQUIREMENTS_FILE="requirements.txt"
+    if [ "$repo" = "/home/ec2-user/alpha-engine-data" ] && [ -f "infrastructure/data-trading-requirements.txt" ]; then
+        REQUIREMENTS_FILE="infrastructure/data-trading-requirements.txt"
+    fi
+    if [ -f ".venv/bin/pip" ] && [ -f "$REQUIREMENTS_FILE" ]; then
+        if .venv/bin/pip install --quiet -r "$REQUIREMENTS_FILE" >> "$LOG" 2>&1; then
+            log "OK   $repo — deps updated (from $REQUIREMENTS_FILE)"
         else
-            log "FAIL $repo — pip install failed"
+            log "FAIL $repo — pip install failed (from $REQUIREMENTS_FILE)"
             PULL_FAILURES=$((PULL_FAILURES + 1))
             FAILED_REPOS+=("$repo (pip)")
         fi
@@ -321,23 +344,48 @@ fi
 # (2026-07-13 operator ruling: "queue on merge, apply on next boot" — THIS
 # boot-pull pass is that queue's drain point for the trading box, which is
 # off most of the day and can't reliably receive a merge-time SSM push).
-# $1: source dir holding *.service/*.timer. $2+: one or more glob prefixes
-# for orphan reconciliation (keeps each repo's orphan sweep scoped to units
-# IT owns — alpha-engine's sweep must never disable/remove a nousergon-data
-# unit or vice versa; multiple prefixes let one source dir cover unit
-# families that don't share a common prefix, e.g. nousergon-data ships both
-# "metron-intraday.*" and "systemd-unit-drift-check.*").
+# $1: source dir holding *.service/*.timer. $2: space-separated EXCLUDE list
+# of exact basenames to skip entirely (install AND enable-reconcile) — for
+# a source dir that ships MULTIPLE repos' unit families where one family no
+# longer belongs on THIS box (config#1768 Phase 1: metron-intraday moved off
+# trading onto ae-dashboard, but nousergon-data's infrastructure/systemd/
+# still ships its unit files for ae-dashboard's OWN sync pass to pick up —
+# the install loop below globs *.service/*.timer unconditionally, so
+# without this exclude it would keep re-installing + re-enabling
+# metron-intraday on trading every boot regardless of the orphan-prefix
+# args, since the orphan pass only fires when a unit is ABSENT from
+# $SYSTEMD_SRC, not merely unwanted on this box). Pass "" for no excludes.
+# $3+: one or more glob prefixes for orphan reconciliation (keeps each
+# repo's orphan sweep scoped to units IT owns — alpha-engine's sweep must
+# never disable/remove a nousergon-data unit or vice versa; multiple
+# prefixes let one source dir cover unit families that don't share a common
+# prefix, e.g. nousergon-data ships both "metron-intraday.*" and
+# "systemd-unit-drift-check.*").
 sync_systemd_units_from() {
     local SYSTEMD_SRC="$1"
     shift
+    local EXCLUDE_BASENAMES="$1"
+    shift
     local ORPHAN_GLOB_PREFIXES=("$@")
     [ -d "$SYSTEMD_SRC" ] || return 0
+
+    _sync_is_excluded() {
+        local candidate="$1"
+        local excl
+        for excl in $EXCLUDE_BASENAMES; do
+            [ "$candidate" = "$excl" ] && return 0
+        done
+        return 1
+    }
 
     local CHANGED=false
     for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         [ -f "$unit" ] || continue
         local name target
         name=$(basename "$unit")
+        if _sync_is_excluded "$name"; then
+            continue
+        fi
         target="/etc/systemd/system/$name"
         if [ ! -f "$target" ]; then
             sudo cp "$unit" /etc/systemd/system/
@@ -407,15 +455,19 @@ sync_systemd_units_from() {
         [ -f "$unit" ] || continue
         local tname
         tname=$(basename "$unit")
+        if _sync_is_excluded "$tname"; then
+            continue
+        fi
         if sudo systemctl enable --now "$tname" >> "$LOG" 2>&1; then
             log "OK   systemd: enable reconciled $tname"
         else
             log "WARN systemd: enable reconcile failed: $tname"
         fi
     done
+    unset -f _sync_is_excluded
 }
 
-sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "alpha-engine-"
+sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "" "alpha-engine-"
 
 # nousergon-data's systemd units (metron-intraday.{service,timer} +
 # config#2352's own systemd-unit-drift-check.{service,timer}) — see
@@ -424,7 +476,37 @@ sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "al
 # "alpha-engine-*"-style prefix: glob on the two exact basenames this repo
 # ships instead of a wildcard prefix, so a future unrelated unit hand-placed
 # on this box for debugging is never swept as an "orphan" of this repo.
-sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" "metron-intraday" "systemd-unit-drift-check"
+#
+# config#1768 Phase 1 (2026-07-21): metron-intraday MOVED off trading onto
+# ae-dashboard (config#1768 workstream 2) — ae-dashboard now runs it
+# (intraday price alerts Lambda already covers the duplicate work this was
+# doing here; see that issue). nousergon-data's infrastructure/systemd/ dir
+# is shared by BOTH boxes' sync passes (ae-dashboard's own boot-pull now
+# also points at this same source dir for its metron-intraday pull), so
+# metron-intraday.{service,timer} must stay in the exclude list here
+# PERMANENTLY, not just as a one-time cleanup — without it, the very next
+# nousergon-data merge touching either unit file would re-install +
+# re-enable it right back onto trading via the reconcile loop above
+# (orphan-removal alone can't catch this: the unit is NOT absent from
+# $SYSTEMD_SRC, it's merely unwanted on THIS box).
+sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" "metron-intraday.service metron-intraday.timer" "systemd-unit-drift-check"
+
+# One-time (idempotent) self-heal for boxes that already had metron-intraday
+# installed+enabled from before the exclude above existed: the exclude only
+# stops FUTURE install/enable/re-enable, it does not retroactively touch a
+# unit already present in /etc/systemd/system/, since sync_systemd_units_from
+# only acts on units it manages (installs, updates, or orphan-removes ones
+# absent from $SYSTEMD_SRC — metron-intraday is neither, now that it's
+# excluded rather than removed from the source dir). `|| true` on every step:
+# this must never fail boot-pull itself, and each systemctl call is already
+# a no-op if the unit doesn't exist / isn't loaded. Safe to leave in
+# permanently (config#1768's own closes-when checks `systemctl is-active
+# metron-intraday` is inactive/masked on ae-trading — this is that
+# self-healing path for this environment, which cannot verify it live).
+if systemctl list-unit-files metron-intraday.timer >> "$LOG" 2>&1 || systemctl list-unit-files metron-intraday.service >> "$LOG" 2>&1; then
+    log "NOTE metron-intraday unit(s) found installed on trading — disabling (config#1768: moved to ae-dashboard)"
+    sudo systemctl disable --now metron-intraday.timer metron-intraday.service 2>> "$LOG" || true
+fi
 
 # Config files are now in the alpha-engine-config private repo (pulled above).
 # Each module's config loader searches ~/alpha-engine-config/ first.
