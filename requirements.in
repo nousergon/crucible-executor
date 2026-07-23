@@ -8,7 +8,7 @@ pyyaml~=6.0
 setuptools>=83.0.0
 yfinance~=1.5.1
 numpy<3
-pandas~=2.2
+pandas~=3.0
 pyarrow~=25.0
 # arcticdb: reads atr_14_pct from the universe library at morning planner time.
 # Single source of truth for ATR across the executor — pullback trigger scaling,
@@ -86,7 +86,7 @@ krepis>=0.14.0
 # import time — executor/portfolio_optimizer.py raises a clear ImportError if
 # missing, so the legacy 1/n sizing path runs unaffected on environments that
 # haven't pulled these in yet.
-# cvxpy: the rest of this stack (arcticdb~=6.18, pyarrow~=25.0, pandas~=2.2)
+# cvxpy: the rest of this stack (arcticdb~=6.18, pyarrow~=25.0, pandas~=3.0)
 # already resolves numpy to the 2.x series today — arcticdb 6.18.x and
 # pyarrow 25.0.x both support numpy 2 (verified via PyPI metadata + a real
 # `pip install -r requirements.txt`, numpy resolved to 2.4.6 even under the
