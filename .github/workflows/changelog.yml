@@ -39,7 +39,7 @@ jobs:
           aws-region: us-east-1
 
       - name: Append to system-wide deploy changelog
-        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@765aa682f6c5b7e1e5fc241c7bac1e9e0d6ca326  # main
         with:
           deploy_status: merged
           deploy_workflow: changelog.yml
