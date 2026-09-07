@@ -97,7 +97,17 @@ nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergo
 # FlowDoctor.last_dispatch_reason()/last_dispatched(), the real per-call
 # dispatch outcome that executor/notifier.py checks instead of trusting a
 # non-None notify_event() report id) — no version bump needed on this line.
-krepis>=0.59.39
+# >=0.59.53 floor (alpha-engine-config-I10141, krepis-PR206): trading_calendar
+# had holiday data only from 2025 and guarded only the future edge of its
+# table, so every pre-2025 weekday answered True as a trading day (2024
+# Labor Day/July 4/Thanksgiving/Christmas all read as trading days); a
+# crucible data.heal backfill failed on it in production 2026-09-07.
+# NYSE_CALENDAR_COVERS_FROM = 2016-01-01 now, with 2016-2024 holidays/early
+# closes generated from exchange_calendars, and any date before 2016-01-01
+# now raises TradingCalendarPrecedesCoverageError instead of silently
+# answering wrong. krepis-PR207 (litellm INFO log suppression) and
+# krepis-PR208 (PyPI propagation budget) are later releases in this line.
+krepis>=0.59.53
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
