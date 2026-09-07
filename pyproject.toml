@@ -19,7 +19,7 @@ dependencies = [
     "requests>=2.34.2",
     "websocket-client>=1.9.0",
     "nousergon-lib[flow-doctor,contracts]==0.124.94",
-    "krepis>=0.59.39",
+    "krepis>=0.59.53",
     "cvxpy>=1.9.2,<1.10",
     "scikit-learn>=1.9.0,<1.10",
 ]
