@@ -37,7 +37,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/main.py
-    line: 1151
+    line: 1542
     reason: >-
       Order-book Telegram notification transport failure. No recording
       surface -- Telegram-transport carve-out; the order book is already
@@ -46,7 +46,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/main.py
-    line: 1262
+    line: 1653
     reason: >-
       Upstream-failure Telegram notification transport failure. No
       recording surface -- secondary to the RuntimeError raised
@@ -55,7 +55,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/main.py
-    line: 1306
+    line: 1697
     reason: >-
       ArcticDB-freshness Telegram notification transport failure. No
       recording surface -- secondary to the RuntimeError raised

@@ -821,64 +821,283 @@ def _write_order_book_summary(
             ContentType="application/json",
         )
         logger.info("Order book summary written to s3://%s/%s", signals_bucket, key)
+        _emit_writer_failure_metric("order_book_summary_write_failed", 0)
     except Exception as e:
+        # SWALLOW, classified (alpha-engine-config-I10190 deliverable 4). The
+        # fleet's fail-loud rule requires any deviation to name three things:
+        #
+        # (a) FAILURE MODE SWALLOWED — `order_books/{date}/summary.json` is not
+        #     written for this session.
+        # (b) WHY THE PRIMARY DELIVERABLE SURVIVES — this is a DERIVED,
+        #     public-safe projection of `ob` for the dashboard. Nothing on the
+        #     trading path reads it: not the daemon (which reads the stop
+        #     records `_write_stops_and_finalize` produces), not the EOD
+        #     reconcile, not the next session's planner. Every field in it is a
+        #     re-serialization of state already persisted elsewhere in this run.
+        #     Losing it costs a dashboard tile, not a risk control — which is
+        #     precisely what makes it DIFFERENT from the stop-record write at
+        #     §6, whose swallow I10190 was filed against and which now raises.
+        # (c) RECORDING SURFACE — `AlphaEngine/Executor/
+        #     order_book_summary_write_failed`, emitted in both polarities so
+        #     absence of the failure is distinguishable from absence of the
+        #     emitter. Deliberately NOT alarmed: a dashboard tile going missing
+        #     does not warrant a page, and an alarm nobody would act on is the
+        #     chronic false positive that teaches an operator to ignore the
+        #     channel. It is rendered and countable, which is the surface this
+        #     failure's severity earns.
+        _emit_writer_failure_metric("order_book_summary_write_failed", 1)
         logger.warning("Failed to write order book summary (non-fatal): %s", e)
 
 
-# Cross-sectional stdev of (level-neutralized) predicted_alpha below which the
-# signal the optimizer trades on is treated as genuinely collapsed. Healthy
-# batches run ~0.01 on the 21-day log-alpha scale; a true collapse drives this
-# toward 0. The floor is ~10x below a healthy day, so only a real degeneracy
-# trips it. Below ``_HOLD_BOOK_MIN_BATCH`` finite alphas the dispersion call is
-# too noisy to make — the caller falls back to the raw gate verdict.
-HOLD_BOOK_ALPHA_STDEV_FLOOR = 0.001
+class StopRecordWriteError(RuntimeError):
+    """The daemon's stop records were not produced for this session.
+
+    ``_write_stops_and_finalize`` writes the stop records
+    ``executor.daemon`` reads, and their ``stop_kind`` decides what the daemon
+    does with every open position — ``catastrophic_gap_only`` under the
+    optimizer, ``alpha`` (the full ``IntradayExitManager``) otherwise. A run
+    that places or retains positions and does not produce them has left a live
+    book with no per-name exit authority.
+    """
+
+    def __init__(self, run_date: str, cause: BaseException):
+        self.run_date = run_date
+        super().__init__(
+            f"Stop records were NOT written for {run_date}: {cause!r}. The "
+            f"daemon has no stop records for this session, so every open "
+            f"position is running without its per-name exit authority "
+            f"(trailing stop / profit-take / collapse under the alpha "
+            f"stop_kind, catastrophic gap stop under the optimizer). Positions "
+            f"already placed this session are LIVE. OPERATOR: re-run the "
+            f"planner for this date once the underlying write failure is "
+            f"resolved, or flatten manually. Failure recorded at "
+            f"executor/stop_write_failures/{run_date}.json and on the "
+            f"AlphaEngine/Executor gauge stop_records_write_failed."
+        )
+
+
+def _emit_writer_failure_metric(metric_name: str, value: float) -> None:
+    """Emit one ``AlphaEngine/Executor`` writer-failure gauge, both polarities.
+
+    Best-effort and deliberately silent on its own failure beyond a WARNING:
+    this runs on the exception path of the thing it is reporting, and an
+    observability error must never replace the real one.
+
+    A DIRECT gauge rather than a CloudWatch Logs metric filter, on purpose. A
+    metric filter would depend on ``/var/log/executor.log`` on the trading box
+    reaching CloudWatch Logs, and this detector's whole job is to be true on the
+    day something on that box is broken — a detector resting on an unverified
+    shipping path is the "ran and saw nothing" class
+    (``alpha-engine-config-I10184``). ``put_metric_data`` is already this
+    repo's proven surface (``signal_reader._emit_admission_refused_metric``).
+    """
+    try:
+        import boto3 as _b3
+
+        _b3.client("cloudwatch").put_metric_data(
+            Namespace="AlphaEngine/Executor",
+            MetricData=[{
+                "MetricName": metric_name, "Value": float(value), "Unit": "Count",
+            }],
+        )
+    except Exception as exc:  # noqa: BLE001 — must never mask the real failure
+        logger.warning(
+            "CloudWatch %s metric emission failed: %s", metric_name, exc,
+        )
+
+
+def _record_stop_write_failure(
+    bucket: str | None, run_date: str, cause: BaseException,
+) -> None:
+    """Durable record that this run finished WITHOUT stop records.
+
+    The metric pages; this artifact is what an operator or a later sweep reads
+    to find out which date, and why. Both are best-effort and neither may raise
+    — the caller re-raises the original failure immediately after.
+    """
+    _emit_writer_failure_metric("stop_records_write_failed", 1)
+    if not bucket:
+        return
+    try:
+        import boto3 as _b3
+
+        _b3.client("s3").put_object(
+            Bucket=bucket,
+            Key=f"executor/stop_write_failures/{run_date}.json",
+            Body=json.dumps({
+                "run_date": run_date,
+                "stop_records_written": False,
+                "error_type": type(cause).__name__,
+                "error": str(cause),
+                "written_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }, indent=2).encode(),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001 — must never mask the real failure
+        logger.warning("stop-write failure artifact write failed: %s", exc)
+
+
+def write_stops_and_finalize_guarded(*args, **kwargs):
+    """``_write_stops_and_finalize``, made LOUD. alpha-engine-config-I10190.
+
+    Until 2026-09-08 the §6 call site was::
+
+        try:
+            _write_stops_and_finalize(...)
+        except Exception as e:
+            logger.warning("Failed to write order book: %s", e)
+
+    — a bare ``except`` on the producer of the daemon's stop records, at
+    WARNING, reaching no durable surface. Measured 2026-09-08:
+    ``grep -rn "Failed to write order book"`` across the fleet found the two
+    call sites in this file and NOTHING else — no metric filter, no alarm, no
+    alert-transport entry.
+
+    **Why RAISE, and not a page-and-continue.** The default under the fleet's
+    fail-loud rule is to raise, and no exception applies here:
+
+    * Swallowing does not save the book. If this write fails, the daemon has no
+      stop records either way — continuing does not restore the protection, it
+      only hides that the protection is gone.
+    * Raising routes ``RunMorningPlanner`` to the preopen pipeline's
+      ``HandleFailure``, which is a surface an operator already watches, within
+      minutes. A WARNING in ``/var/log/executor.log`` is not one.
+    * What is skipped by raising is §6b onward — the order-book rationale
+      artifact, the data manifest, the shadow-optimizer log. Every one of those
+      is already documented in this file as non-blocking audit output. No risk
+      control is downstream of this point.
+    * The counter-argument — that aborting after entries are placed leaves
+      positions with no book — is real but argues for a LOUDER failure, not a
+      quieter one: those positions are exactly the ones a human must be told
+      about, and they are equally unstopped whether or not the process
+      continues.
+
+    **This is the hold-book safeguard's whole safety argument.**
+    ``_should_hold_book`` suppresses the optimizer rebalance and retains the
+    book, and the reason that is acceptable is stated in this file: stops are
+    still written, and the daemon's hard-risk overrides remain active. §6 sits
+    OUTSIDE the §5b hold branch, so it runs on a held day — asserted by
+    ``tests/test_stop_write_is_loud.py``. On exactly the day the system has
+    decided it cannot trust its own signal, the stop records are the only
+    remaining protection; their failure may not be a WARNING nobody receives.
+
+    Emits ``stop_records_write_failed`` in BOTH polarities so the alarm has a
+    continuous baseline and an absent emitter is distinguishable from a healthy
+    run.
+    """
+    bucket = kwargs.get("signals_bucket")
+    run_date = kwargs.get("run_date")
+    if run_date is None and len(args) > 6:
+        run_date = args[6]
+    if bucket is None and len(args) > 8:
+        bucket = args[8]
+    try:
+        result = _write_stops_and_finalize(*args, **kwargs)
+    except Exception as exc:
+        _record_stop_write_failure(bucket, str(run_date), exc)
+        raise StopRecordWriteError(str(run_date), exc) from exc
+    _emit_writer_failure_metric("stop_records_write_failed", 0)
+    return result
+
+
+# ── Hold-book floor ownership (alpha-engine-config-I10179 / I10184) ─────────
+#
+# Until 2026-09-08 this module carried ``HOLD_BOOK_ALPHA_STDEV_FLOOR = 0.001``:
+# a hand-set absolute floor on the SAME quantity the predictor's
+# ``output_distribution_gate`` already declares a floor on (absolute 0.015,
+# "derived from the measured healthy population", alpha-engine-config-I9267,
+# plus a relative floor at 50% of the trailing 10-session median). Two owners,
+# one invariant, 15x apart, neither aware of the other. On 2026-09-08 the
+# predictor called ``alpha_stdev`` 0.005819 collapsed and this module called it
+# healthy; the optimizer rebalanced on a batch the producer had declared dead
+# (``executor/hold_book_flags/2026-09-08.json`` -> ``"held": false``).
+#
+# The fix is ownership, not a new number: the predictor owns every threshold on
+# ``alpha_stdev`` and the executor CONSUMES its verdict. What the executor still
+# owns is the config#1176 discrimination — WHICH gate failure justifies holding
+# the book — because that is a trading decision, not a distributional one.
+#
+# Measured, over the 47 served sessions carrying ``metrics.alpha_stdev``
+# (2026-06-30..2026-09-08, ``s3://alpha-engine-research/predictor/predictions/``):
+#
+#   * the predictor's ABSOLUTE floor 0.015 sits BELOW 14 of 47 served sessions
+#     — 2026-06-30..07-02, 07-06..07-10, 08-24..08-28, 09-08 — and 13 of those
+#     14 ran a champion nobody has ever called collapsed. Consuming the absolute
+#     leg as a hold trigger would have held the book on 30% of history, so it is
+#     deliberately NOT a hold trigger here. That floor was derived from a
+#     TRAINING-panel population; the served population does not support it.
+#   * the RELATIVE leg (today < 50% of the trailing 10-session median) fires on
+#     6 of 47: 2026-08-24..08-28 and 2026-09-08. All six are champion-collapse
+#     sessions — the first five served ``v3.0-meta-2026-08-21-7d3d1cce``, the
+#     candidate ``training/served_slice_dispersion.py``'s behavioural veto was
+#     written to refuse and which was rolled back to ``119e069b`` on 08-31; the
+#     sixth is the first served batch of ``v3.0-meta-2026-09-04-cc3271ea``.
+#     ZERO healthy sessions. That is the leg the hold reads.
+#   * no ABSOLUTE floor on served ``alpha_stdev`` can separate the two states at
+#     all: the lowest healthy session is 0.006575 (2026-07-06..10) against the
+#     collapse at 0.005819 — 13% apart. Any absolute number, including the
+#     0.001 removed here, is un-derivable from this population. The separating
+#     statistic is relative, and it already exists upstream.
+#
+# So no constant on ``alpha_stdev`` is reintroduced. The only executor-side
+# degeneracy test that remains is SCALE-FREE (modal fraction of the served
+# alphas), used solely as the fallback for a gate artifact that carries no
+# structured dispersion legs — and it mirrors the predictor's own
+# ``max_alpha_modal_fraction`` default rather than inventing a second threshold.
+
+#: Modal fraction of the served ``predicted_alpha`` at or above which the
+#: tradable signal is treated as literally constant (the 2026-04-28 class).
+#: Scale-free by construction, so it is NOT a second floor on a magnitude the
+#: predictor already owns. Mirrors
+#: ``crucible-predictor/model/output_distribution_gate.py::
+#: validate_live_batch_distribution(max_alpha_modal_fraction=0.90)``.
+HOLD_BOOK_ALPHA_MODAL_FRACTION = 0.90
 _HOLD_BOOK_MIN_BATCH = 5
 
+#: Gate failures that are an unambiguous breakage of the TRADABLE signal. The
+#: predictor has already decided; the executor holds without re-measuring.
+_TRADABLE_SIGNAL_FAILURES = frozenset({
+    "alpha_nonfinite_rate",   # predicted_alpha is non-finite
+    "alpha_collapse",         # predicted_alpha is essentially one value
+})
 
-def _should_hold_book(
-    gate: dict | None,
-    predictions_by_ticker: dict,
-    *,
-    alpha_stdev_floor: float = HOLD_BOOK_ALPHA_STDEV_FLOOR,
-    min_batch: int = _HOLD_BOOK_MIN_BATCH,
-) -> tuple[bool, dict]:
-    """Decide whether the §5b hold-book safeguard should suppress the optimizer
-    rebalance, returning ``(hold, diagnostics)``.
+#: Gate failures on ``alpha_stdev`` dispersion. Resolved against the gate's own
+#: structured legs (``metrics.relative_dispersion``) rather than re-thresholded:
+#: the RELATIVE leg holds, the ABSOLUTE leg alone does not (see the measurement
+#: above — 13 healthy served sessions sit below 0.015).
+_DISPERSION_FAILURES = frozenset({
+    "alpha_stdev_relative_compression",
+    "alpha_stdev_absolute_floor",
+})
 
-    The predictor's ``output_distribution_gate`` judges the CALIBRATED ``p_up``
-    distribution (isotonic). On a low-dispersion-but-healthy day the isotonic
-    calibrator maps the whole cross-section onto a single staircase step, so
-    ``p_up`` collapses to a few unique values and the gate flags
-    ``passed=False`` — even though the model is fine. The optimizer does NOT
-    trade on ``p_up``; it trades on cross-sectional, level-neutralized
-    ``predicted_alpha``. Halting the book on a ``p_up`` calibration artifact is
-    a false halt (config#1176, observed 2026-06-29: GE's 8% target dropped on a
-    26-name batch whose ``predicted_alpha`` was cleanly differentiated).
+#: Gate failures that describe the shape of the CALIBRATED ``p_up`` (or a
+#: p_up-derived quantity), which the optimizer does not trade on. config#1176:
+#: these must NEVER halt the book on their own — that is the 2026-06-22 /
+#: 2026-06-29 false halt, where the isotonic calibrator collapsed ``p_up`` onto
+#: one staircase step on a day whose ``predicted_alpha`` was cleanly
+#: differentiated and GE's 8% target was dropped on a healthy 26-name batch.
+_P_UP_SHAPE_FAILURES = frozenset({
+    "unique_p_up",
+    "modal_fraction",
+    "stdev",
+    "saturation_rate",
+    "direction_skew",
+    "confidence_semantics",
+    "alpha_sign_skew",
+    "insufficient_regime_coverage",
+    "input_mismatch",
+})
 
-    So we hold ONLY when the gate flagged AND the tradable ``predicted_alpha``
-    signal is itself collapsed. Degeneracy is measured by cross-sectional stdev:
-    a level shift is already removed upstream by predictor-side
-    level-neutralization, so a genuine collapse shows up as near-zero
-    dispersion. This strictly *reduces* false holds — it never adds a hold the
-    old ``gate.passed is False`` path wouldn't already have taken.
 
-    Fail-safe: if the gate is absent (``None``) we proceed (the existing
-    fail-open posture — a missing gate never halts). If the gate flagged but
-    fewer than ``min_batch`` finite alphas are available to judge dispersion, we
-    fall back to the raw gate verdict and hold (conservative — can't confirm the
-    signal is healthy).
+def _served_alpha_diagnostics(predictions_by_ticker: dict) -> tuple[list[float], dict]:
+    """Served ``predicted_alpha`` values plus their scale-free shape stats.
+
+    ``alpha_stdev`` is reported for the operator surface (``order_book_rationale``
+    reads it) but is deliberately NOT compared against any executor-side
+    threshold — see the ownership note above.
     """
     import math
     import statistics
-
-    gate_flagged = gate is not None and gate.get("passed") is False
-    diag: dict = {
-        "gate_flagged": gate_flagged,
-        "failed_check": (gate or {}).get("failed_check"),
-    }
-    if not gate_flagged:
-        diag["decision"] = "proceed_gate_ok"
-        return False, diag
 
     alphas: list[float] = []
     for p in (predictions_by_ticker or {}).values():
@@ -890,26 +1109,192 @@ def _should_hold_book(
         if isinstance(a, (int, float)) and not isinstance(a, bool) and math.isfinite(a):
             alphas.append(float(a))
 
-    diag["n_alpha"] = len(alphas)
+    diag: dict = {"n_alpha": len(alphas)}
+    if alphas:
+        diag["alpha_stdev"] = round(statistics.pstdev(alphas), 6)
+        rounded = [round(a, 9) for a in alphas]
+        modal = max(rounded.count(v) for v in set(rounded)) / len(rounded)
+        diag["alpha_modal_fraction"] = round(modal, 4)
+        diag["n_unique_alpha"] = len(set(rounded))
+    return alphas, diag
+
+
+def _should_hold_book(
+    gate: dict | None,
+    predictions_by_ticker: dict,
+    *,
+    modal_fraction_ceiling: float = HOLD_BOOK_ALPHA_MODAL_FRACTION,
+    min_batch: int = _HOLD_BOOK_MIN_BATCH,
+) -> tuple[bool, dict]:
+    """Decide whether the §5b hold-book safeguard should suppress the optimizer
+    rebalance, returning ``(hold, diagnostics)``.
+
+    The predictor's ``output_distribution_gate`` owns every threshold on the
+    distribution of ``predicted_alpha``. This function owns only the question
+    config#1176 posed: given that the gate flagged, does THIS failure justify
+    holding the book the optimizer would otherwise rotate?
+
+    * A failure of the tradable signal itself (``alpha_collapse``,
+      ``alpha_nonfinite_rate``) -> HOLD. No second measurement.
+    * A dispersion failure -> read the gate's own legs. The RELATIVE leg
+      (``metrics.relative_dispersion.alpha_stdev.passed is False``: today below
+      50% of the trailing 10-session median) is a collapse against the served
+      population and HOLDS. The ABSOLUTE leg alone does NOT hold — 13 of 47
+      healthy served sessions sit below its 0.015, which was derived from a
+      training panel, not from what is served.
+    * A ``p_up``-shape failure -> PROCEED (config#1176). The optimizer does not
+      trade ``p_up``; halting on an isotonic staircase artifact is the 6/22 and
+      6/29 false halt. The scale-free degeneracy test below still runs, so a
+      literally-constant alpha batch is caught, but no magnitude threshold is
+      applied.
+    * An unrecognised failure, or a gate carrying no structured legs -> fall
+      back to the scale-free degeneracy test, which needs no floor.
+
+    Fail-safe: a missing (``None``) gate proceeds — the existing fail-open
+    posture. A flagged gate with fewer than ``min_batch`` finite alphas cannot
+    be judged, so the raw gate verdict is trusted and the book is held.
+    """
+    gate_flagged = gate is not None and gate.get("passed") is False
+    failed_check = (gate or {}).get("failed_check")
+    diag: dict = {"gate_flagged": gate_flagged, "failed_check": failed_check}
+    if not gate_flagged:
+        diag["decision"] = "proceed_gate_ok"
+        return False, diag
+
+    alphas, alpha_diag = _served_alpha_diagnostics(predictions_by_ticker)
+    diag.update(alpha_diag)
+
+    metrics = (gate or {}).get("metrics") or {}
+    rel = ((metrics.get("relative_dispersion") or {}).get("alpha_stdev") or {})
+    rel_passed = rel.get("passed")
+    if isinstance(rel_passed, bool):
+        diag["relative_dispersion_passed"] = rel_passed
+        diag["relative_dispersion_ratio"] = rel.get("ratio")
+        diag["relative_dispersion_history_median"] = rel.get("history_median")
+    # Observe-only corroborator (alpha-engine-config-I10184 deliverable 4): a
+    # rising streak alongside a dispersion failure is a dead champion, a streak
+    # of 1 is noise, and it was 0 three times in early September under a healthy
+    # champion — so it is recorded and NEVER drives this decision on its own.
+    nhc = metrics.get("n_high_confidence") or {}
+    if isinstance(nhc.get("zero_streak"), (int, float)):
+        diag["n_high_confidence_zero_streak"] = int(nhc["zero_streak"])
+    if isinstance(metrics.get("champion_version_id"), str):
+        diag["champion_version_id"] = metrics["champion_version_id"]
+    elif isinstance((metrics.get("relative_dispersion") or {}).get(
+            "today_champion_version_id"), str):
+        diag["champion_version_id"] = (
+            metrics["relative_dispersion"]["today_champion_version_id"]
+        )
+
+    if failed_check in _TRADABLE_SIGNAL_FAILURES:
+        diag["decision"] = "hold_tradable_signal_failed"
+        return True, diag
+
+    if failed_check in _DISPERSION_FAILURES:
+        if rel_passed is False:
+            diag["decision"] = "hold_relative_dispersion_collapse"
+            return True, diag
+        if rel_passed is True:
+            # Only the absolute leg failed. Not a hold — see the ownership note.
+            diag["decision"] = "proceed_absolute_floor_only"
+            return False, diag
+        # Legs absent (older artifact schema): fall through to the scale-free
+        # test rather than trusting an unresolvable verdict.
+
     if len(alphas) < min_batch:
-        # Can't judge the tradable signal — trust the gate verdict and hold.
         diag["decision"] = "hold_signal_undeterminable"
         return True, diag
 
-    stdev = statistics.pstdev(alphas)
-    degenerate = stdev < alpha_stdev_floor
-    diag["alpha_stdev"] = round(stdev, 6)
-    diag["alpha_stdev_floor"] = alpha_stdev_floor
+    degenerate = alpha_diag.get("alpha_modal_fraction", 0.0) >= modal_fraction_ceiling
+    diag["alpha_modal_fraction_ceiling"] = modal_fraction_ceiling
     diag["signal_degenerate"] = degenerate
+    if degenerate:
+        diag["decision"] = "hold_signal_degenerate"
+        return True, diag
+
     diag["decision"] = (
-        "hold_signal_degenerate" if degenerate else "proceed_signal_healthy"
+        "proceed_p_up_artifact_only" if failed_check in _P_UP_SHAPE_FAILURES
+        else "proceed_signal_healthy"
     )
-    return degenerate, diag
+    return False, diag
+
+
+def emit_distribution_gate_metrics(gate: dict | None, hold_diag: dict | None) -> None:
+    """Publish the predictor gate verdict this planner run acted on.
+
+    alpha-engine-config-I10184 deliverable 2. The verdict is already computed
+    and already written to ``executor/hold_book_flags/`` — until now it reached
+    no alarmable surface, so on 2026-09-08 the gate declared the batch collapsed
+    and nothing said so anywhere an operator or an alarm could see.
+
+    Three gauges into ``AlphaEngine/Executor``, emitted on EVERY planner run
+    (including the healthy 0) so the alarm baseline is continuous:
+
+    * ``predictor_dispersion_gate_failed`` — 1 when the gate's ``alpha_stdev``
+      dispersion verdict failed. This is the PAGING metric: it is the leg that
+      now decides the hold and it fired on 6 of 47 served sessions, every one a
+      champion collapse.
+    * ``predictor_output_gate_failed`` — 1 whenever the gate flagged for ANY
+      reason, including the ``p_up`` staircase artifact config#1176 refuses to
+      halt on. Rendered, deliberately not paged: it flagged on 2026-06-29 on a
+      healthy book, so paging it would be a chronic false positive.
+    * ``predictor_n_high_confidence_zero_streak`` — the consecutive-sessions
+      count of ``n_high_confidence == 0`` (deliverable 4). Observe-only: it was
+      0 three times in early September under a healthy champion, so the streak
+      alone must never page; it is what distinguishes "one quiet day" from a
+      dead champion once the dispersion metric above has fired.
+
+    Best-effort — a CloudWatch failure WARNs and never blocks the planner.
+    """
+    gate = gate or {}
+    diag = hold_diag or {}
+    flagged = gate.get("passed") is False
+    rel = (((gate.get("metrics") or {}).get("relative_dispersion") or {})
+           .get("alpha_stdev") or {})
+    dispersion_failed = bool(
+        flagged
+        and (rel.get("passed") is False
+             or diag.get("decision") == "hold_relative_dispersion_collapse")
+    )
+    streak = ((gate.get("metrics") or {}).get("n_high_confidence") or {}).get(
+        "zero_streak"
+    )
+    data = [
+        {
+            "MetricName": "predictor_dispersion_gate_failed",
+            "Value": 1.0 if dispersion_failed else 0.0,
+            "Unit": "Count",
+        },
+        {
+            "MetricName": "predictor_output_gate_failed",
+            "Value": 1.0 if flagged else 0.0,
+            "Unit": "Count",
+        },
+    ]
+    if isinstance(streak, (int, float)) and not isinstance(streak, bool):
+        data.append({
+            "MetricName": "predictor_n_high_confidence_zero_streak",
+            "Value": float(streak),
+            "Unit": "Count",
+        })
+    try:
+        import boto3 as _b3
+
+        _b3.client("cloudwatch").put_metric_data(
+            Namespace="AlphaEngine/Executor", MetricData=data,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability never blocks trading
+        logger.warning(
+            "CloudWatch distribution-gate metric emission failed: %s. Not "
+            "blocking the planner — the hold decision is already made and the "
+            "hold_book_flags artifact still records it.",
+            exc,
+        )
 
 
 def _write_hold_book_flag(
     bucket: str, run_date: str, predictions_date: str | None, gate: dict | None,
-    *, held: bool,
+    *, held: bool, diag: dict | None = None,
 ) -> None:
     """Persist a dashboard-readable record of the hold-book safeguard's verdict
     THIS run (predictor distribution gate flagged "strongly biased" AND the
@@ -935,6 +1320,12 @@ def _write_hold_book_flag(
             "run_date": run_date,
             "predictions_date": predictions_date,
             "held": held,
+            # The decision path, not just its outcome: which gate leg was read,
+            # and the observe-only n_high_confidence zero-streak that
+            # distinguishes one quiet session from a dead champion
+            # (alpha-engine-config-I10184).
+            "hold_decision": (diag or {}).get("decision"),
+            "hold_diagnostics": diag or {},
             "reason": gate.get("reason"),
             "failed_check": gate.get("failed_check"),
             "gate_metrics": gate.get("metrics"),
@@ -2186,13 +2577,17 @@ def run(
             # see ``_should_hold_book``. Fail-open: a missing/None gate proceeds.
             _gate = read_distribution_gate(signals_bucket)
             _hold_book, _hold_diag = _should_hold_book(_gate, predictions_by_ticker)
+            # Publish the verdict this run acted on (alpha-engine-config-I10184
+            # deliverable 2). Before this, the gate verdict reached only an S3
+            # artifact nobody alarms on — 2026-09-08 flagged and paged nothing.
+            emit_distribution_gate_metrics(_gate, _hold_diag)
             # Written unconditionally (held True or False) every run so the
             # console banner reflects THIS cycle, not the last time the
             # safeguard ever fired — see _write_hold_book_flag docstring.
             try:
                 _write_hold_book_flag(
                     signals_bucket, run_date, predictions_date, _gate,
-                    held=_hold_book,
+                    held=_hold_book, diag=_hold_diag,
                 )
             except Exception as _hb_err:
                 logger.warning(
@@ -2264,10 +2659,11 @@ def run(
 
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
-            try:
-                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer, signals_raw=signals_raw, config=config)
-            except Exception as e:
-                logger.warning("Failed to write order book: %s", e)
+            # RAISES on failure (alpha-engine-config-I10190). This produces the
+            # daemon's stop records; a run that cannot write them has left a
+            # live book with no per-name exit authority, and that may not be a
+            # WARNING. See write_stops_and_finalize_guarded for the rationale.
+            write_stops_and_finalize_guarded(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer, signals_raw=signals_raw, config=config)
 
         # ── 6b. Per-ticker order-book rationale artifact ────────────────────────
         # Audit-stable record answering "why is ticker X in state S
