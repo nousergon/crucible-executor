@@ -332,6 +332,11 @@ class IBKRClient:
             try:
                 self.ib.cancelMktData(contract)
             except Exception as e:
+                # (a) market-data unsubscribe failed for this contract.
+                # (c) not recorded elsewhere — deliberate carve-out
+                # (alpha-engine-config-I10031): connection teardown must
+                # never block the caller; worst case is one extra
+                # streaming line until IB's own idle timeout.
                 logger.debug("cancelMktData failed for %s (non-fatal): %s", contract, e)
 
         if price is None:

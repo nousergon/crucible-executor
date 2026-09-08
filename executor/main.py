@@ -235,7 +235,13 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
             try:
                 _EXECUTOR_PARAMS_CACHE_PATH.write_text(json.dumps(safe, indent=2))
             except Exception:
-                logger.debug("Failed to write executor params cache", exc_info=True)
+                # (a) local params-cache write failed — the in-memory
+                # _executor_params_cache above already has this cycle's
+                # value, so nothing downstream is affected until restart.
+                # (c) recorded at WARNING (visible at the INFO root level,
+                # unlike the DEBUG this replaces) — the app log stream /
+                # CloudWatch is the recording surface (alpha-engine-config-I10031).
+                logger.warning("Failed to write executor params cache", exc_info=True)
         return _executor_params_cache
     except Exception as e:
         logger.warning("Could not read executor params from S3: %s", e)
@@ -525,6 +531,11 @@ def _read_signals(
                     f"Research may not have run this week."
                 )
         except Exception:
+            # (a) Telegram transport failed for the stale-signals notice.
+            # (c) not recorded elsewhere — deliberate carve-out
+            # (alpha-engine-config-I10031): a failed notification must
+            # never abort a trading run, and the underlying stale-signals
+            # condition is already visible via the caller's own logging.
             logger.debug("Stale signals Telegram notification failed", exc_info=True)
 
     # Load GBM predictions for rationale capture
@@ -1138,6 +1149,10 @@ def _write_stops_and_finalize(
             f"{blocked_lines}"
         )
     except Exception:
+        # (a) Telegram transport failed for the order-book summary.
+        # (c) not recorded elsewhere — deliberate carve-out
+        # (alpha-engine-config-I10031): a failed notification must never
+        # abort a trading run; the order book itself is already persisted.
         logger.debug("Order book Telegram notification failed", exc_info=True)
 
 
@@ -1245,6 +1260,11 @@ def run(
                     + "\n\nExecutor aborted — no order book written."
                 )
             except Exception:
+                # (a) Telegram transport failed for the upstream-failure
+                # alert. (c) not recorded elsewhere — deliberate carve-out
+                # (alpha-engine-config-I10031): the notification is
+                # secondary to the RuntimeError raised immediately below,
+                # which is the actual, visible failure signal.
                 logger.debug("Upstream failure Telegram notification failed", exc_info=True)
             raise RuntimeError(msg)
 
@@ -1284,6 +1304,10 @@ def run(
                     f"{_freshness_err}\n\nExecutor aborted — no order book written."
                 )
             except Exception:
+                # (a) Telegram transport failed for the ArcticDB-freshness
+                # alert. (c) not recorded elsewhere — deliberate carve-out
+                # (alpha-engine-config-I10031): the notification is
+                # secondary to the RuntimeError raised immediately below.
                 logger.debug("ArcticDB freshness Telegram notification failed", exc_info=True)
             raise RuntimeError(msg) from _freshness_err
 
@@ -1525,10 +1549,14 @@ def run(
                 ev.setdefault("market_regime", market_regime)
                 ev.setdefault("signal_date", signals_date_for_events)
                 ev.setdefault("prediction_date", predictions_date)
-                try:
-                    log_risk_event(conn, ev)
-                except Exception as e:
-                    logger.debug("risk_event log failed (drawdown): %s", e)
+                # (alpha-engine-config-I10031) RAISE: a risk_events write
+                # failure here is a contract violation on the trading
+                # path — the drawdown-tier audit trail must not silently
+                # go missing. Propagates to the outer except at the
+                # bottom of this function, which logs at ERROR, pages
+                # flow-doctor (severity=critical) and records a
+                # not-produced health status before re-raising.
+                log_risk_event(conn, ev)
 
         # ── 2c'. Expectancy-gated de-risk stance (config-I2820 / PR2071) ───────
         # Standing operator de-risk rule (halt-or-derisk-live-deployment,
@@ -1575,10 +1603,12 @@ def run(
                 "prediction_date": predictions_date,
                 "context": derisk_gate.to_log_dict(),
             }
-            try:
-                log_risk_event(conn, derisk_event)
-            except Exception as e:
-                logger.debug("risk_event log failed (derisk gate): %s", e)
+            # (alpha-engine-config-I10031) RAISE: same audit-trail
+            # contract as the drawdown risk_event write above — a swallow
+            # here is a contract violation on the trading path.
+            # Propagates to the outer except, which pages flow-doctor and
+            # records a not-produced health status before re-raising.
+            log_risk_event(conn, derisk_event)
         if not simulate and not dry_run and signals_bucket:
             try:
                 _write_derisk_gate_artifact(derisk_gate, signals_bucket, run_date)
@@ -1904,7 +1934,14 @@ def run(
                             if days_until >= 0:
                                 earnings_by_ticker[t] = days_until
                 except Exception:
-                    logger.debug("Failed to load earnings data", exc_info=True)
+                    # (a) earnings-calendar load failed for this ticker —
+                    # earnings-proximity gating silently does not apply.
+                    # (c) recorded at ERROR (visible at the INFO root
+                    # level) — the app log stream is the recording
+                    # surface. Overlaps alpha-engine-config-I7347
+                    # deliverable 3; fixed here, closed there by
+                    # reference (alpha-engine-config-I10031).
+                    logger.error("Failed to load earnings data", exc_info=True)
 
         # ── 2g. Drawdown forced exits ─────────────────────────────────────────
         if strategy_config.get("drawdown_forced_exit_enabled", True) and dd_multiplier < 1.0:
@@ -2017,10 +2054,12 @@ def run(
         # Log blocked entries to shadow book for evaluation
         if conn and blocked_entries:
             for be in blocked_entries:
-                try:
-                    log_shadow_book_block(conn, be)
-                except Exception as e:
-                    logger.debug("Shadow book log failed for %s: %s", be.get("ticker"), e)
+                # (alpha-engine-config-I10031) RAISE: a shadow-book write
+                # failure silently drops the S-slot challenger's evidence
+                # (its `n` goes quietly wrong). Propagates to the outer
+                # except, which pages flow-doctor and records a
+                # not-produced health status before re-raising.
+                log_shadow_book_block(conn, be)
 
         # Persist structured veto/override events (Phase 2 transparency-
         # inventory — *risk decisions* row). Sibling of the shadow-book
@@ -2028,15 +2067,14 @@ def run(
         # in shadow_book; rule + value + threshold lands in risk_events.
         if conn and plan_risk_events:
             for ev in plan_risk_events:
-                try:
-                    log_risk_event(conn, ev)
-                except Exception as e:
-                    logger.debug(
-                        "risk_event log failed (%s/%s): %s",
-                        ev.get("event_type"),
-                        ev.get("rule"),
-                        e,
-                    )
+                # (alpha-engine-config-I10031) RAISE: identical audit-write
+                # shape to the drawdown/derisk risk_event swallows above —
+                # a third occurrence of the same swallow, treated the same
+                # for consistency (not individually named in the issue's
+                # table of six, but the same audit surface). Propagates to
+                # the outer except, which pages flow-doctor before
+                # re-raising.
+                log_risk_event(conn, ev)
 
         # ── 4–5. Process EXIT and REDUCE signals ────────────────────────────────
         # Under the optimizer, research EXIT is already handled via eligibility
@@ -2415,7 +2453,18 @@ def run(
                     bucket=config.get("signals_bucket", "alpha-engine-research") if 'config' in dir() else "alpha-engine-research",
                 )
             except Exception:
-                logger.debug("Health status write failed on error path", exc_info=True)
+                # (a) the write_health call above (reporting the PRIMARY
+                # failure `_exc`) itself failed. (c) recorded at ERROR
+                # with a traceback (visible at the INFO root level) —
+                # deliberately NOT raised: this is the last-resort error
+                # handler and a `raise` here would replace/mask `_exc`
+                # (the real failure) with this secondary write failure,
+                # right before the `raise` two lines below re-raises
+                # `_exc`. flow-doctor (`fd.report` above, severity=
+                # critical) is the durable recording surface for the
+                # primary failure regardless of whether this write
+                # succeeds (alpha-engine-config-I10031).
+                logger.error("Health status write failed on error path", exc_info=True)
         raise
     finally:
         ibkr.disconnect()

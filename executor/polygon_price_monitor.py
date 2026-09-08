@@ -216,6 +216,10 @@ class PolygonPriceMonitor:
             try:
                 ws.close()
             except Exception as e:
+                # (a) websocket close failed during stop(). (c) not
+                # recorded elsewhere — deliberate carve-out
+                # (alpha-engine-config-I10031): connection teardown must
+                # never block shutdown.
                 logger.debug("PolygonPriceMonitor: ws.close() failed (non-fatal): %s", e)
         if self._thread is not None:
             self._thread.join(timeout=5)
@@ -282,4 +286,8 @@ class PolygonPriceMonitor:
                     if self._ws is not None:
                         self._ws.close()
                 except Exception as e:
+                    # (a) websocket close failed while tearing down before
+                    # a reconnect attempt. (c) not recorded elsewhere —
+                    # deliberate carve-out (alpha-engine-config-I10031):
+                    # teardown must never block the reconnect loop.
                     logger.debug("PolygonPriceMonitor: ws.close() in reconnect loop failed (non-fatal): %s", e)

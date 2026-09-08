@@ -152,6 +152,10 @@ class PriceMonitor:
             try:
                 self._ib.cancelMktData(ticker_data.contract)
             except Exception as e:
+                # (a) market-data unsubscribe failed for this contract.
+                # (c) not recorded elsewhere — deliberate carve-out
+                # (alpha-engine-config-I10031): connection teardown must
+                # never block the caller.
                 logger.debug("cancelMktData failed for %s (non-fatal): %s", ticker_data.contract, e)
         self._subscriptions.clear()
         self._contracts.clear()
