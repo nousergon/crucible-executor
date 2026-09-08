@@ -749,6 +749,14 @@ def _load_signals_from_s3(bucket: str, run_date: str, max_lookback: int = 14) ->
                 logger.info("No signals for %s — using %s (%d day(s) old)", run_date, dt, days_back)
             return json.loads(obj["Body"].read()), None
         except Exception as e:
+            # (a) signals.json read/parse failed for this date — the
+            # fallback (trying the prior day, per the WARNING-not-ERROR
+            # comment below) is the intended control flow, not a defect.
+            # (c) not recorded elsewhere — deliberate carve-out
+            # (alpha-engine-config-I10031): an expected-absence probe with
+            # a defined fallback, same class as the connection-teardown
+            # carve-outs; the caller's own WARNING covers the case where
+            # every fallback is exhausted.
             logger.debug("No signals.json for %s (%s) — trying prior day", dt, e)
             continue
     # WARNING not ERROR: EOD reconcile degrades gracefully on absent signals
@@ -2909,7 +2917,13 @@ def run(
                 s3.upload_file(log_file, trades_bucket, s3_key)
                 logger.info("Log backed up to s3://%s/%s", trades_bucket, s3_key)
         except Exception as e:
-            logger.debug("Log backup failed for %s: %s", log_file, e)
+            # (a) the daemon/executor log backup to S3 failed for this
+            # file — the box's own local copy of the log is unaffected,
+            # only the S3 durability copy is missing for this run_date.
+            # (c) recorded at WARNING (visible at the INFO root level,
+            # unlike the DEBUG this replaces) — the app log stream is the
+            # recording surface (alpha-engine-config-I10031).
+            logger.warning("Log backup failed for %s: %s", log_file, e)
 
     # Build position rationale narratives — mechanical synthesis from
     # the context dict. No LLM exposure in executor per

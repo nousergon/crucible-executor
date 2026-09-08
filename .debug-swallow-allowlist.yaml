@@ -1,0 +1,153 @@
+# .debug-swallow-allowlist.yaml -- baseline for tests/test_no_debug_only_swallows.py
+# (alpha-engine-config-I10031).
+#
+# The class this guards: an `except Exception` (or a narrower except clause
+# immediately following one, per-site) whose body only records the failure
+# at logger.debug(...) or discards it as a bare `pass` -- invisible on every
+# executor entrypoint, whose root logger is set to INFO
+# (krepis/src/krepis/logging.py:500). Mirrors the shape of
+# .provider-linkage-allowlist.yaml (alpha-engine-config-I9295): every entry
+# pre-clears a KNOWN site that is not a producer/writer/audit swallow. A new
+# site with no entry fails the build. An entry whose `expires` has passed
+# fails loudly -- re-justify or remove, never silently re-grandfather. An
+# entry that no longer matches anything ALSO fails, so the allowance cannot
+# quietly widen after the site it covered is gone or fixed.
+#
+# `path` + `line` identify the `except` line itself (the line the guard's
+# AST walk reports). Every entry requires a `reason` naming (a) the failure
+# mode swallowed and (c) the concrete recording surface (or the explicit
+# "no recording surface -- carve-out" for a transport/teardown swallow the
+# fleet rule's own carve-out clause covers), per
+# `~/Development/CLAUDE.md` "Fail loud and fast."
+
+schema_version: 1
+entries:
+  # ── Telegram / notification transport (main.py) ──────────────────────────
+  # (a) the notification transport itself failed. (c) no recording surface
+  # needed -- a failed notification must never abort a trading run, and each
+  # site's underlying condition is already visible via other logging or an
+  # immediately-following raise.
+  - path: executor/main.py
+    line: 533
+    reason: >-
+      Stale-signals Telegram notification transport failure. No recording
+      surface -- Telegram-transport carve-out (a failed notification must
+      never abort a trading run).
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  - path: executor/main.py
+    line: 1151
+    reason: >-
+      Order-book Telegram notification transport failure. No recording
+      surface -- Telegram-transport carve-out; the order book is already
+      persisted independently of the notification.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  - path: executor/main.py
+    line: 1262
+    reason: >-
+      Upstream-failure Telegram notification transport failure. No
+      recording surface -- secondary to the RuntimeError raised
+      immediately after this block, which is the real signal.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  - path: executor/main.py
+    line: 1306
+    reason: >-
+      ArcticDB-freshness Telegram notification transport failure. No
+      recording surface -- secondary to the RuntimeError raised
+      immediately after this block.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  # ── Connection teardown (ibkr.py, price_monitor.py, polygon_price_monitor.py, daemon.py) ──
+  - path: executor/ibkr.py
+    line: 334
+    reason: >-
+      cancelMktData teardown failure. No recording surface -- connection
+      teardown must never block the caller.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  - path: executor/price_monitor.py
+    line: 154
+    reason: >-
+      cancelMktData teardown failure. No recording surface -- connection
+      teardown must never block the caller.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  - path: executor/polygon_price_monitor.py
+    line: 218
+    reason: >-
+      Websocket close() teardown failure during stop(). No recording
+      surface -- teardown must never block shutdown.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  - path: executor/polygon_price_monitor.py
+    line: 288
+    reason: >-
+      Websocket close() teardown failure before a reconnect attempt. No
+      recording surface -- teardown must never block the reconnect loop.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  - path: executor/daemon.py
+    line: 183
+    reason: >-
+      Price-monitor unsubscribe teardown failure during cleanup. No
+      recording surface -- teardown must never block shutdown.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  - path: executor/daemon.py
+    line: 192
+    reason: >-
+      IBKR disconnect teardown failure during cleanup. No recording
+      surface -- teardown must never block shutdown.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  # ── flow-doctor transport fallback (notifier.py) ─────────────────────────
+  - path: executor/notifier.py
+    line: 185
+    reason: >-
+      flow-doctor's own notify_event transport failed. No recording
+      surface -- transport carve-out with an explicit fallback path
+      (send_message), same class as the Telegram-transport swallows.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  # ── Expected-absence probes with a defined fallback ──────────────────────
+  - path: executor/eod_reconcile.py
+    line: 751
+    reason: >-
+      signals.json read/parse failed for one date; the fallback (try the
+      prior day) is the intended control flow. No recording surface --
+      expected-absence probe with a defined fallback, same class as the
+      connection-teardown carve-outs; the caller's own WARNING covers
+      full exhaustion.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+  - path: executor/optimizer_shadow.py
+    line: 103
+    reason: >-
+      Auto-tuned optimizer params S3 object absent or unreadable --
+      expected until an auto-tune run has published params. No recording
+      surface -- expected-absence probe with a defined fallback
+      (YAML/defaults).
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10031
+
+# executor/correctness_verdict.py:314,318 (read_json_from_s3) are
+# deliberately NOT listed here: their handlers `return None, f"..."` --
+# the AST guard's debug-only-or-pass shape does not match a `return`, so
+# they are out of the class this allowlist covers by construction, not
+# via a grandfathered entry. See the inline (a)/(c) comments at those
+# sites: the error is returned in-band and propagated by read_verdict()
+# to its caller, never silently discarded (alpha-engine-config-I10031).

@@ -101,6 +101,13 @@ def _load_auto_tuned_optimizer_cfg(config: dict, s3_client=None) -> dict:
         obj = s3.get_object(Bucket=bucket, Key="config/portfolio_optimizer.json")
         data = json.loads(obj["Body"].read())
     except Exception as e:  # noqa: BLE001 — absence/error → fall back to defaults
+        # (a) the auto-tuned optimizer params S3 object is absent or
+        # unreadable — the existing comment above already names this as
+        # expected (no auto-tune run has published params yet).
+        # (c) not recorded elsewhere — deliberate carve-out
+        # (alpha-engine-config-I10031): an expected-absence probe with a
+        # defined fallback (YAML/defaults), same class as the
+        # connection-teardown carve-outs.
         logger.debug("no auto-tuned optimizer params (%s) — using YAML/defaults", e)
         return {}
 

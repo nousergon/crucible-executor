@@ -420,8 +420,20 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
                 _axis_err,
             )
         except Exception as _e:
-            # lib not yet bumped / unparseable fill_time — best-effort
-            logger.debug("session axis check skipped (best-effort): %s", _e)
+            # (a) the session-axis check itself could not run — lib not
+            # yet bumped / unparseable fill_time (existing comment,
+            # narrower than the ValueError branch above, which reports an
+            # actual mis-key). The trade row is still inserted either way
+            # (see the "Deliberate swallow" comment above this block) —
+            # this branch means the check was skipped, not that it passed.
+            # (c) recorded at WARNING (visible at the INFO root level,
+            # unlike the DEBUG this replaces) — the app log stream is the
+            # recording surface. Found by the class guard
+            # (tests/test_no_debug_only_swallows.py) beyond the issue's
+            # original 28-site count, since a comment line between
+            # `except` and the log call hid it from a literal
+            # `grep -A1 "except Exception"` (alpha-engine-config-I10031).
+            logger.warning("session axis check skipped (best-effort): %s", _e)
     conn.execute(
         """
         INSERT INTO trades (
