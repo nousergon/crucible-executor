@@ -810,8 +810,183 @@ def _write_order_book_summary(
             ContentType="application/json",
         )
         logger.info("Order book summary written to s3://%s/%s", signals_bucket, key)
+        _emit_writer_failure_metric("order_book_summary_write_failed", 0)
     except Exception as e:
+        # SWALLOW, classified (alpha-engine-config-I10190 deliverable 4). The
+        # fleet's fail-loud rule requires any deviation to name three things:
+        #
+        # (a) FAILURE MODE SWALLOWED — `order_books/{date}/summary.json` is not
+        #     written for this session.
+        # (b) WHY THE PRIMARY DELIVERABLE SURVIVES — this is a DERIVED,
+        #     public-safe projection of `ob` for the dashboard. Nothing on the
+        #     trading path reads it: not the daemon (which reads the stop
+        #     records `_write_stops_and_finalize` produces), not the EOD
+        #     reconcile, not the next session's planner. Every field in it is a
+        #     re-serialization of state already persisted elsewhere in this run.
+        #     Losing it costs a dashboard tile, not a risk control — which is
+        #     precisely what makes it DIFFERENT from the stop-record write at
+        #     §6, whose swallow I10190 was filed against and which now raises.
+        # (c) RECORDING SURFACE — `AlphaEngine/Executor/
+        #     order_book_summary_write_failed`, emitted in both polarities so
+        #     absence of the failure is distinguishable from absence of the
+        #     emitter. Deliberately NOT alarmed: a dashboard tile going missing
+        #     does not warrant a page, and an alarm nobody would act on is the
+        #     chronic false positive that teaches an operator to ignore the
+        #     channel. It is rendered and countable, which is the surface this
+        #     failure's severity earns.
+        _emit_writer_failure_metric("order_book_summary_write_failed", 1)
         logger.warning("Failed to write order book summary (non-fatal): %s", e)
+
+
+class StopRecordWriteError(RuntimeError):
+    """The daemon's stop records were not produced for this session.
+
+    ``_write_stops_and_finalize`` writes the stop records
+    ``executor.daemon`` reads, and their ``stop_kind`` decides what the daemon
+    does with every open position — ``catastrophic_gap_only`` under the
+    optimizer, ``alpha`` (the full ``IntradayExitManager``) otherwise. A run
+    that places or retains positions and does not produce them has left a live
+    book with no per-name exit authority.
+    """
+
+    def __init__(self, run_date: str, cause: BaseException):
+        self.run_date = run_date
+        super().__init__(
+            f"Stop records were NOT written for {run_date}: {cause!r}. The "
+            f"daemon has no stop records for this session, so every open "
+            f"position is running without its per-name exit authority "
+            f"(trailing stop / profit-take / collapse under the alpha "
+            f"stop_kind, catastrophic gap stop under the optimizer). Positions "
+            f"already placed this session are LIVE. OPERATOR: re-run the "
+            f"planner for this date once the underlying write failure is "
+            f"resolved, or flatten manually. Failure recorded at "
+            f"executor/stop_write_failures/{run_date}.json and on the "
+            f"AlphaEngine/Executor gauge stop_records_write_failed."
+        )
+
+
+def _emit_writer_failure_metric(metric_name: str, value: float) -> None:
+    """Emit one ``AlphaEngine/Executor`` writer-failure gauge, both polarities.
+
+    Best-effort and deliberately silent on its own failure beyond a WARNING:
+    this runs on the exception path of the thing it is reporting, and an
+    observability error must never replace the real one.
+
+    A DIRECT gauge rather than a CloudWatch Logs metric filter, on purpose. A
+    metric filter would depend on ``/var/log/executor.log`` on the trading box
+    reaching CloudWatch Logs, and this detector's whole job is to be true on the
+    day something on that box is broken — a detector resting on an unverified
+    shipping path is the "ran and saw nothing" class
+    (``alpha-engine-config-I10184``). ``put_metric_data`` is already this
+    repo's proven surface (``signal_reader._emit_admission_refused_metric``).
+    """
+    try:
+        import boto3 as _b3
+
+        _b3.client("cloudwatch").put_metric_data(
+            Namespace="AlphaEngine/Executor",
+            MetricData=[{
+                "MetricName": metric_name, "Value": float(value), "Unit": "Count",
+            }],
+        )
+    except Exception as exc:  # noqa: BLE001 — must never mask the real failure
+        logger.warning(
+            "CloudWatch %s metric emission failed: %s", metric_name, exc,
+        )
+
+
+def _record_stop_write_failure(
+    bucket: str | None, run_date: str, cause: BaseException,
+) -> None:
+    """Durable record that this run finished WITHOUT stop records.
+
+    The metric pages; this artifact is what an operator or a later sweep reads
+    to find out which date, and why. Both are best-effort and neither may raise
+    — the caller re-raises the original failure immediately after.
+    """
+    _emit_writer_failure_metric("stop_records_write_failed", 1)
+    if not bucket:
+        return
+    try:
+        import boto3 as _b3
+
+        _b3.client("s3").put_object(
+            Bucket=bucket,
+            Key=f"executor/stop_write_failures/{run_date}.json",
+            Body=json.dumps({
+                "run_date": run_date,
+                "stop_records_written": False,
+                "error_type": type(cause).__name__,
+                "error": str(cause),
+                "written_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }, indent=2).encode(),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001 — must never mask the real failure
+        logger.warning("stop-write failure artifact write failed: %s", exc)
+
+
+def write_stops_and_finalize_guarded(*args, **kwargs):
+    """``_write_stops_and_finalize``, made LOUD. alpha-engine-config-I10190.
+
+    Until 2026-09-08 the §6 call site was::
+
+        try:
+            _write_stops_and_finalize(...)
+        except Exception as e:
+            logger.warning("Failed to write order book: %s", e)
+
+    — a bare ``except`` on the producer of the daemon's stop records, at
+    WARNING, reaching no durable surface. Measured 2026-09-08:
+    ``grep -rn "Failed to write order book"`` across the fleet found the two
+    call sites in this file and NOTHING else — no metric filter, no alarm, no
+    alert-transport entry.
+
+    **Why RAISE, and not a page-and-continue.** The default under the fleet's
+    fail-loud rule is to raise, and no exception applies here:
+
+    * Swallowing does not save the book. If this write fails, the daemon has no
+      stop records either way — continuing does not restore the protection, it
+      only hides that the protection is gone.
+    * Raising routes ``RunMorningPlanner`` to the preopen pipeline's
+      ``HandleFailure``, which is a surface an operator already watches, within
+      minutes. A WARNING in ``/var/log/executor.log`` is not one.
+    * What is skipped by raising is §6b onward — the order-book rationale
+      artifact, the data manifest, the shadow-optimizer log. Every one of those
+      is already documented in this file as non-blocking audit output. No risk
+      control is downstream of this point.
+    * The counter-argument — that aborting after entries are placed leaves
+      positions with no book — is real but argues for a LOUDER failure, not a
+      quieter one: those positions are exactly the ones a human must be told
+      about, and they are equally unstopped whether or not the process
+      continues.
+
+    **This is the hold-book safeguard's whole safety argument.**
+    ``_should_hold_book`` suppresses the optimizer rebalance and retains the
+    book, and the reason that is acceptable is stated in this file: stops are
+    still written, and the daemon's hard-risk overrides remain active. §6 sits
+    OUTSIDE the §5b hold branch, so it runs on a held day — asserted by
+    ``tests/test_stop_write_is_loud.py``. On exactly the day the system has
+    decided it cannot trust its own signal, the stop records are the only
+    remaining protection; their failure may not be a WARNING nobody receives.
+
+    Emits ``stop_records_write_failed`` in BOTH polarities so the alarm has a
+    continuous baseline and an absent emitter is distinguishable from a healthy
+    run.
+    """
+    bucket = kwargs.get("signals_bucket")
+    run_date = kwargs.get("run_date")
+    if run_date is None and len(args) > 6:
+        run_date = args[6]
+    if bucket is None and len(args) > 8:
+        bucket = args[8]
+    try:
+        result = _write_stops_and_finalize(*args, **kwargs)
+    except Exception as exc:
+        _record_stop_write_failure(bucket, str(run_date), exc)
+        raise StopRecordWriteError(str(run_date), exc) from exc
+    _emit_writer_failure_metric("stop_records_write_failed", 0)
+    return result
 
 
 # ── Hold-book floor ownership (alpha-engine-config-I10179 / I10184) ─────────
@@ -2446,10 +2621,11 @@ def run(
 
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
-            try:
-                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer, signals_raw=signals_raw, config=config)
-            except Exception as e:
-                logger.warning("Failed to write order book: %s", e)
+            # RAISES on failure (alpha-engine-config-I10190). This produces the
+            # daemon's stop records; a run that cannot write them has left a
+            # live book with no per-name exit authority, and that may not be a
+            # WARNING. See write_stops_and_finalize_guarded for the rationale.
+            write_stops_and_finalize_guarded(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer, signals_raw=signals_raw, config=config)
 
         # ── 6b. Per-ticker order-book rationale artifact ────────────────────────
         # Audit-stable record answering "why is ticker X in state S
