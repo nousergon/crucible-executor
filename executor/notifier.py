@@ -183,6 +183,11 @@ def send_daemon_status(message: str) -> bool:
                 return False
             return fd.last_dispatched()
         except Exception as e:
+            # (a) flow-doctor's own notify_event transport failed.
+            # (c) not recorded elsewhere — deliberate carve-out
+            # (alpha-engine-config-I10031): this is a transport swallow
+            # with an explicit fallback path (send_message below), the
+            # same carve-out class as the Telegram-transport swallows.
             logger.debug("flow-doctor notify_event failed, falling back to send_message: %s", e)
     return send_message(message)
 

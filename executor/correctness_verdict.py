@@ -312,10 +312,21 @@ def _get_json(bucket: str, key: str, s3_client=None) -> tuple[dict | None, str |
             return None, f"s3://{bucket}/{key} is ABSENT"
         return None, f"s3://{bucket}/{key} is unreadable ({code})"
     except Exception as exc:  # noqa: BLE001 — CONTRACT: never raises
+        # (a) the S3 read failed for a reason other than a recognized
+        # ClientError code (network, credentials, throttling, ...).
+        # (c) recording surface: the error is NOT dropped — it is
+        # returned in-band as the function's `error` element, which
+        # `read_verdict` (the caller) propagates to ITS caller. This is
+        # the documented CONTRACT: never raises, an explicit design
+        # choice, not a swallow (alpha-engine-config-I10031).
         return None, f"s3://{bucket}/{key} read failed ({type(exc).__name__}: {exc})"
     try:
         doc = json.loads(body)
     except Exception as exc:  # noqa: BLE001
+        # (a) the S3 body was not valid JSON.
+        # (c) recording surface: same in-band `error` return as above —
+        # returned to `read_verdict`, never silently discarded
+        # (alpha-engine-config-I10031).
         return None, f"s3://{bucket}/{key} body is not JSON ({type(exc).__name__})"
     if not isinstance(doc, dict):
         return None, f"s3://{bucket}/{key} body is not a JSON object"

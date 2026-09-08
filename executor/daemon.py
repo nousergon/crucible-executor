@@ -181,11 +181,18 @@ def _cleanup_connections(
         try:
             monitor.unsubscribe_all()
         except Exception:
+            # (a) price-monitor unsubscribe failed during cleanup.
+            # (c) not recorded elsewhere — deliberate carve-out
+            # (alpha-engine-config-I10031): connection teardown must
+            # never block shutdown; the process is exiting regardless.
             logger.debug("monitor.unsubscribe_all failed during cleanup", exc_info=True)
     if ibkr:
         try:
             ibkr.disconnect()
         except Exception:
+            # (a) IBKR disconnect failed during cleanup. (c) not recorded
+            # elsewhere — deliberate carve-out (alpha-engine-config-I10031):
+            # connection teardown must never block shutdown.
             logger.debug("ibkr.disconnect failed during cleanup", exc_info=True)
 
 
@@ -1432,7 +1439,17 @@ def run_daemon(dry_run: bool = False) -> None:
                                 _w["price_at_max_drop"] = _gap["current"]
                             _w["fired"] = _w["fired"] or _gap["fired"]
                     except Exception:  # noqa: BLE001
-                        logger.debug(
+                        # (a) in-memory gap-watch accumulation failed for
+                        # this tick/ticker — the existing "Pure
+                        # observability" comment above already documents
+                        # the failure mode (never perturbs the exit path).
+                        # (c) recorded at WARNING (visible at the INFO
+                        # root level, unlike the DEBUG this replaces) —
+                        # the app log stream is the recording surface;
+                        # the eventual flush at gap-watch-flush time
+                        # (below) is unaffected by one missed tick
+                        # (alpha-engine-config-I10031).
+                        logger.warning(
                             "gap-watch accumulation failed for %s",
                             ticker,
                             exc_info=True,
@@ -1669,7 +1686,19 @@ def run_daemon(dry_run: bool = False) -> None:
                                         },
                                     )
                                 except Exception:  # noqa: BLE001
-                                    logger.debug(
+                                    # (a) the intraday_resolve risk_events
+                                    # write failed — the comment above
+                                    # already documents this as
+                                    # best-effort observability for the
+                                    # offline threshold tuner, not the
+                                    # trading decision itself (the
+                                    # redeploy orders above are already
+                                    # placed and order_book.save()d).
+                                    # (c) recorded at WARNING (visible at
+                                    # the INFO root level) — the app log
+                                    # stream is the recording surface
+                                    # (alpha-engine-config-I10031).
+                                    logger.warning(
                                         "intraday_resolve event log failed",
                                         exc_info=True,
                                     )
@@ -1732,7 +1761,21 @@ def run_daemon(dry_run: bool = False) -> None:
                 trading_day=run_date,
             )
         except Exception:
-            logger.debug("daemon_state flush failed", exc_info=True)
+            # (a) the decision-logger's intraday-capture flush to S3
+            # failed — replay parity for this trading_day is degraded
+            # (the primary trade path already completed via
+            # log_trade/send_trade_alert per the comment above).
+            # Deliberately NOT raised: this is inside the daemon's
+            # top-level `finally`, so raising would crash a clean
+            # shutdown or mask whatever exception the `except` above is
+            # already propagating.
+            # (c) recorded at ERROR — the root FlowDoctorHandler
+            # (nousergon_lib.logging.setup_logging, attached at ERROR)
+            # turns this into its own flow-doctor page/issue automatically
+            # (alpha-engine-config-I10049); a separate fd.report() call
+            # here would double-page the same event, per
+            # tests/test_single_page_per_breach.py (alpha-engine-config-I10031).
+            logger.error("daemon_state flush failed", exc_info=True)
 
         # ── Data manifest ──────────────────────────────────────────────────
         try:
@@ -1748,7 +1791,19 @@ def run_daemon(dry_run: bool = False) -> None:
                 },
             )
         except Exception:
-            logger.debug("Data manifest write failed", exc_info=True)
+            # (a) the run's data-manifest write failed — the input-
+            # provenance record the observability contract requires is
+            # missing for this run_date. Deliberately NOT raised: this is
+            # inside the daemon's top-level `finally`, so raising would
+            # crash a clean shutdown or mask whatever exception the
+            # `except` above is already propagating (same reasoning as
+            # the decision-logger flush immediately above).
+            # (c) recorded at ERROR — the root FlowDoctorHandler
+            # auto-pages this (alpha-engine-config-I10049); see the
+            # decision-logger flush comment immediately above for why a
+            # separate fd.report() is not also called
+            # (alpha-engine-config-I10031).
+            logger.error("Data manifest write failed", exc_info=True)
 
         # ── Flush the catastrophic-gap-stop-watch cohort (config#846) ──────
         # One risk_events row per gap-only position: worst intraday drop vs
@@ -1778,7 +1833,16 @@ def run_daemon(dry_run: bool = False) -> None:
                         },
                     )
                 except Exception:  # noqa: BLE001
-                    logger.debug(
+                    # (a) the catastrophic-gap-watch risk_events flush
+                    # failed for this ticker — the comment above already
+                    # documents this as best-effort observability that
+                    # "must never mask a trading-session error"; the
+                    # session's real exit/stop decisions already executed
+                    # via the live exit_mgr path, independent of this row.
+                    # (c) recorded at WARNING (visible at the INFO root
+                    # level) — the app log stream is the recording
+                    # surface (alpha-engine-config-I10031).
+                    logger.warning(
                         "gap-watch flush failed for %s",
                         _tk,
                         exc_info=True,
