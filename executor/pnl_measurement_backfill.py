@@ -61,15 +61,28 @@ arcticdb`` its instrument IS the live gate's — the day's traded ``[Low, High]`
 read through the same loader ``eod_reconcile`` uses. Without it the instrument
 is an upper bound and every row it writes says so — see section 5.
 
-NOT WIRED INTO THE EOD PATH. ``pnl_backfill.backfill_residual_sleeves`` runs on
-every reconciliation and self-heals its own window, which is the pattern this
-module should eventually follow (principles §2.3 — no operator step). It is
-deliberately NOT wired here: the preopen/postclose/weekly Step Functions are
-change-quiet until Crucible's clause-1 four-week reliability clock starts on
-2026-09-05 (`alpha-engine-config-I9041`), and adding a call to
-``eod_reconcile.run`` alters what the postclose SF executes. The wiring is one
-line beside the existing ``backfill_residual_sleeves(conn)`` call and is filed
-rather than taken.
+THE COST LEG IS NOW WIRED INTO THE EOD PATH (alpha-engine-config-I9614).
+``heal_cost_columns`` runs on every reconciliation beside
+``pnl_backfill.backfill_residual_sleeves``, so a session whose cost columns are
+NULL heals with no operator step (principles §2.3). It was held back until the
+2026-09-05 end of the clause-1 change-quiet window (`alpha-engine-config-I9041`),
+and the evidence for wiring it rather than scheduling another manual run is the
+measurement itself: the cost columns covered 6 of 120 sessions on 2026-08-31 and
+12 of 126 on 2026-09-08 — the CLI legs were never run, and only the forward path
+moved.
+
+``fetch_live_anchor_window`` is the same move for the benchmark leg's vendor
+anchor: two Polygon calls over ``run_date`` and its prior session rather than the
+whole history, so the one genuinely third-party side of the reconciliation runs
+DAILY instead of only when a human types the CLI.
+
+THE DIVIDEND AND MARK-RESTATEMENT LEGS REMAIN MANUAL, and deliberately.
+``--dividends`` issues one Polygon query per held ticker over the full history
+under a 5-calls-per-minute limiter, and ``--restate-marks`` rewrites a published
+NAV — a restatement, which is reserved (see `alpha-engine-config-I9613` for the
+benchmark-restatement ruling of the same shape). Wiring either into a postclose
+would put a rate-limited multi-minute fetch, or an unreviewed rewrite of the
+record, on the critical path of the trading day's close.
 """
 
 from __future__ import annotations
@@ -79,6 +92,7 @@ import json
 import logging
 import math
 import sqlite3
+from collections.abc import Mapping
 from typing import Any
 
 from executor.dividends import SPY_TICKER, accrue_position_dividends
@@ -212,6 +226,54 @@ def apply_cost_backfill(
         )
     conn.commit()
     return len(plans)
+
+
+def heal_cost_columns(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Fill the missing cost columns on historical ``eod_pnl`` rows, idempotently.
+
+    alpha-engine-config-I9614, deliverable 1. :func:`plan_cost_backfill` and
+    :func:`apply_cost_backfill` were reachable ONLY from this module's CLI, and
+    the CLI was never run: measured against
+    ``s3://alpha-engine-research/trades/eod_pnl.csv`` on 2026-09-08,
+    ``commission_usd`` / ``slippage_usd`` / ``traded_notional_usd`` are
+    populated on **12 of 126 sessions** — every session since the 2026-08-21
+    forward-path deploy and not one before it. The gap did not shrink between
+    2026-08-31 (6/120) and 2026-09-08; it only grew forward, which is the
+    signature of a backfill that needs a human and therefore never happens.
+
+    A backfill that needs an operator step is a page, not a fix (principles
+    §2.3 — detect, diagnose, act, VERIFY, close). This runs on every EOD
+    reconciliation beside :func:`executor.pnl_backfill.backfill_residual_sleeves`,
+    which is the repo's own SOTA pattern for exactly this, in the same
+    function.
+
+    Purely local: the inputs are the persisted ``eod_pnl`` rows and the
+    ``trades`` ledger in the same sqlite file. No vendor call, no rate limit,
+    no network. Planning skips any row that already carries ``slippage_usd``,
+    so a converged history costs one query.
+
+    Returns ``{"filled": int, "commission_absent": int, "slippage_usd_total":
+    float}``. ``commission_usd`` is written NULL with ``commission_available=0``
+    where the ledger carries no commission — never 0.0, which is the defect
+    this whole issue is about (an absent measurement wearing a measured zero's
+    clothes).
+    """
+    from executor.trade_logger import get_todays_trades
+
+    rows = _rows(conn)
+    if not rows:
+        return {"filled": 0, "commission_absent": 0, "slippage_usd_total": 0.0}
+    pending = {str(r["date"]) for r in rows if r.get("slippage_usd") is None}
+    if not pending:
+        return {"filled": 0, "commission_absent": 0, "slippage_usd_total": 0.0}
+    trades_by_date = {d: get_todays_trades(conn, d) for d in sorted(pending)}
+    plans = plan_cost_backfill(rows, trades_by_date)
+    written = apply_cost_backfill(conn, plans)
+    return {
+        "filled": written,
+        "commission_absent": sum(1 for p in plans if p["commission_usd"] is None),
+        "slippage_usd_total": sum(p["slippage_usd"] for p in plans),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1495,6 +1557,40 @@ def fetch_vendor_closes(start: str, end: str) -> dict[str, float]:
         idx.date().isoformat(): float(close)
         for idx, close in bars["Close"].items()
     }
+
+
+def fetch_live_anchor_window(
+    rows: list[Mapping[str, Any]],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Vendor closes + SPY distributions for a SHORT live window. Raises on failure.
+
+    alpha-engine-config-I9614, deliverable 3. The CLI legs above fetch the whole
+    history on every invocation, which is correct for a one-off audit and wrong
+    for a per-session gate: the live EOD path needs ``run_date`` and its prior
+    trading session and nothing else, and ``PolygonClient`` is constructed at
+    ``calls_per_min=5`` (free tier — see ``executor.dividends`` and
+    alpha-engine-config-I10047, where a per-ticker loop on that limiter produced
+    16 ``429`` lines and two names silently recorded as having no dividend).
+
+    ``rows`` is the ordered pair (or short run) of persisted ``eod_pnl`` rows
+    the anchor will be evaluated over; only ``date`` is read. Two vendor calls
+    total, independent of window length.
+
+    NEVER returns an empty map as if it were agreement — an unavailable vendor
+    raises, and the caller records a NAMED degradation. That posture is
+    ``executor.dividends.fetch_ex_dividends``'s, deliberately: the failure this
+    whole issue is about is an absent measurement rendered as a passing one.
+    """
+    dates = sorted(str(r.get("date")) for r in rows if r.get("date"))
+    if len(dates) < 2:
+        raise RuntimeError(
+            f"the vendor anchor needs at least two persisted sessions; got "
+            f"{len(dates)} ({dates}) — NOT EVALUATED, not clean"
+        )
+    start, end = dates[0], dates[-1]
+    closes = fetch_vendor_closes(start, end)
+    events = _fetch_spy_events(start)
+    return closes, map_ex_dividends_to_sessions(list(rows), events)
 
 
 def _prior_session_of(date_str: str) -> str:

@@ -1035,3 +1035,118 @@ def test_cli_json_reports_the_verdict_per_candidate_session(tmp_path, capsys):
     assert out["session_verdicts"][0]["correction_usd"] == pytest.approx(
         _AMD_CORRECTION
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The self-heal that removes the operator step (alpha-engine-config-I9614 D1)
+#
+# The backfill legs above are correct and were never run: cost columns covered
+# 6 of 120 sessions on 2026-08-31 and 12 of 126 on 2026-09-08 — only the
+# forward path moved. These bind the healing behaviour so it cannot regress
+# back to a CLI a human has to remember.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _heal_conn():
+    conn = _cost_conn()
+    conn.execute(
+        "CREATE TABLE trades (date TEXT, action TEXT, ticker TEXT, "
+        "filled_shares REAL, fill_price REAL, price_at_order REAL, "
+        "commission_usd REAL, status TEXT, created_at TEXT)"
+    )
+    conn.commit()
+    return conn
+
+
+def test_heal_cost_columns_fills_history_with_no_operator_step(monkeypatch):
+    conn = _heal_conn()
+    monkeypatch.setattr(
+        "executor.trade_logger.get_todays_trades",
+        lambda _c, d: (
+            [{"action": "BUY", "filled_shares": 10, "fill_price": 100.0,
+              "price_at_order": 99.0}] if d == "2026-03-10" else []
+        ),
+    )
+    result = B.heal_cost_columns(conn)
+    assert result["filled"] == 2
+    assert result["commission_absent"] == 1          # the traded session
+    assert result["slippage_usd_total"] == pytest.approx(10.0)
+    row = conn.execute(
+        "SELECT commission_usd, commission_available, slippage_usd, "
+        "daily_return_gross_pct FROM eod_pnl WHERE date='2026-03-10'"
+    ).fetchone()
+    assert row[0] is None      # ABSENT, never a measured $0.00
+    assert row[1] == 0
+    assert row[2] == pytest.approx(10.0)
+    assert row[3] is None      # gross suppressed while the cost leg is absent
+
+
+def test_heal_cost_columns_is_idempotent_and_costs_nothing_when_converged(monkeypatch):
+    conn = _heal_conn()
+    calls = []
+
+    def _trades(_c, d):
+        calls.append(d)
+        return []
+
+    monkeypatch.setattr("executor.trade_logger.get_todays_trades", _trades)
+    assert B.heal_cost_columns(conn)["filled"] == 2
+    calls.clear()
+    # A converged history must not re-read the ledger at all — this runs on
+    # every postclose, so a full-history re-plan every night is a cost the
+    # wiring is not allowed to introduce.
+    assert B.heal_cost_columns(conn)["filled"] == 0
+    assert calls == []
+
+
+def test_heal_cost_columns_on_an_empty_series_is_a_no_op():
+    conn = _heal_conn()
+    conn.execute("DELETE FROM eod_pnl")
+    conn.commit()
+    assert B.heal_cost_columns(conn) == {
+        "filled": 0, "commission_absent": 0, "slippage_usd_total": 0.0,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The live anchor window (alpha-engine-config-I9614 D3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_live_anchor_window_fetches_the_pair_not_the_history(monkeypatch):
+    seen = {}
+
+    def _closes(start, end):
+        seen["range"] = (start, end)
+        return {start: 660.0, end: 663.0}
+
+    monkeypatch.setattr(B, "fetch_vendor_closes", _closes)
+    monkeypatch.setattr(
+        B, "_fetch_spy_events",
+        lambda start: [{"ex_dividend_date": "2026-09-08", "cash_amount": 1.80}],
+    )
+    rows = [{"date": "2026-09-04"}, {"date": "2026-09-08"}]
+    closes, divs = B.fetch_live_anchor_window(rows)
+    assert seen["range"] == ("2026-09-04", "2026-09-08")
+    assert closes == {"2026-09-04": 660.0, "2026-09-08": 663.0}
+    assert divs == {"2026-09-08": pytest.approx(1.80)}
+
+
+def test_live_anchor_window_refuses_a_single_session():
+    """One row cannot anchor a return. NOT EVALUATED — never silently clean."""
+    with pytest.raises(RuntimeError, match="at least two persisted sessions"):
+        B.fetch_live_anchor_window([{"date": "2026-09-08"}])
+
+
+def test_live_anchor_window_propagates_a_vendor_outage(monkeypatch):
+    """An unreachable vendor RAISES so the caller names the degradation.
+
+    The whole issue exists because an absent measurement was persisted as a
+    measured $0.00. An anchor returning an empty map on a vendor outage would
+    read as agreement in check_benchmark_vendor_anchor, which returns no
+    breaches on empty vendor_closes.
+    """
+    def _boom(_s, _e):
+        raise RuntimeError("vendor returned no SPY bars")
+
+    monkeypatch.setattr(B, "fetch_vendor_closes", _boom)
+    with pytest.raises(RuntimeError, match="no SPY bars"):
+        B.fetch_live_anchor_window([{"date": "2026-09-04"}, {"date": "2026-09-08"}])
