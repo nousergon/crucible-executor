@@ -45,7 +45,11 @@ from executor.price_cache import (
     load_price_histories,
 )
 from executor.risk_guard import compute_drawdown_multiplier
-from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
+from executor.signal_reader import (
+    get_actionable_signals,
+    is_signals_stale,
+    read_signals_with_fallback,
+)
 from executor.strategies.config import load_strategy_config
 from executor.strategies.exit_manager import (
     SECTOR_ETF_MAP,
@@ -329,6 +333,47 @@ def load_config() -> dict:
     return copy.deepcopy(_LOAD_CONFIG_CACHE)
 
 
+def _next_earnings_date_from_calendar(cal) -> date | None:
+    """Extract the next earnings date from a ``yfinance.Ticker.calendar`` value.
+
+    PRIMARY, measured contract (yfinance 1.6.0 and 1.7.0 — the version this
+    repo pins in requirements.txt — verified against
+    ``yfinance/scrapers/quote.py::_fetch_calendar``): ``calendar`` is a
+    ``dict``, e.g. ``{"Earnings Date": [date(...), ...], ...}``, or ``{}``
+    when Yahoo has no calendar data for the ticker. There is no DataFrame
+    code path left in the pinned yfinance version — the branch below is
+    defensive only, for an older release returning the legacy DataFrame
+    shape, and is not exercised by anything currently installed.
+    """
+    if cal is None:
+        return None
+    if isinstance(cal, dict):
+        dates = cal.get("Earnings Date")
+        if not dates:
+            return None
+        candidate = dates[0]
+    elif hasattr(cal, "empty") and hasattr(cal, "iloc"):
+        # Legacy pandas DataFrame shape (pre-dict yfinance releases only).
+        if cal.empty:
+            return None
+        candidate = cal.iloc[0, 0]
+    else:
+        return None
+    if candidate is None:
+        return None
+    # datetime and pd.Timestamp are both `date` subclasses AND expose a
+    # `.date()` method — check `.date()` first, or a datetime/Timestamp
+    # would incorrectly pass through the isinstance(candidate, date) branch
+    # unconverted (they'd compare unequal to a plain date downstream).
+    if hasattr(candidate, "date") and callable(candidate.date):
+        return candidate.date()
+    if isinstance(candidate, date):
+        return candidate
+    if isinstance(candidate, str):
+        return date.fromisoformat(candidate)
+    return None
+
+
 def _compute_support_level(price_history, strategy_config: dict) -> float | None:
     """Compute N-day low from price history for support-bounce entry trigger.
 
@@ -517,13 +562,21 @@ def _read_signals(
     # now_dual().trading_day — NOT run_date, which is the session axis
     # (config#1610) and sits one session ahead intraday (comparing against
     # it would false-alert every Monday on perfectly fresh Friday signals).
+    #
+    # Staleness itself is cadence-aware (is_signals_stale, shared with
+    # signal_reader._warn_if_stale) — Research is a weekly Saturday pipeline
+    # writing Friday-dated signals, so a plain "age > N" test fires on some
+    # healthy weekday no matter where N is set (this alert previously used
+    # age > 2 while signal_reader used age > 7, and BOTH were wrong: a
+    # healthy Friday-dated file is 3-9 days old across the week it stays
+    # current).
     if not simulate:
         try:
             from nousergon_lib.dates import now_dual as _now_dual
             _knowledge_day = _now_dual().trading_day
             signals_date_raw = signals_raw.get("date", _knowledge_day)
-            _sig_age = (date.fromisoformat(_knowledge_day) - date.fromisoformat(signals_date_raw)).days
-            if _sig_age > 2:
+            _stale, _sig_age = is_signals_stale(signals_date_raw, _knowledge_day)
+            if _stale:
                 from executor.notifier import send_daemon_status
                 send_daemon_status(
                     f"\u26a0\ufe0f *Stale signals*\n"
@@ -2314,16 +2367,11 @@ def run(
                 try:
                     import yfinance as yf_mod
                     cal = yf_mod.Ticker(t).calendar
-                    if cal is not None and not cal.empty:
-                        next_date = cal.iloc[0, 0] if hasattr(cal, 'iloc') else None
-                        if next_date is not None:
-                            if hasattr(next_date, 'date'):
-                                next_date = next_date.date()
-                            elif isinstance(next_date, str):
-                                next_date = date.fromisoformat(next_date)
-                            days_until = (next_date - date.fromisoformat(run_date)).days
-                            if days_until >= 0:
-                                earnings_by_ticker[t] = days_until
+                    next_date = _next_earnings_date_from_calendar(cal)
+                    if next_date is not None:
+                        days_until = (next_date - date.fromisoformat(run_date)).days
+                        if days_until >= 0:
+                            earnings_by_ticker[t] = days_until
                 except Exception:
                     # (a) earnings-calendar load failed for this ticker —
                     # earnings-proximity gating silently does not apply.
