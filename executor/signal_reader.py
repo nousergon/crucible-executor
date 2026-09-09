@@ -543,14 +543,27 @@ def _expected_signal_friday(ref: date) -> date:
     """The most recent Friday whose weekly Saturday research run should
     already have completed, as of ``ref``.
 
-    Research runs Saturday and writes ``signals.json`` dated with the Friday
-    just closed (the last trading day of that week). That file remains the
-    CURRENT, correct signals file through the entire following Mon-Fri,
-    refreshed only by the NEXT Saturday's run. So the expected
-    ``signals_date`` for any day in ref's week is the Friday strictly
-    before the Monday of ref's own week — deliberately NOT "the most
-    recent calendar Friday", which on a Friday itself would be today (and
-    today's signals aren't written until tomorrow's Saturday run).
+    Declared cadence, not a locally-invented rule: ``research_signals`` in
+    ``alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml`` carries
+    ``cadence: saturday_sf`` (a Saturday run), and
+    ``nous-ergon-ops/nousergon-console/config.d/artifact-observation.yaml``'s
+    ``partition_by_cadence: {saturday_sf: last-trading-day-before-run}``
+    keys that run's artifact to the last trading day (Friday) before it —
+    exactly why ``latest.json`` written 2026-09-05 08:56 UTC carries
+    ``"date": "2026-09-04"``. This function computes that same boundary
+    structurally (weekday arithmetic) rather than copying a day-count
+    threshold into a third place: a hard-coded age cutoff is what produced
+    the two disagreeing, both-wrong thresholds this function replaces (see
+    ``is_signals_stale``).
+
+    Research writes ``signals.json`` dated with the Friday just closed
+    (the last trading day of that week). That file remains the CURRENT,
+    correct signals file through the entire following Mon-Fri, refreshed
+    only by the NEXT Saturday's run. So the expected ``signals_date`` for
+    any day in ref's week is the Friday strictly before the Monday of
+    ref's own week — deliberately NOT "the most recent calendar Friday",
+    which on a Friday itself would be today (and today's signals aren't
+    written until tomorrow's Saturday run).
     """
     monday = ref - timedelta(days=ref.weekday())
     return monday - timedelta(days=3)

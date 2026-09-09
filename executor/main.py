@@ -333,45 +333,38 @@ def load_config() -> dict:
     return copy.deepcopy(_LOAD_CONFIG_CACHE)
 
 
-def _next_earnings_date_from_calendar(cal) -> date | None:
-    """Extract the next earnings date from a ``yfinance.Ticker.calendar`` value.
+def _next_earnings_date_from_dates_df(df, ref: date) -> date | None:
+    """Extract the next (earliest upcoming, on/after ``ref``) earnings date
+    from a ``yfinance.Ticker.get_earnings_dates()`` DataFrame.
 
-    PRIMARY, measured contract (yfinance 1.6.0 and 1.7.0 — the version this
-    repo pins in requirements.txt — verified against
-    ``yfinance/scrapers/quote.py::_fetch_calendar``): ``calendar`` is a
-    ``dict``, e.g. ``{"Earnings Date": [date(...), ...], ...}``, or ``{}``
-    when Yahoo has no calendar data for the ticker. There is no DataFrame
-    code path left in the pinned yfinance version — the branch below is
-    defensive only, for an older release returning the legacy DataFrame
-    shape, and is not exercised by anything currently installed.
+    SOTA pattern mirrored from
+    ``nousergon-data/collectors/metron_market_data.py::_yfinance_earnings``
+    rather than inventing a parallel one
+    (``~/Development/CLAUDE.md`` "mirror a SOTA pattern in another
+    alpha-engine repo"). Deliberately NOT ``Ticker.calendar``: that
+    property's return shape changed from a pandas DataFrame to a ``dict``
+    across yfinance releases (measured: ``calendar`` raised
+    ``AttributeError: 'dict' object has no attribute 'empty'`` for every
+    ENTER candidate under the pinned version here — the defect this
+    function replaces), and the fleet does not agree on one yfinance pin
+    (``crucible-backtester`` ``~=1.5.2``, ``crucible-research`` ``~=1.6.0``,
+    ``crucible-dashboard``/``crucible-executor`` ``==1.7.0``,
+    ``crucible-predictor``/``nousergon-data`` ``>=1.7.0`` — filed as
+    alpha-engine-config-I10305). ``get_earnings_dates()`` is typed
+    ``-> pandas.DataFrame | None`` and has held that shape across all of
+    those pins; verified here against this repo's own pinned
+    ``yfinance==1.7.0``.
     """
-    if cal is None:
+    if df is None or df.empty:
         return None
-    if isinstance(cal, dict):
-        dates = cal.get("Earnings Date")
-        if not dates:
-            return None
-        candidate = dates[0]
-    elif hasattr(cal, "empty") and hasattr(cal, "iloc"):
-        # Legacy pandas DataFrame shape (pre-dict yfinance releases only).
-        if cal.empty:
-            return None
-        candidate = cal.iloc[0, 0]
-    else:
-        return None
-    if candidate is None:
-        return None
-    # datetime and pd.Timestamp are both `date` subclasses AND expose a
-    # `.date()` method — check `.date()` first, or a datetime/Timestamp
-    # would incorrectly pass through the isinstance(candidate, date) branch
-    # unconverted (they'd compare unequal to a plain date downstream).
-    if hasattr(candidate, "date") and callable(candidate.date):
-        return candidate.date()
-    if isinstance(candidate, date):
-        return candidate
-    if isinstance(candidate, str):
-        return date.fromisoformat(candidate)
-    return None
+    import pandas as pd
+
+    idx = pd.to_datetime(df.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    today = pd.Timestamp(ref)
+    future = sorted(d for d in idx if d >= today)
+    return future[0].date() if future else None
 
 
 def _compute_support_level(price_history, strategy_config: dict) -> float | None:
@@ -565,11 +558,18 @@ def _read_signals(
     #
     # Staleness itself is cadence-aware (is_signals_stale, shared with
     # signal_reader._warn_if_stale) — Research is a weekly Saturday pipeline
-    # writing Friday-dated signals, so a plain "age > N" test fires on some
-    # healthy weekday no matter where N is set (this alert previously used
-    # age > 2 while signal_reader used age > 7, and BOTH were wrong: a
-    # healthy Friday-dated file is 3-9 days old across the week it stays
-    # current).
+    # writing Friday-dated signals (declared cadence, not inferred: the
+    # research_signals row in
+    # alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml carries
+    # cadence: saturday_sf, converted from a prior daily cadence 2026-08-13
+    # per that file's own comment — "the paragraph above records the daily
+    # era for provenance; it is not the live state"). This alert's
+    # age > 2 threshold was a leftover from that retired daily era;
+    # signal_reader's age > 7 was updated for weekly but is still a plain
+    # age threshold, which fires on some healthy weekday no matter where
+    # the cutoff is set (a healthy Friday-dated file is 3-9 days old
+    # across the week it stays current) — both are replaced by the single
+    # cadence-boundary predicate below.
     if not simulate:
         try:
             from nousergon_lib.dates import now_dual as _now_dual
@@ -2366,10 +2366,11 @@ def run(
                 t = sig["ticker"]
                 try:
                     import yfinance as yf_mod
-                    cal = yf_mod.Ticker(t).calendar
-                    next_date = _next_earnings_date_from_calendar(cal)
+                    ref = date.fromisoformat(run_date)
+                    df = yf_mod.Ticker(t).get_earnings_dates(limit=8)
+                    next_date = _next_earnings_date_from_dates_df(df, ref)
                     if next_date is not None:
-                        days_until = (next_date - date.fromisoformat(run_date)).days
+                        days_until = (next_date - ref).days
                         if days_until >= 0:
                             earnings_by_ticker[t] = days_until
                 except Exception:
