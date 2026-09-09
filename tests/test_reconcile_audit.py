@@ -180,9 +180,18 @@ class TestAuditWindow:
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52), ("2026-06-26", 728.99, -0.61, 0.22)])
         settled = {"2026-06-25": 734.30, "2026-06-26": 728.99}
         seen = []
+
+        def fake_run(d, *, send_email, run_audit):
+            # Must actually converge — an eod_run mock that changes nothing now
+            # trips the post-correction verification (I10288).
+            conn = init_db(db)
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (settled[d], d))
+            conn.commit()
+            conn.close()
+
         with patch.object(reconcile_audit, "_spy_close",
                           side_effect=lambda d, c: seen.append(d) or settled[d]), \
-             patch.object(reconcile_audit, "eod_run"), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
              patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
              patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
             audit_window(start="2026-06-25", end="2026-06-26",
@@ -371,7 +380,11 @@ class TestAuditWindow:
         assert "accepted" not in res["gaps"][0]
         # Must still page
         fd_mock.report.assert_called_once()
-        assert "Manually run" in fd_mock.report.call_args[0][0].args[0]
+        # Reported as a plain string, not RuntimeError(...) — a flagged gap is
+        # a finding, not a crashed run (alpha-engine-config-I10288).
+        reported = fd_mock.report.call_args[0][0]
+        assert isinstance(reported, str)
+        assert "Manually run" in reported
 
     def test_empty_trades_bucket_skips_accepted_gaps_load(self, tmp_path):
         # When trades_bucket is empty (the _cfg default), accepted_gaps must
@@ -473,4 +486,304 @@ class TestHeldPositionStaleness:
             res = audit_window(start="2026-06-25", end="2026-06-25", config=_cfg(db))
         assert res["corrected"] == []
         assert res["gaps"] == []
+        run_mock.assert_not_called()
+
+
+# ── Revision vs corruption, honest alert text, convergence verification ──────
+#
+# alpha-engine-config-I10288. The 2026-09-04 page read
+#   "RuntimeError: EOD value for 2026-09-04 corrected post-settlement
+#    (stale_position_close): SPY close 770.24 → 770.19"
+# and was taken for an aborted run. It was none of those things: the pass had
+# already SUCCEEDED, nothing raised, and SPY was not the divergent value —
+# 770.24 → 770.19 is 0.65bp, BELOW the pass's own 1bp tolerance, an incidental
+# re-price. The held ticker that actually diverged appeared nowhere in the text.
+
+
+class TestClassification:
+    def test_in_band_correction_classified_revision(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-07-09", 751.60, -0.01, 1.52)])  # 1.46bp
+        settled = {"2026-07-09": 751.71}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (751.71, d))
+            conn.commit()
+            conn.close()
+
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k") as write_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-07-09", end="2026-07-09", config=_cfg(db))
+        assert res["corrected"][0]["classification"] == reconcile_audit.CLASSIFICATION_REVISION
+        assert res["revisions"] == ["2026-07-09"] and res["corruptions"] == []
+        assert write_mock.call_args.kwargs["record"]["classification"] == "revision"
+
+    def test_outlier_correction_classified_corruption(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])  # 10.9bp
+        settled = {"2026-06-25": 734.30}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (734.30, d))
+            conn.commit()
+            conn.close()
+
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-06-25", end="2026-06-25", config=_cfg(db))
+        assert res["corrected"][0]["classification"] == reconcile_audit.CLASSIFICATION_CORRUPTION
+        assert res["corruptions"] == ["2026-06-25"]
+
+    def test_absent_stored_close_is_corruption_not_revision(self, tmp_path):
+        # A None stored close is UNBOUNDED divergence — it must never be
+        # ranked as the mildest case by falling through a None comparison.
+        assert reconcile_audit._classify(None, page_threshold_bps=5.0) == "corruption"
+        assert reconcile_audit._classify(float("inf"), page_threshold_bps=5.0) == "corruption"
+        assert reconcile_audit._classify(4.9, page_threshold_bps=5.0) == "revision"
+        assert reconcile_audit._classify(5.0, page_threshold_bps=5.0) == "corruption"
+
+
+class TestAlertTextNamesTheDivergentLeg:
+    def test_position_close_page_does_not_claim_spy(self, tmp_path):
+        # The reported 2026-09-04 shape, reproduced: SPY within tolerance,
+        # a held ticker 60bp stale. The page must name the TICKER, must carry
+        # its bps, and must not present SPY as the finding.
+        db = str(tmp_path / "t.db")
+        _seed_eod_with_positions(
+            db, "2026-09-04", 770.24, 0.10, 1.40,
+            {"AMD": {"closing_price": 100.00, "shares": 10}},
+        )
+        settled_spy = {"2026-09-04": 770.19}          # 0.65bp — BELOW tolerance
+        settled_tickers = {("AMD", "2026-09-04"): 100.60}  # 60bp — the real finding
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute(
+                "UPDATE eod_pnl SET spy_close=?, positions_snapshot=? WHERE date=?",
+                (770.19, '{"AMD": {"closing_price": 100.60, "shares": 10}}', d),
+            )
+            conn.commit()
+            conn.close()
+
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled_spy[d]), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: settled_tickers.get((t, d))), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-09-04", end="2026-09-04", config=_cfg(db))
+
+        assert res["corrected"][0]["reason"] == "stale_position_close"
+        fd_mock.report.assert_called_once()
+        msg = fd_mock.report.call_args[0][0]
+        # Reported as a completed correction, not an exception.
+        assert isinstance(msg, str)
+        assert "position_close:AMD" in msg and "100.0" in msg and "100.6" in msg
+        assert "corruption" in msg
+        # The sub-tolerance SPY re-price is NOT presented as the finding.
+        assert "spy_close" not in msg
+        assert "770.24" not in msg
+        # And the page says WHY it paged.
+        assert "PAGED" in msg
+
+    def test_max_divergence_across_legs_drives_the_page(self, tmp_path):
+        # SPY 1.2bp (in-band) AND a held ticker 60bp (corruption). The old
+        # first-match reason/divergence picked SPY's 1.2bp, so the 60bp
+        # corruption did NOT page. Both legs must be recorded and the page
+        # decision must read the MAX.
+        db = str(tmp_path / "t.db")
+        _seed_eod_with_positions(
+            db, "2026-09-04", 770.10, 0.10, 1.40,
+            {"AMD": {"closing_price": 100.00, "shares": 10}},
+        )
+        settled_spy = {"2026-09-04": 770.19}               # ~1.17bp
+        settled_tickers = {("AMD", "2026-09-04"): 100.60}  # ~60bp
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute(
+                "UPDATE eod_pnl SET spy_close=?, positions_snapshot=? WHERE date=?",
+                (770.19, '{"AMD": {"closing_price": 100.60, "shares": 10}}', d),
+            )
+            conn.commit()
+            conn.close()
+
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled_spy[d]), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: settled_tickers.get((t, d))), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-09-04", end="2026-09-04", config=_cfg(db))
+
+        c = res["corrected"][0]
+        assert {leg["leg"] for leg in c["legs"]} == {"spy_close", "position_close:AMD"}
+        assert c["divergence_bps"] == pytest.approx(60.0, abs=1.0)   # the MAX, not SPY's 1.2
+        assert c["reason"] == "stale_position_close"                  # the worst leg names it
+        assert set(c["reasons"]) == {"stale_close", "stale_position_close"}
+        assert c["classification"] == "corruption"
+        assert c["paged"] is True
+        fd_mock.report.assert_called_once()
+
+
+class TestConvergenceVerification:
+    def test_unconverged_correction_raises_and_pages_critical(self, tmp_path):
+        # eod_run "corrects" the row to a value that STILL diverges from
+        # settled. Recorded, paged at critical, and the window RAISES — this
+        # is the one outcome here that no later pass heals.
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
+        settled = {"2026-06-25": 734.30}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (733.90, d))  # still 5.4bp off
+            conn.commit()
+            conn.close()
+
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k") as write_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock), \
+             pytest.raises(reconcile_audit.ReconciliationUnconvergedError) as exc:
+            audit_window(start="2026-06-25", end="2026-06-25", config=_cfg(db))
+
+        assert "2026-06-25" in str(exc.value)
+        assert exc.value.summary["unconverged"][0]["date"] == "2026-06-25"
+        # The audit record still landed, and states non-convergence.
+        rec = write_mock.call_args.kwargs["record"]
+        assert rec["converged"] is False and rec["residual_legs"]
+        # Paged at critical, not swallowed.
+        severities = [c.kwargs["severity"] for c in fd_mock.report.call_args_list]
+        assert "critical" in severities
+
+    def test_converged_correction_records_converged_true(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
+        settled = {"2026-06-25": 734.30}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (734.30, d))
+            conn.commit()
+            conn.close()
+
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k") as write_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-06-25", end="2026-06-25", config=_cfg(db))
+        assert res["unconverged"] == []
+        assert res["corrected"][0]["converged"] is True
+        assert write_mock.call_args.kwargs["record"]["converged"] is True
+
+    def test_every_date_checked_before_the_raise(self, tmp_path):
+        # Per-date isolation survives: an unconverged 06-25 must not stop
+        # 06-26 from being checked and recorded.
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52), ("2026-06-26", 728.00, -0.72, 0.33)])
+        settled = {"2026-06-25": 734.30, "2026-06-26": 728.99}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            # 06-25 does not converge; 06-26 does.
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?",
+                         (733.90 if d == "2026-06-25" else 728.99, d))
+            conn.commit()
+            conn.close()
+
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k") as write_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None), \
+             pytest.raises(reconcile_audit.ReconciliationUnconvergedError) as exc:
+            audit_window(start="2026-06-25", end="2026-06-26", config=_cfg(db))
+        summary = exc.value.summary
+        assert summary["checked"] == 2
+        assert [c["date"] for c in summary["corrected"]] == ["2026-06-25", "2026-06-26"]
+        assert [u["date"] for u in summary["unconverged"]] == ["2026-06-25"]
+        assert write_mock.call_count == 2  # both audit records written before the raise
+
+
+class TestAuditRecordStatesBlastRadius:
+    def test_record_carries_downstream_map(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
+        settled = {"2026-06-25": 734.30}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (734.30, d))
+            conn.commit()
+            conn.close()
+
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k") as write_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            audit_window(start="2026-06-25", end="2026-06-25", config=_cfg(db))
+        rec = write_mock.call_args.kwargs["record"]
+        assert rec["downstream"] == reconcile_audit.DOWNSTREAM_ON_CORRECTION
+        assert any("input_closure" in k for k in rec["downstream"])
+
+
+class TestPositionLevelCascade:
+    def test_next_session_rereconciled_after_prior_correction(self, tmp_path):
+        # 06-25's held AMD close was stale and gets corrected. 06-26's OWN
+        # stored values are all clean — but its pricing&timing / mark_basis
+        # were computed from 06-25's PRE-correction prior_positions, so its
+        # frozen consolidated/2026-06-26/eod_report.json is derived from the
+        # old basis. Before I10288 no leg fired for 06-26 and it never healed.
+        db = str(tmp_path / "t.db")
+        _seed_eod_with_positions(db, "2026-06-25", 734.30, 0.10, 1.40,
+                                 {"AMD": {"closing_price": 100.00, "shares": 10}})
+        _seed_eod_with_positions(db, "2026-06-26", 728.99, -0.7231, 0.22,
+                                 {"AMD": {"closing_price": 102.00, "shares": 10}})
+        settled_spy = {"2026-06-25": 734.30, "2026-06-26": 728.99}
+        settled_tickers = {("AMD", "2026-06-25"): 101.50, ("AMD", "2026-06-26"): 102.00}
+        calls = []
+
+        def fake_run(d, *, send_email, run_audit):
+            calls.append(d)
+            conn = init_db(db)
+            snap = f'{{"AMD": {{"closing_price": {settled_tickers[("AMD", d)]}, "shares": 10}}}}'
+            conn.execute("UPDATE eod_pnl SET positions_snapshot=? WHERE date=?", (snap, d))
+            conn.commit()
+            conn.close()
+
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled_spy[d]), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: settled_tickers.get((t, d))), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-06-25", end="2026-06-26", config=_cfg(db))
+
+        assert calls == ["2026-06-25", "2026-06-26"]  # the cascade re-ran 06-26
+        cascade = res["corrected"][1]
+        assert cascade["date"] == "2026-06-26"
+        assert cascade["reason"] == "stale_prior_basis"
+        assert cascade["legs"][-1]["leg"] == "prior_corrected:2026-06-25"
+        # A derived-input change, not a divergence — must not read as corruption.
+        assert cascade["legs"][-1]["divergence_bps"] == 0.0
+        assert cascade["converged"] is True  # and must not trip the residual check
+
+    def test_no_cascade_when_prior_was_clean(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-25", 734.30, 0.10, 1.40), ("2026-06-26", 728.99, -0.7231, 0.22)])
+        settled = {"2026-06-25": 734.30, "2026-06-26": 728.99}
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-06-25", end="2026-06-26", config=_cfg(db))
+        assert res["corrected"] == []
         run_mock.assert_not_called()

@@ -16,8 +16,18 @@ per-ticker ``closing_price`` for ANY held position diverged from that
 ticker's own current settled close (config#6349: the SPY-only checks caught
 nothing for a non-SPY name's provisional-then-corrected price, which then
 silently fed every later day's NAV three-way pricing&timing diff via
-``prior_positions``). Each correction writes an audit record and pages
-flow-doctor.
+``prior_positions``), OR whose immediately-prior session was itself corrected
+earlier in this same pass (alpha-engine-config-I10288: the position-level
+analogue of the spy_return cascade — a corrected day changes the NEXT day's
+``prior_positions`` basis, and that day's own stored closes are all fine, so no
+other leg ever fires for it).
+
+Each correction is CLASSIFIED as a *revision* (a bounded post-settlement vendor
+change to a print that was correct when we stored it) or a *corruption* (a value
+the settled source plausibly never held), is VERIFIED to have converged against
+settled data before it is called done, writes an audit record naming its own
+downstream blast radius, and — for a corruption or a repeat — pages flow-doctor.
+A correction that does NOT converge raises ``ReconciliationUnconvergedError``.
 
 It does NOT blanket-synthesize a NAV for a missing row. Ledger-replay backfill
 (``backfill_eod_pnl``) reconstructs positions from the full trades ledger, which
@@ -87,6 +97,131 @@ AUDIT_KEY_TEMPLATE = "trades/eod_corrections/{run_date}.json"
 # magnitude — one date drifting is routine noise, multiple dates drifting
 # together in one pass signals a systemic feed issue, not settlement lag.
 PAGE_THRESHOLD_BPS = 5.0
+
+# ── Revision vs corruption ───────────────────────────────────────────────────
+#
+# A divergence between a stored EOD value and the current settled value has two
+# materially different causes, and until alpha-engine-config-I10288 this pass
+# could not say which it was seeing:
+#
+#   REVISION   — the upstream vendor moved an already-settled print by a bounded
+#                amount after we stored it. Our write was CORRECT at write time;
+#                the source changed underneath it. This is a normal, expected
+#                property of end-of-day equity data and it is not a defect in
+#                anything we own. It is still recorded, still corrected, and
+#                still makes every downstream artifact derived from the old
+#                value stale — see DOWNSTREAM_ON_CORRECTION.
+#   CORRUPTION — a stored value the settled source plausibly never held: absent
+#                or zero (unbounded divergence), or a divergence too large to be
+#                settlement lag. This is the config#1276 incident class.
+#
+# The band is the same number the paging decision already used (PAGE_THRESHOLD_
+# BPS), so this names an existing behaviour rather than changing it: corruption
+# pages, a lone revision does not. What changes is that the classification is
+# now an explicit, machine-readable field on the record, in the flow-doctor
+# context and in the first line of the alert text — so an operator reading the
+# page can tell a healed vendor revision from a data-integrity incident without
+# opening the S3 record.
+CLASSIFICATION_REVISION = "revision"
+CLASSIFICATION_CORRUPTION = "corruption"
+
+# Which downstream artifacts consumed the pre-correction value, and whether the
+# re-reconcile this pass performs re-derives them. Recorded verbatim on every
+# correction record so the audit trail STATES ITS OWN BLAST RADIUS instead of
+# leaving every reader to re-derive it from six repos (alpha-engine-config-
+# I10288). Every entry below was traced against the code, not assumed.
+DOWNSTREAM_ON_CORRECTION: dict[str, str] = {
+    # eod_reconcile writes the row via trade_logger.log_eod's INSERT OR REPLACE,
+    # so EVERY column for that date is rewritten, not only the SPY fields.
+    "eod_pnl row for the corrected date (all columns)":
+        "rederived — trade_logger.log_eod INSERT OR REPLACE",
+    # closing_price is re-read from settled ArcticDB for every held name.
+    "eod_pnl.positions_snapshot closing_price, every held ticker":
+        "rederived — eod_reconcile re-prices each held name from settled ArcticDB",
+    "trades/eod_pnl.csv, trades/trades_full.csv, trades/shadow_book.csv":
+        "rederived — the whole table is re-exported on every run",
+    "consolidated/{corrected_date}/eod_report.json":
+        "rederived — re-emitted by the same run",
+    "the EOD email already sent for that date":
+        "stale — never resent by design; the operator saw the old number",
+    # The reason this pass now carries a prior_corrected leg: without it these
+    # frozen per-date artifacts never heal.
+    "consolidated/{later_date}/eod_report.json — daily_return_pct, "
+    "pricing_timing_usd, mark_basis_usd, trailing_history for sessions AFTER the "
+    "corrected date (computed from prior_positions)":
+        "rederived ONLY for the next session inside this audit window, via the "
+        "prior_corrected cascade leg; any later session outside the window stays stale",
+    "evaluator/{date}/report_card.json and evaluator/{date}/attribution.json "
+    "(frozen weekly records, including input_closure_usd)":
+        "PERMANENTLY STALE — written once per weekly cycle, no invalidation hook exists "
+        "(see alpha-engine-config-I10271)",
+    "evaluator/latest/report_card.json and evaluator/latest/attribution.json":
+        "rederived at the next scheduled weekly run — these read trades/eod_pnl.csv live",
+    "report_card trend_4w / trend_13w":
+        "never fully heals — computed by diffing against the frozen past report cards above",
+    "crucible-dashboard pages reading trades/eod_pnl.csv or trades_full.csv":
+        "rederived — pure readers of the live CSV",
+}
+
+# leg name → the historical ``reason`` code, kept so the S3 record schema and
+# every existing consumer of ``reason`` keep working unchanged.
+_LEG_REASON = {
+    "spy_close": "stale_close",
+    "spy_return_pct": "stale_return",
+    "position_close": "stale_position_close",
+    "prior_corrected": "stale_prior_basis",
+}
+
+
+class ReconciliationUnconvergedError(RuntimeError):
+    """A re-reconcile ran and the stored value STILL diverges from settled.
+
+    Categorically different from a revision or a corruption that this pass
+    HEALED: it means the self-heal did not heal. ``eod_pnl`` is knowably wrong,
+    no later pass corrects it on its own (this pass would simply re-detect and
+    re-fail every day), and the number is one a human uses for financial
+    decisions. Fail loud — raised after the whole window is processed so every
+    date is still checked and recorded first.
+    """
+
+    def __init__(self, message: str, *, summary: dict | None = None) -> None:
+        super().__init__(message)
+        self.summary = summary or {}
+
+
+def _mag(divergence_bps: float | None) -> float:
+    """Divergence magnitude for comparison/ordering. ``None`` means "we could
+    not compute it" (e.g. a stored value of None), which is UNBOUNDED, not
+    zero — treating it as zero would rank the worst case as the mildest."""
+    return float("inf") if divergence_bps is None else float(divergence_bps)
+
+
+def _fmt_bps(divergence_bps: float | None) -> str:
+    m = _mag(divergence_bps)
+    return "inf" if m == float("inf") else f"{m:.2f}"
+
+
+def _classify(divergence_bps: float | None, *, page_threshold_bps: float) -> str:
+    """``CLASSIFICATION_REVISION`` or ``CLASSIFICATION_CORRUPTION`` — see the
+    band definition above. Unbounded divergence is always corruption."""
+    return (CLASSIFICATION_CORRUPTION
+            if _mag(divergence_bps) >= page_threshold_bps
+            else CLASSIFICATION_REVISION)
+
+
+def _describe_legs(legs: list[dict]) -> str:
+    """Human-readable, per-leg description of what actually diverged.
+
+    The alert text used to be hard-coded to SPY regardless of which value was
+    stale, so a held-position divergence paged as "SPY close X → Y" quoting a
+    SUB-TOLERANCE incidental SPY re-price while the divergent ticker appeared
+    nowhere (alpha-engine-config-I10288). This names every stale leg, and only
+    the stale legs.
+    """
+    return "; ".join(
+        f"{leg['leg']} {leg['stored']} → {leg['settled']} ({_fmt_bps(leg['divergence_bps'])}bp)"
+        for leg in legs
+    )
 
 
 def _window_dates(
@@ -163,6 +298,93 @@ def _settled_close_for_ticker(ticker: str, run_date: str, config: dict) -> float
     return float(match["Close"].iloc[-1])
 
 
+def _detect_stale_legs(
+    conn,
+    run_date: str,
+    config: dict,
+    *,
+    tolerance_bps: float,
+    settled: float,
+) -> tuple[tuple | None, list[dict]]:
+    """Every stored EOD value for ``run_date`` that diverges from settled data.
+
+    ONE detector, called TWICE: once to decide whether a day needs correcting,
+    and again after the re-reconcile to verify the correction actually took.
+    Sharing the function is the point — a verification written as a second,
+    parallel comparison could pass while the real detector still fails.
+
+    Returns ``(row, legs)``. ``row`` is the ``eod_pnl`` row (or None when the
+    day has no row at all — the gap case, handled by the caller). ``legs`` is
+    every divergent value, ordered worst-first, each
+    ``{"leg", "divergence_bps", "stored", "settled"}``.
+
+    Three leg families, all subject to the same post-settlement revision
+    behaviour — this is why the check is a list rather than a single SPY
+    number (alpha-engine-config-I10288):
+      * ``spy_close``      — the day's own SPY close vs settled.
+      * ``spy_return_pct`` — the stored return vs one recomputed from settled
+        closes. Catches the CASCADE: a prior day's close was corrected, so this
+        day's denominator is stale even though its own close is fine.
+      * ``position_close:<TICKER>`` — every ticker the day actually held, vs
+        that ticker's own settled close (config#6349). A stale ``closing_price``
+        feeds ``mark_basis`` on every later day via ``prior_positions``.
+    """
+    row = conn.execute(
+        "SELECT spy_close, spy_return_pct, daily_alpha_pct, positions_snapshot "
+        "FROM eod_pnl WHERE date = ?",
+        (run_date,),
+    ).fetchone()
+    if row is None:
+        return None, []
+
+    stored_close, stored_spy_return = row[0], row[1]
+    legs: list[dict] = []
+
+    own_close_div_bps = (
+        float("inf") if stored_close is None
+        else abs(settled / float(stored_close) - 1.0) * 1e4)
+    if own_close_div_bps > tolerance_bps:
+        legs.append({"leg": "spy_close", "divergence_bps": own_close_div_bps,
+                     "stored": stored_close, "settled": settled})
+
+    prior_row = conn.execute(
+        "SELECT date FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1", (run_date,)
+    ).fetchone()
+    settled_prior = _settled_close(prior_row[0], config) if prior_row else None
+    expected_spy_return = (
+        (settled / settled_prior - 1.0) * 100.0 if settled_prior else None)
+    return_div_bps = (
+        None if (expected_spy_return is None or stored_spy_return is None)
+        else abs(expected_spy_return - float(stored_spy_return)) * 100.0)  # 1% = 100bp
+    return_stale = (
+        (stored_spy_return is None and expected_spy_return is not None)
+        or (return_div_bps is not None and return_div_bps > tolerance_bps))
+    if return_stale:
+        legs.append({"leg": "spy_return_pct", "divergence_bps": return_div_bps,
+                     "stored": stored_spy_return, "settled": expected_spy_return})
+
+    snap_raw = row[3]
+    if snap_raw:
+        try:
+            snap_positions = json.loads(snap_raw)
+        except (json.JSONDecodeError, TypeError):
+            snap_positions = {}
+        for ticker, pos in snap_positions.items():
+            stored_cp = pos.get("closing_price")
+            if stored_cp is None:
+                continue
+            settled_cp = _settled_close_for_ticker(ticker, run_date, config)
+            if settled_cp is None:
+                continue
+            cp_div_bps = abs(settled_cp / float(stored_cp) - 1.0) * 1e4 if stored_cp else float("inf")
+            if cp_div_bps > tolerance_bps:
+                legs.append({"leg": f"position_close:{ticker}", "divergence_bps": cp_div_bps,
+                             "stored": stored_cp, "settled": settled_cp})
+
+    legs.sort(key=lambda leg: -_mag(leg["divergence_bps"]))
+    return row, legs
+
+
 def _write_audit_record(
     *,
     trades_bucket: str,
@@ -224,8 +446,10 @@ def audit_window(
     )
 
     corrected: list[dict] = []
+    corrected_dates: set[str] = set()
     skipped: list[dict] = []
     gaps: list[dict] = []
+    unconverged: list[dict] = []
     checked = 0
 
     for d in dates:  # oldest → newest so corrections propagate forward in one pass
@@ -235,11 +459,7 @@ def audit_window(
             continue
         checked += 1
 
-        row = conn.execute(
-            "SELECT spy_close, spy_return_pct, daily_alpha_pct, positions_snapshot "
-            "FROM eod_pnl WHERE date = ?",
-            (d,),
-        ).fetchone()
+        row, legs = _detect_stale_legs(conn, d, config, tolerance_bps=tolerance_bps, settled=settled)
 
         # ── Missing row (a skipped session). reconcile_audit does NOT
         # blanket-synthesize a NAV here — ledger-replay backfill
@@ -277,11 +497,13 @@ def audit_window(
                     "carry-forward + reprice, config#1454) — gap cleared.", d,
                 )
                 if fd:
+                    # Plain string, not RuntimeError() — this is a SUCCESS
+                    # notice; wrapping it in an exception rendered a completed
+                    # auto-backfill as a crash (alpha-engine-config-I10288).
                     fd.report(
-                        RuntimeError(
-                            f"eod_pnl gap at {d} AUTO-backfilled (verified zero-fill "
-                            f"carry-forward + reprice, config#1454). Prior trading day: "
-                            f"{auto_result['gate'].get('prior_date')}."),
+                        f"eod_pnl gap at {d} AUTO-backfilled (verified zero-fill "
+                        f"carry-forward + reprice, config#1454). Prior trading day: "
+                        f"{auto_result['gate'].get('prior_date')}.",
                         severity="warning",
                         context={"site": "reconcile_audit_gap_auto_backfilled", "run_date": d})
                 continue
@@ -315,94 +537,80 @@ def audit_window(
                 "auto_backfill_reason": auto_result["reason"],
             })
             if fd:
+                # Plain string, not RuntimeError() — a flagged gap awaiting an
+                # operator is a finding, not a crashed run
+                # (alpha-engine-config-I10288).
                 fd.report(
-                    RuntimeError(
-                        f"eod_pnl gap at {d}: no row (skipped session). Auto-backfill "
-                        f"not eligible ({auto_result['reason']}). Manually run "
-                        f"`backfill_eod_pnl --date {d}` after verifying held positions."),
+                    f"eod_pnl gap at {d}: no row (skipped session). Auto-backfill "
+                    f"not eligible ({auto_result['reason']}). Manually run "
+                    f"`backfill_eod_pnl --date {d}` after verifying held positions.",
                     severity="warning",
                     context={"site": "reconcile_audit_gap", "run_date": d})
             continue
 
-        stored_close, stored_spy_return = row[0], row[1]
-
-        # Detector: re-reconcile if the day's OWN close diverged from settled, OR
-        # if its stored spy_return no longer matches the value recomputed from
-        # settled closes. The second clause catches the CASCADE — a prior day's
-        # close was corrected, so THIS day's spy_return denominator is stale even
-        # though its own close is fine (the 06-26-after-06-25 case). Without it,
-        # an own-close-only detector would never self-heal a cascaded return.
-        own_close_div_bps = (
-            float("inf") if stored_close is None
-            else abs(settled / float(stored_close) - 1.0) * 1e4)
-
-        prior_row = conn.execute(
+        # ── Position-level cascade. The stored-return check above catches the
+        # SPY cascade (a corrected prior close makes THIS day's spy_return
+        # denominator stale). The position-level analogue had no clause at all:
+        # `eod_reconcile.run` computes this day's `pricing_timing_usd` /
+        # `mark_basis_usd` / per-name `daily_return_pct` from the PRIOR day's
+        # `positions_snapshot.closing_price` (eod_reconcile.py `prior_positions`),
+        # so correcting day d leaves d+1's already-frozen
+        # `consolidated/{d+1}/eod_report.json` derived from the OLD basis —
+        # permanently, because d+1's own stored closes are all fine and no leg
+        # ever fires for it (alpha-engine-config-I10288).
+        #
+        # This is a derived-input change, not a divergence in anything stored
+        # for THIS day, so it carries 0.0 bps: it must trigger a re-reconcile
+        # without being mistaken for a corruption or dominating `reason`.
+        # Computed here rather than inside `_detect_stale_legs` so it is NOT
+        # re-asserted by the post-correction verification (the prior stays
+        # "corrected in this pass" for the whole run).
+        prior_eod = conn.execute(
             "SELECT date FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1", (d,)
         ).fetchone()
-        settled_prior = _settled_close(prior_row[0], config) if prior_row else None
-        expected_spy_return = (
-            (settled / settled_prior - 1.0) * 100.0 if settled_prior else None)
-        return_div_bps = (
-            None if (expected_spy_return is None or stored_spy_return is None)
-            else abs(expected_spy_return - float(stored_spy_return)) * 100.0)  # 1% = 100bp
+        if prior_eod and prior_eod[0] in corrected_dates:
+            legs.append({"leg": f"prior_corrected:{prior_eod[0]}", "divergence_bps": 0.0,
+                         "stored": f"basis from {prior_eod[0]} pre-correction",
+                         "settled": f"basis from {prior_eod[0]} post-correction"})
+            legs.sort(key=lambda leg: -_mag(leg["divergence_bps"]))
 
-        own_stale = own_close_div_bps > tolerance_bps
-        return_stale = (
-            (stored_spy_return is None and expected_spy_return is not None)
-            or (return_div_bps is not None and return_div_bps > tolerance_bps))
-
-        # ── Held-position check (config#6349): the SPY-only checks above
-        # catch nothing for a non-SPY name whose ArcticDB price was
-        # provisional-then-corrected. That stale `closing_price` then feeds
-        # `mark_basis` on every later day's pricing&timing diff via
-        # `prior_positions`, indefinitely. Check every ticker this day
-        # actually held against its own current settled close.
-        stale_tickers: dict[str, float] = {}
-        snap_raw = row[3]
-        if snap_raw:
-            try:
-                snap_positions = json.loads(snap_raw)
-            except (json.JSONDecodeError, TypeError):
-                snap_positions = {}
-            for ticker, pos in snap_positions.items():
-                stored_cp = pos.get("closing_price")
-                if stored_cp is None:
-                    continue
-                settled_cp = _settled_close_for_ticker(ticker, d, config)
-                if settled_cp is None:
-                    continue
-                cp_div_bps = abs(settled_cp / float(stored_cp) - 1.0) * 1e4 if stored_cp else float("inf")
-                if cp_div_bps > tolerance_bps:
-                    stale_tickers[ticker] = cp_div_bps
-        ticker_stale = bool(stale_tickers)
-
-        if not own_stale and not return_stale and not ticker_stale:
+        if not legs:
             continue  # clean — own close, recomputed spy_return, and every held ticker's close all match
 
-        reason = "stale_close" if own_stale else "stale_return" if return_stale else "stale_position_close"
+        stored_close, stored_spy_return = row[0], row[1]
+        stale_tickers = {
+            leg["leg"].split(":", 1)[1]: leg["divergence_bps"]
+            for leg in legs if leg["leg"].startswith("position_close:")
+        }
+
+        # ``divergence_bps`` is the MAXIMUM over every stale leg, and ``reason``
+        # names the leg that produced it. It used to be whichever leg was
+        # checked first (spy_close, then spy_return, then positions), so a 1.2bp
+        # SPY drift alongside a 40bp held-ticker corruption reported
+        # ``stale_close``/1.2bp — and since the paging decision reads
+        # ``divergence_bps``, the 40bp corruption did not page
+        # (alpha-engine-config-I10288). ``reasons`` lists every triggered leg
+        # class so nothing is dropped from the record either.
+        divergence_bps = max(_mag(leg["divergence_bps"]) for leg in legs)
+        reason = _LEG_REASON[legs[0]["leg"].split(":", 1)[0]]
+        reasons = list(dict.fromkeys(_LEG_REASON[leg["leg"].split(":", 1)[0]] for leg in legs))
+        classification = _classify(divergence_bps, page_threshold_bps=page_threshold_bps)
         before = {"spy_close": stored_close, "spy_return_pct": stored_spy_return,
                   "daily_alpha_pct": row[2], "stale_tickers": stale_tickers or None}
-        divergence_bps = (
-            own_close_div_bps if own_stale
-            else return_div_bps if return_stale
-            else max(stale_tickers.values()))
-        if stale_tickers:
-            logger.warning(
-                "[reconcile_audit] %s held-position closes diverged from settled: %s",
-                d, {t: f"{v:.2f}bp" for t, v in stale_tickers.items()},
-            )
 
         logger.warning(
-            "[reconcile_audit] %s needs correction (%s): stored_close=%s settled=%.2f "
-            "own_div=%s return_div=%s%s", d, reason, stored_close, settled,
-            (f"{own_close_div_bps:.2f}bp" if own_close_div_bps != float("inf") else "inf"),
-            (f"{return_div_bps:.2f}bp" if return_div_bps is not None else "n/a"),
-            " [dry-run]" if dry_run else "",
+            "[reconcile_audit] %s needs correction [%s] (%s; %d stale leg(s)): %s — max divergence "
+            "%sbp vs tolerance %.2fbp%s",
+            d, classification, "+".join(reasons), len(legs), _describe_legs(legs),
+            _fmt_bps(divergence_bps), tolerance_bps, " [dry-run]" if dry_run else "",
         )
 
         if dry_run:
-            corrected.append({"date": d, "reason": reason, "divergence_bps": divergence_bps,
+            corrected.append({"date": d, "reason": reason, "reasons": reasons,
+                              "classification": classification, "legs": legs,
+                              "divergence_bps": divergence_bps,
                               "before": before, "settled_spy_close": settled, "applied": False})
+            corrected_dates.add(d)
             continue
 
         # ── Apply the canonical correction (re-price + re-emit from settled data).
@@ -422,50 +630,116 @@ def audit_window(
         after = ({"spy_close": after_row[0], "spy_return_pct": after_row[1],
                   "daily_alpha_pct": after_row[2]} if after_row else None)
 
-        # Page-worthiness: an outlier-magnitude correction, OR a correction
-        # that isn't the first in this run (multiple dates drifting together
-        # is systemic, not routine settlement lag) — see PAGE_THRESHOLD_BPS.
+        # ── Verify the correction actually took. The re-reconcile's `after`
+        # values used to be recorded and never checked, so a re-price that did
+        # NOT converge was written to the audit trail as a completed correction
+        # (alpha-engine-config-I10288). Re-run the SAME detector against the
+        # now-rewritten row: any leg still divergent means the self-heal did not
+        # heal, eod_pnl is knowably wrong, and no later pass fixes it — this
+        # pass would simply re-detect and re-fail it every day. Collected here
+        # and RAISED after the window completes, so per-date isolation still
+        # records every finding first.
+        _, residual_legs = _detect_stale_legs(
+            conn, d, config, tolerance_bps=tolerance_bps, settled=settled)
+
+        # Page-worthiness: a CORRUPTION-classified correction (the same
+        # at/above-PAGE_THRESHOLD_BPS band as before), OR a correction that
+        # isn't the first in this run (multiple dates drifting together is
+        # systemic, not routine settlement lag) — see PAGE_THRESHOLD_BPS.
         # Every flow-doctor severity level maps to SOME Telegram notifier in
         # flow-doctor.yaml (critical→#critical, error/warning→#ops-health,
         # info→#trades) — there is no "silent" severity to pick. So routine,
-        # in-band corrections skip the fd.report() call entirely rather than
+        # in-band revisions skip the fd.report() call entirely rather than
         # trying to pick a severity that happens not to page; they still get
         # the full S3 audit trail (below) and a local INFO log line.
+        #
+        # NOT a swallow of the failure mode: (a) what is not paged is a bounded
+        # vendor revision that this pass has already corrected AND verified as
+        # converged — the unconverged case below is unconditionally paged at
+        # severity=critical and raises; (b) the primary deliverable (a correct
+        # eod_pnl row) is delivered before the paging decision is even made;
+        # (c) the recording surface is the S3 correction record at
+        # trades/eod_corrections/{date}.json plus the INFO log line, both of
+        # which carry the full leg detail and the classification.
         is_recurrence = len(corrected) >= 1
-        is_outlier = divergence_bps is None or divergence_bps == float("inf") or divergence_bps >= page_threshold_bps
-        page_worthy = is_outlier or is_recurrence
+        page_worthy = classification == CLASSIFICATION_CORRUPTION or is_recurrence
+        page_reason = (
+            f"classification={CLASSIFICATION_CORRUPTION} "
+            f"({_fmt_bps(divergence_bps)}bp >= {page_threshold_bps:.2f}bp threshold)"
+            if classification == CLASSIFICATION_CORRUPTION
+            else "second-or-later correction in this pass (systemic, not settlement lag)"
+            if is_recurrence else None
+        )
 
         record = {
             "date": d,
             "reason": reason,
+            "reasons": reasons,
+            "classification": classification,
+            "legs": legs,
+            "residual_legs": residual_legs,
+            "converged": not residual_legs,
             "tolerance_bps": tolerance_bps,
             "page_threshold_bps": page_threshold_bps,
             "divergence_bps": divergence_bps,
             "paged": page_worthy,
+            "page_reason": page_reason,
             "settled_spy_close": settled,
             "before": before,
             "after": after,
+            "downstream": DOWNSTREAM_ON_CORRECTION,
             "source": "arcticdb_macro",
             "corrected_at": datetime.now(UTC).isoformat(),
         }
         _write_audit_record(trades_bucket=trades_bucket, run_date=d, record=record, region=region)
         correction_message = (
-            f"EOD value for {d} corrected post-settlement ({reason}): "
-            f"SPY close {(before or {}).get('spy_close')} → {after.get('spy_close') if after else settled}"
+            f"EOD {d} corrected post-settlement [{classification}] "
+            f"({'+'.join(reasons)}; {len(legs)} stale leg(s)): {_describe_legs(legs)}. "
+            f"max divergence {_fmt_bps(divergence_bps)}bp "
+            f"(tolerance {tolerance_bps:.2f}bp, page threshold {page_threshold_bps:.2f}bp)"
+            + (f". PAGED: {page_reason}" if page_worthy else "")
         )
         if page_worthy:
             if fd:
+                # A plain string, not an exception: this is a COMPLETED,
+                # verified self-heal, and wrapping it in RuntimeError() made a
+                # successful correction indistinguishable on the alert surface
+                # from an aborted run (alpha-engine-config-I10288 — the
+                # 2026-09-04 page was read as a crash). FlowDoctor.report()
+                # accepts a string and never raises.
                 fd.report(
-                    RuntimeError(correction_message),
+                    correction_message,
                     severity="warning",
                     context={"site": "reconcile_audit_corrected", "run_date": d, "reason": reason,
+                             "reasons": reasons, "classification": classification,
+                             "legs": legs, "converged": not residual_legs,
                              "divergence_bps": divergence_bps, "page_threshold_bps": page_threshold_bps},
                 )
         else:
-            logger.info("[reconcile_audit] %s (in-band, %.2fbp < %.2fbp threshold — audit trail "
-                        "only, not paged)", correction_message, divergence_bps, page_threshold_bps)
-        corrected.append({"date": d, "reason": reason, "divergence_bps": divergence_bps,
+            logger.info("[reconcile_audit] %s — in-band, audit trail only, not paged", correction_message)
+
+        if residual_legs:
+            residual_message = (
+                f"EOD {d} re-reconcile did NOT converge: {len(residual_legs)} leg(s) still diverge "
+                f"from settled after correction: {_describe_legs(residual_legs)}. "
+                f"eod_pnl for {d} is knowably wrong and no later pass corrects it."
+            )
+            _log_paged("[reconcile_audit] %s", residual_message)
+            if fd:
+                fd.report(
+                    residual_message,
+                    severity="critical",
+                    context={"site": "reconcile_audit_unconverged", "run_date": d,
+                             "residual_legs": residual_legs, "tolerance_bps": tolerance_bps},
+                )
+            unconverged.append({"date": d, "residual_legs": residual_legs})
+
+        corrected.append({"date": d, "reason": reason, "reasons": reasons,
+                          "classification": classification, "legs": legs,
+                          "residual_legs": residual_legs, "converged": not residual_legs,
+                          "divergence_bps": divergence_bps,
                           "before": before, "after": after, "applied": True, "paged": page_worthy})
+        corrected_dates.add(d)
 
     conn.close()
     summary = {
@@ -473,12 +747,31 @@ def audit_window(
         "corrected": corrected,
         "skipped": skipped,
         "gaps": gaps,
+        "unconverged": unconverged,
+        "revisions": [c["date"] for c in corrected
+                      if c.get("classification") == CLASSIFICATION_REVISION],
+        "corruptions": [c["date"] for c in corrected
+                        if c.get("classification") == CLASSIFICATION_CORRUPTION],
         "tolerance_bps": tolerance_bps,
+        "page_threshold_bps": page_threshold_bps,
         "dry_run": dry_run,
         "window": dates,
     }
-    logger.info("[reconcile_audit] done: checked=%d corrected=%d gaps=%d skipped=%d dry_run=%s",
-                checked, len(corrected), len(gaps), len(skipped), dry_run)
+    logger.info("[reconcile_audit] done: checked=%d corrected=%d (revisions=%d corruptions=%d) "
+                "gaps=%d skipped=%d unconverged=%d dry_run=%s",
+                checked, len(corrected), len(summary["revisions"]), len(summary["corruptions"]),
+                len(gaps), len(skipped), len(unconverged), dry_run)
+
+    # Fail loud, after every date has been checked and recorded. A correction
+    # that did not converge is the one outcome here that is NOT self-healing:
+    # the pass ran, wrote, verified, and the value is still wrong.
+    if unconverged:
+        raise ReconciliationUnconvergedError(
+            "reconcile_audit could not converge "
+            f"{len(unconverged)} date(s) against settled data: "
+            + "; ".join(f"{u['date']} ({_describe_legs(u['residual_legs'])})" for u in unconverged),
+            summary=summary,
+        )
     return summary
 
 
