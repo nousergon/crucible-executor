@@ -22,12 +22,18 @@ analogue of the spy_return cascade — a corrected day changes the NEXT day's
 ``prior_positions`` basis, and that day's own stored closes are all fine, so no
 other leg ever fires for it).
 
-Each correction is CLASSIFIED as a *revision* (a bounded post-settlement vendor
-change to a print that was correct when we stored it) or a *corruption* (a value
-the settled source plausibly never held), is VERIFIED to have converged against
+Each correction is CLASSIFIED as a *source substitution* (the stored close and
+the settled close came from DIFFERENT vendors, because ArcticDB's Close for a
+date is written by yfinance at ~4:05 PM ET and overwritten by polygon at
+~5:30 AM PT the next morning — expected, scheduled, and the cause of ~all of
+them), a *revision* (a bounded post-settlement change by the SAME vendor to a
+print that was correct when we stored it), or a *corruption* (a value the
+settled source plausibly never held, or a substituted leg too large to be an
+auction/adjustment difference). It is VERIFIED to have converged against
 settled data before it is called done, writes an audit record naming its own
-downstream blast radius, and — for a corruption or a repeat — pages flow-doctor.
-A correction that does NOT converge raises ``ReconciliationUnconvergedError``.
+downstream blast radius, and — for a corruption or a non-substitution repeat —
+pages flow-doctor. A correction that does NOT converge raises
+``ReconciliationUnconvergedError``.
 
 It does NOT blanket-synthesize a NAV for a missing row. Ledger-replay backfill
 (``backfill_eod_pnl``) reconstructs positions from the full trades ledger, which
@@ -73,15 +79,19 @@ from nousergon_lib.trading_calendar import previous_trading_day
 
 from executor.accepted_gaps import load_accepted_gaps
 from executor.config_loader import load_config
-from executor.eod_reconcile import _log_paged, _spy_close
+from executor.eod_reconcile import _log_paged, _row_close_source, _spy_close
 from executor.eod_reconcile import run as eod_run
 from executor.trade_logger import init_db
 
 logger = logging.getLogger(__name__)
 
-# A close that came from the SAME ArcticDB source should match its stored copy
-# exactly unless ArcticDB was corrected since. 1 bp filters float/round noise
-# while still catching the config#1276 class (06-22 was 1.5 bp, 06-25 was 11 bp).
+# 1 bp filters float/round noise while still catching the config#1276 class
+# (06-22 was 1.5 bp, 06-25 was 11 bp). It is a DETECTION tolerance, not an
+# acceptance one: every leg above it is still corrected and still recorded.
+# What a leg MEANS is decided by ``_classify_leg``, not by this number — the
+# comment that used to sit here ("a close from the SAME ArcticDB source should
+# match its stored copy exactly") asserted a premise the pipeline violates
+# every trading day; see CLASSIFICATION_SOURCE_SUBSTITUTION below.
 DEFAULT_TOLERANCE_BPS = 1.0
 DEFAULT_TRAILING_DAYS = 5
 AUDIT_KEY_TEMPLATE = "trades/eod_corrections/{run_date}.json"
@@ -124,6 +134,49 @@ PAGE_THRESHOLD_BPS = 5.0
 # opening the S3 record.
 CLASSIFICATION_REVISION = "revision"
 CLASSIFICATION_CORRUPTION = "corruption"
+
+# ── The third cause, and the one that actually fires (I10360) ────────────────
+#
+# The two causes above both assume the stored value and the settled value came
+# from the SAME vendor, so any difference must be that vendor changing its
+# mind. Measured against the pipeline, that premise is false EVERY trading day:
+#
+#   ArcticDB's Close for date d is written at ~4:05 PM ET on d by the yfinance
+#   EOD pass, and OVERWRITTEN at ~5:30 AM PT on d+1 by the polygon morning
+#   pass, which outranks it 3-to-1 in daily_closes._SOURCE_PRIORITY. The
+#   postclose reconcile freezes the first; this audit reads the second.
+#   (nousergon-data collectors/daily_closes.py module docstring — polygon is
+#   skipped same-day because its free tier 403s on same-day grouped-daily.)
+#
+# So a divergence between a yfinance-sourced stored close and a polygon-sourced
+# settled close is a SCHEDULED SOURCE SUBSTITUTION: a different vendor, on a
+# different adjustment basis (polygon grouped-daily is corporate-action
+# adjusted; the yfinance bar is fetched with auto_adjust=False), read at a
+# different point relative to the closing auction. It is expected, it is
+# corrected here, and it is NOT evidence of a data-integrity incident.
+#
+# Measured over the 20 correction records in
+# s3://alpha-engine-research/trades/eod_corrections/ covering 2026-08-07 to
+# 2026-09-08: 20 of 20 sessions produced a correction and 12 of 20 PAGED, all
+# classified corruption or paged as a recurrence. That is a detector firing on
+# its own pipeline's timetable — the exact "trains the operator to ignore this
+# producer" failure PAGE_THRESHOLD_BPS was introduced (config#2145) to prevent.
+CLASSIFICATION_SOURCE_SUBSTITUTION = "source_substitution"
+
+# A substituted leg is still worth a page when it is too large to be the
+# auction/adjustment/vendor-clock band. Measured over the same 20 records:
+# 55 position-level legs, median 3.80 bp, p90 15.34 bp, and only THREE above
+# 50 bp (AMD 232.4/154.4 bp, TWLO 70.9 bp) — all three on two adjacent sessions
+# (2026-08-11, 2026-08-13), i.e. a feed event, not the daily band. 50 bp
+# therefore separates 52/55 routine substitutions from 3/55 genuinely bad
+# provisional prints. A leg above it is reclassified CORRUPTION: our same-day
+# EOD email and every same-day reader used a materially wrong number, which is
+# actionable regardless of which vendor produced it.
+SOURCE_SUBSTITUTION_PAGE_BPS = 50.0
+
+# Vendors, lowercased, as alpha-engine-data's daily_closes.collect stamps them.
+_SOURCE_UNKNOWN = "unknown"
+_SOURCE_CANONICAL = "polygon"
 
 # Which downstream artifacts consumed the pre-correction value, and whether the
 # re-reconcile this pass performs re-derives them. Recorded verbatim on every
@@ -203,10 +256,62 @@ def _fmt_bps(divergence_bps: float | None) -> str:
 
 def _classify(divergence_bps: float | None, *, page_threshold_bps: float) -> str:
     """``CLASSIFICATION_REVISION`` or ``CLASSIFICATION_CORRUPTION`` — see the
-    band definition above. Unbounded divergence is always corruption."""
+    band definition above. Unbounded divergence is always corruption.
+
+    Provenance-blind. Callers that HAVE provenance use ``_classify_leg``.
+    """
     return (CLASSIFICATION_CORRUPTION
             if _mag(divergence_bps) >= page_threshold_bps
             else CLASSIFICATION_REVISION)
+
+
+def _classify_leg(leg: dict, *, page_threshold_bps: float) -> str:
+    """Classify ONE leg, using its two vendor provenances when both are known.
+
+    * stored vendor != settled vendor, settled vendor is polygon (the canonical
+      one) → ``CLASSIFICATION_SOURCE_SUBSTITUTION``, UNLESS the divergence
+      exceeds ``SOURCE_SUBSTITUTION_PAGE_BPS``, which is beyond any plausible
+      auction/adjustment difference and means the provisional print itself was
+      wrong → ``CLASSIFICATION_CORRUPTION``.
+    * anything else — same vendor on both sides, or either side unknown →
+      the pre-existing magnitude band, unchanged. Unknown provenance holds the
+      STRICTER verdict on purpose: "we cannot tell" must never be quieter than
+      "we can", or a lost provenance column would silence the detector.
+    """
+    stored_source = (leg.get("stored_source") or _SOURCE_UNKNOWN).lower()
+    settled_source = (leg.get("settled_source") or _SOURCE_UNKNOWN).lower()
+    substituted = (
+        stored_source != _SOURCE_UNKNOWN
+        and settled_source != _SOURCE_UNKNOWN
+        and stored_source != settled_source
+        and settled_source == _SOURCE_CANONICAL
+    )
+    if substituted:
+        return (CLASSIFICATION_CORRUPTION
+                if _mag(leg.get("divergence_bps")) >= SOURCE_SUBSTITUTION_PAGE_BPS
+                else CLASSIFICATION_SOURCE_SUBSTITUTION)
+    return _classify(leg.get("divergence_bps"), page_threshold_bps=page_threshold_bps)
+
+
+# Worst-first. A pass's verdict is its worst leg's verdict.
+_CLASSIFICATION_RANK = {
+    CLASSIFICATION_CORRUPTION: 3,
+    CLASSIFICATION_SOURCE_SUBSTITUTION: 2,
+    CLASSIFICATION_REVISION: 1,
+}
+
+
+def _classify_legs(legs: list[dict], *, page_threshold_bps: float) -> tuple[str, list[dict]]:
+    """``(overall_classification, legs)`` with each leg's own ``classification``
+    stamped on it, so the S3 record shows WHY the day was called what it was."""
+    for leg in legs:
+        leg["classification"] = _classify_leg(leg, page_threshold_bps=page_threshold_bps)
+    overall = max(
+        (leg["classification"] for leg in legs),
+        key=lambda c: _CLASSIFICATION_RANK.get(c, 0),
+        default=CLASSIFICATION_REVISION,
+    )
+    return overall, legs
 
 
 def _describe_legs(legs: list[dict]) -> str:
@@ -219,9 +324,24 @@ def _describe_legs(legs: list[dict]) -> str:
     the stale legs.
     """
     return "; ".join(
-        f"{leg['leg']} {leg['stored']} → {leg['settled']} ({_fmt_bps(leg['divergence_bps'])}bp)"
+        f"{leg['leg']} {leg['stored']} → {leg['settled']} "
+        f"({_fmt_bps(leg['divergence_bps'])}bp{_describe_sources(leg)})"
         for leg in legs
     )
+
+
+def _describe_sources(leg: dict) -> str:
+    """`` [yfinance→polygon]`` when the two sides came from different vendors.
+
+    Named in the alert text itself so an operator reading the page can see
+    that the number changed because the SOURCE was swapped on schedule,
+    without opening the S3 record (alpha-engine-config-I10360).
+    """
+    stored_source = leg.get("stored_source") or _SOURCE_UNKNOWN
+    settled_source = leg.get("settled_source") or _SOURCE_UNKNOWN
+    if _SOURCE_UNKNOWN in (stored_source, settled_source) or stored_source == settled_source:
+        return ""
+    return f" [{stored_source}→{settled_source}]"
 
 
 def _window_dates(
@@ -266,9 +386,17 @@ def _settled_close(run_date: str, config: dict) -> float | None:
         return None
 
 
-def _settled_close_for_ticker(ticker: str, run_date: str, config: dict) -> float | None:
-    """Settled ArcticDB close for any held ``ticker`` on ``run_date``, or None
-    if not yet available.
+def _settled_close_for_ticker(
+    ticker: str, run_date: str, config: dict,
+) -> tuple[float, str] | None:
+    """``(settled_close, vendor)`` for any held ``ticker`` on ``run_date``, or
+    None if not yet available.
+
+    The vendor comes from the ArcticDB row's own ``source`` provenance column
+    and is what lets ``_classify_leg`` tell the scheduled yfinance→polygon
+    substitution apart from a genuine data-integrity event
+    (alpha-engine-config-I10360). Rows without the column resolve to
+    ``_SOURCE_UNKNOWN``, which classifies STRICTLY, as before.
 
     Generalizes ``_settled_close`` (SPY-only) to every ticker a day's stored
     ``positions_snapshot`` actually held (config#6349). The original SPY-only
@@ -295,7 +423,7 @@ def _settled_close_for_ticker(ticker: str, run_date: str, config: dict) -> float
     match = df[idx == target]
     if match.empty:
         return None
-    return float(match["Close"].iloc[-1])
+    return float(match["Close"].iloc[-1]), _row_close_source(match)
 
 
 def _detect_stale_legs(
@@ -373,13 +501,19 @@ def _detect_stale_legs(
             stored_cp = pos.get("closing_price")
             if stored_cp is None:
                 continue
-            settled_cp = _settled_close_for_ticker(ticker, run_date, config)
-            if settled_cp is None:
+            settled = _settled_close_for_ticker(ticker, run_date, config)
+            if settled is None:
                 continue
+            settled_cp, settled_source = settled
             cp_div_bps = abs(settled_cp / float(stored_cp) - 1.0) * 1e4 if stored_cp else float("inf")
             if cp_div_bps > tolerance_bps:
                 legs.append({"leg": f"position_close:{ticker}", "divergence_bps": cp_div_bps,
-                             "stored": stored_cp, "settled": settled_cp})
+                             "stored": stored_cp, "settled": settled_cp,
+                             # ``close_source`` is persisted by eod_reconcile at
+                             # freeze time; a snapshot written before I10360
+                             # has none, and classifies strictly.
+                             "stored_source": pos.get("close_source") or _SOURCE_UNKNOWN,
+                             "settled_source": settled_source})
 
     legs.sort(key=lambda leg: -_mag(leg["divergence_bps"]))
     return row, legs
@@ -446,6 +580,9 @@ def audit_window(
     )
 
     corrected: list[dict] = []
+    # Corrections in THIS pass that were not a scheduled yfinance→polygon
+    # substitution — the population the recurrence page is about (I10360).
+    corrected_non_substitution = 0
     corrected_dates: set[str] = set()
     skipped: list[dict] = []
     gaps: list[dict] = []
@@ -594,7 +731,12 @@ def audit_window(
         divergence_bps = max(_mag(leg["divergence_bps"]) for leg in legs)
         reason = _LEG_REASON[legs[0]["leg"].split(":", 1)[0]]
         reasons = list(dict.fromkeys(_LEG_REASON[leg["leg"].split(":", 1)[0]] for leg in legs))
-        classification = _classify(divergence_bps, page_threshold_bps=page_threshold_bps)
+        # Provenance-aware: the day's verdict is its WORST leg's verdict, and a
+        # leg whose two sides came from different vendors is a scheduled source
+        # substitution rather than a revision or a corruption
+        # (alpha-engine-config-I10360). ``_classify_legs`` also stamps each leg
+        # with its own classification, which is written to the S3 record.
+        classification, legs = _classify_legs(legs, page_threshold_bps=page_threshold_bps)
         before = {"spy_close": stored_close, "spy_return_pct": stored_spy_return,
                   "daily_alpha_pct": row[2], "stale_tickers": stale_tickers or None}
 
@@ -661,15 +803,28 @@ def audit_window(
         # (c) the recording surface is the S3 correction record at
         # trades/eod_corrections/{date}.json plus the INFO log line, both of
         # which carry the full leg detail and the classification.
-        is_recurrence = len(corrected) >= 1
+        # The recurrence rule ("multiple dates drifting together in one pass is
+        # systemic, not settlement lag") is dead for source substitutions: the
+        # yfinance→polygon overwrite makes EVERY windowed date drift, every
+        # pass, by construction — which is why 12 of the 20 sessions from
+        # 2026-08-07 to 2026-09-08 paged. Count only corrections that were NOT
+        # a scheduled substitution, so the recurrence signal still fires for
+        # the thing it was built to catch.
+        is_recurrence = (
+            classification != CLASSIFICATION_SOURCE_SUBSTITUTION
+            and corrected_non_substitution >= 1
+        )
         page_worthy = classification == CLASSIFICATION_CORRUPTION or is_recurrence
         page_reason = (
             f"classification={CLASSIFICATION_CORRUPTION} "
             f"({_fmt_bps(divergence_bps)}bp >= {page_threshold_bps:.2f}bp threshold)"
             if classification == CLASSIFICATION_CORRUPTION
-            else "second-or-later correction in this pass (systemic, not settlement lag)"
+            else "second-or-later non-substitution correction in this pass "
+                 "(systemic, not settlement lag)"
             if is_recurrence else None
         )
+        if classification != CLASSIFICATION_SOURCE_SUBSTITUTION:
+            corrected_non_substitution += 1
 
         record = {
             "date": d,
@@ -752,14 +907,22 @@ def audit_window(
                       if c.get("classification") == CLASSIFICATION_REVISION],
         "corruptions": [c["date"] for c in corrected
                         if c.get("classification") == CLASSIFICATION_CORRUPTION],
+        # The number that says the reclassification is working: on a healthy
+        # fleet nearly every correction is a scheduled substitution and
+        # ``corruptions`` is empty. A run where ``substitutions`` is empty but
+        # dates WERE corrected means provenance is missing on both sides —
+        # unobserved, not clean (alpha-engine-config-I10360).
+        "substitutions": [c["date"] for c in corrected
+                          if c.get("classification") == CLASSIFICATION_SOURCE_SUBSTITUTION],
         "tolerance_bps": tolerance_bps,
         "page_threshold_bps": page_threshold_bps,
         "dry_run": dry_run,
         "window": dates,
     }
-    logger.info("[reconcile_audit] done: checked=%d corrected=%d (revisions=%d corruptions=%d) "
-                "gaps=%d skipped=%d unconverged=%d dry_run=%s",
-                checked, len(corrected), len(summary["revisions"]), len(summary["corruptions"]),
+    logger.info("[reconcile_audit] done: checked=%d corrected=%d (substitutions=%d "
+                "revisions=%d corruptions=%d) gaps=%d skipped=%d unconverged=%d dry_run=%s",
+                checked, len(corrected), len(summary["substitutions"]),
+                len(summary["revisions"]), len(summary["corruptions"]),
                 len(gaps), len(skipped), len(unconverged), dry_run)
 
     # Fail loud, after every date has been checked and recorded. A correction
