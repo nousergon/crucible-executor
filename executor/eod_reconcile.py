@@ -38,6 +38,7 @@ from executor.pnl_backfill import backfill_residual_sleeves
 from executor.pnl_integrity import (
     RESIDUAL_CUMULATIVE_WINDOW_SESSIONS,
     check_attribution_closure,
+    check_benchmark_vendor_anchor,
     check_custodian_marks,
     check_mark_coverage,
     check_residual_bounds,
@@ -49,6 +50,7 @@ from executor.pnl_integrity import (
     verify_nav_change_basis_closes,
     verify_twr_closes,
 )
+from executor.pnl_measurement_backfill import fetch_live_anchor_window, heal_cost_columns
 from executor.trade_logger import (
     backup_to_s3,
     dividend_receivable_usd,
@@ -2541,6 +2543,15 @@ def run(
     # day's artifacts is strictly worse than a late failure, and the operator
     # needs the artifacts to diagnose the breach.
     integrity_breaches: list[dict] = []
+    # OBSERVE-MODE records (alpha-engine-config-I9614 D2). Same shape as
+    # `integrity_breaches` and persisted into the same `integrity_breach_json`,
+    # but deliberately NOT read by the deferred raise at the end of this
+    # function. A gate whose subject already breaches by construction — the
+    # published benchmark history, pending the restatement ruling in
+    # `alpha-engine-config-I9613` — would fail every postclose for a condition
+    # already measured and queued for a human, which is how a fleet acquires a
+    # chronic false positive. Visible and recorded, but not yet load-bearing.
+    observe_records: list[dict] = []
 
     # Bound the residual. Prefer the TRUE residual (rotation + pricing&timing
     # lifted out); fall back to the raw plug only when the sleeves could not
@@ -2565,6 +2576,40 @@ def run(
     # migration carries NULL — reconstruct them from what IS persisted rather
     # than letting the window fall back to a different quantity.
     backfill_result = backfill_residual_sleeves(conn)
+    # ── Cost columns heal themselves too (alpha-engine-config-I9614 D1) ─────
+    # Same argument, one column-family over: commission_usd / slippage_usd /
+    # traded_notional_usd / daily_return_gross_pct were reachable only from
+    # `python -m executor.pnl_measurement_backfill --apply --costs`, and that
+    # CLI was never run — 6 of 120 sessions populated on 2026-08-31, 12 of 126
+    # on 2026-09-08, i.e. only the forward path ever moved. A backfill behind
+    # an operator step is a page, not a fix. Purely local (the trades ledger in
+    # this same sqlite file), no vendor call, and planning skips populated rows,
+    # so a converged history costs one query.
+    try:
+        cost_heal = heal_cost_columns(conn)
+    except Exception as exc:  # noqa: BLE001
+        # (a) swallowed: a failure inside a HISTORICAL self-heal; (b) the
+        # primary deliverable — today's reconciliation, its gates, artifacts
+        # and email — is computed from today's inputs and survives intact;
+        # (c) recorded: a data_warning on this session's row plus the traceback
+        # in the run log. Raising here would abort a good close over a bad
+        # historical row, which is the failure mode `backfill_residual_sleeves`
+        # was given the same treatment for.
+        cost_heal = None
+        logger.warning("Cost-column self-heal failed", exc_info=True)
+        data_warnings.append(
+            f"Cost-column self-heal FAILED on {run_date} ({exc}) — the "
+            "historical commission/slippage columns did not heal this run and "
+            "are still absent on the sessions they were absent on. Today's own "
+            "cost line is unaffected."
+        )
+    if cost_heal and cost_heal["filled"]:
+        logger.info(
+            "Cost columns healed on %d historical session(s): "
+            "Σslippage $%+.2f, commission ABSENT (NULL, not 0.0) on %d of them",
+            cost_heal["filled"], cost_heal["slippage_usd_total"],
+            cost_heal["commission_absent"],
+        )
     for skipped_date, why in backfill_result["skipped"]:
         logger.warning(
             "Residual sleeves unreconstructible for %s (%s) — that session is "
@@ -2840,10 +2885,89 @@ def run(
             nc_basis["n_sessions"], nc_basis["drift_bps"], nc_basis["tolerance_bps"],
             len(nc_basis.get("coverage_gap_sessions") or []),
         )
-    if integrity_breaches:
+    # ── The benchmark leg's INDEPENDENT side (alpha-engine-config-I9614 D2) ──
+    # Every gate above this point is closed inside the system's own numbers.
+    # `spy_close` and `spy_return_pct` are written by the same producer on the
+    # same run, so no equation built from the two of them can fail for the
+    # reason that matters — they can be wrong TOGETHER, and over the live
+    # history they were: the published benchmark chain reads +15.5242% against
+    # the vendor's +14.0325% total return (149.2bp), and every internal check
+    # agreed with itself throughout.
+    #
+    # `check_benchmark_vendor_anchor` is the one side of this reconciliation
+    # the system did not compute — Polygon's own SPY closes and its declared
+    # distributions. It landed in PR522 reachable only from a CLI. Running the
+    # only non-tautological instrument in the stack when a human remembers to
+    # type it is the same defect as not having it.
+    #
+    # OBSERVE MODE. Breaches go to `data_warnings` and the persisted
+    # `integrity_breach_json`, NOT to the pipeline exit code, because the
+    # published history breaches by construction until the restatement in
+    # `alpha-engine-config-I9613` is ruled. A hard gate today would fail every
+    # postclose for a condition already known, measured and queued for a human.
+    # Promotion to hard is that issue's closes-when, not this one's.
+    try:
+        anchor_rows = [
+            {"date": r[0], "spy_close": r[1], "spy_return_pct": r[2]}
+            for r in conn.execute(
+                "SELECT date, spy_close, spy_return_pct FROM eod_pnl "
+                "WHERE date <= ? ORDER BY date DESC LIMIT 2",
+                (run_date,),
+            ).fetchall()
+        ][::-1]
+        vendor_closes, vendor_dividends = fetch_live_anchor_window(anchor_rows)
+        anchor_breaches = check_benchmark_vendor_anchor(
+            anchor_rows,
+            vendor_closes=vendor_closes,
+            vendor_dividends=vendor_dividends,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A vendor that cannot be reached is a NAMED degradation, never a pass.
+        # `executor.dividends.fetch_ex_dividends` is the precedent and the
+        # reason it exists: this issue's original defect 3 was an absent
+        # measurement (`IBKR.get_accrued_dividends_by_symbol()` returning `{}`)
+        # persisted as a measured $0.00. An anchor that silently returned "no
+        # breaches" when Polygon was down would be the identical mistake one
+        # layer up. (a) swallowed: the third-party fetch; (b) the primary
+        # deliverable — the reconciliation, its artifacts and its other gates —
+        # survives; (c) recorded: a `benchmark_anchor_unevaluated` record in
+        # `integrity_breach_json` and a `data_warnings` line, both persisted.
+        logger.warning("Benchmark vendor anchor NOT EVALUATED", exc_info=True)
+        unevaluated = (
+            f"Benchmark vendor anchor NOT EVALUATED on {run_date}: {exc}. The "
+            "benchmark leg of today's alpha carries no independent check — "
+            "this is an ABSENT measurement, not a clean one."
+        )
+        data_warnings.append(unevaluated)
+        observe_records.append({
+            "kind": "benchmark_anchor_unevaluated",
+            "severity": "unevaluated",
+            "run_date": run_date,
+            "reason": str(exc),
+            "message": unevaluated,
+        })
+    else:
+        for breach in anchor_breaches:
+            _log_paged("BENCHMARK ANCHOR (observe): %s", breach["message"])
+            data_warnings.append(breach["message"])
+            observe_records.append({"severity": "observe", **breach})
+        if not anchor_breaches:
+            logger.info(
+                "Benchmark vendor anchor clean over %s: persisted spy_close and "
+                "spy_return_pct agree with the vendor's own closes and declared "
+                "distributions.",
+                " → ".join(r["date"] for r in anchor_rows),
+            )
+
+    if integrity_breaches or observe_records:
+        # Observe-mode records are persisted BESIDE the hard breaches, in the
+        # same column, each carrying its own `severity`. They do not reach the
+        # deferred raise. Writing them somewhere else would put the one
+        # independent measurement of the benchmark leg on a surface no
+        # consumer of `integrity_breach_json` reads.
         conn.execute(
             "UPDATE eod_pnl SET integrity_breach_json = ? WHERE date = ?",
-            (json.dumps(integrity_breaches), run_date),
+            (json.dumps(integrity_breaches + observe_records), run_date),
         )
         conn.commit()
 

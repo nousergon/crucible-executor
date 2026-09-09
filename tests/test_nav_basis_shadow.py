@@ -266,8 +266,20 @@ class _RunResult:
         self.fd_sites = fd_sites
 
 
+def _vendor_unavailable(_rows):
+    """Default anchor stub: the vendor is unreachable.
+
+    Patched in unconditionally so the run is deterministic whether or not the
+    developer's shell carries a POLYGON_API_KEY — an EOD run that reaches the
+    network in a unit test is a flaky test, and one that reaches it only on
+    some machines is worse.
+    """
+    raise RuntimeError("vendor unavailable (test stub)")
+
+
 def _run_eod(
     *, nav_basis: str, mark_basis_usd: float, drop_cash: bool = False,
+    anchor=_vendor_unavailable,
 ) -> _RunResult:
     """Drive ``eod_reconcile.run`` end to end against the fixture book."""
     from executor import eod_reconcile
@@ -296,6 +308,8 @@ def _run_eod(
              patch.object(eod_reconcile, "_spy_close", return_value=CLOSE_TODAY), \
              patch.object(eod_reconcile, "fetch_ex_dividends",
                           return_value=({}, {}, True, None)), \
+             patch.object(eod_reconcile, "fetch_live_anchor_window",
+                          side_effect=anchor), \
              patch.object(eod_reconcile, "_load_signals_from_s3",
                           return_value=({}, None)), \
              patch.object(eod_reconcile, "_load_predictions_from_s3",
@@ -573,3 +587,101 @@ def test_report_block_survives_json_serialisation():
     result = _run_eod(nav_basis=NAV_BASIS_IB_NETLIQ, mark_basis_usd=800.0)
     recon = json.loads(json.dumps(result.report))["nav_reconciliation"]
     assert recon["nav_basis"] == NAV_BASIS_IB_NETLIQ
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The benchmark leg's independent side, wired into the live path
+# (alpha-engine-config-I8188 / I9614 D2)
+#
+# Every other gate in this file closes inside the system's own numbers.
+# `spy_close` and `spy_return_pct` are written by the same producer on the same
+# run, so they can be wrong TOGETHER — over the live history they are, by
+# 149.2bp against the vendor. These bind the two properties that make the
+# vendor anchor worth having in the postclose at all: it RUNS every session,
+# and it never reports agreement it did not measure.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _breach_kinds(row) -> list[str]:
+    raw = row.get("integrity_breach_json")
+    return [b.get("kind") for b in json.loads(raw)] if raw else []
+
+
+class TestBenchmarkVendorAnchorInTheLivePath:
+
+    def test_an_unreachable_vendor_is_named_never_a_silent_pass(self):
+        """An absent measurement persisted as a clean one is THE defect of
+        I8188 (defect 3 was `{}` from the broker rendered as $0.00)."""
+        result = _run_eod(
+            nav_basis=NAV_BASIS_IB_NETLIQ, mark_basis_usd=800.0,
+            anchor=_vendor_unavailable,
+        )
+        assert "benchmark_anchor_unevaluated" in _breach_kinds(result.row)
+        assert [w for w in result.warnings if "NOT EVALUATED" in w and "anchor" in w]
+
+    def test_the_unevaluated_record_does_not_fail_the_postclose(self):
+        """Observe mode is observe mode: `_run_eod` returning at all is the
+        assertion — the deferred raise reads `integrity_breaches`, which
+        observe records never enter."""
+        result = _run_eod(
+            nav_basis=NAV_BASIS_IB_NETLIQ, mark_basis_usd=800.0,
+            anchor=_vendor_unavailable,
+        )
+        assert result.row["portfolio_nav"] is not None
+
+    def test_a_vendor_close_divergence_is_recorded_and_still_observe_only(self):
+        """The published `spy_close` disagreeing with the vendor's own close is
+        the one thing no internal equation can detect."""
+        def _diverging(rows):
+            dates = sorted(str(r["date"]) for r in rows)
+            closes = dict.fromkeys(dates, 500.0)     # far from the fixture close
+            return closes, {}
+
+        result = _run_eod(
+            nav_basis=NAV_BASIS_IB_NETLIQ, mark_basis_usd=800.0,
+            anchor=_diverging,
+        )
+        kinds = _breach_kinds(result.row)
+        assert "benchmark_close_divergence" in kinds
+        assert "benchmark_anchor_unevaluated" not in kinds
+        assert result.row["portfolio_nav"] is not None   # observe, not a raise
+
+    def test_the_anchor_catches_a_return_no_internal_check_can(self):
+        """THE non-tautology test.
+
+        Here every persisted `spy_close` matches the vendor's exactly, so the
+        close-divergence arm is silent — and the stored `spy_return_pct` still
+        disagrees with the return those same closes imply. No equation built
+        from `spy_close` and `spy_return_pct` alone can distinguish this from a
+        correct series, because both columns are written by this system on this
+        run. The vendor's own price path is the second measurement.
+        """
+        def _closes_match_returns_do_not(rows):
+            return {str(r["date"]): float(r["spy_close"]) for r in rows}, {}
+
+        result = _run_eod(
+            nav_basis=NAV_BASIS_IB_NETLIQ, mark_basis_usd=800.0,
+            anchor=_closes_match_returns_do_not,
+        )
+        kinds = _breach_kinds(result.row)
+        assert "benchmark_anchor_drift" in kinds
+        assert "benchmark_close_divergence" not in kinds
+        assert result.row["portfolio_nav"] is not None   # observe, not a raise
+
+    def test_a_fully_agreeing_vendor_records_nothing(self):
+        """Agreement on BOTH arms is silence — the gate is not a nag."""
+        def _agreeing(rows):
+            ordered = sorted(rows, key=lambda r: str(r["date"]))
+            closes, level = {}, 100.0
+            for r in ordered:
+                ret = float(r["spy_return_pct"] or 0.0)
+                level *= (1.0 + ret / 100.0)
+                closes[str(r["date"])] = level
+            # Feed the book the same closes so the divergence arm is silent
+            # too; the arithmetic above is the vendor's own path.
+            return closes, {}
+
+        result = _run_eod(
+            nav_basis=NAV_BASIS_IB_NETLIQ, mark_basis_usd=800.0,
+            anchor=_agreeing,
+        )
+        assert "benchmark_anchor_drift" not in _breach_kinds(result.row)
