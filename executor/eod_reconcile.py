@@ -126,6 +126,8 @@ def _check_nav_three_way_hard_gate(
     pricing_timing_available: bool,
     nav: float | None,
     run_date: str,
+    residual_usd: float | None = None,
+    attribution_ok: bool = False,
 ) -> dict | None:
     """NAV three-way reconcile hard-gate decision (config#2457).
 
@@ -135,11 +137,44 @@ def _check_nav_three_way_hard_gate(
     cancels — see the ``nav_reconciliation`` block in ``run()`` for the full
     derivation.
 
+    **Re-based onto the unexplained residual (alpha-engine-config-I9087).**
+    Before this the gate fired whenever the RAW term crossed
+    ``_nav_hard_gate_tolerance_usd`` — 8 of 48 sessions (16.7%,
+    2026-06-22..2026-08-28), almost all of them routine delayed-feed
+    (``reqMarketDataType(3)``) mark staleness rather than a real reconcile
+    break, the "trained to ignore it" path the module's own docstring warns
+    against (config#2145). ``residual_usd`` — the portion of the mark-basis
+    divergence NOT attributed by ``_attribute_mark_basis_divergence`` to
+    names whose IB mark demonstrably is not the settled close — measured
+    three orders of magnitude smaller (−$30.7 / +$8.4) on the two sessions
+    with full attribution coverage.
+
+    Two independent triggers, EITHER of which fires the gate:
+
+    1. ``residual_usd`` exceeds ``NAV_BREACH_RESIDUAL_FLOOR_USD`` while
+       ``attribution_ok`` is True — the unexplained-residual hard gate this
+       issue exists to install.
+    2. The RAW term still crosses the (unwidened) ``tolerance_usd`` — the
+       raw term is RETAINED, never removed, as the ``broker_data_quality``
+       signal on the warning tier (the caller resolves final severity from
+       ``_classify_nav_breach``; this function only decides whether
+       anything is reportable at all).
+
+    **Fail closed (required, not optional — alpha-engine-config-I9087).**
+    When ``attribution_ok`` is False — ``_attribute_mark_basis_divergence``
+    raised, returned partial coverage, or produced no attribution at all —
+    the residual cannot be trusted, so trigger 1 above falls back to the RAW
+    term against ``tolerance_usd`` (never a wider band; the caller forces
+    the classification to ``reconcile_defect``/error in this case). A
+    defect in the attribution codepath can therefore never silently
+    suppress a real breach: attribution failure can only ever make the gate
+    MORE likely to fire, never less.
+
     Returns ``None`` when the gate does not fire (no data, or within
-    tolerance). Returns a dict describing the breach when it does — the
-    caller (``run()``) is responsible for logging + paging flow-doctor; kept
-    as a pure decision function so it's unit-testable without mocking the
-    rest of ``run()``'s IO (snapshot/DB/S3).
+    tolerance on both triggers). Returns a dict describing the breach when
+    it does — the caller (``run()``) is responsible for logging + paging
+    flow-doctor; kept as a pure decision function so it's unit-testable
+    without mocking the rest of ``run()``'s IO (snapshot/DB/S3).
 
     Deliberately does NOT fire when ``pricing_timing_available`` is False
     (missing prior snapshot) — that path already gets its own honesty
@@ -150,7 +185,18 @@ def _check_nav_three_way_hard_gate(
     if not pricing_timing_available or not nav:
         return None
     tolerance_usd = _nav_hard_gate_tolerance_usd(nav)
-    if abs(pricing_timing_usd) <= tolerance_usd:
+    raw_breach = abs(pricing_timing_usd) > tolerance_usd
+    if attribution_ok:
+        residual_breach = (
+            residual_usd is not None
+            and abs(residual_usd) > NAV_BREACH_RESIDUAL_FLOOR_USD
+        )
+    else:
+        # Fail closed: the residual is not trustworthy, so the only signal
+        # left is the raw term against its own (unwidened) tolerance —
+        # identical to the pre-I9087 gate for this one case.
+        residual_breach = raw_breach
+    if not raw_breach and not residual_breach:
         return None
     return {
         "run_date": run_date,
@@ -159,6 +205,10 @@ def _check_nav_three_way_hard_gate(
         "tolerance_usd": tolerance_usd,
         "tolerance_bps": NAV_HARD_GATE_TOLERANCE_NAV_BPS,
         "nav": nav,
+        "residual_usd": residual_usd,
+        "residual_breach": residual_breach,
+        "raw_breach": raw_breach,
+        "attribution_ok": attribution_ok,
         "message": (
             f"NAV three-way reconcile breach for {run_date}: pricing & timing "
             f"divergence ${pricing_timing_usd:+,.0f} "
@@ -2299,24 +2349,33 @@ def run(
         # is zero by construction and passing it here would silence the gate
         # entirely — I6819 item 3 requires it keep firing on IB divergence
         # after the cut-over. The tolerance is untouched.
-        nav_hard_gate_breach = _check_nav_three_way_hard_gate(
-            pricing_timing_usd=mark_basis_delta_usd,
-            pricing_timing_available=pricing_timing_available,
-            nav=nav,
-            run_date=run_date,
-        )
-        if nav_hard_gate_breach:
-            # Reclassify (config#6349 deliverable 4): if flagged out-of-range
-            # IB marks fully explain the divergence, this is a broker
-            # data-quality event, not a NAV reconcile code defect — a
-            # different remediation, and named in the alert either way so
-            # an operator isn't left tracing four positions by hand.
-            # Attribution basis is the FULL BOOK, not the out-of-range subset
-            # (alpha-engine-config-I8733) — same per-ticker decomposition
-            # `pricing_timing_unattributable_usd` is built from, so the
-            # classifier and the artifact can never disagree about how much of
-            # the breach the marks explain.
-            from executor.eod_report import compute_pricing_timing_by_ticker
+        #
+        # Attribution is computed UNCONDITIONALLY here — not only inside a
+        # confirmed raw-term breach — because the gate itself now depends on
+        # its output (alpha-engine-config-I9087): the residual the gate reads
+        # can only be known once the mark-basis divergence is decomposed.
+        # Attribution basis is the FULL BOOK, not the out-of-range subset
+        # (alpha-engine-config-I8733) — same per-ticker decomposition
+        # `pricing_timing_unattributable_usd` is built from, so the
+        # classifier and the artifact can never disagree about how much of
+        # the breach the marks explain.
+        #
+        # Deliberate, narrow deviation from "fail loud, no silent swallows":
+        # (a) failure mode swallowed — `compute_pricing_timing_by_ticker` /
+        # `_attribute_mark_basis_divergence` raising on this one day's book;
+        # (b) the primary EOD deliverable (NAV log + email) survives because
+        # this whole reconciliation section already runs inside its own
+        # exception boundary at the `run()` call site; (c) recording surface
+        # — logged at ERROR here AND, because `attribution_ok` becomes False,
+        # the gate below fails CLOSED and pages flow-doctor at error rather
+        # than silently passing. Attribution is safety-critical the moment
+        # the gate depends on it, so a raise must escalate, never vanish.
+        from executor.eod_report import compute_pricing_timing_by_ticker
+        _pt_by_ticker: dict = {}
+        _pt_uncovered = 0
+        _mb = {"contributors": [], "explained_usd": None, "covered_usd": 0.0, "uncovered_names": 0}
+        _attribution_exception: Exception | None = None
+        try:
             _pt_by_ticker, _pt_uncovered = compute_pricing_timing_by_ticker(
                 positions, prior_positions if prior_snapshot_loaded else None,
             )
@@ -2328,19 +2387,61 @@ def run(
                 positions=positions,
                 prior_positions=prior_positions if prior_snapshot_loaded else None,
             )
-            _breach_classification = _classify_nav_breach(
-                nav_hard_gate_breach["pricing_timing_usd"],
-                ib_mark_range_flags,
-                full_book_mark_basis_usd=(
-                    sum(_pt_by_ticker.values()) if prior_snapshot_loaded else None
-                ),
-                full_book_uncovered_names=_pt_uncovered,
-                mark_divergence_explained_usd=(
-                    _mb["explained_usd"] if prior_snapshot_loaded else None
-                ),
+        except Exception as exc:
+            _attribution_exception = exc
+            logger.exception(
+                "Mark-basis divergence attribution raised for %s — the NAV "
+                "hard gate falls back to the raw pricing/timing term and "
+                "fails CLOSED (alpha-engine-config-I9087).",
+                run_date,
             )
+        # Attribution is trustworthy only when it ran clean AND covered the
+        # whole book — a partial-coverage or no-attribution-at-all result
+        # (I9087's required fail-closed condition) must not be read as "the
+        # residual is small", or a defect in this codepath would silently
+        # suppress a real breach.
+        attribution_ok = (
+            _attribution_exception is None
+            and prior_snapshot_loaded
+            and _mb.get("explained_usd") is not None
+            and _mb.get("uncovered_names", 0) == 0
+            and _pt_uncovered == 0
+        )
+        _breach_classification = _classify_nav_breach(
+            mark_basis_delta_usd,
+            ib_mark_range_flags,
+            full_book_mark_basis_usd=(
+                sum(_pt_by_ticker.values()) if prior_snapshot_loaded else None
+            ),
+            full_book_uncovered_names=_pt_uncovered,
+            mark_divergence_explained_usd=(
+                _mb["explained_usd"] if prior_snapshot_loaded else None
+            ),
+        )
+        nav_hard_gate_breach = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=mark_basis_delta_usd,
+            pricing_timing_available=pricing_timing_available,
+            nav=nav,
+            run_date=run_date,
+            residual_usd=_breach_classification["residual_usd"],
+            attribution_ok=attribution_ok,
+        )
+        if nav_hard_gate_breach:
+            # Fail-closed classification override (alpha-engine-config-I9087):
+            # when attribution could not be trusted, the breach is NEVER
+            # allowed to read as `broker_data_quality` — `_classify_nav_breach`
+            # above was fed a degraded/absent explanation term and must not be
+            # taken at face value. Otherwise the classifier's own two-test
+            # verdict stands, which already folds in the I9085 NAV-identity
+            # cross-check (`nav_identity_holds`).
+            if not attribution_ok:
+                _breach_classification = dict(
+                    _breach_classification,
+                    classification="reconcile_defect",
+                )
             nav_hard_gate_breach.update(_breach_classification)
             nav_hard_gate_breach["mark_basis_contributors"] = _mb["contributors"]
+            nav_hard_gate_breach["attribution_ok"] = attribution_ok
             # Classification is always named — a book-wide mark skew can now
             # classify broker_data_quality with ZERO tickers out of range, and
             # the responder still has to be told which way to go.
@@ -2353,6 +2454,12 @@ def run(
                     if _breach_classification["nav_identity_residual_usd"] is None
                     else f", NAV-identity residual "
                          f"${_breach_classification['nav_identity_residual_usd']:+,.0f}"
+                )
+                + (
+                    ""
+                    if attribution_ok
+                    else " — ATTRIBUTION UNAVAILABLE, gate failed CLOSED "
+                         "(alpha-engine-config-I9087)"
                 )
                 + ")."
             )
@@ -2403,6 +2510,8 @@ def run(
                         "hard_gate_tolerance_usd": nav_hard_gate_breach["tolerance_usd"],
                         "nav": nav_hard_gate_breach["nav"],
                         "classification": nav_hard_gate_breach["classification"],
+                        "residual_usd": nav_hard_gate_breach["residual_usd"],
+                        "attribution_ok": nav_hard_gate_breach["attribution_ok"],
                         "ib_mark_outside_range_tickers": [
                             f["ticker"] for f in ib_mark_range_flags
                         ],

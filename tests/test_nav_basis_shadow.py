@@ -431,8 +431,19 @@ class TestDefaultBasisPublishesBothFigures:
         is published without a data_warnings line — deliverable 4."""
         assert not [w for w in result.warnings if "NAV basis divergence" in w]
 
-    def test_no_hard_gate_page(self, result):
-        assert "nav_three_way_reconcile_hard_gate" not in result.fd_sites
+    def test_hard_gate_pages_on_the_unexplained_residual(self, result):
+        """Updated for alpha-engine-config-I9087: the gate is re-based onto
+        the unexplained residual, not the raw $2,500/15bp tolerance. The
+        fixture's $800 skew is spread evenly across all 12 names (each
+        individually well inside the 10bp off-close floor), so
+        `_attribute_mark_basis_divergence` explains none of it — the whole
+        $800 is residual, past `NAV_BREACH_RESIDUAL_FLOOR_USD` ($500), so the
+        gate now fires here where the pre-I9087 raw-term gate (silent below
+        $2,500) would not have. This is the intended tightening: routine
+        broker noise concentrated in a few flagged names is explained and
+        stays quiet at the warning tier: an unattributed book-wide skew is
+        exactly what the residual-based gate exists to catch."""
+        assert "nav_three_way_reconcile_hard_gate" in result.fd_sites
 
 
 class TestOutOfBandDifferenceWarns:
