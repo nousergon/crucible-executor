@@ -45,7 +45,11 @@ from executor.price_cache import (
     load_price_histories,
 )
 from executor.risk_guard import compute_drawdown_multiplier
-from executor.signal_reader import get_actionable_signals, read_signals_with_fallback
+from executor.signal_reader import (
+    get_actionable_signals,
+    is_signals_stale,
+    read_signals_with_fallback,
+)
 from executor.strategies.config import load_strategy_config
 from executor.strategies.exit_manager import (
     SECTOR_ETF_MAP,
@@ -329,6 +333,40 @@ def load_config() -> dict:
     return copy.deepcopy(_LOAD_CONFIG_CACHE)
 
 
+def _next_earnings_date_from_dates_df(df, ref: date) -> date | None:
+    """Extract the next (earliest upcoming, on/after ``ref``) earnings date
+    from a ``yfinance.Ticker.get_earnings_dates()`` DataFrame.
+
+    SOTA pattern mirrored from
+    ``nousergon-data/collectors/metron_market_data.py::_yfinance_earnings``
+    rather than inventing a parallel one
+    (``~/Development/CLAUDE.md`` "mirror a SOTA pattern in another
+    alpha-engine repo"). Deliberately NOT ``Ticker.calendar``: that
+    property's return shape changed from a pandas DataFrame to a ``dict``
+    across yfinance releases (measured: ``calendar`` raised
+    ``AttributeError: 'dict' object has no attribute 'empty'`` for every
+    ENTER candidate under the pinned version here — the defect this
+    function replaces), and the fleet does not agree on one yfinance pin
+    (``crucible-backtester`` ``~=1.5.2``, ``crucible-research`` ``~=1.6.0``,
+    ``crucible-dashboard``/``crucible-executor`` ``==1.7.0``,
+    ``crucible-predictor``/``nousergon-data`` ``>=1.7.0`` — filed as
+    alpha-engine-config-I10305). ``get_earnings_dates()`` is typed
+    ``-> pandas.DataFrame | None`` and has held that shape across all of
+    those pins; verified here against this repo's own pinned
+    ``yfinance==1.7.0``.
+    """
+    if df is None or df.empty:
+        return None
+    import pandas as pd
+
+    idx = pd.to_datetime(df.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    today = pd.Timestamp(ref)
+    future = sorted(d for d in idx if d >= today)
+    return future[0].date() if future else None
+
+
 def _compute_support_level(price_history, strategy_config: dict) -> float | None:
     """Compute N-day low from price history for support-bounce entry trigger.
 
@@ -517,13 +555,28 @@ def _read_signals(
     # now_dual().trading_day — NOT run_date, which is the session axis
     # (config#1610) and sits one session ahead intraday (comparing against
     # it would false-alert every Monday on perfectly fresh Friday signals).
+    #
+    # Staleness itself is cadence-aware (is_signals_stale, shared with
+    # signal_reader._warn_if_stale) — Research is a weekly Saturday pipeline
+    # writing Friday-dated signals (declared cadence, not inferred: the
+    # research_signals row in
+    # alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml carries
+    # cadence: saturday_sf, converted from a prior daily cadence 2026-08-13
+    # per that file's own comment — "the paragraph above records the daily
+    # era for provenance; it is not the live state"). This alert's
+    # age > 2 threshold was a leftover from that retired daily era;
+    # signal_reader's age > 7 was updated for weekly but is still a plain
+    # age threshold, which fires on some healthy weekday no matter where
+    # the cutoff is set (a healthy Friday-dated file is 3-9 days old
+    # across the week it stays current) — both are replaced by the single
+    # cadence-boundary predicate below.
     if not simulate:
         try:
             from nousergon_lib.dates import now_dual as _now_dual
             _knowledge_day = _now_dual().trading_day
             signals_date_raw = signals_raw.get("date", _knowledge_day)
-            _sig_age = (date.fromisoformat(_knowledge_day) - date.fromisoformat(signals_date_raw)).days
-            if _sig_age > 2:
+            _stale, _sig_age = is_signals_stale(signals_date_raw, _knowledge_day)
+            if _stale:
                 from executor.notifier import send_daemon_status
                 send_daemon_status(
                     f"\u26a0\ufe0f *Stale signals*\n"
@@ -2313,17 +2366,13 @@ def run(
                 t = sig["ticker"]
                 try:
                     import yfinance as yf_mod
-                    cal = yf_mod.Ticker(t).calendar
-                    if cal is not None and not cal.empty:
-                        next_date = cal.iloc[0, 0] if hasattr(cal, 'iloc') else None
-                        if next_date is not None:
-                            if hasattr(next_date, 'date'):
-                                next_date = next_date.date()
-                            elif isinstance(next_date, str):
-                                next_date = date.fromisoformat(next_date)
-                            days_until = (next_date - date.fromisoformat(run_date)).days
-                            if days_until >= 0:
-                                earnings_by_ticker[t] = days_until
+                    ref = date.fromisoformat(run_date)
+                    df = yf_mod.Ticker(t).get_earnings_dates(limit=8)
+                    next_date = _next_earnings_date_from_dates_df(df, ref)
+                    if next_date is not None:
+                        days_until = (next_date - ref).days
+                        if days_until >= 0:
+                            earnings_by_ticker[t] = days_until
                 except Exception:
                     # (a) earnings-calendar load failed for this ticker —
                     # earnings-proximity gating silently does not apply.

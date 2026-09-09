@@ -539,23 +539,83 @@ def read_signals_with_fallback(s3_bucket: str, run_date: str | None = None, max_
     )
 
 
-def _warn_if_stale(signals_date: str | None, run_date: str | None) -> None:
-    """Log a WARNING if the loaded signals are more than 7 days old relative to run_date.
+def _expected_signal_friday(ref: date) -> date:
+    """The most recent Friday whose weekly Saturday research run should
+    already have completed, as of ``ref``.
 
-    Staleness >7 days means the Research pipeline likely missed its Saturday
-    run — the signals will still work, but something upstream needs investigation.
+    Declared cadence, not a locally-invented rule: ``research_signals`` in
+    ``alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml`` carries
+    ``cadence: saturday_sf`` (a Saturday run), and
+    ``nous-ergon-ops/nousergon-console/config.d/artifact-observation.yaml``'s
+    ``partition_by_cadence: {saturday_sf: last-trading-day-before-run}``
+    keys that run's artifact to the last trading day (Friday) before it —
+    exactly why ``latest.json`` written 2026-09-05 08:56 UTC carries
+    ``"date": "2026-09-04"``. This function computes that same boundary
+    structurally (weekday arithmetic) rather than copying a day-count
+    threshold into a third place: a hard-coded age cutoff is what produced
+    the two disagreeing, both-wrong thresholds this function replaces (see
+    ``is_signals_stale``).
+
+    Research writes ``signals.json`` dated with the Friday just closed
+    (the last trading day of that week). That file remains the CURRENT,
+    correct signals file through the entire following Mon-Fri, refreshed
+    only by the NEXT Saturday's run. So the expected ``signals_date`` for
+    any day in ref's week is the Friday strictly before the Monday of
+    ref's own week — deliberately NOT "the most recent calendar Friday",
+    which on a Friday itself would be today (and today's signals aren't
+    written until tomorrow's Saturday run).
+    """
+    monday = ref - timedelta(days=ref.weekday())
+    return monday - timedelta(days=3)
+
+
+def is_signals_stale(
+    signals_date: str | date | None, ref_date: str | date | None
+) -> tuple[bool, int]:
+    """Cadence-aware staleness check for weekly Friday-dated signals.
+
+    Returns ``(is_stale, age_days)``. ``is_stale`` is True only when the
+    Research weekly Saturday run was genuinely missed — i.e. the loaded
+    signals predate ``_expected_signal_friday(ref_date)``. A signals file
+    being 3-9 calendar days old is the NORMAL state for most of the week
+    it is valid and must never alert on its own — a plain age threshold
+    (e.g. "age > 2" or "age > 7") fires on some healthy weekday regardless
+    of where the cutoff is set, because a healthy file's age climbs from 1
+    to 7 days over the course of every week it's current.
+
+    Accepts ``str`` (ISO date) or ``date`` for both arguments; ``ref_date``
+    falls back to today when falsy. Shared by ``_warn_if_stale`` (log-only)
+    and ``executor/main.py``'s Telegram stale-signals notice — a single
+    definition so the two call sites cannot disagree again.
+    """
+    if not signals_date:
+        return False, 0
+    sig = signals_date if isinstance(signals_date, date) else date.fromisoformat(signals_date)
+    if ref_date:
+        ref = ref_date if isinstance(ref_date, date) else date.fromisoformat(ref_date)
+    else:
+        ref = date.today()
+    age = (ref - sig).days
+    expected = _expected_signal_friday(ref)
+    return sig < expected, age
+
+
+def _warn_if_stale(signals_date: str | None, run_date: str | None) -> None:
+    """Log a WARNING if the loaded signals predate the most recently
+    expected weekly Friday cut (see ``is_signals_stale``) — i.e. Research
+    likely missed a Saturday run. The signals will still work; something
+    upstream needs investigation.
     """
     if not signals_date:
         return
     try:
-        sig = date.fromisoformat(signals_date)
+        stale, age = is_signals_stale(signals_date, run_date)
     except (ValueError, TypeError):
         return
-    ref = date.fromisoformat(run_date) if run_date else date.today()
-    age = (ref - sig).days
-    if age > 7:
+    if stale:
+        ref = run_date or str(date.today())
         logger.warning(
-            f"Loaded signals are {age} calendar days old (signals_date={sig}, "
+            f"Loaded signals are {age} calendar days old (signals_date={signals_date}, "
             f"run_date={ref}). Research pipeline may have missed a weekly run."
         )
 
