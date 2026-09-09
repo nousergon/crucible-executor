@@ -124,7 +124,7 @@ entries:
 
   # ── Expected-absence probes with a defined fallback ──────────────────────
   - path: executor/eod_reconcile.py
-    line: 753
+    line: 803
     reason: >-
       signals.json read/parse failed for one date; the fallback (try the
       prior day) is the intended control flow. No recording surface --

@@ -277,6 +277,132 @@ class TestNavThreeWayHardGate:
             )
 
 
+class TestNavThreeWayHardGateResidualBased:
+    """alpha-engine-config-I9087 — the gate re-based onto the UNEXPLAINED
+    RESIDUAL rather than the raw pricing/timing term, with a required
+    fail-closed guard.
+
+    Brian's ruling (config#9087, 2026-09-08): the raw term breached 8 of 48
+    sessions (16.7%) — almost all routine delayed-feed mark staleness — while
+    the unexplained residual on the two fully-attributed sessions was three
+    orders of magnitude smaller (−$30.7 / +$8.4). The gate now fires on
+    EITHER the residual crossing `NAV_BREACH_RESIDUAL_FLOOR_USD` (when
+    attribution is trustworthy) OR the raw term still crossing its own
+    (unwidened) tolerance — the raw-term signal is retained, never removed,
+    for the `broker_data_quality` warning-tier classification the call site
+    derives from `_classify_nav_breach`.
+    """
+
+    NAV = 1_000_000.0  # tolerance floor ($2,500) governs at this NAV level
+
+    def test_small_raw_term_does_not_fire_when_residual_is_also_small(self):
+        """The quiet-day case this issue exists to produce: raw term and
+        residual both within their respective bands — no page at all, where
+        the pre-I9087 gate would already have been silent too (raw < old
+        tolerance)."""
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=1_000.0,
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-09-08",
+            residual_usd=50.0,
+            attribution_ok=True,
+        )
+        assert result is None
+
+    def test_unexplained_residual_fires_even_when_raw_term_is_within_tolerance(self):
+        """THE REGRESSION GUARD for I9087. A raw term that never crosses the
+        old $2,500/15bp tolerance must still page when the ATTRIBUTED
+        residual — the portion `_attribute_mark_basis_divergence` cannot
+        explain — exceeds `NAV_BREACH_RESIDUAL_FLOOR_USD`. This is the one
+        behavior the raw-term-only gate could never produce."""
+        tolerance = _nav_hard_gate_tolerance_usd(self.NAV)
+        raw = tolerance - 100.0  # comfortably inside the raw-term tolerance
+        residual = NAV_BREACH_RESIDUAL_FLOOR_USD + 100.0  # breaches the residual floor
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=raw,
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-09-08",
+            residual_usd=residual,
+            attribution_ok=True,
+        )
+        assert result is not None
+        assert result["residual_breach"] is True
+        assert result["raw_breach"] is False
+        assert result["residual_usd"] == pytest.approx(residual)
+
+    def test_raw_term_breach_still_fires_when_residual_is_explained(self):
+        """The raw term is RETAINED, never removed (I9087 requirement 2):
+        a raw-term breach with a small (explained) residual still returns a
+        breach dict — the call site classifies it `broker_data_quality` and
+        pages at the warning tier, not silence."""
+        tolerance = _nav_hard_gate_tolerance_usd(self.NAV)
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=tolerance + 500.0,
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-09-08",
+            residual_usd=30.0,
+            attribution_ok=True,
+        )
+        assert result is not None
+        assert result["raw_breach"] is True
+        assert result["residual_breach"] is False
+
+    def test_attribution_failure_fails_closed_and_still_pages(self):
+        """MERGE BLOCKER (alpha-engine-config-I9087). When attribution is
+        untrustworthy (`attribution_ok=False` — raised, partial coverage, or
+        no attribution at all), the gate must NOT read a small/absent
+        residual as "no breach". It falls back to the raw term against its
+        own tolerance and pages — attribution failure can only make the gate
+        MORE likely to fire, never less. Here the residual argument passed
+        in is deliberately tiny (as a broken attribution codepath might
+        wrongly report) to prove the gate does not trust it."""
+        tolerance = _nav_hard_gate_tolerance_usd(self.NAV)
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=tolerance + 1_000.0,
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-09-08",
+            residual_usd=1.0,  # would pass under a trusted residual test
+            attribution_ok=False,
+        )
+        assert result is not None
+        assert result["attribution_ok"] is False
+        assert result["residual_breach"] is True  # fell back to the raw test
+        assert result["raw_breach"] is True
+
+    def test_attribution_failure_with_raw_term_within_tolerance_does_not_fire(self):
+        """Fail-closed does not mean "always page" — with no divergence at
+        all (raw within tolerance), a broken attribution codepath still has
+        nothing to report on."""
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=200.0,
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-09-08",
+            residual_usd=None,
+            attribution_ok=False,
+        )
+        assert result is None
+
+    def test_no_attribution_data_supplied_behaves_as_pre_i9087_raw_gate(self):
+        """Call sites (or tests) that don't pass residual/attribution
+        arguments at all default to `attribution_ok=False`, which reduces to
+        the exact pre-I9087 raw-term-only gate — no silent behavior change
+        for a caller that hasn't wired attribution through yet."""
+        tolerance = _nav_hard_gate_tolerance_usd(self.NAV)
+        result = _check_nav_three_way_hard_gate(
+            pricing_timing_usd=tolerance + 500.0,
+            pricing_timing_available=True,
+            nav=self.NAV,
+            run_date="2026-09-08",
+        )
+        assert result is not None
+        assert result["raw_breach"] is True
+
+
 class TestDetectIbMarkOutsideRange:
     """config#6349/#6818 — flag a held ticker whose IB portfolio mark lands
     outside the day's own ArcticDB [Low, High], the root cause behind six-
