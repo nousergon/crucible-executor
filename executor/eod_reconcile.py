@@ -70,6 +70,56 @@ _FLOW_DOCTOR_YAML = get_flow_doctor_yaml_path()  # experiment-package-first (con
 setup_logging("eod", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
 
+# ── Close provenance (alpha-engine-config-I10360) ────────────────────────────
+#
+# ArcticDB's Close for a given trading day is written TWICE by different
+# vendors, by design (alpha-engine-data collectors/daily_closes.py):
+#
+#   ~4:05 PM ET, run_date      — ``yfinance_only`` EOD pass. yfinance's
+#                                same-day 1d bar, ``auto_adjust=False``.
+#                                Polygon is skipped because its free tier
+#                                returns 403 for same-day grouped-daily.
+#   ~5:30 AM PT, run_date + 1  — ``polygon_only`` morning pass. Polygon
+#                                grouped-daily, corporate-action ADJUSTED,
+#                                with true VWAP. ``_SOURCE_PRIORITY`` ranks
+#                                polygon 3 vs yfinance 1, so it deliberately
+#                                OVERWRITES the row.
+#
+# This reconcile runs inside the postclose Step Function, i.e. between those
+# two writes — so the close it freezes is ALWAYS the provisional yfinance
+# print, and the T+1 ``reconcile_audit`` pass ALWAYS reads the polygon one.
+# The value did not "revise"; the SOURCE was replaced on a schedule.
+#
+# Recording which vendor produced the close we froze is what lets the audit
+# tell that expected substitution apart from a genuine data-integrity event.
+# Without it the audit compares two vendors while asserting one source, and
+# classifies the difference as ``corruption`` on ~60% of trading days.
+#
+# The ``universe`` library carries the per-row ``source`` column; the ``macro``
+# library stores Close ONLY, so macro-routed symbols degrade to "unknown" and
+# the audit keeps its pre-existing magnitude band for them (loud degradation,
+# not a silent pass) — tracked as alpha-engine-config-I10362.
+CLOSE_SOURCE_UNKNOWN = "unknown"
+
+
+def _row_close_source(match: pd.DataFrame) -> str:
+    """Vendor provenance of the matched ArcticDB row, or ``CLOSE_SOURCE_UNKNOWN``.
+
+    Never raises and never guesses: an absent column, a null cell or an empty
+    string all resolve to "unknown", which the audit treats as "cannot tell"
+    and therefore holds to the STRICTER pre-provenance classification.
+    """
+    if "source" not in match.columns:
+        return CLOSE_SOURCE_UNKNOWN
+    raw = match["source"].iloc[-1]
+    if raw is None:
+        return CLOSE_SOURCE_UNKNOWN
+    if isinstance(raw, float) and raw != raw:  # NaN, without a pd.isna try/except
+        return CLOSE_SOURCE_UNKNOWN
+    text = str(raw).strip().lower()
+    return CLOSE_SOURCE_UNKNOWN if text in ("", "nan", "none", "<na>") else text
+
+
 from executor.config_loader import (  # noqa: E402 -- must follow setup_logging above
     NAV_BASIS_IB_NETLIQ,
     NAV_BASIS_SETTLED_CLOSE,
@@ -1612,6 +1662,8 @@ def run(
     macro_lib = None  # lazy-open only if a macro-routed held ticker appears
     target_ts = pd.Timestamp(run_date).normalize()
     closing_prices: dict[str, float] = {}
+    # Vendor that produced each frozen close — see _row_close_source above.
+    close_sources: dict[str, str] = {}
     # Same-day traded [Low, High] per held ticker — used only to validate the
     # IB portfolio mark (config#6349/#6818), never to price positions.
     day_low: dict[str, float] = {}
@@ -1643,6 +1695,7 @@ def run(
             missing.append(f"{ticker} (no row for {run_date})")
             continue
         closing_prices[ticker] = float(match["Close"].iloc[-1])
+        close_sources[ticker] = _row_close_source(match)
         if "Low" in match.columns and "High" in match.columns:
             day_low[ticker] = float(match["Low"].iloc[-1])
             day_high[ticker] = float(match["High"].iloc[-1])
@@ -1976,6 +2029,11 @@ def run(
         # Persist the canonical close so tomorrow's reconcile reads the same
         # source for prior_price (not derived from possibly-stale IB MV).
         pos["closing_price"] = current_price
+        # ...and WHICH VENDOR produced it. The T+1 audit re-reads this cell
+        # after the polygon pass has overwritten it, so this is the only
+        # surviving record of the provenance of the number we actually froze
+        # (alpha-engine-config-I10360).
+        pos["close_source"] = close_sources.get(ticker, CLOSE_SOURCE_UNKNOWN)
 
         # Daily return — gap-aware. Held-through positions price against the
         # previous TRADING day's ArcticDB close (config#1228); a stale

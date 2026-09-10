@@ -3,6 +3,7 @@ that were frozen pre-settlement (config#1276)."""
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -426,7 +427,7 @@ class TestHeldPositionStaleness:
             {"AMD": {"closing_price": 100.00, "shares": 10}},
         )
         settled_spy = {"2026-06-25": 734.30}
-        settled_tickers = {("AMD", "2026-06-25"): 101.50}
+        settled_tickers = {("AMD", "2026-06-25"): (101.50, "polygon")}
 
         def fake_run(d, *, send_email, run_audit):
             assert send_email is False and run_audit is False
@@ -460,7 +461,7 @@ class TestHeldPositionStaleness:
             {"AMD": {"closing_price": 100.00, "shares": 10}},
         )
         settled_spy = {"2026-06-25": 734.30}
-        settled_tickers = {("AMD", "2026-06-25"): 100.005}
+        settled_tickers = {("AMD", "2026-06-25"): (100.005, "polygon")}
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled_spy[d]), \
              patch.object(reconcile_audit, "_settled_close_for_ticker",
                            lambda t, d, c: settled_tickers.get((t, d))), \
@@ -560,7 +561,7 @@ class TestAlertTextNamesTheDivergentLeg:
             {"AMD": {"closing_price": 100.00, "shares": 10}},
         )
         settled_spy = {"2026-09-04": 770.19}          # 0.65bp — BELOW tolerance
-        settled_tickers = {("AMD", "2026-09-04"): 100.60}  # 60bp — the real finding
+        settled_tickers = {("AMD", "2026-09-04"): (100.60, "polygon")}  # 60bp — the real finding
 
         def fake_run(d, *, send_email, run_audit):
             conn = init_db(db)
@@ -604,7 +605,7 @@ class TestAlertTextNamesTheDivergentLeg:
             {"AMD": {"closing_price": 100.00, "shares": 10}},
         )
         settled_spy = {"2026-09-04": 770.19}               # ~1.17bp
-        settled_tickers = {("AMD", "2026-09-04"): 100.60}  # ~60bp
+        settled_tickers = {("AMD", "2026-09-04"): (100.60, "polygon")}  # ~60bp
 
         def fake_run(d, *, send_email, run_audit):
             conn = init_db(db)
@@ -749,7 +750,8 @@ class TestPositionLevelCascade:
         _seed_eod_with_positions(db, "2026-06-26", 728.99, -0.7231, 0.22,
                                  {"AMD": {"closing_price": 102.00, "shares": 10}})
         settled_spy = {"2026-06-25": 734.30, "2026-06-26": 728.99}
-        settled_tickers = {("AMD", "2026-06-25"): 101.50, ("AMD", "2026-06-26"): 102.00}
+        settled_tickers = {("AMD", "2026-06-25"): (101.50, "polygon"),
+                           ("AMD", "2026-06-26"): (102.00, "polygon")}
         calls = []
 
         def fake_run(d, *, send_email, run_audit):
@@ -787,3 +789,207 @@ class TestPositionLevelCascade:
             res = audit_window(start="2026-06-25", end="2026-06-26", config=_cfg(db))
         assert res["corrected"] == []
         run_mock.assert_not_called()
+
+
+# ── Scheduled source substitution (alpha-engine-config-I10360) ──────────────
+#
+# The 2026-09-08 page:
+#   "EOD 2026-09-08 corrected post-settlement [corruption] (stale_position_close;
+#    5 stale leg(s)): position_close:ANF 151.61 → 151.43 (11.87bp); … PAGED:
+#    classification=corruption (11.87bp >= 5.00bp threshold)"
+#
+# Measured against the durable records in
+# s3://alpha-engine-research/trades/eod_corrections/: 20 of the last 20 EOD
+# audits produced a correction and 12 of 20 paged. The cause is not a vendor
+# revising a print — it is that ArcticDB's Close for date d is written by the
+# yfinance EOD pass at ~4:05 PM ET on d and OVERWRITTEN by the polygon morning
+# pass at ~5:30 AM PT on d+1 (daily_closes._SOURCE_PRIORITY ranks polygon 3 vs
+# yfinance 1). The postclose reconcile freezes the first; this audit reads the
+# second. Different vendor, different adjustment basis, different clock —
+# every single trading day, by design.
+
+class TestSourceSubstitutionClassification:
+    def _seed_with_source(self, db, date_str, spy, ticker, stored_close, source):
+        _seed_eod_with_positions(
+            db, date_str, spy, 0.10, 1.40,
+            {ticker: {"closing_price": stored_close, "shares": 10,
+                      "close_source": source}},
+        )
+
+    def _fake_run(self, db, ticker, new_close):
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute(
+                "UPDATE eod_pnl SET positions_snapshot=? WHERE date=?",
+                (json.dumps({ticker: {"closing_price": new_close, "shares": 10,
+                                      "close_source": "polygon"}}), d),
+            )
+            conn.commit()
+            conn.close()
+        return fake_run
+
+    def test_yfinance_to_polygon_divergence_is_substitution_and_does_not_page(self, tmp_path):
+        # The exact 2026-09-08 ANF leg: 151.61 → 151.43, 11.87bp. Above the
+        # 5bp page threshold, so today it pages as a corruption. With both
+        # provenances known it is a scheduled substitution: still corrected,
+        # still verified, still recorded — and NOT paged.
+        db = str(tmp_path / "t.db")
+        self._seed_with_source(db, "2026-09-08", 770.19, "ANF", 151.61, "yfinance")
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: 770.19), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: (151.43, "polygon")), \
+             patch.object(reconcile_audit, "eod_run",
+                          side_effect=self._fake_run(db, "ANF", 151.43)), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-09-08", end="2026-09-08", config=_cfg(db))
+
+        c = res["corrected"][0]
+        assert c["classification"] == reconcile_audit.CLASSIFICATION_SOURCE_SUBSTITUTION
+        assert c["divergence_bps"] == pytest.approx(11.87, abs=0.1)
+        assert c["paged"] is False
+        assert c["converged"] is True
+        assert res["corruptions"] == []
+        fd_mock.report.assert_not_called()
+        # The correction still HAPPENED — this is a reclassification, never a
+        # suppression of the repair.
+        assert c["after"] is not None
+        assert c["legs"][0]["stored_source"] == "yfinance"
+        assert c["legs"][0]["settled_source"] == "polygon"
+
+    def test_substitution_above_the_wide_band_is_still_corruption(self, tmp_path):
+        # The 2026-08-13 AMD leg (232bp) — far beyond any auction/adjustment
+        # difference. The provisional print itself was wrong, and the same-day
+        # EOD email carried it. Still pages.
+        db = str(tmp_path / "t.db")
+        self._seed_with_source(db, "2026-08-13", 777.88, "AMD", 100.00, "yfinance")
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: 777.88), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: (102.33, "polygon")), \
+             patch.object(reconcile_audit, "eod_run",
+                          side_effect=self._fake_run(db, "AMD", 102.33)), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-08-13", end="2026-08-13", config=_cfg(db))
+
+        c = res["corrected"][0]
+        assert c["classification"] == reconcile_audit.CLASSIFICATION_CORRUPTION
+        assert c["paged"] is True
+        fd_mock.report.assert_called_once()
+
+    def test_same_vendor_divergence_keeps_the_corruption_band(self, tmp_path):
+        # Both sides polygon: the vendor genuinely restated an already-settled
+        # print. That is the config#1276 class and its band is UNCHANGED.
+        db = str(tmp_path / "t.db")
+        self._seed_with_source(db, "2026-09-08", 770.19, "ANF", 151.61, "polygon")
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: 770.19), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: (151.43, "polygon")), \
+             patch.object(reconcile_audit, "eod_run",
+                          side_effect=self._fake_run(db, "ANF", 151.43)), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-09-08", end="2026-09-08", config=_cfg(db))
+
+        c = res["corrected"][0]
+        assert c["classification"] == reconcile_audit.CLASSIFICATION_CORRUPTION
+        assert c["paged"] is True
+
+    def test_unknown_provenance_holds_the_stricter_verdict(self, tmp_path):
+        # A snapshot written before I10360 carries no close_source. "We cannot
+        # tell" must never be quieter than "we can" — otherwise losing the
+        # provenance column would silence the detector.
+        db = str(tmp_path / "t.db")
+        _seed_eod_with_positions(
+            db, "2026-09-08", 770.19, 0.10, 1.40,
+            {"ANF": {"closing_price": 151.61, "shares": 10}},   # no close_source
+        )
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: 770.19), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: (151.43, "polygon")), \
+             patch.object(reconcile_audit, "eod_run",
+                          side_effect=self._fake_run(db, "ANF", 151.43)), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-09-08", end="2026-09-08", config=_cfg(db))
+
+        assert res["corrected"][0]["classification"] == reconcile_audit.CLASSIFICATION_CORRUPTION
+        assert res["corrected"][0]["paged"] is True
+
+    def test_alert_text_names_the_vendor_swap(self, tmp_path):
+        # An operator reading the page must be able to see the swap without
+        # opening the S3 record. Uses a >50bp leg so a page is emitted.
+        db = str(tmp_path / "t.db")
+        self._seed_with_source(db, "2026-08-13", 777.88, "AMD", 100.00, "yfinance")
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: 777.88), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: (102.33, "polygon")), \
+             patch.object(reconcile_audit, "eod_run",
+                          side_effect=self._fake_run(db, "AMD", 102.33)), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            audit_window(start="2026-08-13", end="2026-08-13", config=_cfg(db))
+        msg = fd_mock.report.call_args[0][0]
+        assert "[yfinance→polygon]" in msg
+
+    def test_recurrence_page_ignores_substitutions(self, tmp_path):
+        # Two consecutive substituted days. The old recurrence rule ("a second
+        # correction in one pass is systemic") pages on this, and the yfinance
+        # →polygon overwrite makes it true on EVERY pass. It must not page.
+        db = str(tmp_path / "t.db")
+        # Both days share the same settled SPY close, so the recomputed
+        # spy_return is 0.0 — seeded to match, isolating the position leg.
+        for d, close in (("2026-09-04", 151.00), ("2026-09-08", 151.61)):
+            _seed_eod_with_positions(
+                db, d, 770.19, 0.0, 1.40,
+                {"ANF": {"closing_price": close, "shares": 10,
+                         "close_source": "yfinance"}},
+            )
+        settled = {"2026-09-04": 150.90, "2026-09-08": 151.43}
+
+        def fake_run(d, *, send_email, run_audit):
+            conn = init_db(db)
+            conn.execute(
+                "UPDATE eod_pnl SET positions_snapshot=? WHERE date=?",
+                (json.dumps({"ANF": {"closing_price": settled[d], "shares": 10,
+                                     "close_source": "polygon"}}), d),
+            )
+            conn.commit()
+            conn.close()
+
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: 770.19), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: (settled[d], "polygon")), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-09-04", end="2026-09-08", config=_cfg(db))
+
+        assert len(res["corrected"]) == 2
+        assert all(c["paged"] is False for c in res["corrected"])
+        fd_mock.report.assert_not_called()
+
+    def test_classify_leg_band_edges(self):
+        sub = {"divergence_bps": 49.9, "stored_source": "yfinance",
+               "settled_source": "polygon"}
+        assert reconcile_audit._classify_leg(sub, page_threshold_bps=5.0) == \
+            reconcile_audit.CLASSIFICATION_SOURCE_SUBSTITUTION
+        sub_big = dict(sub, divergence_bps=50.0)
+        assert reconcile_audit._classify_leg(sub_big, page_threshold_bps=5.0) == \
+            reconcile_audit.CLASSIFICATION_CORRUPTION
+        # Unbounded is corruption regardless of provenance.
+        assert reconcile_audit._classify_leg(dict(sub, divergence_bps=None),
+                                             page_threshold_bps=5.0) == \
+            reconcile_audit.CLASSIFICATION_CORRUPTION
+        # A substitution TOWARD a non-canonical vendor is not the scheduled
+        # overwrite — it keeps the strict band.
+        assert reconcile_audit._classify_leg(
+            {"divergence_bps": 10.0, "stored_source": "polygon",
+             "settled_source": "yfinance"}, page_threshold_bps=5.0) == \
+            reconcile_audit.CLASSIFICATION_CORRUPTION
