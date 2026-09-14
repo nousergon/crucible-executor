@@ -41,15 +41,35 @@ attribution then falls back to the arrival price *visibly*, never silently.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import re
 import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
+import boto3
+
 logger = logging.getLogger(__name__)
+
+# Written by `eod_reconcile` at the end of every session (the literal lives at
+# its call site; this is the only other reader). The log is the durable
+# execution record for a day whose IB session is long gone.
+DAEMON_LOG_KEY_TEMPLATE = "trades/logs/{run_date}/daemon.log"
+
+# One marker per swept session. Its purpose is NEGATIVE caching: a row that
+# can never resolve — an order genuinely cancelled before any fill — would
+# otherwise re-download a ~100 MB log on every EOD run, forever. The marker
+# records what the sweep found so the next run can skip the date and a human
+# can see why it was left alone.
+SWEEP_MARKER_KEY_TEMPLATE = "trades/fill_reconciliation/{run_date}.json"
+
+# Per-run cap on archived logs pulled from S3. The daemon logs run 35-100 MB
+# each; a backlog drains over consecutive sessions instead of making one EOD
+# run pay for all of it.
+DEFAULT_SWEEP_MAX_DATES = 3
 
 # Statuses ``IBKRClient.place_market_order`` / ``place_bracket_with_stop`` emit
 # for an order that may still fill (or fill further) after the row was written.
@@ -324,24 +344,211 @@ def reconcile_from_ib(conn: sqlite3.Connection, run_date: str, ib) -> dict[str, 
     return reconcile_unfilled_trades(conn, run_date, fills_by_order_from_ib(ib))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Historical sweep — repair sessions whose rows were never reconciled
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def unresolved_session_dates(conn: sqlite3.Connection, *, before: str) -> list[str]:
+    """Ascending distinct ``trades.date`` values before ``before`` holding a
+    non-terminal row. ``before`` is exclusive so the current session, which the
+    live passes own, is never swept from the archive."""
+    placeholders = ",".join("?" for _ in NON_TERMINAL_STATUSES)
+    rows = conn.execute(
+        f"SELECT DISTINCT date FROM trades WHERE date < ? AND status IN ({placeholders}) "  # noqa: S608 — placeholders are "?" marks, values bound below
+        "ORDER BY date",
+        (before, *NON_TERMINAL_STATUSES),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _s3(region: str):
+    return boto3.client("s3", region_name=region)
+
+
+def _sweep_marker(bucket: str, run_date: str, region: str) -> dict | None:
+    """The prior sweep's record for ``run_date``, or None if never swept."""
+    try:
+        body = _s3(region).get_object(
+            Bucket=bucket, Key=SWEEP_MARKER_KEY_TEMPLATE.format(run_date=run_date)
+        )["Body"].read()
+        return json.loads(body)
+    except Exception:  # noqa: BLE001 — absent or unreadable marker means "not swept yet", which is the safe reading: it costs one re-download, never a missed repair
+        return None
+
+
+def _write_sweep_marker(bucket: str, run_date: str, region: str, record: dict) -> None:
+    try:
+        _s3(region).put_object(
+            Bucket=bucket,
+            Key=SWEEP_MARKER_KEY_TEMPLATE.format(run_date=run_date),
+            Body=json.dumps(record, indent=2, default=str).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as err:  # noqa: BLE001 — (a) the negative-cache write failed; (b) the repair itself already succeeded and is committed; (c) recorded at WARNING here, and the only cost is that the next run re-reads this date's log
+        logger.warning(
+            "fill reconciliation: sweep marker write failed for %s (%s) — "
+            "the repair stands; the next sweep will re-read this date's log",
+            run_date, err,
+        )
+
+
+def _archived_log_lines(bucket: str, run_date: str, region: str):
+    """Stream the archived daemon log for ``run_date``, or None when absent.
+
+    Streamed rather than read whole: these logs reach ~100 MB and this runs on
+    the trading box alongside the snapshot capture.
+    """
+    key = DAEMON_LOG_KEY_TEMPLATE.format(run_date=run_date)
+    try:
+        body = _s3(region).get_object(Bucket=bucket, Key=key)["Body"]
+    except Exception as err:  # noqa: BLE001 — a missing archived log is a fact about that date, reported by the caller as `unavailable`, never an error that aborts the sweep
+        logger.info(
+            "fill reconciliation: no archived daemon log at s3://%s/%s (%s)",
+            bucket, key, err.__class__.__name__,
+        )
+        return None
+    return (line.decode("utf-8", errors="replace") for line in body.iter_lines())
+
+
+def sweep_unresolved_sessions(
+    conn: sqlite3.Connection,
+    *,
+    bucket: str,
+    before: str,
+    region: str = "us-east-1",
+    max_dates: int = DEFAULT_SWEEP_MAX_DATES,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Repair prior sessions whose rows were never reconciled, from S3 logs.
+
+    The live passes (daemon tick, snapshot capture) only ever see the session
+    they run in, so every row written before this module existed is
+    unreachable by them. This closes that back-catalogue from the archived
+    daemon logs, which are the durable execution record.
+
+    Returns ``{"changed": [...], "swept": [...], "unavailable": [...],
+    "skipped": [...], "still_unresolved": {date: n}}``. ``changed`` is the
+    dates whose rows actually moved — the caller re-derives those days'
+    ``eod_pnl`` rows, because this function repairs the trade ledger and
+    deliberately does not decide what is downstream of it.
+    """
+    result: dict[str, Any] = {
+        "changed": [], "swept": [], "unavailable": [], "skipped": [], "still_unresolved": {},
+    }
+    dates = unresolved_session_dates(conn, before=before)
+    if not dates:
+        return result
+    logger.info(
+        "fill reconciliation sweep: %d prior session(s) hold an unresolved row: %s",
+        len(dates), ", ".join(dates),
+    )
+    for run_date in dates:
+        if len(result["swept"]) >= max_dates:
+            logger.info(
+                "fill reconciliation sweep: stopping at the %d-date cap; %d date(s) remain "
+                "and will be picked up by the next run",
+                max_dates, len(dates) - len(result["swept"]) - len(result["skipped"]),
+            )
+            break
+        if not force and _sweep_marker(bucket, run_date, region) is not None:
+            result["skipped"].append(run_date)
+            continue
+        lines = _archived_log_lines(bucket, run_date, region)
+        if lines is None:
+            result["unavailable"].append(run_date)
+            continue
+        outcome = reconcile_unfilled_trades(
+            conn, run_date, parse_daemon_log_executions(lines)
+        )
+        result["swept"].append(run_date)
+        if outcome["patched"]:
+            result["changed"].append(run_date)
+        if outcome["unresolved"]:
+            result["still_unresolved"][run_date] = len(outcome["unresolved"])
+            for row in outcome["unresolved"]:
+                logger.warning(
+                    "fill reconciliation sweep: %s %s %s %s (order %s) has no execution in "
+                    "the archived log — the order never filled, or the log predates it",
+                    run_date, row["action"], row["shares"], row["ticker"], row.get("ib_order_id"),
+                )
+        _write_sweep_marker(bucket, run_date, region, {
+            "run_date": run_date,
+            "swept_at": datetime.now(UTC).isoformat(),
+            "patched": [
+                {"ticker": r["ticker"], "action": r["action"], "ib_order_id": r["ib_order_id"],
+                 "fill_price": r["after"].get("fill_price"),
+                 "was": r["before"].get("fill_price")}
+                for r in outcome["patched"]
+            ],
+            "unresolved": [
+                {"ticker": r["ticker"], "action": r["action"], "shares": r["shares"],
+                 "ib_order_id": r.get("ib_order_id"), "status": r.get("status")}
+                for r in outcome["unresolved"]
+            ],
+        })
+    logger.info(
+        "fill reconciliation sweep: swept=%d changed=%s unavailable=%s skipped=%d",
+        len(result["swept"]), result["changed"] or "none",
+        result["unavailable"] or "none", len(result["skipped"]),
+    )
+    return result
+
+
 def _main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--date", required=True, help="trades.date session to reconcile (YYYY-MM-DD)")
-    p.add_argument("--from-daemon-log", required=True, help="path to that day's daemon log")
+    p.add_argument("--date", help="trades.date session to reconcile (YYYY-MM-DD)")
+    p.add_argument("--from-daemon-log", help="path to that day's daemon log")
+    p.add_argument("--sweep", action="store_true",
+                   help="repair every prior session with an unresolved row, from the S3 log archive")
+    p.add_argument("--before", default=None,
+                   help="sweep sessions strictly before this date (default: today's trading day)")
+    p.add_argument("--max-dates", type=int, default=DEFAULT_SWEEP_MAX_DATES,
+                   help="cap on archived logs pulled in one sweep")
+    p.add_argument("--force", action="store_true",
+                   help="re-sweep dates that already carry a sweep marker")
     p.add_argument("--db", default=None, help="trades.db path (default: config db_path)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
+    if not args.sweep and not (args.date and args.from_daemon_log):
+        p.error("either --sweep, or both --date and --from-daemon-log, are required")
 
     from executor.trade_logger import init_db
 
+    config = None
     db_path = args.db
-    if db_path is None:
+    if db_path is None or args.sweep:
         from executor.config_loader import load_config
 
-        db_path = load_config()["db_path"]
+        config = load_config()
+        db_path = db_path or config["db_path"]
+    conn = init_db(db_path)
+
+    if args.sweep:
+        from nousergon_lib.dates import now_dual
+
+        before = args.before or now_dual().trading_day
+        sweep = sweep_unresolved_sessions(
+            conn, bucket=config["trades_bucket"], before=before,
+            region=config.get("aws_region", "us-east-1"),
+            max_dates=args.max_dates, force=args.force,
+        )
+        for line in (
+            f"swept:       {', '.join(sweep['swept']) or 'none'}",
+            f"changed:     {', '.join(sweep['changed']) or 'none'}",
+            f"unavailable: {', '.join(sweep['unavailable']) or 'none'}",
+            f"skipped:     {len(sweep['skipped'])} already-swept date(s)",
+        ):
+            print(line)
+        if sweep["changed"]:
+            print("\nRe-derive those sessions' eod_pnl rows with:")
+            for d in sweep["changed"]:
+                print(f"  python -c \"from executor.eod_reconcile import run; "
+                      f"run(run_date='{d}', send_email=False, run_audit=False)\"")
+        return 1 if sweep["still_unresolved"] or sweep["unavailable"] else 0
+
     with open(args.from_daemon_log, encoding="utf-8", errors="replace") as fh:
         fills = parse_daemon_log_executions(fh)
-    conn = init_db(db_path)
     result = reconcile_unfilled_trades(conn, args.date, fills, dry_run=args.dry_run)
     for rec in result["patched"]:
         print(

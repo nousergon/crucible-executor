@@ -104,6 +104,62 @@ def _reconcile_fills(ib, db_path: str, run_date: str) -> None:
         )
 
 
+def _sweep_prior_sessions(config: dict, run_date: str) -> None:
+    """Repair earlier sessions whose rows were never reconciled, then re-derive
+    their ``eod_pnl`` rows.
+
+    The live reconciliation passes only ever see the session they run in, so
+    rows written before that machinery existed are unreachable by them. This
+    drains that back-catalogue from the archived daemon logs in S3, a bounded
+    number of dates per run, each date swept at most once (a negative-cache
+    marker records the outcome, so an order that genuinely never filled does
+    not re-download a ~100 MB log every night).
+
+    The re-derive uses the same entry point ``reconcile_audit`` uses for its
+    own corrections — ``run(..., run_audit=False)`` — rather than a second,
+    parallel correction path. Per-date isolation throughout: one unrepairable
+    session must not cost the others, or the snapshot.
+    """
+    from executor.eod_reconcile import run as eod_run
+    from executor.fill_reconciliation import sweep_unresolved_sessions
+    from executor.trade_logger import init_db
+
+    bucket = config.get("trades_bucket")
+    if not bucket:
+        logger.warning("fill reconciliation sweep skipped: no trades_bucket configured")
+        return
+    try:
+        conn = init_db(config["db_path"])
+    except Exception as err:  # noqa: BLE001 — (a) the sweep could not open the ledger; (b) today's snapshot and today's own reconciliation are unaffected; (c) ERROR log here, and the next run retries
+        logger.error("fill reconciliation sweep could not open trades.db: %s", err)
+        return
+    try:
+        result = sweep_unresolved_sessions(
+            conn, bucket=bucket, before=run_date,
+            region=config.get("aws_region", "us-east-1"),
+        )
+    except Exception as err:  # noqa: BLE001 — (a) the sweep failed; (b) today's snapshot is already captured and unaffected; (c) ERROR log here, and any row it would have fixed stays non-terminal, which the EOD run reports in data_warnings
+        logger.error("fill reconciliation sweep failed: %s", err)
+        conn.close()
+        return
+    finally:
+        conn.close()
+
+    for corrected_date in result["changed"]:
+        try:
+            eod_run(run_date=corrected_date, send_email=False, run_audit=False)
+            logger.info(
+                "fill reconciliation sweep: re-derived eod_pnl for %s after correcting its fills",
+                corrected_date,
+            )
+        except Exception as err:  # noqa: BLE001 — per-date isolation, mirroring reconcile_audit's own apply loop: one bad day must not abort the rest
+            logger.error(
+                "fill reconciliation sweep: eod_pnl re-derive FAILED for %s: %s — "
+                "its trade rows are corrected but its P&L row still reflects the old fills",
+                corrected_date, err,
+            )
+
+
 def run(run_date: str | None = None) -> None:
     """Capture live IB state and write to S3 keyed by run_date.
 
@@ -173,6 +229,7 @@ def run(run_date: str | None = None) -> None:
         # placing it here rather than in the reconcile itself — the
         # reconcile reads a snapshot and never opens an IB session.
         _reconcile_fills(ibkr.ib, config["db_path"], run_date)
+        _sweep_prior_sessions(config, run_date)
     finally:
         ibkr.disconnect()
 

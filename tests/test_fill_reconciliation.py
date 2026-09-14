@@ -23,6 +23,8 @@ from executor.fill_reconciliation import (
     parse_daemon_log_executions,
     reconcile_from_ib,
     reconcile_unfilled_trades,
+    sweep_unresolved_sessions,
+    unresolved_session_dates,
     unresolved_trades,
 )
 from executor.trade_logger import init_db, log_trade
@@ -262,3 +264,140 @@ class TestIbSource:
         ib = SimpleNamespace(fills=lambda: [self._fill(690, "PBF", "SLD", 775.0, 74.0, "a", 3.5)])
         res = reconcile_from_ib(conn, "2026-09-14", ib)
         assert res["patched"][0]["after"]["status"] == "Filled"
+
+
+# ── Historical sweep (alpha-engine-config-I10807) ────────────────────────────
+
+
+class _FakeS3:
+    """Minimal S3 double for the sweep: an object store plus a call log.
+
+    `logs` maps run_date -> list of log lines; `markers` maps run_date -> dict.
+    `fetched` records which archived logs were actually downloaded, which is
+    what the negative-cache tests assert on.
+    """
+
+    def __init__(self, logs=None, markers=None):
+        self.logs = logs or {}
+        self.markers = dict(markers or {})
+        self.fetched: list[str] = []
+        self.put: list[str] = []
+
+    class _Missing(Exception):
+        pass
+
+    def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg spelling
+        if Key.startswith("trades/fill_reconciliation/"):
+            d = Key.split("/")[-1].removesuffix(".json")
+            if d not in self.markers:
+                raise self._Missing(f"NoSuchKey {Key}")
+            return {"Body": SimpleNamespace(read=lambda: json.dumps(self.markers[d]).encode())}
+        d = Key.split("/")[-2]
+        if d not in self.logs:
+            raise self._Missing(f"NoSuchKey {Key}")
+        self.fetched.append(d)
+        lines = [line.encode() for line in self.logs[d]]
+        return {"Body": SimpleNamespace(iter_lines=lambda: iter(lines))}
+
+    def put_object(self, Bucket, Key, Body, ContentType):  # noqa: N803
+        d = Key.split("/")[-1].removesuffix(".json")
+        self.markers[d] = json.loads(Body.decode())
+        self.put.append(d)
+
+
+@pytest.fixture
+def fake_s3(monkeypatch):
+    holder = {}
+
+    def _install(s3):
+        holder["s3"] = s3
+        monkeypatch.setattr("executor.fill_reconciliation.boto3.client", lambda *a, **k: s3)
+        return s3
+
+    return _install
+
+
+class TestUnresolvedSessionDates:
+    def test_distinct_prior_dates_ascending(self, conn):
+        _log(conn, date="2026-09-10", ib_order_id=650)
+        _log(conn, date="2026-08-31", ib_order_id=640)
+        _log(conn, date="2026-08-31", ib_order_id=641, ticker="DUOL")
+        _log(conn, date="2026-09-14")
+        assert unresolved_session_dates(conn, before="2026-09-14") == ["2026-08-31", "2026-09-10"]
+
+    def test_the_current_session_is_never_swept_from_the_archive(self, conn):
+        _log(conn, date="2026-09-14")
+        assert unresolved_session_dates(conn, before="2026-09-14") == []
+
+    def test_terminal_rows_do_not_put_a_date_in_the_sweep(self, conn):
+        _log(conn, date="2026-09-10", ib_order_id=650, status="Filled", fill_price=78.0)
+        assert unresolved_session_dates(conn, before="2026-09-14") == []
+
+
+class TestSweep:
+    def test_repairs_a_prior_session_from_its_archived_log(self, conn, fake_s3):
+        # The historical shape: the estimate was written INTO fill_price, which
+        # is what made a Working row indistinguishable from a filled one.
+        _log(conn, date="2026-09-11", ib_order_id=690, fill_price=77.33)
+        s3 = fake_s3(_FakeS3(logs={"2026-09-11": _daemon_lines()}))
+        res = sweep_unresolved_sessions(conn, bucket="b", before="2026-09-14")
+        assert res["changed"] == ["2026-09-11"] and res["swept"] == ["2026-09-11"]
+        assert conn.execute("SELECT status, fill_price FROM trades").fetchone() == ("Filled", 74.0)
+        assert s3.markers["2026-09-11"]["patched"][0]["fill_price"] == 74.0
+        assert s3.markers["2026-09-11"]["patched"][0]["was"] == 77.33
+
+    def test_an_already_swept_date_is_not_downloaded_again(self, conn, fake_s3):
+        _log(conn, date="2026-09-11", ib_order_id=999)  # no execution will ever match
+        s3 = fake_s3(_FakeS3(logs={"2026-09-11": _daemon_lines()},
+                             markers={"2026-09-11": {"run_date": "2026-09-11", "patched": []}}))
+        res = sweep_unresolved_sessions(conn, bucket="b", before="2026-09-14")
+        assert res["skipped"] == ["2026-09-11"] and res["swept"] == []
+        assert s3.fetched == []
+
+    def test_force_re_sweeps_a_marked_date(self, conn, fake_s3):
+        _log(conn, date="2026-09-11", ib_order_id=690)
+        s3 = fake_s3(_FakeS3(logs={"2026-09-11": _daemon_lines()},
+                             markers={"2026-09-11": {"run_date": "2026-09-11", "patched": []}}))
+        res = sweep_unresolved_sessions(conn, bucket="b", before="2026-09-14", force=True)
+        assert res["changed"] == ["2026-09-11"] and s3.fetched == ["2026-09-11"]
+
+    def test_a_row_the_log_cannot_resolve_is_marked_not_guessed(self, conn, fake_s3):
+        _log(conn, date="2026-09-11", ib_order_id=999)
+        s3 = fake_s3(_FakeS3(logs={"2026-09-11": _daemon_lines()}))
+        res = sweep_unresolved_sessions(conn, bucket="b", before="2026-09-14")
+        assert res["changed"] == [] and res["still_unresolved"] == {"2026-09-11": 1}
+        assert conn.execute("SELECT status, fill_price FROM trades").fetchone() == ("Working", None)
+        # the marker is still written — that is the negative cache that stops a
+        # ~100 MB log being re-downloaded every night for a row that can never resolve
+        assert s3.markers["2026-09-11"]["unresolved"][0]["ib_order_id"] == 999
+
+    def test_a_missing_archived_log_is_reported_not_raised(self, conn, fake_s3):
+        _log(conn, date="2026-05-26", ib_order_id=690)
+        s3 = fake_s3(_FakeS3(logs={}))
+        res = sweep_unresolved_sessions(conn, bucket="b", before="2026-09-14")
+        assert res["unavailable"] == ["2026-05-26"] and res["swept"] == []
+        # no marker: the date was never actually examined, so it must stay eligible
+        assert s3.markers == {}
+
+    def test_max_dates_caps_one_run_and_leaves_the_rest(self, conn, fake_s3):
+        for d in ("2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11"):
+            _log(conn, date=d, ib_order_id=690)
+        fake_s3(_FakeS3(logs={d: _daemon_lines() for d in
+                              ("2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11")}))
+        res = sweep_unresolved_sessions(conn, bucket="b", before="2026-09-14", max_dates=2)
+        assert res["swept"] == ["2026-09-08", "2026-09-09"]
+        assert unresolved_session_dates(conn, before="2026-09-14") == ["2026-09-10", "2026-09-11"]
+
+    def test_no_unresolved_rows_touches_s3_not_at_all(self, conn, fake_s3):
+        s3 = fake_s3(_FakeS3(logs={"2026-09-11": _daemon_lines()}))
+        assert sweep_unresolved_sessions(conn, bucket="b", before="2026-09-14")["swept"] == []
+        assert s3.fetched == [] and s3.put == []
+
+    def test_a_failed_marker_write_does_not_undo_the_repair(self, conn, fake_s3):
+        _log(conn, date="2026-09-11", ib_order_id=690)
+        s3 = _FakeS3(logs={"2026-09-11": _daemon_lines()})
+        s3.put_object = lambda **kw: (_ for _ in ()).throw(RuntimeError("AccessDenied"))
+        fake_s3(s3)
+        res = sweep_unresolved_sessions(conn, bucket="b", before="2026-09-14")
+        assert res["changed"] == ["2026-09-11"]
+        assert conn.execute("SELECT fill_price FROM trades").fetchone() == (74.0,)
