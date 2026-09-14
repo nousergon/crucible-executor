@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://nousergon.dev/contracts/staging_daily_closes.schema.json",
+  "title": "staging/daily_closes/{trading_day}.parquet — per-row record",
+  "version": 1,
+  "description": "Pinned CONSUMER copy, owned by crucible-executor (alpha-engine-config-I10796 / data_collection_plan_260914.md P-27). The producer is the data collector (nousergon-data), writing a parquet whose row shape is nousergon-data/sources/contract.py::PriceBar.to_record() (RECORD_KEYS). This file is read for FRESHNESS ONLY today by executor/upstream_artifact_gate.py (a HEAD/LIST probe, no parquet parse) — the row schema below is pinned so a future content-parsing consumer, and this contract test, both have one place to change together. A producer schema-version bump is a cross-repo PR per data_collection_plan_260914.md §4.3: the nousergon-data change lands first, naming this file as a consumer to update. As of this writing no producer-side contracts/ copy of this schema exists yet in nousergon-data (checked: no open PR under 'schema'/'contract' touching staging/daily_closes as of 2026-09-14) — this pin is sourced directly from sources/contract.py::PriceBar and must be reconciled against the producer's own contracts/ file once P-07 lands there.",
+  "type": "object",
+  "required": ["ticker", "date", "Open", "High", "Low", "Close", "Adj_Close", "Volume", "source"],
+  "properties": {
+    "ticker": {
+      "type": "string",
+      "description": "canonical store-key (dash form: BRK-B), caret-stripped"
+    },
+    "date": {
+      "type": "string",
+      "format": "date",
+      "description": "YYYY-MM-DD trading day of the bar"
+    },
+    "Open": { "type": "number" },
+    "High": { "type": "number" },
+    "Low": { "type": "number" },
+    "Close": { "type": "number" },
+    "Adj_Close": { "type": "number" },
+    "Volume": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "raw shares (0 when the source carries no volume, e.g. FRED)"
+    },
+    "VWAP": {
+      "type": ["number", "null"],
+      "description": "true volume-weighted price; null when the source can't provide it"
+    },
+    "source": {
+      "type": "string",
+      "description": "provenance — the producing adapter's name (e.g. yfinance_only, polygon_only)"
+    }
+  },
+  "additionalProperties": true
+}

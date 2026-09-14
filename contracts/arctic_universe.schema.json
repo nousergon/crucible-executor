@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://nousergon.dev/contracts/arctic_universe.schema.json",
+  "title": "ArcticDB library `universe` — column/dtype/index contract",
+  "version": 1,
+  "description": "Pinned CONSUMER copy, owned by crucible-executor (alpha-engine-config-I10796 / data_collection_plan_260914.md P-27, which also pins a copy in crucible for v2's data.daily under the same source library). Producer: nousergon-data ArcticDB store + builders (store/arctic_store.py, builders/daily_append.py) writing s3://alpha-engine-research/arcticdb/, library `universe`. Not a per-S3-object JSON Schema — this documents the per-symbol frame shape ArcticDB serves, matching data_collection_plan_260914.md §4.1's 'column/dtype/index contract, pinned in crucible' pattern extended to crucible-executor as the trader's own pin. Reader: executor/price_cache.py (`_open_universe_library` -> `nousergon_lib.arcticdb.open_universe_lib`, `load_price_histories`, `load_atr_14_pct`) and executor/signal_reader.py (`filter_buy_candidates_to_universe` via `universe_lib.list_symbols()`). No producer-side contracts/ copy of this shape exists yet in nousergon-data as of 2026-09-14 (data_collection_plan_260914.md §3 lists it as 'contracts/arctic_universe.schema.json (target)') — this pin is sourced directly from the live read paths in this repo and must be reconciled against the producer's own file, and crucible's pinned copy, once P-07 lands.",
+  "library": "universe",
+  "bucket_prefix": "arcticdb/",
+  "symbol_shape": {
+    "index": {
+      "type": "DatetimeIndex",
+      "tz": "UTC (written UTC-midnight; consumers normalize with `.normalize()`)",
+      "ordering": "ascending"
+    },
+    "columns": {
+      "Open": { "dtype": "float64", "required_for": ["load_price_histories"] },
+      "High": { "dtype": "float64", "required_for": ["load_price_histories"] },
+      "Low": { "dtype": "float64", "required_for": ["load_price_histories"] },
+      "Close": { "dtype": "float64", "required_for": ["load_price_histories"] },
+      "Volume": { "dtype": "int64", "required_for": [] },
+      "VWAP": { "dtype": "float64", "required_for": [] },
+      "atr_14_pct": {
+        "dtype": "float64",
+        "description": "decimal fraction (0.0238 = 2.38%), predictor feature-store definition",
+        "required_for": ["load_atr_14_pct"],
+        "staleness_contract": "most-recent row must be within 1 trading day of reference_date, or load_atr_14_pct hard-fails (executor.price_cache._ATR_MAX_STALENESS_TRADING_DAYS)"
+      }
+    }
+  },
+  "membership": {
+    "list_symbols": "universe_lib.list_symbols() -- read by executor/signal_reader.py::filter_buy_candidates_to_universe as the ArcticDB-side membership check on the morning planner's buy_candidates",
+    "excludes": "SPY/VIX/VIX3M/TNX/IRX/GLD/USO/XL*-sector-ETFs route to the separate `macro` library (Close-only), not `universe` -- see executor/price_cache.py::_MACRO_SYMBOLS"
+  },
+  "consumer_contract": {
+    "hard_fail_on": [
+      "ArcticDB library unreachable (load_price_histories, load_atr_14_pct)",
+      "any requested ticker missing the atr_14_pct column (load_atr_14_pct)",
+      "any requested ticker's most-recent row older than 1 trading day (load_atr_14_pct)",
+      "non-finite or non-positive atr_14_pct (load_atr_14_pct)"
+    ],
+    "degrade_on": [
+      "individual ticker read errors in load_price_histories are surfaced as a RuntimeError naming the failed tickers (not silently dropped)",
+      "an empty frame for a ticker is omitted with an INFO log, not a hard fail (load_price_histories)"
+    ]
+  }
+}
