@@ -72,6 +72,38 @@ def _snapshot_key(run_date: str) -> str:
     return f"trades/snapshots/{run_date}.json"
 
 
+def _reconcile_fills(ib, db_path: str, run_date: str) -> None:
+    """Write today's session executions back onto any still-open trade row.
+
+    Loud on failure, but never fatal: the snapshot this stage exists to
+    capture is the ONE non-re-runnable artifact of the day (see ``run``),
+    and a reconciliation error must not cost it. The EOD run re-checks
+    ``unresolved_trades`` and names anything still open in
+    ``data_warnings``, so a failure here is visible downstream.
+    """
+    from executor.fill_reconciliation import reconcile_from_ib
+    from executor.trade_logger import init_db
+
+    try:
+        conn = init_db(db_path)
+        try:
+            result = reconcile_from_ib(conn, run_date, ib)
+        finally:
+            conn.close()
+    except Exception as err:  # noqa: BLE001 — (a) reconciliation failed; (c) ERROR log here + EOD data_warnings from unresolved_trades
+        logger.error("fill reconciliation backstop failed for %s: %s", run_date, err)
+        return
+    logger.info(
+        "fill reconciliation backstop | run_date=%s patched=%d unresolved=%d",
+        run_date, len(result["patched"]), len(result["unresolved"]),
+    )
+    for row in result["unresolved"]:
+        logger.warning(
+            "fill reconciliation backstop: %s %s %s (order %s) still %s — no execution on the session",
+            row["action"], row["shares"], row["ticker"], row.get("ib_order_id"), row.get("status"),
+        )
+
+
 def run(run_date: str | None = None) -> None:
     """Capture live IB state and write to S3 keyed by run_date.
 
@@ -133,6 +165,14 @@ def run(run_date: str | None = None) -> None:
         account = ibkr.get_account_snapshot()
         positions = ibkr.get_positions()
         accrued_dividends = ibkr.get_accrued_dividends_by_symbol()
+        # EOD backstop for fill reconciliation (alpha-engine-config-I10800):
+        # ib_insync syncs the day's executions on connect, so this fresh
+        # session holds every fill the daemon's own per-tick pass may have
+        # missed (daemon died between the fill and its next tick). Runs
+        # BEFORE EODReconcile reads trades.db, which is the whole point of
+        # placing it here rather than in the reconcile itself — the
+        # reconcile reads a snapshot and never opens an IB session.
+        _reconcile_fills(ibkr.ib, config["db_path"], run_date)
     finally:
         ibkr.disconnect()
 

@@ -53,6 +53,7 @@ from executor.decision_capture import (
     is_decision_capture_enabled,
 )
 from executor.entry_triggers import EntryTriggerEngine
+from executor.fill_reconciliation import reconcile_from_ib
 from executor.ibkr import IBKRClient
 from executor.intraday_exit_manager import IntradayExitManager
 from executor.intraday_resolve import (
@@ -1079,6 +1080,15 @@ def run_daemon(dry_run: bool = False) -> None:
             )
 
             if not dry_run:
+                # Arrival price captured BEFORE the order goes out, so the
+                # row's price_at_order is the mark the decision saw — not the
+                # fill it got (which made urgent-exit slippage 0 by
+                # construction) and not a post-hoc quote.
+                try:
+                    _arrival_px = ibkr.get_current_price(ticker)
+                except Exception as _arr_err:  # noqa: BLE001 — a missing arrival mark is a data gap, not a reason to skip the exit
+                    logger.warning("get_current_price(%s) failed before URGENT %s: %s", ticker, action, _arr_err)
+                    _arrival_px = None
                 order_result = _place_order_with_retry(ibkr, ticker, side, shares, f"URGENT {action}")
                 if order_result["status"] in ("Rejected", "Timeout"):
                     logger.error(
@@ -1106,7 +1116,15 @@ def run_daemon(dry_run: bool = False) -> None:
                         actual_shares,
                     )
 
-                fill_price = order_result.get("fill_price") or ibkr.get_current_price(ticker) or 0
+                # `_real_fill` is the broker execution (None while the order
+                # is still Working past the poll window); `fill_price` is the
+                # best ESTIMATE for alerts and book-keeping. Only the real
+                # fill is persisted as fill_price — a Working row carries NULL
+                # until executor.fill_reconciliation writes the execution
+                # back, so the EOD attribution never prices a rotation at an
+                # estimate that reads as a fill (alpha-engine-config-I10800).
+                _real_fill = order_result.get("fill_price")
+                fill_price = _real_fill or _arrival_px or ibkr.get_current_price(ticker) or 0
 
                 # ── Roundtrip linkage for urgent exits ──
                 _entry = get_unmatched_entry(conn, ticker)
@@ -1118,8 +1136,8 @@ def run_daemon(dry_run: bool = False) -> None:
                 _spy_state = monitor.get_price("SPY")
                 if _spy_state:
                     _spy_now = _spy_state.get("last")
-                _rpnl = ((fill_price - _entry_fill) * actual_shares) if _entry_fill else None
-                _rpct = ((fill_price / _entry_fill) - 1) * 100 if _entry_fill else None
+                _rpnl = ((_real_fill - _entry_fill) * actual_shares) if (_entry_fill and _real_fill) else None
+                _rpct = ((_real_fill / _entry_fill) - 1) * 100 if (_entry_fill and _real_fill) else None
                 _spy_ret = ((_spy_now / _entry_spy) - 1) * 100 if (_spy_now and _entry_spy) else None
                 _ralpha = (_rpct - _spy_ret) if (_rpct is not None and _spy_ret is not None) else None
                 _dheld = (date.fromisoformat(run_date) - date.fromisoformat(_entry_date)).days if _entry_date else None
@@ -1131,11 +1149,11 @@ def run_daemon(dry_run: bool = False) -> None:
                         "ticker": ticker,
                         "action": action,
                         "shares": actual_shares,
-                        "price_at_order": fill_price,
+                        "price_at_order": _arrival_px if _arrival_px else fill_price,
                         "portfolio_nav_at_order": None,
                         "position_pct": None,
                         "ib_order_id": order_result.get("ib_order_id"),
-                        "fill_price": fill_price,
+                        "fill_price": _real_fill,
                         "fill_time": order_result.get("fill_time"),
                         "filled_shares": order_result.get("filled_shares"),
                         # Per-execution commission as IB reported it, or None
@@ -1371,6 +1389,23 @@ def run_daemon(dry_run: bool = False) -> None:
                     "open-orders snapshot writer raised: %s",
                     _oo_err,
                 )
+
+            # ── Fill reconciliation (alpha-engine-config-I10800) ──────────
+            # A market order still open when place_market_order's 30 s poll
+            # window closed was logged Working with no fill. Its executions
+            # arrive on this session as fill events; write them back within
+            # one tick so the row is the broker record by the time EOD
+            # attribution reads it. One SQL query when nothing is open.
+            if not dry_run:
+                try:
+                    _fr = reconcile_from_ib(conn, run_date, ibkr.ib)
+                    if _fr["patched"]:
+                        logger.info(
+                            "fill reconciliation: %d row(s) written back from session fills; %d still open",
+                            len(_fr["patched"]), len(_fr["unresolved"]),
+                        )
+                except Exception as _fr_err:  # noqa: BLE001 — (a) the write-back failed; (c) WARNING log + the snapshot-capture backstop re-runs the same reconciliation at EOD
+                    logger.warning("fill reconciliation raised: %s", _fr_err)
 
             # ── Mid-day backup (noon ET) ─────────────────────────────
             global _midday_backup_done
@@ -2060,7 +2095,10 @@ def _execute_exit(
             actual_shares,
         )
 
-    fill_price = order_result.get("fill_price") or current_price
+    # Real broker fill vs. best estimate — see the URGENT-exit site above
+    # (alpha-engine-config-I10800). Only the real fill is persisted.
+    _real_fill = order_result.get("fill_price")
+    fill_price = _real_fill or current_price
 
     # ── Roundtrip linkage ──
     _entry = get_unmatched_entry(conn, ticker)
@@ -2073,8 +2111,8 @@ def _execute_exit(
         _spy_state = monitor.get_price("SPY")
         if _spy_state:
             _spy_now = _spy_state.get("last")
-    _rpnl = ((fill_price - _entry_fill) * actual_shares) if _entry_fill else None
-    _rpct = ((fill_price / _entry_fill) - 1) * 100 if _entry_fill else None
+    _rpnl = ((_real_fill - _entry_fill) * actual_shares) if (_entry_fill and _real_fill) else None
+    _rpct = ((_real_fill / _entry_fill) - 1) * 100 if (_entry_fill and _real_fill) else None
     _spy_ret = ((_spy_now / _entry_spy) - 1) * 100 if (_spy_now and _entry_spy) else None
     _ralpha = (_rpct - _spy_ret) if (_rpct is not None and _spy_ret is not None) else None
     _dheld = (date.fromisoformat(run_date) - date.fromisoformat(_entry_date)).days if _entry_date else None
@@ -2090,7 +2128,7 @@ def _execute_exit(
             "portfolio_nav_at_order": None,
             "position_pct": None,
             "ib_order_id": order_result.get("ib_order_id"),
-            "fill_price": fill_price,
+            "fill_price": _real_fill,
             "fill_time": order_result.get("fill_time"),
             "filled_shares": order_result.get("filled_shares"),
             # Per-execution commission as IB reported it, or None when it
@@ -2376,7 +2414,11 @@ def _execute_entry(
             actual_shares,
         )
 
-    fill_price = order_result.get("fill_price") or current_price
+    # Real broker fill vs. best estimate (alpha-engine-config-I10800). The
+    # estimate still seeds the trailing stop and the alert; the ROW carries
+    # NULL until executor.fill_reconciliation writes the execution back.
+    _real_fill = order_result.get("fill_price")
+    fill_price = _real_fill or current_price
 
     # ── Roundtrip fields for entry ──
     _signal_price = entry.get("current_price")  # morning plan price
@@ -2400,7 +2442,7 @@ def _execute_entry(
             "portfolio_nav_at_order": None,
             "position_pct": entry.get("position_pct"),
             "ib_order_id": order_result.get("ib_order_id"),
-            "fill_price": fill_price,
+            "fill_price": _real_fill,
             "fill_time": order_result.get("fill_time"),
             "filled_shares": order_result.get("filled_shares"),
             # Per-execution commission as IB reported it, or None when it

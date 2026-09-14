@@ -2010,6 +2010,46 @@ def run(
     trades_today_rows = get_todays_trades(conn, run_date)
     buy_entry_px = _buy_entry_prices(trades_today_rows)
 
+    # ── Fill provenance (alpha-engine-config-I10800) ─────────────────────────
+    # Every row below is priced into a sleeve at its broker FILL. A row the
+    # daemon logged before its fill arrived (status Working/PartialFill/
+    # Timeout) is normally repaired by executor.fill_reconciliation — on the
+    # daemon's next tick, or by the snapshot-capture backstop — before this
+    # runs. One that is STILL unresolved here, or any row carrying no
+    # fill_price at all, is priced at its arrival estimate instead, and the
+    # gap to its real fill lands in `unattributed_true_usd`. Named here so
+    # the EOD email and the console carry the suspect before the residual
+    # bounds gate has to fail the run on it.
+    from executor.eod_report import arrival_priced_trades
+    from executor.fill_reconciliation import unresolved_trades
+
+    _unresolved_rows = unresolved_trades(conn, run_date)
+    if _unresolved_rows:
+        data_warnings.append(
+            f"Fill reconciliation incomplete for {run_date}: "
+            f"{len(_unresolved_rows)} trade row(s) still {'/'.join(sorted({r['status'] for r in _unresolved_rows}))} "
+            "after the daemon and snapshot-capture passes — "
+            + ", ".join(
+                f"{r['action']} {r['shares']} {r['ticker']} (order {r.get('ib_order_id')})"
+                for r in _unresolved_rows
+            )
+            + ". Their attribution is priced at the arrival estimate; the gap to the "
+            "real fill is inside unattributed_true_usd. Repair: "
+            "`python -m executor.fill_reconciliation --date "
+            f"{run_date} --from-daemon-log <daemon.log>` then re-run this reconcile."
+        )
+    _arrival_priced = arrival_priced_trades(trades_today_rows)
+    if _arrival_priced:
+        data_warnings.append(
+            f"{len(_arrival_priced)} trade row(s) for {run_date} priced into the attribution "
+            "at the ARRIVAL price (no fill_price on the row): "
+            + ", ".join(
+                f"{r['action']} {r['shares']} {r['ticker']} @ {r['price']:.2f} [{r['status']}]"
+                for r in _arrival_priced
+            )
+            + ". Implementation shortfall for these rows is in the residual, not the sleeve."
+        )
+
     for ticker, pos in positions.items():
         shares = pos.get("shares", 0)
         mv = pos.get("market_value", 0)
