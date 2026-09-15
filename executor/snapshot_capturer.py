@@ -81,13 +81,30 @@ def _reconcile_fills(ib, db_path: str, run_date: str) -> None:
     ``unresolved_trades`` and names anything still open in
     ``data_warnings``, so a failure here is visible downstream.
     """
-    from executor.fill_reconciliation import reconcile_from_ib
+    from executor.fill_reconciliation import (
+        LOCAL_DAEMON_LOG_PATH,
+        reconcile_from_daemon_log_file,
+        reconcile_from_ib,
+    )
     from executor.trade_logger import init_db
 
     try:
         conn = init_db(db_path)
         try:
             result = reconcile_from_ib(conn, run_date, ib)
+            # This session is on a different clientId than the daemon, so it
+            # usually holds none of the daemon's executions (measured on the
+            # 2026-09-14 replay). The daemon log on this box holds all of them.
+            patched = list(result["patched"])
+            if result["unresolved"]:
+                try:
+                    result = reconcile_from_daemon_log_file(conn, run_date, LOCAL_DAEMON_LOG_PATH)
+                    patched += result["patched"]
+                except FileNotFoundError:
+                    logger.error(
+                        "fill reconciliation backstop: no daemon log at %s — %d row(s) left "
+                        "for the EOD data_warnings", LOCAL_DAEMON_LOG_PATH, len(result["unresolved"]),
+                    )
         finally:
             conn.close()
     except Exception as err:  # noqa: BLE001 — (a) reconciliation failed; (c) ERROR log here + EOD data_warnings from unresolved_trades
@@ -95,18 +112,18 @@ def _reconcile_fills(ib, db_path: str, run_date: str) -> None:
         return
     logger.info(
         "fill reconciliation backstop | run_date=%s patched=%d unresolved=%d",
-        run_date, len(result["patched"]), len(result["unresolved"]),
+        run_date, len(patched), len(result["unresolved"]),
     )
     for row in result["unresolved"]:
         logger.warning(
-            "fill reconciliation backstop: %s %s %s (order %s) still %s — no execution on the session",
+            "fill reconciliation backstop: %s %s %s (order %s) still %s — no execution "
+            "on the session or in the daemon log",
             row["action"], row["shares"], row["ticker"], row.get("ib_order_id"), row.get("status"),
         )
 
 
 def _sweep_prior_sessions(config: dict, run_date: str) -> None:
-    """Repair earlier sessions whose rows were never reconciled, then re-derive
-    their ``eod_pnl`` rows.
+    """Repair earlier sessions' trade rows that were never reconciled.
 
     The live reconciliation passes only ever see the session they run in, so
     rows written before that machinery existed are unreachable by them. This
@@ -115,12 +132,17 @@ def _sweep_prior_sessions(config: dict, run_date: str) -> None:
     marker records the outcome, so an order that genuinely never filled does
     not re-download a ~100 MB log every night).
 
-    The re-derive uses the same entry point ``reconcile_audit`` uses for its
-    own corrections — ``run(..., run_audit=False)`` — rather than a second,
-    parallel correction path. Per-date isolation throughout: one unrepairable
-    session must not cost the others, or the snapshot.
+    It deliberately does NOT re-derive those sessions' ``eod_pnl`` rows.
+    ``eod_reconcile.run(..., run_audit=False)`` re-runs TODAY's whole
+    derivation over an old session, restating observed columns the fill never
+    touched. Measured on the 2026-09-14 replay: a $1.75 BRO fill correction on
+    2026-05-21 re-derived that row through the NAV mark correction added in
+    August (-$3,037 of NAV), the TWR self-heal then rewrote 2026-05-22's return
+    but not its nav_change_usd, and TWR closure went from 0.3bp to 29.1bp —
+    failing the run. The fill-dependent attribution of a corrected session is
+    left stale and logged here until an attribution-only restatement exists
+    (alpha-engine-config-I10824).
     """
-    from executor.eod_reconcile import run as eod_run
     from executor.fill_reconciliation import sweep_unresolved_sessions
     from executor.trade_logger import init_db
 
@@ -146,18 +168,12 @@ def _sweep_prior_sessions(config: dict, run_date: str) -> None:
         conn.close()
 
     for corrected_date in result["changed"]:
-        try:
-            eod_run(run_date=corrected_date, send_email=False, run_audit=False)
-            logger.info(
-                "fill reconciliation sweep: re-derived eod_pnl for %s after correcting its fills",
-                corrected_date,
-            )
-        except Exception as err:  # noqa: BLE001 — per-date isolation, mirroring reconcile_audit's own apply loop: one bad day must not abort the rest
-            logger.error(
-                "fill reconciliation sweep: eod_pnl re-derive FAILED for %s: %s — "
-                "its trade rows are corrected but its P&L row still reflects the old fills",
-                corrected_date, err,
-            )
+        logger.warning(
+            "fill reconciliation sweep: %s trade rows corrected; its eod_pnl attribution is "
+            "intentionally NOT re-derived and still reflects the old fills — a whole-row "
+            "re-derive restates observed NAV (alpha-engine-config-I10824)",
+            corrected_date,
+        )
 
 
 def run(run_date: str | None = None) -> None:
