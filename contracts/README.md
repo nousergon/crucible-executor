@@ -32,23 +32,22 @@ producer-side copy, mirrored byte-verbatim under
 | This pin | Producer copy | Status |
 |---|---|---|
 | `constituents.schema.json` | `nousergon-data/contracts/constituents.schema.json` | reconciled; no divergence |
-| `arctic_universe.schema.json` | `nousergon-data/contracts/arctic_universe.schema.json` | reconciled; **one declared divergence** |
+| `arctic_universe.schema.json` | `nousergon-data/contracts/arctic_universe.schema.json` | reconciled; no divergence (closed alpha-engine-config-I10828) |
 | `staging_daily_closes.schema.json` | *(none)* | producer has not published one; this pin stays sourced from `sources/contract.py::PriceBar` |
 
 The two files per key stay SEPARATE rather than one replacing the other: the
 producer's models the write path (`additionalProperties: false`), this repo's
 records what the trader's read path consumes and what it hard-fails without.
 
-**The declared divergence.** The producer's `arctic_universe.schema.json` is
-`additionalProperties: false` and declares neither `atr_14_pct` nor `VWAP`.
-`executor/price_cache.py` reads both, and `load_atr_14_pct` hard-fails without
-the first — so a frame that is valid against the producer's own published
-contract is one the morning planner refuses to trade on. The gap is in the
-producer's contract; it is asserted in both directions by
-`test_declared_divergence_is_still_true`, which goes red the day the producer
-adds either column. Do not close it by editing `nousergon-data/contracts/`
-from this repo — that is the parallel contract the P-07 pattern exists to
-prevent.
+**Closed: the arctic_universe divergence (alpha-engine-config-I10828).** The
+producer's `arctic_universe.schema.json` used to be `additionalProperties:
+false` while declaring neither `atr_14_pct` nor `VWAP`, both of which
+`executor/price_cache.py` reads and the first of which `load_atr_14_pct`
+hard-fails without — a frame valid against the producer's own published
+contract was one the morning planner refused to trade on. The producer now
+declares both (nullable, additive). Ongoing coverage:
+`test_producer_declares_the_columns_this_repo_hard_depends_on`, which goes red
+if the producer ever drops either column again.
 
 **Refreshing a producer copy**: copy the file again from `nousergon-data`
 `main` into `tests/contracts/producer/`, bump `PRODUCER_SHA` in the parity
