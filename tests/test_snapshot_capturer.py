@@ -337,3 +337,71 @@ class TestFillReconciliationBackstop:
         """Ordering is the point: ib.fills() needs a live session."""
         ib = self._run(_mock_config("/nonexistent/dir/trades.db"))
         ib.disconnect.assert_called_once()
+
+    def test_falls_back_to_the_daemon_log_when_the_session_holds_no_fills(self, tmp_path, monkeypatch):
+        """Measured on the 2026-09-14 replay: the snapshot session (its own
+        clientId) saw none of the daemon's executions — patched=0 — while the
+        daemon log on the box held every one."""
+        from executor.fill_reconciliation import unresolved_trades
+        from executor.trade_logger import init_db, log_trade
+
+        exec_line = (
+            "execDetails Execution(execId='e1', time=datetime.datetime(2026, 4, 29, 13, 31, 48, "
+            "tzinfo=datetime.timezone.utc), acctNumber='DU0000000', exchange='NYSE', side='SLD', "
+            "shares=775.0, price=74.0, permId=1, clientId=2, orderId=690, liquidation=0)"
+        )
+        log = tmp_path / "daemon.log"
+        log.write_text(exec_line + "\n")
+        monkeypatch.setattr("executor.fill_reconciliation.LOCAL_DAEMON_LOG_PATH", str(log))
+
+        db = str(tmp_path / "trades.db")
+        conn = init_db(db)
+        log_trade(conn, {
+            "date": "2026-04-29", "ticker": "PBF", "action": "REDUCE", "shares": 775,
+            "price_at_order": 77.33, "fill_price": None, "ib_order_id": 690, "status": "Working",
+        })
+        conn.close()
+
+        self._run(_mock_config(db))  # session fills() is empty
+
+        conn = init_db(db)
+        assert conn.execute("SELECT status, fill_price FROM trades").fetchone() == ("Filled", 74.0)
+        assert unresolved_trades(conn, "2026-04-29") == []
+
+    def test_a_missing_daemon_log_is_logged_and_never_costs_the_snapshot(self, tmp_path, monkeypatch, caplog):
+        from executor.trade_logger import init_db, log_trade
+
+        monkeypatch.setattr("executor.fill_reconciliation.LOCAL_DAEMON_LOG_PATH", str(tmp_path / "absent.log"))
+        db = str(tmp_path / "trades.db")
+        conn = init_db(db)
+        log_trade(conn, {
+            "date": "2026-04-29", "ticker": "PBF", "action": "REDUCE", "shares": 775,
+            "price_at_order": 77.33, "fill_price": None, "ib_order_id": 690, "status": "Working",
+        })
+        conn.close()
+        with caplog.at_level("ERROR"):
+            ib = self._run(_mock_config(db))
+        assert ib.disconnect.called
+        assert any("no daemon log at" in r.getMessage() for r in caplog.records)
+
+
+class TestHistoricalSweep:
+    """The sweep corrects prior sessions' trade rows but must NOT re-derive
+    their eod_pnl rows (alpha-engine-config-I10824): a whole-row re-derive of
+    2026-05-21 restated its NAV by -$3,037 for a $1.75 fill and broke TWR
+    closure on the 2026-09-14 replay."""
+
+    def test_corrected_prior_sessions_are_not_re_derived(self, tmp_path):
+        from executor.snapshot_capturer import _sweep_prior_sessions
+        from executor.trade_logger import init_db
+
+        init_db(str(tmp_path / "trades.db")).close()
+        cfg = _mock_config(str(tmp_path / "trades.db"))
+        sweep = {"changed": ["2026-05-21"], "swept": ["2026-05-21"], "unavailable": [],
+                 "skipped": [], "still_unresolved": {}}
+        with patch("executor.fill_reconciliation.sweep_unresolved_sessions", return_value=sweep), \
+             patch("executor.eod_reconcile.run", side_effect=AssertionError("must not re-derive")), \
+             patch("executor.snapshot_capturer.logger") as log:
+            _sweep_prior_sessions(cfg, "2026-09-14")
+        warned = [c.args for c in log.warning.call_args_list]
+        assert any("I10824" in a[0] and "2026-05-21" in a[1:] for a in warned)

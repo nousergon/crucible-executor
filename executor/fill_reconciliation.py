@@ -23,10 +23,15 @@ execution record:
   fills_by_order_from_ib(ib))`` after each poll, so a row is corrected within
   one poll interval of its fill arriving (``ib.fills()`` holds every execution
   the session has seen).
-* **Snapshot capture** — the postclose ``CaptureSnapshot`` stage opens a fresh
-  IB session; ``ib_insync`` syncs the day's executions on connect, so the same
-  call is the EOD backstop for a daemon that died between the fill and its
-  next tick.
+* **Snapshot capture** — the postclose ``CaptureSnapshot`` stage is the EOD
+  backstop for a daemon that died between the fill and its next tick. Its
+  fresh IB session connects on a DIFFERENT clientId than the daemon, and the
+  executions ``ib_insync`` syncs on connect are that client's own — measured
+  on the 2026-09-14 replay: ``patched=0``, both open rows "no execution on the
+  session" while their executions sat in the daemon log. So the backstop reads
+  the session first and then the box's own daemon log
+  (``reconcile_from_daemon_log_file`` over ``LOCAL_DAEMON_LOG_PATH``), which
+  carries every execution the daemon's session saw.
 * **Daemon log replay** — ``parse_daemon_log_executions`` reads the
   ``execDetails`` / ``commissionReport`` lines the IB wrapper logs, for a day
   whose IB session is gone (the log is backed up to S3 every EOD, so it is the
@@ -58,6 +63,11 @@ logger = logging.getLogger(__name__)
 # its call site; this is the only other reader). The log is the durable
 # execution record for a day whose IB session is long gone.
 DAEMON_LOG_KEY_TEMPLATE = "trades/logs/{run_date}/daemon.log"
+
+# The daemon's live log on the trading box — the file `eod_reconcile` uploads
+# to DAEMON_LOG_KEY_TEMPLATE. Read in place by the snapshot-capture backstop,
+# which runs before that upload.
+LOCAL_DAEMON_LOG_PATH = "/var/log/daemon.log"
 
 # One marker per swept session. Its purpose is NEGATIVE caching: a row that
 # can never resolve — an order genuinely cancelled before any fill — would
@@ -342,6 +352,29 @@ def reconcile_from_ib(conn: sqlite3.Connection, run_date: str, ib) -> dict[str, 
     if not unresolved_trades(conn, run_date):
         return {"patched": [], "unresolved": []}
     return reconcile_unfilled_trades(conn, run_date, fills_by_order_from_ib(ib))
+
+
+def reconcile_from_daemon_log_file(
+    conn: sqlite3.Connection, run_date: str, path: str
+) -> dict[str, list[dict[str, Any]]]:
+    """``reconcile_unfilled_trades`` over a daemon log file on disk, restricted
+    to executions timestamped on ``run_date``.
+
+    The live log on the box spans more than one session, and IB order ids are
+    per-client counters rather than globally unique, so an execution from
+    another day must not be able to resolve today's row. Raises
+    ``FileNotFoundError`` when the log is absent — the caller decides whether
+    that is fatal. Skips the read entirely when nothing is open."""
+    if not unresolved_trades(conn, run_date):
+        return {"patched": [], "unresolved": []}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        fills = parse_daemon_log_executions(fh)
+    same_day = {
+        order_id: kept
+        for order_id, executions in fills.items()
+        if (kept := [e for e in executions if (e.get("time") or "")[:10] == run_date])
+    }
+    return reconcile_unfilled_trades(conn, run_date, same_day)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

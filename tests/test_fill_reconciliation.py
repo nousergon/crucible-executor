@@ -21,6 +21,7 @@ from executor.fill_reconciliation import (
     NON_TERMINAL_STATUSES,
     fills_by_order_from_ib,
     parse_daemon_log_executions,
+    reconcile_from_daemon_log_file,
     reconcile_from_ib,
     reconcile_unfilled_trades,
     sweep_unresolved_sessions,
@@ -401,3 +402,43 @@ class TestSweep:
         res = sweep_unresolved_sessions(conn, bucket="b", before="2026-09-14")
         assert res["changed"] == ["2026-09-11"]
         assert conn.execute("SELECT fill_price FROM trades").fetchone() == (74.0,)
+
+
+# ── Local daemon log (the snapshot-capture backstop's second source) ─────────
+
+
+class TestDaemonLogFile:
+    """The snapshot session is on a different clientId than the daemon, so on
+    the 2026-09-14 replay it held none of the daemon's executions; the box's
+    own daemon log held all of them."""
+
+    @staticmethod
+    def _write(tmp_path, lines):
+        path = tmp_path / "daemon.log"
+        path.write_text("\n".join(lines) + "\n")
+        return str(path)
+
+    def test_repairs_the_open_rows_from_the_log_on_disk(self, conn, tmp_path):
+        _log(conn)
+        _log(conn, ticker="DUOL", shares=369, price_at_order=147.25, ib_order_id=684)
+        res = reconcile_from_daemon_log_file(conn, "2026-09-14", self._write(tmp_path, _daemon_lines()))
+        assert {r["ticker"]: r["after"]["fill_price"] for r in res["patched"]} == {"PBF": 74.0, "DUOL": 147.3182}
+        assert unresolved_trades(conn, "2026-09-14") == []
+
+    def test_an_execution_from_another_day_cannot_resolve_todays_row(self, conn, tmp_path):
+        # IB order ids are per-client counters and the live log spans sessions.
+        _log(conn, date="2026-09-15")
+        res = reconcile_from_daemon_log_file(conn, "2026-09-15", self._write(tmp_path, _daemon_lines()))
+        assert res["patched"] == [] and len(res["unresolved"]) == 1
+        assert conn.execute("SELECT status, fill_price FROM trades").fetchone() == ("Working", None)
+
+    def test_a_missing_log_raises_for_the_caller_to_judge(self, conn, tmp_path):
+        _log(conn)
+        with pytest.raises(FileNotFoundError):
+            reconcile_from_daemon_log_file(conn, "2026-09-14", str(tmp_path / "absent.log"))
+
+    def test_nothing_open_never_reads_the_log(self, conn, tmp_path):
+        _log(conn, status="Filled", fill_price=74.0)
+        assert reconcile_from_daemon_log_file(conn, "2026-09-14", str(tmp_path / "absent.log")) == {
+            "patched": [], "unresolved": [],
+        }
