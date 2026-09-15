@@ -224,6 +224,22 @@ class TestDaemonLogSource:
         assert {r["ticker"]: r["after"]["fill_price"] for r in res["patched"]} == {"PBF": 74.0, "DUOL": 147.3182}
         assert res["unresolved"] == []
 
+    def test_an_execution_on_a_whole_minute_is_not_dropped(self, conn):
+        # datetime repr omits a zero second: the 2026-09-14 PBF 75-share
+        # execution at 13:32:00 was skipped and the row stayed PartialFill 700/775.
+        whole_minute = (
+            "execDetails Execution(execId='0000dc8f.6b9c094e.01.01', time=datetime.datetime(2026, 9, 14, 13, 32, "
+            "tzinfo=datetime.timezone.utc), acctNumber='DU0000000', exchange='IBKRATS', side='SLD', shares=75.0, "
+            "price=74.0, permId=973605159, clientId=2, orderId=690, liquidation=0)"
+        )
+        fills = parse_daemon_log_executions([*_daemon_lines(), whole_minute])
+        minute = [e for e in fills[690] if e["exec_id"] == "0000dc8f.6b9c094e.01.01"]
+        assert [(e["shares"], e["time"]) for e in minute] == [(75.0, "2026-09-14T13:32:00+00:00")]
+        _log(conn, shares=850)
+        res = reconcile_unfilled_trades(conn, "2026-09-14", fills)
+        assert res["patched"][0]["after"]["filled_shares"] == 850
+        assert res["patched"][0]["after"]["status"] == "Filled"
+
     def test_placeholder_commission_report_is_unknown_not_zero(self):
         fills = parse_daemon_log_executions(_daemon_lines())
         # the second PBF execution only ever appeared with the empty placeholder report

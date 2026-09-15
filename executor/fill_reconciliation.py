@@ -139,9 +139,15 @@ def fills_by_order_from_ib(ib) -> dict[int, list[dict[str, Any]]]:
 # The commission arrives later on its own ``commissionReport`` line keyed by
 # execId. All three are ``repr`` output of ib_insync dataclasses, so the field
 # order is stable across the versions the fleet pins.
+#
+# ``datetime.__repr__`` drops a zero second (and a zero microsecond), so an
+# execution at 13:32:00 logs as ``datetime.datetime(2026, 9, 14, 13, 32,
+# tzinfo=...)``. Seconds are therefore optional: requiring them silently
+# dropped PBF's 75-share 13:32:00 execution on 2026-09-14 and left the row a
+# PartialFill of 700/775.
 _EXEC_RE = re.compile(
     r"Execution\(execId='(?P<exec_id>[^']+)', time=datetime\.datetime\("
-    r"(?P<y>\d+), (?P<mo>\d+), (?P<d>\d+), (?P<h>\d+), (?P<mi>\d+), (?P<s>\d+)"
+    r"(?P<y>\d+), (?P<mo>\d+), (?P<d>\d+), (?P<h>\d+), (?P<mi>\d+)(?:, (?P<s>\d+))?"
     r"(?:, (?P<us>\d+))?(?:, tzinfo=[^)]*)?\), acctNumber='[^']*', exchange='[^']*', "
     r"side='(?P<side>[A-Z]+)', shares=(?P<shares>[\d.]+), price=(?P<price>[\d.]+), "
     r"permId=\d+, clientId=\d+, orderId=(?P<order_id>\d+)"
@@ -170,7 +176,7 @@ def parse_daemon_log_executions(lines: Iterable[str]) -> dict[int, list[dict[str
             if exec_id not in by_exec:
                 ts = datetime(
                     int(m["y"]), int(m["mo"]), int(m["d"]),
-                    int(m["h"]), int(m["mi"]), int(m["s"]),
+                    int(m["h"]), int(m["mi"]), int(m["s"] or 0),
                 )
                 by_exec[exec_id] = {
                     "exec_id": exec_id,
