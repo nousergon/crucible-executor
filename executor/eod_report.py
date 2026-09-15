@@ -99,6 +99,8 @@ import json
 import logging
 import math
 import sqlite3
+from collections.abc import Mapping
+from typing import Any
 
 import boto3
 
@@ -215,54 +217,87 @@ def _prior_share_close(prior_pos: dict | None) -> tuple[float, float]:
     return shares, close
 
 
-def _sell_exit_prices(trades_today: list[dict] | None) -> dict[str, float]:
-    """Share-weighted average sell/exit fill price per ticker from today's trades."""
+def _trade_attribution_price(t: Mapping[str, Any] | dict) -> tuple[float | None, bool]:
+    """Price a trade row contributes to the attribution, and whether it is a FILL.
+
+    Order of authority: ``fill_price`` (the broker execution, share-weighted
+    VWAP) → ``price`` (the mapped ``_trades_today`` shape) → ``price_at_order``
+    (the arrival price — an ESTIMATE the daemon wrote before the fill arrived,
+    or the reference price a Working row was logged with). The second element
+    is False whenever the fallback was taken, so a caller can report that this
+    row's implementation shortfall is inside the residual rather than inside
+    the position/rotation sleeve it belongs to.
+
+    Reading ``price_at_order`` first is how a $3.33 gap between a REDUCE's
+    estimate and its real fill reached the unattributed residual and failed the
+    postclose pipeline on 2026-09-14 (alpha-engine-config-I10800); it also put
+    every session's slippage into the residual by construction, since
+    ``session_costs`` measures shortfall against the same arrival price.
+    """
+    for key, is_fill in (("fill_price", True), ("price", False), ("price_at_order", False)):
+        raw = t.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            px = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if px > 0:
+            return px, is_fill
+    return None, False
+
+
+def _weighted_prices(trades_today: list[dict] | None, actions, side_word: str) -> dict[str, float]:
     agg: dict[str, list[float]] = {}
     for t in trades_today or []:
         action = str(t.get("action", "")).upper()
-        if action not in _SELL_ACTIONS and "SELL" not in action:
+        if action not in actions and side_word not in action:
             continue
         tkr = t.get("ticker")
-        # Tolerate both the mapped ``price`` (``_trades_today``) and the raw
-        # ``price_at_order`` column (``trade_logger.get_todays_trades``).
-        raw_px = t.get("price")
-        if raw_px is None:
-            raw_px = t.get("price_at_order")
+        px, _ = _trade_attribution_price(t)
         try:
             sh = abs(float(t.get("shares") or 0))
-            px = float(raw_px or 0)
         except (TypeError, ValueError):
             continue
-        if not tkr or sh <= 0 or px <= 0:
+        if not tkr or sh <= 0 or px is None:
             continue
         slot = agg.setdefault(tkr, [0.0, 0.0])
         slot[0] += sh * px
         slot[1] += sh
     return {k: v[0] / v[1] for k, v in agg.items() if v[1] > 0}
+
+
+def _sell_exit_prices(trades_today: list[dict] | None) -> dict[str, float]:
+    """Share-weighted average sell/exit fill price per ticker from today's trades."""
+    return _weighted_prices(trades_today, _SELL_ACTIONS, "SELL")
 
 
 def _buy_entry_prices(trades_today: list[dict] | None) -> dict[str, float]:
     """Share-weighted average buy/enter fill price per ticker from today's trades."""
-    agg: dict[str, list[float]] = {}
+    return _weighted_prices(trades_today, _BUY_ACTIONS, "BUY")
+
+
+def arrival_priced_trades(trades_today: list[dict] | None) -> list[dict]:
+    """Rows the attribution had to price at the ARRIVAL price, not a fill.
+
+    Each entry names the row (``ticker``, ``action``, ``shares``, ``status``,
+    ``price``) so the EOD run can put it in ``data_warnings``: the row's
+    shortfall against its real fill is sitting in the unattributed residual,
+    and if the residual bounds gate fires, this list is the first suspect.
+    """
+    out: list[dict] = []
     for t in trades_today or []:
-        action = str(t.get("action", "")).upper()
-        if action not in _BUY_ACTIONS and "BUY" not in action:
+        px, is_fill = _trade_attribution_price(t)
+        if px is None or is_fill:
             continue
-        tkr = t.get("ticker")
-        raw_px = t.get("price")
-        if raw_px is None:
-            raw_px = t.get("price_at_order")
-        try:
-            sh = abs(float(t.get("shares") or 0))
-            px = float(raw_px or 0)
-        except (TypeError, ValueError):
-            continue
-        if not tkr or sh <= 0 or px <= 0:
-            continue
-        slot = agg.setdefault(tkr, [0.0, 0.0])
-        slot[0] += sh * px
-        slot[1] += sh
-    return {k: v[0] / v[1] for k, v in agg.items() if v[1] > 0}
+        out.append({
+            "ticker": t.get("ticker"),
+            "action": t.get("action"),
+            "shares": t.get("shares"),
+            "status": t.get("status"),
+            "price": px,
+        })
+    return out
 
 
 def compute_pricing_timing_by_ticker(

@@ -97,7 +97,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/daemon.py
-    line: 183
+    line: 184
     reason: >-
       Price-monitor unsubscribe teardown failure during cleanup. No
       recording surface -- teardown must never block shutdown.
@@ -105,7 +105,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/daemon.py
-    line: 192
+    line: 193
     reason: >-
       IBKR disconnect teardown failure during cleanup. No recording
       surface -- teardown must never block shutdown.

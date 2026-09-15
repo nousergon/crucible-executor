@@ -8,7 +8,9 @@ inputs from observations made at time X.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -91,14 +93,26 @@ class TestLoadSnapshot:
 # ── run ──────────────────────────────────────────────────────────────────────
 
 
-def _mock_config():
+def _mock_config(db_path="/nonexistent/trades.db"):
     return {
         "trades_bucket": "alpha-engine-research",
         "aws_region": "us-east-1",
         "ibkr_host": "127.0.0.1",
         "ibkr_port": 4002,
         "ibkr_client_id": 99,
+        # Read by the fill-reconciliation backstop (alpha-engine-config-I10800).
+        # Tests that do not exercise the backstop patch `_reconcile_fills` out;
+        # the default path is deliberately unopenable so an unpatched test
+        # fails loudly rather than touching a real database.
+        "db_path": db_path,
     }
+
+
+@contextlib.contextmanager
+def _no_fill_reconciliation():
+    """Stub the fill-reconciliation backstop for tests about snapshot capture."""
+    with patch("executor.snapshot_capturer._reconcile_fills") as stub:
+        yield stub
 
 
 class TestRun:
@@ -119,7 +133,8 @@ class TestRun:
             s3 = MagicMock()
             mock_boto.return_value = s3
 
-            run(run_date=None)
+            with _no_fill_reconciliation():
+                run(run_date=None)
 
             # Verify the put_object key was constructed from the resolved
             # run_date, not from None or some other default.
@@ -173,7 +188,8 @@ class TestRun:
             s3 = MagicMock()
             mock_boto.return_value = s3
 
-            run(run_date="2026-04-29")
+            with _no_fill_reconciliation():
+                run(run_date="2026-04-29")
 
             kwargs = s3.put_object.call_args.kwargs
             payload = json.loads(kwargs["Body"].decode("utf-8"))
@@ -204,7 +220,8 @@ class TestRun:
             mock_ib_cls.return_value = ib
             mock_boto.return_value = MagicMock()
 
-            run(run_date="2026-04-29")
+            with _no_fill_reconciliation():
+                run(run_date="2026-04-29")
 
             ib.disconnect.assert_called_once()
 
@@ -225,3 +242,98 @@ class TestRun:
             with pytest.raises(RuntimeError, match="IB outage"):
                 run(run_date="2026-04-29")
             ib.disconnect.assert_called_once()
+
+
+# ── Fill-reconciliation backstop (alpha-engine-config-I10800) ────────────────
+
+
+class TestFillReconciliationBackstop:
+    """CaptureSnapshot is the EOD backstop for a trade row whose fill landed
+    after the daemon's poll window and after the daemon's own last tick. This
+    session is freshly connected, so ib_insync has synced the day's executions
+    onto it."""
+
+    @staticmethod
+    def _patched(cfg):
+        return (
+            patch("executor.snapshot_capturer.now_dual",
+                  return_value=SimpleNamespace(trading_day="2026-04-29", calendar_date="2026-04-29")),
+            patch("executor.snapshot_capturer.load_config", return_value=cfg),
+            patch("executor.snapshot_capturer.IBKRClient"),
+            patch("boto3.client"),
+        )
+
+    def _run(self, cfg):
+        a, b, c, d = self._patched(cfg)
+        with a, b, c as mock_ib_cls, d as mock_boto:
+            ib = MagicMock()
+            ib.get_account_snapshot.return_value = {"net_liquidation": 1.0}
+            ib.get_positions.return_value = {}
+            ib.get_accrued_dividends_by_symbol.return_value = {}
+            ib.ib.fills.return_value = []
+            mock_ib_cls.return_value = ib
+            mock_boto.return_value = MagicMock()
+            run(run_date="2026-04-29")
+            return ib
+
+    def test_reconciles_the_open_row_against_the_session_fills(self, tmp_path):
+        from executor.fill_reconciliation import unresolved_trades
+        from executor.trade_logger import init_db, log_trade
+
+        db = str(tmp_path / "trades.db")
+        conn = init_db(db)
+        log_trade(conn, {
+            "date": "2026-04-29", "ticker": "PBF", "action": "REDUCE", "shares": 775,
+            "price_at_order": 77.33, "fill_price": None, "ib_order_id": 690, "status": "Working",
+        })
+        conn.close()
+
+        a, b, c, d = self._patched(_mock_config(db))
+        with a, b, c as mock_ib_cls, d as mock_boto:
+            ib = MagicMock()
+            ib.get_account_snapshot.return_value = {"net_liquidation": 1.0}
+            ib.get_positions.return_value = {}
+            ib.get_accrued_dividends_by_symbol.return_value = {}
+            ib.ib.fills.return_value = [SimpleNamespace(
+                contract=SimpleNamespace(symbol="PBF"),
+                execution=SimpleNamespace(
+                    orderId=690, side="SLD", shares=775.0, price=74.0, execId="x",
+                    time=datetime(2026, 4, 29, 13, 31, 48, tzinfo=UTC),
+                ),
+                commissionReport=SimpleNamespace(execId="x", commission=3.5),
+            )]
+            mock_ib_cls.return_value = ib
+            mock_boto.return_value = MagicMock()
+            run(run_date="2026-04-29")
+
+        conn = init_db(db)
+        assert conn.execute("SELECT status, fill_price FROM trades").fetchone() == ("Filled", 74.0)
+        assert unresolved_trades(conn, "2026-04-29") == []
+
+    def test_a_reconciliation_failure_never_costs_the_snapshot(self, caplog):
+        """The snapshot is the day's ONE non-re-runnable artifact; a broken
+        backstop must not be able to take it down."""
+        with patch("executor.snapshot_capturer._reconcile_fills", side_effect=AssertionError("unreachable")):
+            a, b, c, d = self._patched(_mock_config())
+            with a, b, c as mock_ib_cls, d as mock_boto:
+                ib = MagicMock()
+                ib.get_account_snapshot.return_value = {"net_liquidation": 1.0}
+                ib.get_positions.return_value = {}
+                ib.get_accrued_dividends_by_symbol.return_value = {}
+                mock_ib_cls.return_value = ib
+                s3 = MagicMock()
+                mock_boto.return_value = s3
+                with pytest.raises(AssertionError):
+                    run(run_date="2026-04-29")
+
+        # ...and when the failure is inside _reconcile_fills itself, it is
+        # caught there, logged, and the snapshot still lands.
+        with caplog.at_level("ERROR"):
+            ib = self._run(_mock_config("/nonexistent/dir/trades.db"))
+        assert ib.disconnect.called
+        assert any("fill reconciliation backstop failed" in r.getMessage() for r in caplog.records)
+
+    def test_runs_before_the_ib_session_is_closed(self):
+        """Ordering is the point: ib.fills() needs a live session."""
+        ib = self._run(_mock_config("/nonexistent/dir/trades.db"))
+        ib.disconnect.assert_called_once()
