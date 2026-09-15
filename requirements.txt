@@ -82,7 +82,7 @@ narwhals==2.26.0
     # via scikit-learn
 nest-asyncio==1.6.0
     # via ib-insync
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@008969bdc43f9e418ae6ec98a9c46784fc490d9b
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@5ca3449996fad68988c3d07b1d5a8b98159f8deb
     # via -r requirements.in
 numpy==2.4.6
     # via

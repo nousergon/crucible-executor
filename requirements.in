@@ -84,7 +84,7 @@ websocket-client~=1.9
 # crucible-predictor/inference/lib_pin_drift.py's floor-repo scope for the
 # first time, which reads THIS file (not requirements.txt) for exactly the
 # uv-resolves-to-SHA reason above.
-nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.94
+nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.130
 # krepis (MIT foundation) — direct pin: eod_emailer.py now imports the lifted
 # console deep-link chokepoint `krepis.console.console_url` (config#1300, krepis
 # v0.4.0 added it). nousergon-lib pulls krepis transitively, but the direct
