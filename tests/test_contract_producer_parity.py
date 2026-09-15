@@ -21,7 +21,7 @@ that agreed with the producer once and silently diverged afterwards is the
 producer's files at that SHA. Nothing here edits them, and no code path reads
 them at runtime — `contracts/` stays the repo's own consumer pin (it has to:
 it carries the read-path facts the producer's copy does not model, see the
-declared divergence below). These copies exist so the DIFFERENCE between the
+hard-dependency check below). These copies exist so the DIFFERENCE between the
 two is asserted rather than assumed.
 
 What is pinned:
@@ -32,8 +32,9 @@ What is pinned:
      never declared is a contract this repo invented.
   3. A producer-conformant document validates against this repo's consumer
      pin. A consumer pin stricter than the producer rejects real data.
-  4. The DECLARED divergence, asserted in both directions (see
-     `_DECLARED_ARCTIC_DIVERGENCE`).
+  4. The producer still declares every column this repo hard-depends on (see
+     `_ARCTIC_COLUMNS_THIS_REPO_DEPENDS_ON`) — closed alpha-engine-config-I10828,
+     asserted going forward so a future producer regression is caught here.
 
 Refresh procedure when the producer's schema moves: copy the file again from
 `nousergon-data` `main`, run this test, and reconcile `contracts/` against
@@ -55,26 +56,22 @@ _PRODUCER = Path(__file__).parent / "contracts" / "producer"
 
 # The producer SHA these copies were taken at. Cited so a reviewer can diff
 # them without guessing which revision they mirror.
-PRODUCER_SHA = "2ef120fb"  # nousergon-data-PR1711, contracts/ introduced
+PRODUCER_SHA = "nousergon-data-PR1726"  # atr_14_pct + VWAP added, alpha-engine-config-I10828
 
-# ── The declared divergence ─────────────────────────────────────────────────
+# ── The divergence is closed ─────────────────────────────────────────────────
 #
 # `executor/price_cache.py` HARD-FAILS on a `universe` frame missing
 # `atr_14_pct` (`load_atr_14_pct`: absent column, non-finite value, or a most-
 # recent row older than `_ATR_MAX_STALENESS_TRADING_DAYS` all abort the morning
 # planner), and reads `VWAP` in `load_prior_day_vwap`. The producer's
-# `arctic_universe.schema.json` declares neither, and sets
-# `additionalProperties: false` — so a frame that is VALID against the
-# producer's own published contract is one this repo refuses to trade on.
-#
-# That is a real gap in the producer's contract, not in this pin, and it is
-# recorded here rather than papered over by trimming this repo's requirements
-# down to the producer's. Two assertions hold it: the columns are absent from
-# the producer copy TODAY (so nothing silently assumes otherwise), and they are
-# present in this repo's own pin (so the trader's real dependency is written
-# down somewhere). The day the producer adds them, the first assertion fails
-# and this list is what gets deleted.
-_DECLARED_ARCTIC_DIVERGENCE = ("atr_14_pct", "VWAP")
+# `arctic_universe.schema.json` used to declare neither while being
+# `additionalProperties: false` — a frame VALID against the producer's own
+# published contract was one this repo refused to trade on
+# (alpha-engine-config-I10828). The producer now declares both (nullable,
+# additive — VWAP null on yfinance/FRED rows, atr_14_pct null during ATR
+# warmup), closing the gap. The columns this repo's read path actually
+# depends on for a hard-fail path.
+_ARCTIC_COLUMNS_THIS_REPO_DEPENDS_ON = ("atr_14_pct", "VWAP")
 
 
 def _load(path: Path) -> dict:
@@ -165,7 +162,7 @@ def test_sector_map_is_required_on_both_sides(
     assert "sector_map" in consumer_constituents["required"]
 
 
-# ── 2/3. arctic universe: OHLCV parity + the declared divergence ────────────
+# ── 2/3. arctic universe: OHLCV parity + hard-dependency coverage ───────────
 
 
 def test_consumer_ohlcv_columns_match_the_producer_contract(
@@ -182,24 +179,24 @@ def test_consumer_ohlcv_columns_match_the_producer_contract(
     assert producer_required == {"Open", "High", "Low", "Close", "Volume"}
 
 
-@pytest.mark.parametrize("column", _DECLARED_ARCTIC_DIVERGENCE)
-def test_declared_divergence_is_still_true(producer_arctic, consumer_arctic, column):
-    """`atr_14_pct` and `VWAP` are read by `executor/price_cache.py` and are
-    NOT in the producer's published contract, which is `additionalProperties:
-    false`. A frame valid against the producer's own schema is therefore one
-    this repo refuses to trade on.
+@pytest.mark.parametrize("column", _ARCTIC_COLUMNS_THIS_REPO_DEPENDS_ON)
+def test_producer_declares_the_columns_this_repo_hard_depends_on(
+    producer_arctic, consumer_arctic, column,
+):
+    """`atr_14_pct` and `VWAP` are read by `executor/price_cache.py`
+    (`load_atr_14_pct` hard-fails without the first). Closed
+    alpha-engine-config-I10828: the producer now declares both, nullable, on
+    its `additionalProperties: false` contract, so a frame valid against the
+    producer's own schema is one this repo can actually trade on.
 
-    When the producer adds the column this test goes red — that is the
-    intended signal to delete it from `_DECLARED_ARCTIC_DIVERGENCE` and, for
-    `atr_14_pct`, to stop carrying its staleness contract only in this repo's
-    pin. Tracked upstream rather than fixed here: editing nousergon-data's
-    `contracts/` from this repo would be exactly the parallel contract the
-    P-07 pattern exists to prevent."""
+    If the producer ever drops either column again, this test goes red —
+    that is the intended signal to re-open the gap and re-add a declared
+    divergence entry rather than let the drop pass silently."""
     assert producer_arctic["additionalProperties"] is False
-    assert column not in producer_arctic["properties"], (
-        f"{column} now EXISTS in the producer contract ({PRODUCER_SHA}) — "
-        f"remove it from _DECLARED_ARCTIC_DIVERGENCE and reconcile "
-        f"contracts/arctic_universe.schema.json against it"
+    assert column in producer_arctic["properties"], (
+        f"{column} is no longer declared in the producer contract "
+        f"({PRODUCER_SHA}) — executor/price_cache.py still hard-depends on "
+        f"it; re-open alpha-engine-config-I10828"
     )
     assert column in consumer_arctic["symbol_shape"]["columns"], (
         f"{column} is read by executor/price_cache.py but is documented by "
