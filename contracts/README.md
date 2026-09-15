@@ -24,8 +24,9 @@ one, for a future bump) merged first.
 ## Producer parity
 
 P-07 landed in `nousergon-data` as `nousergon-data-PR1711` (`2ef120fb`),
-publishing the producer's own `contracts/`. Two of the three keys now have a
-producer-side copy, mirrored byte-verbatim under
+publishing the producer's own `contracts/`, and `nousergon-data-PR1712`
+(`3cd646b`) subsequently added `contracts/staging_daily_closes.schema.json`.
+All three keys now have a producer-side copy, mirrored byte-verbatim under
 `tests/contracts/producer/` and held in agreement with the files here by
 `tests/test_contract_producer_parity.py`:
 
@@ -33,7 +34,7 @@ producer-side copy, mirrored byte-verbatim under
 |---|---|---|
 | `constituents.schema.json` | `nousergon-data/contracts/constituents.schema.json` | reconciled; no divergence |
 | `arctic_universe.schema.json` | `nousergon-data/contracts/arctic_universe.schema.json` | reconciled; no divergence (closed alpha-engine-config-I10828) |
-| `staging_daily_closes.schema.json` | *(none)* | producer has not published one; this pin stays sourced from `sources/contract.py::PriceBar` |
+| `staging_daily_closes.schema.json` | `nousergon-data/contracts/staging_daily_closes.schema.json` (`nousergon-data-PR1712`) | reconciled; OPEN divergence on OHLC/Volume nullability (alpha-engine-config-I10853) |
 
 The two files per key stay SEPARATE rather than one replacing the other: the
 producer's models the write path (`additionalProperties: false`), this repo's
@@ -48,6 +49,18 @@ contract was one the morning planner refused to trade on. The producer now
 declares both (nullable, additive). Ongoing coverage:
 `test_producer_declares_the_columns_this_repo_hard_depends_on`, which goes red
 if the producer ever drops either column again.
+
+**OPEN: the staging_daily_closes divergence (alpha-engine-config-I10853).**
+The producer types `Open`/`High`/`Low`/`Close`/`Adj_Close`/`Volume` as
+nullable — a documented, legitimate producer state (a gap day with no vendor
+value). This repo's consumer pin types the same fields as plain
+`number`/`integer` with no null option, so a producer-conformant row
+carrying a real null price fails this repo's own contract. Not fixed here:
+`executor/upstream_artifact_gate.py` only probes freshness (no row parse)
+so nothing live is broken today, but fixing it means loosening a contract
+this repo owns, which needs its own ruling. Pinned as a passing,
+documented-divergence test:
+`test_producer_allows_null_ohlc_but_consumer_pin_rejects_it`.
 
 **Refreshing a producer copy**: copy the file again from `nousergon-data`
 `main` into `tests/contracts/producer/`, bump `PRODUCER_SHA` in the parity
