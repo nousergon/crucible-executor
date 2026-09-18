@@ -1,0 +1,20 @@
+[Unit]
+Description=Daily broker reconciliation for the v2 trader (alpha-engine-config-I11071)
+
+[Timer]
+# 21:35 UTC weekdays -- after both alpha-engine-eod-reconcile-standalone.timer
+# (21:05 UTC, v1 component 3's own EOD reconcile) and
+# alpha-engine-reference-rate-publish.timer (21:15 UTC), and well after the
+# 20:00 UTC NYSE close, so today's fills have settled on the IB paper account
+# before crucible_trader.commands reconcile connects and reads them. This is
+# the v2 trader's OWN reconciliation (`trader.reconcile`,
+# alpha-engine-config-I10651/-I11071) -- independent of, and never coupled
+# to, the two v1 timers above; it shares only this directory because
+# boot-pull.sh's sync_systemd_units_from loop installs every `*.timer` here
+# on each boot (nous-ergon-ops-PR1333), needing no operator step.
+OnCalendar=Mon,Tue,Wed,Thu,Fri 21:35:00 UTC
+Persistent=true
+Unit=alpha-engine-trader-reconcile.service
+
+[Install]
+WantedBy=timers.target

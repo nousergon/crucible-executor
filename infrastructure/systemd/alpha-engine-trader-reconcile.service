@@ -1,0 +1,29 @@
+[Unit]
+Description=v2 trader broker reconciliation (alpha-engine-config-I11071) — trader.reconcile, a separate system from the v1 units in this directory
+After=ibgateway.service
+Wants=ibgateway.service
+
+[Service]
+Type=oneshot
+User=ec2-user
+# ASSUMPTION, unverified in this change (no live box was touched to confirm
+# it): the private `crucible-trader` checkout lives here, deployed the same
+# way this repo's own checkout is. If the trader box provisions it under a
+# different path, this line is the only thing that needs to change --
+# `scripts/trader_reconcile.sh` is otherwise self-contained (it builds its
+# own throwaway venv per run from the pinned release, same shape as
+# `trader_paper_smoke.sh`).
+WorkingDirectory=/home/ec2-user/crucible-trader
+ExecStart=/usr/bin/env bash /home/ec2-user/crucible-trader/scripts/trader_reconcile.sh
+StandardOutput=journal
+StandardError=journal
+# CRUCIBLE_TRADER_STORE_URI / _IB_HOST / _IB_PORT / _IB_CLIENT_ID: no
+# defaults by design (`crucible_trader.settings.Settings.from_env`,
+# `crucible_trader.broker_session.GatewayAddress.from_env`). Also
+# unverified here: which mechanism supplies them on this box (an
+# EnvironmentFile the trader's own provisioning writes, or SSM-backed
+# `nousergon_lib.secrets`, per this directory's `.env`-deprecation
+# precedent) -- naming it is a box-provisioning decision outside
+# `crucible-trader`'s and this timer's own scope.
+EnvironmentFile=/etc/crucible-trader/reconcile.env
+Environment=AWS_REGION=us-east-1
