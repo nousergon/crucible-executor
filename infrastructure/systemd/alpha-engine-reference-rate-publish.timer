@@ -1,0 +1,16 @@
+[Unit]
+Description=Publish metron/reference_rate.json on component 3's own post-close schedule (alpha-engine-config-I11007)
+
+[Timer]
+# 21:15 UTC weekdays — 10 min after eod_reconcile.py's own documented
+# post-close slot (21:05 UTC, see that module's docstring), so the daily
+# snapshot this reads is normally already written by the (still coexisting,
+# pre-cutover) v1 postclose pipeline's CaptureSnapshot step. Self-sufficient
+# either way: publish_reference_rate.py captures its own snapshot if one
+# isn't there yet.
+OnCalendar=Mon,Tue,Wed,Thu,Fri 21:15:00 UTC
+Persistent=true
+Unit=alpha-engine-reference-rate-publish.service
+
+[Install]
+WantedBy=timers.target
