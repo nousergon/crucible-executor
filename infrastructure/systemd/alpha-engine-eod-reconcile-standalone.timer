@@ -1,0 +1,17 @@
+[Unit]
+Description=EOD reconciliation on component 3's own post-close schedule (alpha-engine-config-I11066)
+
+[Timer]
+# 21:05 UTC weekdays — eod_reconcile.py's own long-documented post-close
+# slot (see that module's top-of-file docstring: "Cron: 5 21 * * 1-5"), and
+# 10 minutes ahead of alpha-engine-reference-rate-publish.timer's 21:15 UTC
+# so that timer's nav_history read of trades/eod_pnl.csv normally finds
+# today's row already written. Self-sufficient either way:
+# eod_reconcile_standalone.py captures its own snapshot if one isn't there
+# yet, same shape as publish_reference_rate.py (alpha-engine-config-I11007).
+OnCalendar=Mon,Tue,Wed,Thu,Fri 21:05:00 UTC
+Persistent=true
+Unit=alpha-engine-eod-reconcile-standalone.service
+
+[Install]
+WantedBy=timers.target
