@@ -11,12 +11,12 @@ attrs==26.1.0
     #   referencing
 beautifulsoup4==4.15.0
     # via yfinance
-boto3==1.43.93
+boto3==1.43.98
     # via
     #   -r requirements.in
     #   krepis
     #   nousergon-lib
-botocore==1.43.93
+botocore==1.43.98
     # via
     #   boto3
     #   s3transfer
@@ -36,7 +36,7 @@ cloudpickle==3.1.2
     # via joblib
 curl-cffi==0.16.3
     # via yfinance
-cvxpy==1.9.2
+cvxpy==1.9.3
     # via -r requirements.in
 eventkit==1.0.3
     # via ib-insync
@@ -48,7 +48,7 @@ highspy==1.15.1
     # via cvxpy
 ib-insync==0.9.86
     # via -r requirements.in
-idna==3.19
+idna==3.20
     # via requests
 jinja2==3.1.6
     # via osqp
@@ -66,7 +66,7 @@ jsonschema-specifications==2025.9.1
     # via jsonschema
 korean-lunar-calendar==0.4.0
     # via exchange-calendars
-krepis==0.59.61
+krepis==0.59.64
     # via
     #   -r requirements.in
     #   nousergon-lib
@@ -113,7 +113,7 @@ pandas==2.3.3
     #   yfinance
 peewee==4.5.1
     # via yfinance
-platformdirs==4.11.8
+platformdirs==4.11.11
     # via yfinance
 protobuf==6.33.6
     # via
@@ -193,9 +193,9 @@ six==1.17.0
     # via python-dateutil
 soupsieve==2.9.2
     # via beautifulsoup4
-sparsediffpy==0.3.0
+sparsediffpy==0.6.1
     # via cvxpy
-threadpoolctl==3.6.0
+threadpoolctl==3.7.0
     # via scikit-learn
 toolz==1.1.0
     # via exchange-calendars
@@ -215,7 +215,7 @@ tzdata==2026.4
     # via
     #   exchange-calendars
     #   pandas
-urllib3==2.7.0
+urllib3==2.8.0
     # via
     #   botocore
     #   requests
