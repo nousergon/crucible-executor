@@ -139,6 +139,34 @@ NOOP_CHAMPION_ARMS_SERVED = ("agentic",)
 SHADOW_SERVED_ARMS = (
     "no_agent_quant",
     "single_agent_quant",
+    # ── The RESEARCH slot (alpha-engine-config-I11393, -I11438) ─────────────
+    #
+    # Brian's ruling 2026-09-22 collapsed scanner_spec / universe_cut /
+    # producer into ONE slot deciding which names reach the predictor. These
+    # are its five arms, and until now NOT ONE of them was servable here:
+    # VALID_CHAMPIONS held only retired arms, so the moment the pointer named
+    # a live arm `apply_champion_selection` would raise at planner start and
+    # HALT TRADING. That is the failure this module's own -I9299 comment above
+    # describes having already been designed against once — the same gap, one
+    # slot later.
+    #
+    # No new handler: every one publishes a conforming
+    # `signals_shadow/{arm}/{date}/signals.json`, which is exactly what
+    # `_apply_shadow_signals_arm` was built to serve — *"tomorrow it is any arm
+    # crucible-research registers, with no edit here."* This tuple is the one
+    # edit that docstring still needs, and -I11442 removes even that by
+    # deriving it from `arena/research/register.json`.
+    #
+    # The set is crucible-research's `producers.registry.research_slot_producers()`
+    # as of 2026-09-22. It is NOT derived here because this module must not
+    # depend on an S3 read to decide whether it may start a trading day: a
+    # transient read failure would either halt a healthy run or, worse,
+    # fail open.
+    "attractiveness_60",
+    "attractiveness_20",
+    "tech_score_20",
+    "predictor_from_60",
+    "thinktank_20",
 )
 
 # alpha-engine-config-I8755 — the entry-selection arm the pipeline was already
