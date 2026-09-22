@@ -410,6 +410,101 @@ def test_wrapper_never_raises_writes_sentinel_on_failure():
     assert "SPY price history" in body["error"]
 
 
+class TestFailureSentinelForensics:
+    """The failure artifact must carry the numbers that describe the failure.
+
+    Until alpha-engine-config-I11369 it carried ``repr(e)`` and nothing else,
+    so the 2026-09-22 ``TurnoverBudgetError`` that held the whole book had to
+    be diagnosed by rebuilding the inputs from scratch.
+    """
+
+    def test_sentinel_carries_structured_type_message_and_traceback(self):
+        from executor.optimizer_shadow import _build_failure_sentinel
+
+        try:
+            raise ValueError("no SPY price history")
+        except ValueError as exc:
+            sentinel = _build_failure_sentinel(exc, "2026-09-22")
+
+        assert sentinel["shadow_status"] == "failed"
+        assert sentinel["error_type"] == "ValueError"
+        assert sentinel["error_message"] == "no SPY price history"
+        # The old field is kept verbatim — every existing reader uses it.
+        assert sentinel["error"] == repr(ValueError("no SPY price history"))
+        assert "ValueError" in sentinel["traceback"]
+        assert sentinel["run_date"] == "2026-09-22"
+
+    def test_diagnostics_attached_to_the_exception_survive_into_the_sentinel(self):
+        from executor.optimizer_shadow import _build_failure_sentinel
+        from executor.portfolio_optimizer import TurnoverBudgetError
+
+        exc = TurnoverBudgetError("solved one-way turnover 0.017503 exceeds ...")
+        exc.diagnostics = {
+            "turnover_constraint_cap": 0.016209,
+            "turnover_pre_clip_one_way": 0.017503,
+            "turnover_solver_status": "optimal_inaccurate",
+        }
+        sentinel = _build_failure_sentinel(exc, "2026-09-22")
+        assert sentinel["diagnostics_partial"]["turnover_constraint_cap"] == 0.016209
+        assert (
+            sentinel["diagnostics_partial"]["turnover_solver_status"]
+            == "optimal_inaccurate"
+        )
+
+    def test_the_field_is_present_and_null_when_nothing_was_attached(self):
+        # A key that appears only on the interesting path is
+        # indistinguishable from a dead emitter.
+        from executor.optimizer_shadow import _build_failure_sentinel
+
+        sentinel = _build_failure_sentinel(RuntimeError("early"), "2026-09-22")
+        assert "diagnostics_partial" in sentinel
+        assert sentinel["diagnostics_partial"] is None
+
+
+def test_a_shadow_failure_publishes_an_ops_alert(monkeypatch):
+    """The day the optimizer refuses to trade must page (I11369).
+
+    On 2026-09-22 the only surface that carried it was a log line on the
+    trading box; the alert must say the book was HELD or it gets triaged as
+    a crash.
+    """
+    published = []
+    import executor.notifier as notifier
+
+    monkeypatch.setattr(
+        notifier, "publish_ops_alert",
+        lambda message, **kw: published.append((message, kw)),
+    )
+
+    inputs = _baseline_inputs()
+    del inputs["price_histories"]["SPY"]
+    run_shadow_optimizer(s3_client=MagicMock(), **inputs)
+
+    assert len(published) == 1, "exactly one page per failed session"
+    message, kw = published[0]
+    assert kw["severity"] == "error"
+    assert kw["dedup_key"].startswith("optimizer-shadow-failed-")
+    assert "HELD" in message
+    assert "not a crash" in message
+
+
+def test_an_alert_failure_never_breaks_the_sentinel_write(monkeypatch):
+    # The S3 sentinel is the durable surface and is written first; the alert
+    # is best-effort, like every other secondary-observability path here.
+    import executor.notifier as notifier
+
+    def _boom(message, **kw):
+        raise RuntimeError("SNS down")
+
+    monkeypatch.setattr(notifier, "publish_ops_alert", _boom)
+    inputs = _baseline_inputs()
+    del inputs["price_histories"]["SPY"]
+    s3 = MagicMock()
+
+    assert run_shadow_optimizer(s3_client=s3, **inputs) is None
+    assert s3.put_object.call_count == 2
+
+
 # ─── B.4 uncertainty wiring + ablation tests ────────────────────────────────
 # Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §B.4
 #
