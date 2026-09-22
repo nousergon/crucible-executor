@@ -179,6 +179,44 @@ _EXECUTOR_PARAMS_KNOWN_METADATA_KEYS = (
 _EXECUTOR_PARAMS_STALE_HOURS = 24 * 7 * 2
 
 
+def _alert_regime_leg_blind(leg: str, exc: BaseException, run_date: str) -> None:
+    """Page when a regime-ensemble leg could not be read AND its override is ON.
+
+    alpha-engine-config-I11369 sweep. Both legs fall back to "legacy regime
+    behavior preserved" on a read failure, at WARNING and nothing else.
+
+    The alert is conditioned on the leg's own enable flag, not emitted
+    unconditionally: with the flag OFF the leg is observe-only, the read
+    failure genuinely changes nothing, and paging on it would manufacture a
+    daily false page — the exact shape `policy-notification-routing`
+    exists to prevent. With the flag ON, a protective bear/drawdown
+    override that should have fired silently did not, which alters what
+    gets traded for the whole session.
+
+    Day-scoped dedup: the legs are read once per planning cycle, so one
+    page per leg per run_date is the whole signal.
+    """
+    try:
+        from executor.notifier import publish_ops_alert
+
+        publish_ops_alert(
+            f"*Regime leg `{leg}` read FAILED with its override ENABLED "
+            f"— {run_date}*\n"
+            f"`{type(exc).__name__}: {exc}`\n"
+            f"The protective override this leg drives did NOT apply; the "
+            f"planner fell back to legacy regime behavior and sized the "
+            f"whole book against an unadjusted regime "
+            f"(alpha-engine-config-I11369).",
+            severity="error",
+            source="alpha-engine/executor/main.py::regime_leg",
+            dedup_key=f"regime-leg-blind-{leg}-{run_date}",
+        )
+    except Exception as alert_err:
+        logger.warning(
+            "Regime-leg-blind ops alert failed (non-blocking): %s", alert_err
+        )
+
+
 def _check_executor_params_staleness(last_modified: datetime | None) -> None:
     """Best-effort WARN when ``last_modified`` is older than
     ``_EXECUTOR_PARAMS_STALE_HOURS``. Never raises, never blocks trading."""
@@ -1902,6 +1940,8 @@ def run(
                     "fast-signal read failed (%s) — forced-bear not "
                     "applied; legacy regime behavior preserved.", _fb_err,
                 )
+                if config.get("regime_forced_bear_enabled", False):
+                    _alert_regime_leg_blind("forced_bear", _fb_err, run_date)
 
         # ── 2b'''. Resolve drawdown-leg posture override ──────────────────────
         # regime-drawdown-hysteresis-260518.md (regime ensemble leg 3).
@@ -1969,6 +2009,8 @@ def run(
                     "drawdown-leg read failed (%s) — drawdown override not "
                     "applied; legacy regime behavior preserved.", _dd_err,
                 )
+                if config.get("drawdown_regime_enabled", False):
+                    _alert_regime_leg_blind("drawdown", _dd_err, run_date)
 
         # ── 2c. Compute graduated drawdown multiplier ──────────────────────────
         # Pass an events sink so any halt/throttle event lands in
