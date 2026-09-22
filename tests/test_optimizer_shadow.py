@@ -435,8 +435,8 @@ class TestFailureSentinelForensics:
         assert sentinel["run_date"] == "2026-09-22"
 
     def test_diagnostics_attached_to_the_exception_survive_into_the_sentinel(self):
-        from executor.portfolio_optimizer import TurnoverBudgetError
         from executor.optimizer_shadow import _build_failure_sentinel
+        from executor.portfolio_optimizer import TurnoverBudgetError
 
         exc = TurnoverBudgetError("solved one-way turnover 0.017503 exceeds ...")
         exc.diagnostics = {

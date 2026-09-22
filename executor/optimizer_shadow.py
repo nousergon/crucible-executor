@@ -271,7 +271,7 @@ def _alert_shadow_failure(sentinel: dict, run_date: str) -> None:
             f"Artifact: `s3://<signals_bucket>/predictor/optimizer_shadow/"
             f"{run_date}.json`",
             severity="error",
-            source="executor.optimizer_shadow",
+            source="alpha-engine/executor/optimizer_shadow.py::_alert_shadow_failure",
             dedup_key=f"optimizer-shadow-failed-{run_date}",
         )
     except Exception as exc:

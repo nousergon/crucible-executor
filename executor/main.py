@@ -2730,7 +2730,7 @@ def run(
                         f"retained with their stops. This is the safe branch "
                         f"(alpha-engine-config-I7346), not a crash.",
                         severity="error",
-                        source="executor.main.optimizer_cutover",
+                        source="alpha-engine/executor/main.py::optimizer_cutover",
                         dedup_key=f"optimizer-log-unusable-{run_date}",
                     )
                 except Exception as _alert_err:
