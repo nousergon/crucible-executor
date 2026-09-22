@@ -46,7 +46,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1.4.0"
+SCHEMA_VERSION = "1.5.0"
 
 # Default S3 prefix. Lives under ``trades/`` alongside the order book
 # itself (``trades/order_book/{date}.json``) so the rationale and the
@@ -318,6 +318,7 @@ def _build_book_status(
     hold_book_active: bool,
     hold_book_diag: Mapping[str, Any] | None,
     predictions_by_ticker: Mapping[str, Any],
+    optimizer_expected: bool = False,
 ) -> dict[str, Any]:
     """One-line "why did/didn't the book move today" status for the console banner.
 
@@ -338,9 +339,23 @@ def _build_book_status(
       tradable ``predicted_alpha`` collapsed, so the optimizer rebalance
       was suppressed and the current book retained.
     * ``rebalanced`` — entries and/or exits were written.
+    * ``optimizer_unavailable`` — the optimizer was expected to drive the
+      book and produced NO usable solve, so the planner left the order
+      book empty and held the existing positions. A fault, and schema
+      1.5.0 exists because until then it was indistinguishable from the
+      benign state below (alpha-engine-config-I11370).
     * ``no_rebalance_at_target`` — the optimizer solved optimal with
       one-way turnover below the rebalance band; the book is unchanged by
       design (a valid HOLD, not a fault).
+
+    The last two were ONE branch until 2026-09-22, when a
+    ``TurnoverBudgetError`` held the whole book and page 16 reported *"the
+    optimizer solved optimal ... Valid HOLD, not a fault"* directly above a
+    warning naming six tickers in an unknown state. The benign verdict was
+    the bare ``else``, and its headline had explicit handling for a
+    ``turnover_one_way`` of ``None`` — it rendered "below threshold" and
+    made the claim anyway. A verdict is never emitted now when the number
+    that proves it is absent.
 
     Dispersion of the tradable signal is the authoritative
     ``_should_hold_book`` ``alpha_stdev`` when present (computed only when
@@ -363,11 +378,28 @@ def _build_book_status(
     # One-way turnover the optimizer computed for this batch (the field the
     # planner already logs as the HOLD justification).
     turnover_one_way: float | None = None
+    optimizer_solved = False
+    optimizer_failure: str | None = None
     if isinstance(optimizer_shadow_log, Mapping):
         _diag = optimizer_shadow_log.get("diagnostics") or {}
         _t = _diag.get("turnover_one_way") if isinstance(_diag, Mapping) else None
         if isinstance(_t, (int, float)) and not isinstance(_t, bool):
             turnover_one_way = float(_t)
+        # "The optimizer produced an answer" is a DIFFERENT fact from "the
+        # answer was no-change", and conflating them is I11370. A `failed`
+        # sentinel carries shadow_status and no diagnostics at all.
+        optimizer_solved = (
+            optimizer_shadow_log.get("shadow_status") == "ok"
+            and isinstance(_diag, Mapping)
+            and bool(_diag)
+        )
+        if not optimizer_solved:
+            optimizer_failure = (
+                str(optimizer_shadow_log.get("error_message"))
+                or str(optimizer_shadow_log.get("error"))
+                or None
+            )
+    _expected = bool(optimizer_expected)
 
     # Predictor dispersion — what made a low-conviction day low-conviction.
     alphas: list[float] = []
@@ -434,17 +466,39 @@ def _build_book_status(
         state = "rebalanced"
         _e = "entry" if n_entries == 1 else "entries"
         headline = f"Book rebalanced — {n_entries} {_e} + {n_exits} exit(s) written."
-    else:
-        state = "no_rebalance_at_target"
-        _t = (
-            f"{turnover_one_way * 100:.2f}%"
-            if turnover_one_way is not None
-            else "below threshold"
+    elif _expected and (not optimizer_solved or turnover_one_way is None):
+        # The optimizer owns the book and did not produce one. Two guards,
+        # both load-bearing: `optimizer_solved` catches the failed sentinel,
+        # and the `turnover_one_way is None` clause catches every other way
+        # the evidence for the benign verdict can be missing. A claim is not
+        # made when the number proving it is absent (I11370).
+        state = "optimizer_unavailable"
+        _why = optimizer_failure or "no usable optimizer log was produced"
+        headline = (
+            "Book HELD — the optimizer was expected to drive the book and "
+            f"produced no usable solve ({_why}). The order book is "
+            "intentionally EMPTY: no entries, no exits, no rebalance. "
+            "Existing positions are retained with stops. This is the safe "
+            "branch (alpha-engine-config-I7346), and it is a FAULT to "
+            "investigate, not a valid HOLD."
         )
+    elif turnover_one_way is not None:
+        state = "no_rebalance_at_target"
         headline = (
             "No rebalance — the optimizer solved optimal and the current portfolio "
-            f"already matches target (one-way turnover {_t}, below the rebalance "
-            "band). Existing positions retained with stops. Valid HOLD, not a fault."
+            f"already matches target (one-way turnover {turnover_one_way * 100:.2f}%, "
+            "below the rebalance band). Existing positions retained with stops. "
+            "Valid HOLD, not a fault."
+        )
+    else:
+        # Legacy (non-optimizer) run: nothing was written and no optimizer was
+        # ever expected to write it. Still a benign no-rebalance, but the
+        # headline may not borrow the optimizer's credibility — that borrowing
+        # is exactly what made the 2026-09-22 banner false (I11370).
+        state = "no_rebalance_at_target"
+        headline = (
+            "No rebalance — no entries or exits were written for this session. "
+            "Existing positions retained with stops. Valid HOLD, not a fault."
         )
 
     return {
@@ -455,6 +509,8 @@ def _build_book_status(
         "n_dropped": n_dropped,
         "turnover_one_way": turnover_one_way,
         "rebalance_band_pct": rebalance_band_pct,
+        "optimizer_solved": optimizer_solved,
+        "optimizer_failure": optimizer_failure,
         "safeguard": safeguard,
         "dispersion": dispersion,
     }
@@ -479,6 +535,7 @@ def build_order_book_rationale(
     distribution_gate: Mapping[str, Any] | None = None,
     hold_book_active: bool = False,
     hold_book_diag: Mapping[str, Any] | None = None,
+    optimizer_expected: bool = False,
 ) -> dict[str, Any]:
     """Join the morning-planner decision structures into a per-ticker record.
 
@@ -821,6 +878,7 @@ def build_order_book_rationale(
         hold_book_active=hold_book_active,
         hold_book_diag=hold_book_diag,
         predictions_by_ticker=predictions_by_ticker,
+        optimizer_expected=optimizer_expected,
     )
 
     return {

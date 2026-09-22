@@ -135,7 +135,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/optimizer_shadow.py
-    line: 103
+    line: 104
     reason: >-
       Auto-tuned optimizer params S3 object absent or unreadable --
       expected until an auto-tune run has published params. No recording

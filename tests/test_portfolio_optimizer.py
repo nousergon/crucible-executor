@@ -23,7 +23,9 @@ from executor.portfolio_optimizer import (
     OptimizerResult,
     TurnoverBudgetError,
     _apply_turnover_governor,
+    _clip_and_renormalize,
     _mandatory_turnover_floor,
+    _solve_with_fallback,
     _turnover_diagnostics,
     compute_conviction_budget_multiplier,
     solve_target_weights,
@@ -1364,54 +1366,109 @@ class TestTurnoverBudgetDoesNotDeleteAnEntryCohort:
 
 
 class TestTurnoverBudgetAssertion:
-    """``_apply_turnover_governor`` no longer shrinks — it asserts, and raises
-    when the solved vector exceeds the budget by more than the post-solve
-    clip can account for."""
+    """``_apply_turnover_governor`` no longer shrinks — it asserts.
+
+    It asserts the SOLVER's vector against the budget (the only quantity the
+    convex constraint governed) and the post-solve clip's MEASURED
+    displacement against its own mutations, separately
+    (alpha-engine-config-I11368).
+    """
+
+    CAP_META = {
+        "turnover_constraint_applied": True,
+        "turnover_constraint_cap": 0.20,
+        "turnover_mandatory_floor": 0.0,
+        "turnover_constraint": None,
+    }
+
+    @staticmethod
+    def _clip(one_way=0.0, negatives=0.0, box=0.0, dust=0.0):
+        return {
+            "clip_turnover_one_way": one_way,
+            "clip_negative_mass": negatives,
+            "clip_box_excess": box,
+            "clip_mass_zeroed": dust,
+            "clip_renorm_scale": 1.0,
+        }
 
     def test_conforming_vector_passes_and_is_unmodified(self):
         w_prev = np.array([0.10, 0.87, 0.03])
         weights = np.array([0.15, 0.82, 0.03])  # one-way 0.05
-        meta = {
-            "turnover_constraint_applied": True,
-            "turnover_constraint_cap": 0.20,
-            "turnover_mandatory_floor": 0.0,
-            "turnover_constraint": None,
-        }
         out, gov = _apply_turnover_governor(
             weights, w_prev, {"large_move_turnover_flag": None},
-            turnover_meta=meta, clip_mass_zeroed=0.0,
+            turnover_meta=self.CAP_META, clip_meta=self._clip(),
+            solver_status="optimal",
         )
         assert out is weights
         assert gov["requested_turnover_one_way"] == pytest.approx(0.05)
+        assert gov["turnover_pre_clip_one_way"] == pytest.approx(0.05)
 
     def test_violation_raises_rather_than_shrinking(self):
         w_prev = np.array([0.10, 0.87, 0.03])
         weights = np.array([0.60, 0.37, 0.03])  # one-way 0.50, cap 0.20
-        meta = {
-            "turnover_constraint_applied": True,
-            "turnover_constraint_cap": 0.20,
-            "turnover_mandatory_floor": 0.0,
-            "turnover_constraint": None,
-        }
-        with pytest.raises(TurnoverBudgetError, match="exceeds the daily"):
+        with pytest.raises(TurnoverBudgetError, match="SOLVER assertion"):
             _apply_turnover_governor(
-                weights, w_prev, {}, turnover_meta=meta, clip_mass_zeroed=0.0,
+                weights, w_prev, {}, turnover_meta=self.CAP_META,
+                clip_meta=self._clip(), solver_status="optimal",
             )
 
-    def test_clip_mass_is_the_tolerance(self):
-        # The dust-drop + renormalize step legitimately adds up to
-        # `clip_mass_zeroed` of one-way turnover. Within that budget the
-        # assertion must NOT fire; beyond it, it must.
+    def test_the_clip_displacement_is_subtracted_not_used_as_a_tolerance(self):
+        # Executed 0.20 against a 0.19 cap. The old contract asked whether
+        # `clip_mass_zeroed` was large enough to excuse the 0.01 excess. The
+        # new one subtracts the clip's MEASURED displacement to recover the
+        # solved vector's own turnover, and tests THAT.
         w_prev = np.array([0.10, 0.87, 0.03])
         weights = np.array([0.30, 0.67, 0.03])  # one-way 0.20 exactly
         meta = {"turnover_constraint_cap": 0.19, "turnover_constraint": None}
-        # 0.20 > 0.19 by 0.01 — explained by a 0.02 clip, not by a 0.001 one.
+        # Clip moved 0.015 → solved turnover 0.185, under the cap. Passes.
         _apply_turnover_governor(
-            weights, w_prev, {}, turnover_meta=meta, clip_mass_zeroed=0.02,
+            weights, w_prev, {}, turnover_meta=meta,
+            clip_meta=self._clip(one_way=0.015, dust=0.02),
+            solver_status="optimal",
         )
-        with pytest.raises(TurnoverBudgetError):
+        # Clip moved 0.001 → solved turnover 0.199, over the cap. Raises,
+        # even though the dust mass alone (0.02) would have excused it before.
+        with pytest.raises(TurnoverBudgetError, match="SOLVER assertion"):
             _apply_turnover_governor(
-                weights, w_prev, {}, turnover_meta=meta, clip_mass_zeroed=0.001,
+                weights, w_prev, {}, turnover_meta=meta,
+                clip_meta=self._clip(one_way=0.001, dust=0.02),
+                solver_status="optimal",
+            )
+
+    def test_optimal_inaccurate_earns_a_wider_feasibility_tolerance(self):
+        # The 2026-09-22 shape (alpha-engine-config-I11368), scaled to this
+        # fixture: a solved point 9.4e-4 over the cap. Under `optimal` that is
+        # a solver returning an infeasible point and must raise. Under
+        # `optimal_inaccurate` the solver never claimed convergence, and
+        # holding the entire book over its declared residual was the defect.
+        w_prev = np.array([0.10, 0.87, 0.03])
+        excess = 9.4e-4
+        cap = 0.0162
+        weights = np.array([0.10 + cap + excess, 0.87 - cap - excess, 0.03])
+        meta = {"turnover_constraint_cap": cap, "turnover_constraint": None}
+        with pytest.raises(TurnoverBudgetError, match="SOLVER assertion"):
+            _apply_turnover_governor(
+                weights, w_prev, {}, turnover_meta=meta,
+                clip_meta=self._clip(), solver_status="optimal",
+            )
+        _, gov = _apply_turnover_governor(
+            weights, w_prev, {}, turnover_meta=meta,
+            clip_meta=self._clip(), solver_status="optimal_inaccurate",
+        )
+        assert gov["turnover_solver_status"] == "optimal_inaccurate"
+        assert gov["turnover_solver_feasibility_tol"] > excess
+
+    def test_an_unaccountable_clip_displacement_raises_naming_the_clip(self):
+        # The clip says it moved 0.05 of one-way turnover while its own three
+        # mutations total 0.001 — an accounting defect in the clip, not a
+        # solver problem, and the message must say so.
+        w_prev = np.array([0.10, 0.87, 0.03])
+        weights = np.array([0.15, 0.82, 0.03])
+        with pytest.raises(TurnoverBudgetError, match="CLIP assertion"):
+            _apply_turnover_governor(
+                weights, w_prev, {}, turnover_meta=self.CAP_META,
+                clip_meta=self._clip(one_way=0.05, dust=0.001),
+                solver_status="optimal",
             )
 
     def test_disabled_budget_never_raises(self):
@@ -1419,10 +1476,136 @@ class TestTurnoverBudgetAssertion:
         weights = np.array([0.90, 0.07, 0.03])
         meta = {"turnover_constraint_applied": False, "turnover_constraint_cap": None}
         out, gov = _apply_turnover_governor(
-            weights, w_prev, {}, turnover_meta=meta, clip_mass_zeroed=0.0,
+            weights, w_prev, {}, turnover_meta=meta, clip_meta=self._clip(),
+            solver_status="optimal",
         )
         assert out is weights
         assert gov["turnover_capped"] is False
+
+
+class TestClipAccounting:
+    """``_clip_and_renormalize`` reports all three of its mutations.
+
+    Reporting only the dust drop is what let 9.4e-4 of negative-clamp +
+    renormalize turnover be charged to the solver on 2026-09-22
+    (alpha-engine-config-I11368).
+    """
+
+    CFG = {"min_position_pct": 0.01}
+
+    def test_clamped_negatives_are_measured(self):
+        weights = np.array([-0.004, 0.974, 0.03])
+        caps = np.array([1.0, 1.0, 1.0])
+        out, meta = _clip_and_renormalize(weights, caps, cash_idx=2, cfg=self.CFG)
+        assert meta["clip_negative_mass"] == pytest.approx(0.004)
+        assert out.sum() == pytest.approx(1.0)
+        # The displacement it actually caused is reported, not inferred.
+        assert meta["clip_turnover_one_way"] > 0.0
+
+    def test_box_excess_is_measured(self):
+        weights = np.array([0.50, 0.47, 0.03])
+        caps = np.array([0.40, 1.0, 1.0])
+        _, meta = _clip_and_renormalize(weights, caps, cash_idx=2, cfg=self.CFG)
+        assert meta["clip_box_excess"] == pytest.approx(0.10, abs=1e-6)
+
+    def test_dust_keeps_its_old_name_and_meaning(self):
+        weights = np.array([0.005, 0.965, 0.03])
+        caps = np.array([1.0, 1.0, 1.0])
+        _, meta = _clip_and_renormalize(weights, caps, cash_idx=2, cfg=self.CFG)
+        assert meta["clip_mass_zeroed"] == pytest.approx(0.005)
+
+    def test_a_clean_vector_reports_a_zero_footprint(self):
+        weights = np.array([0.20, 0.77, 0.03])
+        caps = np.array([1.0, 1.0, 1.0])
+        out, meta = _clip_and_renormalize(weights, caps, cash_idx=2, cfg=self.CFG)
+        assert meta["clip_turnover_one_way"] == pytest.approx(0.0, abs=1e-12)
+        assert meta["clip_negative_mass"] == 0.0
+        assert meta["clip_box_excess"] == pytest.approx(0.0, abs=1e-12)
+        assert meta["clip_mass_zeroed"] == 0.0
+        assert out == pytest.approx(weights)
+
+    def test_the_measured_displacement_bounds_what_the_assertion_subtracts(self):
+        # End-to-end of the two pieces: whatever the clip reports moving, the
+        # governor must be able to subtract it and land back on a solved
+        # turnover that the clip's own mutations explain.
+        weights = np.array([-0.004, 0.969, 0.005, 0.03])
+        caps = np.array([1.0, 1.0, 1.0, 1.0])
+        out, meta = _clip_and_renormalize(
+            weights, caps, cash_idx=3, cfg={"min_position_pct": 0.01},
+        )
+        budget = 2.0 * (
+            meta["clip_negative_mass"]
+            + meta["clip_box_excess"]
+            + meta["clip_mass_zeroed"]
+        ) + 1e-9
+        assert meta["clip_turnover_one_way"] <= budget
+
+
+class TestSolverPreference:
+    """``_solve_with_fallback`` prefers a CERTIFIED optimal point."""
+
+    class _FakeProblem:
+        def __init__(self, statuses, values):
+            self._statuses = list(statuses)
+            self._values = list(values)
+            self.status = None
+            self.solved = []
+
+        def solve(self, solver=None):
+            self.solved.append(solver)
+            self.status = self._statuses.pop(0)
+            self._var.value = self._values.pop(0)
+
+    class _FakeVar:
+        value = None
+
+    def _run(self, statuses, values, monkeypatch):
+        import cvxpy as cp
+        monkeypatch.setattr(
+            cp, "installed_solvers", lambda: ["CLARABEL", "SCS", "OSQP"],
+        )
+        prob = self._FakeProblem(statuses, values)
+        var = self._FakeVar()
+        prob._var = var
+        return _solve_with_fallback(prob, var, {}), prob
+
+    def test_an_optimal_first_solver_short_circuits(self, monkeypatch):
+        (w, status, name), prob = self._run(
+            ["optimal"], [np.array([1.0])], monkeypatch,
+        )
+        assert status == "optimal" and name == "CLARABEL"
+        assert prob.solved == ["CLARABEL"]
+
+    def test_inaccurate_is_held_back_while_a_certified_point_is_sought(
+        self, monkeypatch,
+    ):
+        (w, status, name), prob = self._run(
+            ["optimal_inaccurate", "optimal"],
+            [np.array([1.0]), np.array([2.0])],
+            monkeypatch,
+        )
+        assert prob.solved == ["CLARABEL", "SCS"]
+        assert status == "optimal" and name == "SCS"
+        assert w == pytest.approx(np.array([2.0]))
+
+    def test_inaccurate_is_accepted_when_nothing_converges(self, monkeypatch):
+        (w, status, name), prob = self._run(
+            ["optimal_inaccurate", "infeasible", "infeasible"],
+            [np.array([1.0]), np.array([9.0]), np.array([9.0])],
+            monkeypatch,
+        )
+        assert prob.solved == ["CLARABEL", "SCS", "OSQP"]
+        assert status == "optimal_inaccurate" and name == "CLARABEL"
+        # The snapshot survives the later solves that overwrote w.value.
+        assert w == pytest.approx(np.array([1.0]))
+
+    def test_no_solution_at_all_returns_a_three_tuple(self, monkeypatch):
+        (w, status, name), _ = self._run(
+            ["infeasible", "infeasible", "infeasible"],
+            [None, None, None],
+            monkeypatch,
+        )
+        assert w is None and name is None and status == "infeasible"
 
 
 class TestMandatoryTurnoverFloor:

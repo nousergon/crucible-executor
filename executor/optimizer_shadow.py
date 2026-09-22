@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import traceback
 from datetime import UTC, datetime
 from typing import Any
 
@@ -199,17 +200,85 @@ def run_shadow_optimizer(
         return log
     except Exception as e:
         logger.warning(f"Shadow optimizer failed (non-blocking): {e}", exc_info=True)
-        sentinel = {
-            "run_date": run_date,
-            "shadow_status": "failed",
-            "error": repr(e),
-            "written_at_utc": datetime.now(UTC).isoformat(),
-        }
+        sentinel = _build_failure_sentinel(e, run_date)
         try:
             _write_shadow_log_to_s3(sentinel, signals_bucket, run_date, s3_client)
         except Exception as inner:
             logger.warning(f"Shadow sentinel write also failed: {inner}")
+        _alert_shadow_failure(sentinel, run_date)
         return None
+
+
+def _build_failure_sentinel(exc: BaseException, run_date: str) -> dict:
+    """The failure artifact, carrying the numbers that describe the failure.
+
+    Until alpha-engine-config-I11369 this was ``repr(e)`` and nothing else:
+    544 bytes against the 76-84 KB of a healthy day. When the 2026-09-22
+    ``TurnoverBudgetError`` held the whole book, the only artifact recording
+    it had discarded the solver status, the turnover metadata, the clip
+    decomposition and the conviction block — every number the diagnosis
+    needed — so the investigation had to be rebuilt from the inputs.
+
+    ``diagnostics_partial`` carries whatever the raising code attached to the
+    exception before unwinding (``exc.diagnostics``, set by the optimizer's
+    assertions). Absent on an exception raised before diagnostics exist, and
+    the field says so rather than being omitted — a key that appears only on
+    the interesting path is indistinguishable from a dead emitter.
+    """
+    partial = getattr(exc, "diagnostics", None)
+    return {
+        "run_date": run_date,
+        "shadow_status": "failed",
+        # Structured, so a consumer can branch on the failure CLASS without
+        # regex-ing a human sentence.
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        # Kept verbatim: every existing reader of this artifact reads `error`.
+        "error": repr(exc),
+        "diagnostics_partial": partial if isinstance(partial, dict) else None,
+        "traceback": "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )[-8000:],
+        "written_at_utc": datetime.now(UTC).isoformat(),
+    }
+
+
+def _alert_shadow_failure(sentinel: dict, run_date: str) -> None:
+    """Page on a shadow-optimizer failure (alpha-engine-config-I11369).
+
+    The executor did NOT crash: it held the book, deliberately and safely.
+    That is precisely why this needs its own alert — a silent success is what
+    a held book looks like from every other surface, and on 2026-09-22 the
+    only thing that surfaced it was a human reading a yellow warning on a
+    dashboard page hours later. The alert must say the book was held, or it
+    gets triaged as a crash.
+
+    Best-effort, like every other secondary-observability path in this
+    module: the S3 sentinel is the durable recording surface and is already
+    written by the time this runs. The S3-side alarm (I11369) is the
+    detection that does not depend on this process surviving.
+    """
+    try:
+        from executor.notifier import publish_ops_alert
+
+        publish_ops_alert(
+            f"*Portfolio optimizer did not produce a book — {run_date}*\n"
+            f"The optimizer raised `{sentinel.get('error_type')}` and the "
+            f"executor HELD the existing book for the session with stops "
+            f"(alpha-engine-config-I7346). No entries, no exits, no rebalance. "
+            f"This is the safe branch, not a crash.\n\n"
+            f"{sentinel.get('error_message')}\n\n"
+            f"Artifact: `s3://<signals_bucket>/predictor/optimizer_shadow/"
+            f"{run_date}.json`",
+            severity="error",
+            source="executor.optimizer_shadow",
+            dedup_key=f"optimizer-shadow-failed-{run_date}",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Shadow-failure ops alert failed (sentinel already written to S3): %s",
+            exc,
+        )
 
 
 def _build_and_solve(

@@ -2698,13 +2698,46 @@ def run(
                         _diag.get("turnover_one_way"),
                     )
             else:
+                _sh_status = (shadow_log or {}).get("shadow_status")
+                _sh_diag = ((shadow_log or {}).get("diagnostics") or {}).get("status")
                 logger.error(
                     "use_portfolio_optimizer=True but optimizer log is not "
                     "usable (shadow_status=%r, diag=%r) — leaving order book "
                     "empty for safety. Operator must investigate.",
-                    (shadow_log or {}).get("shadow_status"),
-                    ((shadow_log or {}).get("diagnostics") or {}).get("status"),
+                    _sh_status, _sh_diag,
                 )
+                # alpha-engine-config-I11369 — "Operator must investigate"
+                # written to a log on the trading box is not a notification.
+                # This branch suppresses the ENTIRE day's trading decision;
+                # until this alert existed the only thing that surfaced it
+                # was a human reading a dashboard warning hours later
+                # (2026-09-22). Best-effort, like every other secondary
+                # observability path here: the S3 sentinel written by
+                # run_shadow_optimizer is the durable surface.
+                _optimizer_unavailable_reason = (
+                    f"shadow_status={_sh_status!r}, diagnostics.status={_sh_diag!r}"
+                )
+                try:
+                    from executor.notifier import publish_ops_alert
+
+                    publish_ops_alert(
+                        f"*Order book HELD — optimizer log unusable "
+                        f"({run_date})*\n"
+                        f"`use_portfolio_optimizer=True` but the optimizer "
+                        f"produced no usable log ({_optimizer_unavailable_reason}). "
+                        f"The order book is intentionally EMPTY: no entries, "
+                        f"no exits, no rebalance. Existing positions are "
+                        f"retained with their stops. This is the safe branch "
+                        f"(alpha-engine-config-I7346), not a crash.",
+                        severity="error",
+                        source="executor.main.optimizer_cutover",
+                        dedup_key=f"optimizer-log-unusable-{run_date}",
+                    )
+                except Exception as _alert_err:
+                    logger.warning(
+                        "Optimizer-unusable ops alert failed (non-blocking): %s",
+                        _alert_err,
+                    )
 
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
@@ -2762,6 +2795,10 @@ def run(
                     distribution_gate=_gate,
                     hold_book_active=_hold_book,
                     hold_book_diag=_hold_diag,
+                    # Whether the optimizer OWNS the book decides whether an
+                    # absent solve is a fault or just a legacy run
+                    # (alpha-engine-config-I11370).
+                    optimizer_expected=bool(use_optimizer),
                 )
                 write_order_book_rationale(
                     _rationale,

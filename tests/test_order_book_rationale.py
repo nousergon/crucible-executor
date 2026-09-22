@@ -1030,9 +1030,9 @@ class TestBookStatus:
         base.update(over)
         return base
 
-    def test_schema_version_is_1_4_0(self):
+    def test_schema_version_is_1_5_0(self):
         payload = build_order_book_rationale(**self._base_kwargs())
-        assert payload["schema_version"] == "1.4.0"
+        assert payload["schema_version"] == "1.5.0"
         assert "book_status" in payload
 
     def test_no_rebalance_at_target_on_zero_turnover(self):
@@ -1053,6 +1053,67 @@ class TestBookStatus:
         assert bs["rebalance_band_pct"] == 0.25
         assert "0.41%" in bs["headline"]
         assert bs["safeguard"]["fired"] is False
+
+    def test_optimizer_unavailable_when_the_solve_failed(self):
+        # The 2026-09-22 shape (alpha-engine-config-I11370): the optimizer
+        # owns the book, raised, and wrote a `failed` sentinel. The benign
+        # `no_rebalance_at_target` verdict must NOT be reachable from here.
+        sentinel = {
+            "run_date": "2026-09-22",
+            "shadow_status": "failed",
+            "error_type": "TurnoverBudgetError",
+            "error_message": "solved one-way turnover 0.017503 exceeds ...",
+        }
+        payload = build_order_book_rationale(
+            optimizer_shadow_log=sentinel,
+            optimizer_expected=True,
+            **self._base_kwargs()
+        )
+        bs = payload["book_status"]
+        assert bs["state"] == "optimizer_unavailable"
+        assert bs["optimizer_solved"] is False
+        assert "0.017503" in bs["optimizer_failure"]
+        # The banner must not claim what it cannot show.
+        assert "solved optimal" not in bs["headline"]
+        assert "Valid HOLD, not a fault" not in bs["headline"]
+        assert "HELD" in bs["headline"]
+
+    def test_optimizer_unavailable_when_turnover_evidence_is_absent(self):
+        # Second guard: an `ok` log that still carries no turnover number.
+        # The old code rendered "one-way turnover below threshold" and
+        # asserted the optimizer solved optimal anyway.
+        payload = build_order_book_rationale(
+            optimizer_shadow_log={"shadow_status": "ok", "diagnostics": {}},
+            optimizer_expected=True,
+            **self._base_kwargs()
+        )
+        assert payload["book_status"]["state"] == "optimizer_unavailable"
+
+    def test_a_legacy_run_is_still_a_benign_no_rebalance(self):
+        # No optimizer expected, no shadow log → benign, and the headline
+        # may not borrow the optimizer's credibility.
+        payload = build_order_book_rationale(**self._base_kwargs())
+        bs = payload["book_status"]
+        assert bs["state"] == "no_rebalance_at_target"
+        assert "optimizer" not in bs["headline"].lower()
+
+    def test_a_dropped_allocation_still_outranks_optimizer_unavailable(self):
+        # Precedence is unchanged: the most-alarming state wins.
+        shadow = {"shadow_status": "failed", "error_message": "boom"}
+        ob = {
+            **self._empty_books(),
+            "approved_entries": [_entry_with_meta("AAPL")],
+        }
+        payload = build_order_book_rationale(
+            optimizer_shadow_log=shadow,
+            optimizer_expected=True,
+            **self._base_kwargs(
+                signals={"enter": [_sig("AAPL", "ENTER")], "exit": [],
+                         "reduce": [], "hold": []},
+                order_book_data=ob,
+            )
+        )
+        assert payload["book_status"]["state"] == "rebalanced"
 
     def test_rebalanced_when_entries_or_exits_written(self):
         ob = {
