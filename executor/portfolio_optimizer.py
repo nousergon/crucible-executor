@@ -1667,6 +1667,17 @@ def _turnover_diagnostics(
         "turnover_mandatory_floor_by_cause": turnover_meta.get(
             "turnover_mandatory_floor_by_cause"
         ),
+        # The LP-measured floor and which term set the cap (I11368). These
+        # are set on `turnover_meta` by `_apply_turnover_constraint`, but
+        # this function builds its output dict explicitly, so anything not
+        # named here never reaches the artifact. They read as `null` on
+        # 2026-09-22's replay while the probe HAD run and HAD widened the cap
+        # — a component emitting nothing is unobserved, not healthy.
+        "turnover_min_attainable": turnover_meta.get("turnover_min_attainable"),
+        "turnover_floor_probe_status": turnover_meta.get(
+            "turnover_floor_probe_status"
+        ),
+        "turnover_cap_source": turnover_meta.get("turnover_cap_source"),
         "turnover_constraint_binding": False,
         "turnover_constraint_shadow_price": None,
         # Conviction gate (I9315) — emitted on every solve, throttled or not.
