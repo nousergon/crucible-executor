@@ -244,6 +244,54 @@ def _reconnect(
 _allow_shorts: bool = False  # Set from config in run_daemon(); default: never short
 
 
+def _resolve_pending_sell_shares(ibkr, ticker: str, *, phase: str) -> int:
+    """In-flight sell shares for the short-sell guard, or 0 with a PAGE.
+
+    The guard subtracts this from the held quantity, so an unknown value
+    falling back to 0 OVERSTATES what is available to sell — it makes the
+    check pass. That is the direction of the 2026-04-22 PFE incident this
+    guard exists to prevent (a retry loop issued three duplicate SELL 77s,
+    each individually passing held=155, summing to 231 → short 76).
+
+    Until alpha-engine-config-I11369's sweep, the fallback was a
+    `logger.warning` and nothing else: the guard could run blind, on the
+    exact failure mode it was written for, and no human would learn it had.
+    The fallback is UNCHANGED here — refusing the sell instead would block
+    an urgent risk exit on any transient IBKR error, which is the worse
+    trade — but it is now loud. Whether this should fail closed rather than
+    open is a real fork on the order path and is filed as its own decision,
+    not settled silently here.
+    """
+    try:
+        return int(ibkr.get_open_sell_shares(ticker))
+    except Exception as exc:
+        logger.warning(
+            "get_open_sell_shares(%s) failed: %s — treating as 0", ticker, exc
+        )
+        try:
+            from executor.notifier import publish_ops_alert
+
+            publish_ops_alert(
+                f"*Short-sell in-flight guard ran BLIND — {ticker} ({phase})*\n"
+                f"`get_open_sell_shares({ticker})` raised `{type(exc).__name__}: "
+                f"{exc}`. In-flight sell shares fell back to 0, so the "
+                f"short-sell check was evaluated against the held quantity "
+                f"alone and may have passed an order it would otherwise have "
+                f"capped. This is the 2026-04-22 PFE failure mode "
+                f"(alpha-engine-config-I11369). Reconcile {ticker} against the "
+                f"broker before the next session.",
+                severity="error",
+                source="alpha-engine/executor/daemon.py::short_sell_guard",
+                dedup_key=f"short-sell-guard-blind-{ticker}-{phase}",
+            )
+        except Exception as alert_err:
+            logger.warning(
+                "Short-sell-guard-blind ops alert failed (non-blocking): %s",
+                alert_err,
+            )
+        return 0
+
+
 def _validate_sell_shares(
     positions: dict,
     ticker: str,
@@ -1052,10 +1100,9 @@ def run_daemon(dry_run: bool = False) -> None:
                 # individually passed held=155, summing to 231 → short 76.
                 pending = 0
                 if not dry_run:
-                    try:
-                        pending = ibkr.get_open_sell_shares(ticker)
-                    except Exception as exc:
-                        logger.warning("get_open_sell_shares(%s) failed: %s — treating as 0", ticker, exc)
+                    pending = _resolve_pending_sell_shares(
+                        ibkr, ticker, phase="urgent-exit",
+                    )
                 validated = _validate_sell_shares(
                     _phase0_positions,
                     ticker,
@@ -1743,6 +1790,30 @@ def run_daemon(dry_run: bool = False) -> None:
                         _rec_err,
                         exc_info=True,
                     )
+                    # alpha-engine-config-I11369 sweep. An ERROR log on the
+                    # trading box is not a notification, and this branch is
+                    # not a lost diagnostic: cash freed by a hard-risk exit
+                    # stays idle for the rest of the session, which is a
+                    # book-affecting omission nothing else records.
+                    try:
+                        from executor.notifier import publish_ops_alert
+
+                        publish_ops_alert(
+                            f"*Intraday reconcile FAILED — {run_date}*\n"
+                            f"`{type(_rec_err).__name__}: {_rec_err}`\n"
+                            f"Cash freed by today's exits was not redeployed "
+                            f"and will stay idle until the next morning "
+                            f"planner. Orders already placed this tick are "
+                            f"unaffected and saved.",
+                            severity="error",
+                            source="alpha-engine/executor/daemon.py::intraday_reconcile",
+                            dedup_key=f"intraday-reconcile-failed-{run_date}",
+                        )
+                    except Exception as _alert_err:
+                        logger.warning(
+                            "Intraday-reconcile ops alert failed "
+                            "(non-blocking): %s", _alert_err,
+                        )
 
             # ── Check entries ────────────────────────────────────────
             if strategy_config.get("intraday_entry_triggers_enabled", True):
@@ -2046,11 +2117,7 @@ def _execute_exit(
     # Short-sell prevention: verify we hold enough shares net of in-flight sells.
     if not dry_run:
         positions = ibkr.get_positions()
-        pending = 0
-        try:
-            pending = ibkr.get_open_sell_shares(ticker)
-        except Exception as exc:
-            logger.warning("get_open_sell_shares(%s) failed: %s — treating as 0", ticker, exc)
+        pending = _resolve_pending_sell_shares(ibkr, ticker, phase="intraday")
         validated = _validate_sell_shares(
             positions,
             ticker,
