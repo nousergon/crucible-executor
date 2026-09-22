@@ -1630,6 +1630,49 @@ class TestSolverPreference:
         assert w is None and name is None and status == "infeasible"
 
 
+class TestTurnoverFloorProbeIsObservable:
+    """The floor probe's own numbers reach the artifact.
+
+    `_turnover_diagnostics` builds its output dict explicitly, so a key set
+    on `turnover_meta` and not named there never leaves the module. On the
+    2026-09-22 replay `turnover_min_attainable`, `turnover_floor_probe_status`
+    and `turnover_cap_source` all read `null` while the probe had run and had
+    widened the cap by 2.6e-4 — indistinguishable, on the artifact, from a
+    probe that never ran (alpha-engine-config-I11368).
+    """
+
+    def test_the_probe_fields_survive_into_the_diagnostics(self):
+        meta = {
+            "turnover_constraint_applied": True,
+            "turnover_constraint_cap": 0.1338,
+            "turnover_mandatory_floor": 0.13330,
+            "turnover_min_attainable": 0.13356,
+            "turnover_floor_probe_status": "optimal",
+            "turnover_cap_source": "mandatory_floor",
+            "turnover_constraint": None,
+        }
+        out = _turnover_diagnostics(
+            np.array([0.5, 0.5]), np.array([0.5, 0.5]), meta,
+        )
+        assert out["turnover_min_attainable"] == 0.13356
+        assert out["turnover_floor_probe_status"] == "optimal"
+        assert out["turnover_cap_source"] == "mandatory_floor"
+
+    def test_the_fields_are_present_and_null_when_the_probe_did_not_run(self):
+        # Present-and-null, never absent: a key that appears only on the
+        # interesting path is indistinguishable from a dead emitter.
+        out = _turnover_diagnostics(
+            np.array([0.5, 0.5]), np.array([0.5, 0.5]),
+            {"turnover_constraint_cap": None},
+        )
+        for k in (
+            "turnover_min_attainable",
+            "turnover_floor_probe_status",
+            "turnover_cap_source",
+        ):
+            assert k in out and out[k] is None
+
+
 class TestMinAttainableTurnoverFloor:
     """The cap floor is MEASURED by an LP, not estimated by a projection.
 
