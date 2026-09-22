@@ -22,9 +22,11 @@ from executor.portfolio_optimizer import (
     OPTIMIZER_CONFIG_DEFAULTS,
     OptimizerResult,
     TurnoverBudgetError,
+    _apply_turnover_constraint,
     _apply_turnover_governor,
     _clip_and_renormalize,
     _mandatory_turnover_floor,
+    _solve_min_attainable_turnover,
     _solve_with_fallback,
     _turnover_diagnostics,
     compute_conviction_budget_multiplier,
@@ -1397,7 +1399,7 @@ class TestTurnoverBudgetAssertion:
         out, gov = _apply_turnover_governor(
             weights, w_prev, {"large_move_turnover_flag": None},
             turnover_meta=self.CAP_META, clip_meta=self._clip(),
-            solver_status="optimal",
+            solver_status="optimal", solver_name="CLARABEL",
         )
         assert out is weights
         assert gov["requested_turnover_one_way"] == pytest.approx(0.05)
@@ -1409,7 +1411,7 @@ class TestTurnoverBudgetAssertion:
         with pytest.raises(TurnoverBudgetError, match="SOLVER assertion"):
             _apply_turnover_governor(
                 weights, w_prev, {}, turnover_meta=self.CAP_META,
-                clip_meta=self._clip(), solver_status="optimal",
+                clip_meta=self._clip(), solver_status="optimal", solver_name="CLARABEL",
             )
 
     def test_the_clip_displacement_is_subtracted_not_used_as_a_tolerance(self):
@@ -1424,7 +1426,7 @@ class TestTurnoverBudgetAssertion:
         _apply_turnover_governor(
             weights, w_prev, {}, turnover_meta=meta,
             clip_meta=self._clip(one_way=0.015, dust=0.02),
-            solver_status="optimal",
+            solver_status="optimal", solver_name="CLARABEL",
         )
         # Clip moved 0.001 → solved turnover 0.199, over the cap. Raises,
         # even though the dust mass alone (0.02) would have excused it before.
@@ -1432,31 +1434,51 @@ class TestTurnoverBudgetAssertion:
             _apply_turnover_governor(
                 weights, w_prev, {}, turnover_meta=meta,
                 clip_meta=self._clip(one_way=0.001, dust=0.02),
-                solver_status="optimal",
+                solver_status="optimal", solver_name="CLARABEL",
             )
 
-    def test_optimal_inaccurate_earns_a_wider_feasibility_tolerance(self):
-        # The 2026-09-22 shape (alpha-engine-config-I11368), scaled to this
-        # fixture: a solved point 9.4e-4 over the cap. Under `optimal` that is
-        # a solver returning an infeasible point and must raise. Under
-        # `optimal_inaccurate` the solver never claimed convergence, and
-        # holding the entire book over its declared residual was the defect.
+    def test_the_tolerance_is_keyed_on_the_solver_not_just_the_status(self):
+        # The exact 2026-09-22 path (alpha-engine-config-I11368): Clarabel
+        # returned `infeasible`, SCS picked the solve up, and its point sat
+        # 9.4e-4 outside the budget. SCS's default eps is 1e-4, so that is
+        # SCS converging, not SCS misbehaving — while the same numbers from
+        # Clarabel, an interior-point method converging to ~1e-9, would mean
+        # a genuinely infeasible point. Status alone cannot tell them apart,
+        # and a status-only tolerance would still have held the book.
         w_prev = np.array([0.10, 0.87, 0.03])
         excess = 9.4e-4
         cap = 0.0162
         weights = np.array([0.10 + cap + excess, 0.87 - cap - excess, 0.03])
         meta = {"turnover_constraint_cap": cap, "turnover_constraint": None}
+
         with pytest.raises(TurnoverBudgetError, match="SOLVER assertion"):
             _apply_turnover_governor(
                 weights, w_prev, {}, turnover_meta=meta,
-                clip_meta=self._clip(), solver_status="optimal",
+                clip_meta=self._clip(),
+                solver_status="optimal", solver_name="CLARABEL",
             )
+
         _, gov = _apply_turnover_governor(
             weights, w_prev, {}, turnover_meta=meta,
-            clip_meta=self._clip(), solver_status="optimal_inaccurate",
+            clip_meta=self._clip(),
+            solver_status="optimal", solver_name="SCS",
         )
-        assert gov["turnover_solver_status"] == "optimal_inaccurate"
+        assert gov["turnover_solver_name"] == "SCS"
         assert gov["turnover_solver_feasibility_tol"] > excess
+
+    def test_an_unknown_solver_is_held_to_the_strictest_tolerance(self):
+        # Adding a solver to the fallback chain must not silently widen what
+        # this module will trade.
+        w_prev = np.array([0.10, 0.87, 0.03])
+        cap = 0.0162
+        weights = np.array([0.10 + cap + 9.4e-4, 0.87 - cap - 9.4e-4, 0.03])
+        meta = {"turnover_constraint_cap": cap, "turnover_constraint": None}
+        with pytest.raises(TurnoverBudgetError, match="SOLVER assertion"):
+            _apply_turnover_governor(
+                weights, w_prev, {}, turnover_meta=meta,
+                clip_meta=self._clip(),
+                solver_status="optimal", solver_name="SOME_NEW_SOLVER",
+            )
 
     def test_an_unaccountable_clip_displacement_raises_naming_the_clip(self):
         # The clip says it moved 0.05 of one-way turnover while its own three
@@ -1468,7 +1490,7 @@ class TestTurnoverBudgetAssertion:
             _apply_turnover_governor(
                 weights, w_prev, {}, turnover_meta=self.CAP_META,
                 clip_meta=self._clip(one_way=0.05, dust=0.001),
-                solver_status="optimal",
+                solver_status="optimal", solver_name="CLARABEL",
             )
 
     def test_disabled_budget_never_raises(self):
@@ -1477,7 +1499,7 @@ class TestTurnoverBudgetAssertion:
         meta = {"turnover_constraint_applied": False, "turnover_constraint_cap": None}
         out, gov = _apply_turnover_governor(
             weights, w_prev, {}, turnover_meta=meta, clip_meta=self._clip(),
-            solver_status="optimal",
+            solver_status="optimal", solver_name="CLARABEL",
         )
         assert out is weights
         assert gov["turnover_capped"] is False
@@ -1606,6 +1628,125 @@ class TestSolverPreference:
             monkeypatch,
         )
         assert w is None and name is None and status == "infeasible"
+
+
+class TestMinAttainableTurnoverFloor:
+    """The cap floor is MEASURED by an LP, not estimated by a projection.
+
+    2026-09-22 (alpha-engine-config-I11368): the projection bound said
+    0.016209 of one-way turnover was attainable; the sector and %ADV caps
+    made the true minimum higher; the budget pinned at the projection bound
+    made the program infeasible; Clarabel said `infeasible`; SCS returned a
+    point 9.4e-4 outside; the assertion refused it and the book was held for
+    the day. A bound had been mistaken for an optimum.
+    """
+
+    def test_the_lp_recovers_the_exact_minimum_a_projection_under_states(self):
+        import cvxpy as cp
+
+        # Four slots: two names capped at 0.40 each, a third empty name that
+        # can absorb, and cash pinned at 0.20. A sector constraint the
+        # projection cannot see caps names 0+1 together at 0.50, while
+        # w_prev holds 0.40/0.40 — inside every box and summing to 1.0, so
+        # the projection reports ZERO forced movement. The sector cap in fact
+        # forces 0.30 out of that pair.
+        caps = np.array([0.40, 0.40, 0.40, 1.0])
+        w_prev = np.array([0.40, 0.40, 0.00, 0.20])
+        w = cp.Variable(4)
+        constraints = [
+            cp.sum(w) == 1.0,
+            w >= 0,
+            w <= caps,
+            w[3] == 0.20,
+            cp.sum(w[[0, 1]]) <= 0.50,
+        ]
+        projection = _mandatory_turnover_floor(
+            w_prev, caps, cash_idx=3, cfg={"cash_sleeve_pct": 0.20},
+        )
+        assert projection == pytest.approx(0.0, abs=1e-9), (
+            "the projection is blind to the sector cap — this is the gap"
+        )
+
+        measured, status = _solve_min_attainable_turnover(cp, w, w_prev, constraints)
+        assert status in ("optimal", "optimal_inaccurate")
+        # 0.30 leaves names 0+1 and lands in name 2 → L1 0.60, one-way 0.30.
+        assert measured == pytest.approx(0.30, abs=1e-4)
+        assert measured > projection, (
+            "the LP measures what the projection could not see — pinning the "
+            "budget at the projection bound is what made 2026-09-22 infeasible"
+        )
+
+    def test_a_genuinely_forced_exit_is_measured_not_under_stated(self):
+        import cvxpy as cp
+
+        # Name 0 went ineligible and is pinned to 0; SPY (name 1) absorbs it.
+        w_prev = np.array([0.30, 0.50, 0.20])
+        w = cp.Variable(3)
+        constraints = [
+            cp.sum(w) == 1.0,
+            w >= 0,
+            w <= np.array([0.0, 1.0, 1.0]),
+            w[2] == 0.20,
+        ]
+        measured, status = _solve_min_attainable_turnover(cp, w, w_prev, constraints)
+        assert status in ("optimal", "optimal_inaccurate")
+        # 0.30 out of name 0, 0.30 into SPY → L1 0.60, one-way 0.30.
+        assert measured == pytest.approx(0.30, abs=1e-4)
+
+    def test_an_unsolvable_probe_falls_back_to_the_projection(self):
+        import cvxpy as cp
+
+        w_prev = np.array([0.5, 0.5])
+        w = cp.Variable(2)
+        # Mutually exclusive constraints — no feasible point at all.
+        constraints = [cp.sum(w) == 1.0, w >= 0.9]
+        measured, status = _solve_min_attainable_turnover(cp, w, w_prev, constraints)
+        assert measured is None, "an unsolved probe must widen nothing"
+        assert status is not None, "and must say why, not go silent"
+
+    def test_the_cap_records_which_term_set_it(self):
+        import cvxpy as cp
+
+        w_prev = np.array([0.30, 0.50, 0.20])
+        w = cp.Variable(3)
+        constraints: list = [cp.sum(w) == 1.0, w >= 0]
+        meta = _apply_turnover_constraint(
+            cp, w, w_prev, constraints,
+            effective_caps=np.array([1.0, 1.0, 1.0]),
+            cash_idx=2,
+            cfg={"max_daily_turnover": 0.20, "cash_sleeve_pct": 0.20},
+            min_attainable_turnover=0.0,
+            min_attainable_status="optimal",
+        )
+        assert meta["turnover_cap_source"] == "discretionary"
+        assert meta["turnover_min_attainable"] == 0.0
+        assert meta["turnover_floor_probe_status"] == "optimal"
+
+    def test_a_floor_bound_cap_is_widened_past_the_floor_not_pinned_to_it(self):
+        import cvxpy as cp
+
+        # The 2026-09-22 shape: the conviction gate throttles the
+        # discretionary budget below the floor, so the floor sets the cap.
+        # It must be set ABOVE the floor by a slack a solver can land inside,
+        # not at `floor * (1 + 1e-6)` — 1.6e-8 of weight, which reached
+        # Clarabel as `infeasible`.
+        w_prev = np.array([0.30, 0.50, 0.20])
+        w = cp.Variable(3)
+        constraints: list = [cp.sum(w) == 1.0, w >= 0]
+        floor = 0.016209
+        meta = _apply_turnover_constraint(
+            cp, w, w_prev, constraints,
+            effective_caps=np.array([1.0, 1.0, 1.0]),
+            cash_idx=2,
+            cfg={"max_daily_turnover": 0.0001, "cash_sleeve_pct": 0.20},
+            min_attainable_turnover=floor,
+            min_attainable_status="optimal",
+        )
+        assert meta["turnover_cap_source"] == "mandatory_floor"
+        cap = meta["turnover_constraint_cap"]
+        assert cap > floor
+        assert cap - floor > 1e-4, "the slack must exceed SCS's own eps"
+        assert cap - floor < 1e-3, "and must stay small enough to still bind"
 
 
 class TestMandatoryTurnoverFloor:

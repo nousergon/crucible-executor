@@ -308,12 +308,19 @@ def solve_target_weights(
     # so a hard enough shrink could push an entire entry cohort under the band
     # and delete it while the solve still reported `optimal`. A budget spent
     # by the objective cannot do that: nothing is scaled after the fact.
+    # The exact minimum one-way turnover the constraints so far already
+    # force, measured before the budget is added to them (I11368).
+    _min_turnover, _min_status = _solve_min_attainable_turnover(
+        cp, w, w_prev, constraints,
+    )
     turnover_meta = _apply_turnover_constraint(
         cp, w, w_prev, constraints, effective_caps, cash_idx, cfg,
         eligibility=eligibility,
         alpha_hat=alpha_hat,
         alpha_uncertainty=alpha_uncertainty,
         spy_idx=spy_idx,
+        min_attainable_turnover=_min_turnover,
+        min_attainable_status=_min_status,
     )
 
     problem = cp.Problem(objective, constraints)
@@ -340,6 +347,7 @@ def solve_target_weights(
         turnover_meta=turnover_meta,
         clip_meta=clip_meta,
         solver_status=status,
+        solver_name=solver_name,
     )
     diagnostics = _build_diagnostics(
         weights, w_prev, sigma, alpha_hat, spy_idx, status, cfg,
@@ -1025,11 +1033,44 @@ def _real_sectors(sectors: list[str]) -> set[str]:
 #
 # These are declared tolerances, not tuned ones. Anything past them is still
 # unexplained and still raises.
+# Slack granted above the mandatory turnover floor when the floor sets the cap.
+# Declared, and sized to the loosest solver in the fallback chain rather than
+# picked: SCS converges to ~1e-4, so a set narrower than that is one no solver
+# in the chain can be asked to land inside.
+_TURNOVER_FLOOR_REL_SLACK = 1e-3
+_TURNOVER_FLOOR_ABS_SLACK = 1e-4
+
+# Keyed on (solver, status), NOT status alone. `optimal` is the solver's own
+# verdict against its own convergence criteria, and those criteria differ by
+# two orders of magnitude across this chain: Clarabel is an interior-point
+# method converging to ~1e-9, SCS is a first-order ADMM method whose DEFAULT
+# eps_abs/eps_rel is 1e-4 — an SCS `optimal` routinely carries 1e-4-scale
+# primal residuals and is not lying when it does.
+#
+# This is exactly the 2026-09-22 path (alpha-engine-config-I11368): Clarabel
+# returned `infeasible`, SCS picked it up, and its point sat 9.4e-4 outside a
+# constraint the assertion was holding to 1e-6. A status-only tolerance would
+# still have held the book.
+#
+# Declared tolerances, not tuned ones. Anything past them is still unexplained
+# and still raises.
 _SOLVER_FEASIBILITY_TOL = {
-    "optimal": 1e-6,
-    "optimal_inaccurate": 5e-3,
+    ("CLARABEL", "optimal"): 1e-6,
+    ("CLARABEL", "optimal_inaccurate"): 1e-3,
+    ("SCS", "optimal"): 2e-3,
+    ("SCS", "optimal_inaccurate"): 5e-3,
+    ("OSQP", "optimal"): 2e-3,
+    ("OSQP", "optimal_inaccurate"): 5e-3,
 }
+# An unknown solver is held to the strictest value, so adding one to the chain
+# cannot silently widen what this module will trade.
 _DEFAULT_SOLVER_FEASIBILITY_TOL = 1e-6
+
+
+def _solver_feasibility_tol(solver_name: str | None, status: str | None) -> float:
+    return _SOLVER_FEASIBILITY_TOL.get(
+        (solver_name or "", status or ""), _DEFAULT_SOLVER_FEASIBILITY_TOL
+    )
 
 
 def _solve_with_fallback(problem, w, cfg: dict):
@@ -1395,6 +1436,49 @@ def compute_conviction_budget_multiplier(
     return out
 
 
+def _solve_min_attainable_turnover(cp, w, w_prev: np.ndarray, constraints: list):
+    """The EXACT minimum one-way turnover the non-budget constraints force.
+
+    ``_mandatory_turnover_floor`` estimates this by projecting ``w_prev`` into
+    the box and absorbing the residual. Its own docstring concedes the gap:
+    "Sector and participation caps can only be satisfied at that point or need
+    more movement". On 2026-09-22 they needed more movement
+    (alpha-engine-config-I11368). The projection said 0.016209 was attainable,
+    the true minimum was above it, and the budget constraint pinned at the
+    projection bound made the whole program INFEASIBLE — Clarabel said so, in
+    the log, and SCS then returned a near-feasible point 9.4e-4 outside the
+    constraint, which the post-solve assertion correctly refused to trade.
+    The book was held for a day because a bound was mistaken for an optimum.
+
+    So stop estimating it. Minimising ``‖w − w_prev‖₁ / 2`` subject to every
+    constraint EXCEPT the turnover budget is a small LP over a feasible set we
+    already know is non-empty, and its optimum is the answer exactly. One
+    extra solve, once per session, against a day held.
+
+    Returns ``(value, status)``; ``(None, status)`` when it does not solve, in
+    which case the caller keeps the projection bound and the pre-existing
+    infeasible-fallback path still catches whatever follows.
+    """
+    try:
+        problem = cp.Problem(cp.Minimize(cp.norm(w - w_prev, 1) / 2), constraints)
+        value, status, _ = _solve_with_fallback(problem, w, {})
+    except Exception as e:  # noqa: BLE001 - see below
+        # Never let the floor probe break a solve that would otherwise run:
+        # its whole job is to WIDEN a cap, so falling back to the projection
+        # bound is the pre-existing behaviour, not a degraded one. Recorded at
+        # WARNING and carried in `turnover_floor_probe_status`.
+        logger.warning("min-attainable-turnover probe raised %r; keeping the "
+                       "projection bound", e)
+        return None, f"raised:{type(e).__name__}"
+    if value is None:
+        logger.warning(
+            "min-attainable-turnover probe did not solve (status=%s); keeping "
+            "the projection bound", status,
+        )
+        return None, status
+    return float(np.sum(np.abs(value - w_prev)) / 2), status
+
+
 def _apply_turnover_constraint(
     cp,
     w,
@@ -1408,6 +1492,8 @@ def _apply_turnover_constraint(
     alpha_hat: np.ndarray | None = None,
     alpha_uncertainty: np.ndarray | None = None,
     spy_idx: int | None = None,
+    min_attainable_turnover: float | None = None,
+    min_attainable_status: str | None = None,
 ) -> dict:
     """Append the L1 daily-turnover budget to ``constraints``.
 
@@ -1471,7 +1557,24 @@ def _apply_turnover_constraint(
     q = float(conviction.get("conviction_budget_multiplier", 1.0))
     discretionary = float(cap) * q
     meta["turnover_budget_discretionary"] = discretionary
-    effective_cap = max(discretionary, floor * (1.0 + 1e-6) + 1e-9)
+    # The floor that goes into the cap is the LARGER of the projection bound
+    # and the LP's exact minimum, when the LP solved. The projection ignores
+    # the sector and %ADV caps and can therefore under-state what is forced
+    # (alpha-engine-config-I11368).
+    binding_floor = float(floor)
+    if min_attainable_turnover is not None:
+        binding_floor = max(binding_floor, float(min_attainable_turnover))
+    # The slack above the floor exists so an interior-point solver is not
+    # handed a feasible set of measure ~zero. `(1 + 1e-6)` was that slack and
+    # it is 1.6e-8 of weight on a 0.0162 floor — indistinguishable from
+    # pinning the constraint exactly, which is how 2026-09-22 reached
+    # Clarabel as `infeasible`. Sized now to the convergence tolerance of the
+    # loosest solver in the fallback chain (SCS, eps ~1e-4), which is what
+    # actually has to land inside the set.
+    effective_cap = max(
+        discretionary, binding_floor * (1.0 + _TURNOVER_FLOOR_REL_SLACK)
+        + _TURNOVER_FLOOR_ABS_SLACK,
+    )
     constraint = cp.norm(w - w_prev, 1) / 2 <= effective_cap
     constraints.append(constraint)
     meta.update({
@@ -1479,6 +1582,17 @@ def _apply_turnover_constraint(
         "turnover_constraint_cap": float(effective_cap),
         "turnover_mandatory_floor": float(floor),
         "turnover_mandatory_floor_by_cause": by_cause,
+        "turnover_min_attainable": (
+            None if min_attainable_turnover is None
+            else float(min_attainable_turnover)
+        ),
+        "turnover_floor_probe_status": min_attainable_status,
+        # Which term set the cap. A floor-bound cap means the day's movement
+        # is FORCED, not discretionary — a materially different operator fact
+        # from a budget the conviction gate throttled.
+        "turnover_cap_source": (
+            "discretionary" if discretionary >= effective_cap else "mandatory_floor"
+        ),
         "turnover_constraint": constraint,
     })
     if q < 1.0:
@@ -1652,6 +1766,7 @@ def _apply_turnover_governor(
     turnover_meta: dict | None = None,
     clip_meta: dict | None = None,
     solver_status: str | None = None,
+    solver_name: str | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Post-solve ASSERTION that the daily turnover budget held.
 
@@ -1677,10 +1792,11 @@ def _apply_turnover_governor(
     Two independent assertions now, each naming one stage:
 
       * **solver** — the solved point must satisfy the budget to within the
-        feasibility tolerance its own status earns. An ``optimal`` solve is
-        held to 1e-6; an ``optimal_inaccurate`` one has not converged and is
-        held to ``_SOLVER_FEASIBILITY_TOL["optimal_inaccurate"]``. Past that,
-        the solver returned a point violating a constraint it was given.
+        feasibility tolerance its own SOLVER and status earn — see
+        ``_SOLVER_FEASIBILITY_TOL``, which is keyed on both because an SCS
+        ``optimal`` and a Clarabel ``optimal`` differ by three orders of
+        magnitude. Past that, the solver returned a point violating a
+        constraint it was given.
       * **clip** — the post-solve step's measured displacement must not
         exceed what its own three mutations can account for. Past that, the
         accounting in ``_clip_and_renormalize`` is wrong.
@@ -1733,9 +1849,7 @@ def _apply_turnover_governor(
     # (|a| ≥ |b| − |a−b|), which is the direction the assertion needs — it can
     # never understate a real solver breach.
     pre_clip = max(requested - clip_turnover, 0.0)
-    solver_tol = _SOLVER_FEASIBILITY_TOL.get(
-        solver_status or "", _DEFAULT_SOLVER_FEASIBILITY_TOL
-    )
+    solver_tol = _solver_feasibility_tol(solver_name, solver_status)
     # The clip may legitimately displace at most what its own three mutations
     # move: the clamped negatives, the mass shaved off the box, the dust
     # dropped, and the renormalize that redistributes all of it (≤ the same
@@ -1749,6 +1863,7 @@ def _apply_turnover_governor(
 
     gov["turnover_pre_clip_one_way"] = pre_clip
     gov["turnover_solver_status"] = solver_status
+    gov["turnover_solver_name"] = solver_name
     gov["turnover_solver_feasibility_tol"] = solver_tol
     gov.update({k: float(v) for k, v in clip.items()})
 
@@ -1773,7 +1888,7 @@ def _apply_turnover_governor(
                 f"SOLVER assertion: the solved one-way turnover {pre_clip:.6f} "
                 f"exceeds the daily budget {float(cap):.6f} beyond the "
                 f"feasibility tolerance {solver_tol:.6g} that a "
-                f"status={solver_status!r} solve earns (executed "
+                f"{solver_name} status={solver_status!r} solve earns (executed "
                 f"{requested:.6f}, of which the post-solve clip measurably "
                 f"contributed {clip_turnover:.6f}). The budget is a constraint "
                 f"inside the convex program, so the solver returned a point "
