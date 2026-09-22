@@ -115,6 +115,18 @@ def _baseline_inputs():
     }
 
 
+def _puts_by_key(s3) -> dict:
+    """S3 puts addressed by Key rather than by call order.
+
+    Positional indexing broke the moment the healthy marker became a third
+    write (alpha-engine-config-I11369); a test that names the key it means
+    does not care how many siblings it gains.
+    """
+    return {
+        c.kwargs["Key"]: c.kwargs for c in s3.put_object.call_args_list
+    }
+
+
 def test_happy_path_assembles_inputs_and_writes_to_s3():
     inputs = _baseline_inputs()
     s3 = MagicMock()
@@ -130,13 +142,20 @@ def test_happy_path_assembles_inputs_and_writes_to_s3():
     assert len(log["target_weights"]) == log["n_tickers"]
     assert log["diagnostics"]["status"] in ("optimal", "optimal_inaccurate")
 
-    assert s3.put_object.call_count == 2, "Should write dated + latest keys"
-    dated_call = s3.put_object.call_args_list[0].kwargs
-    assert dated_call["Key"] == "predictor/optimizer_shadow/2026-05-11.json"
-    latest_call = s3.put_object.call_args_list[1].kwargs
-    assert latest_call["Key"] == "predictor/optimizer_shadow/latest.json"
+    puts = _puts_by_key(s3)
+    assert set(puts) == {
+        "predictor/optimizer_shadow/2026-05-11.json",
+        "predictor/optimizer_shadow/latest.json",
+        # The out-of-process detector: written ONLY on the ok path, so its
+        # ABSENCE is what the freshness monitor alerts on (I11369).
+        "predictor/optimizer_shadow/_healthy/2026-05-11.json",
+    }
+    dated_call = puts["predictor/optimizer_shadow/2026-05-11.json"]
     body = json.loads(dated_call["Body"])
     assert body["shadow_status"] == "ok"
+    marker = json.loads(puts["predictor/optimizer_shadow/_healthy/2026-05-11.json"]["Body"])
+    assert marker["shadow_status"] == "ok"
+    assert marker["solver_status"] in ("optimal", "optimal_inaccurate")
 
 
 def test_adv_coverage_engages_participation_aware_tcost(monkeypatch):
@@ -408,6 +427,45 @@ def test_wrapper_never_raises_writes_sentinel_on_failure():
     body = json.loads(s3.put_object.call_args_list[0].kwargs["Body"])
     assert body["shadow_status"] == "failed"
     assert "SPY price history" in body["error"]
+
+
+class TestHealthyMarker:
+    """The out-of-process half of the detection (alpha-engine-config-I11369).
+
+    Every in-process detector — the ops alert, the sentinel, the log line —
+    is lost together if the executor dies, and the sentinel is written by the
+    same code whose failure it reports. A marker written ONLY on the ok path
+    turns all of that into one thing the freshness monitor already does well:
+    notice that something expected did not appear.
+    """
+
+    def test_no_marker_is_written_when_the_optimizer_fails(self):
+        inputs = _baseline_inputs()
+        del inputs["price_histories"]["SPY"]
+        s3 = MagicMock()
+
+        assert run_shadow_optimizer(s3_client=s3, **inputs) is None
+
+        keys = set(_puts_by_key(s3))
+        assert not any("_healthy/" in k for k in keys), (
+            "a failed session must leave the marker ABSENT — that absence is "
+            "the entire signal"
+        )
+        # The sentinel itself is still written; the two are independent.
+        assert "predictor/optimizer_shadow/2026-05-11.json" in keys
+
+    def test_a_marker_write_failure_never_fails_a_healthy_solve(self):
+        # Written after the real artifact: losing it costs one session of
+        # detection and must never turn a good solve into a reported failure.
+        s3 = MagicMock()
+
+        def _put(**kwargs):
+            if "_healthy/" in kwargs["Key"]:
+                raise RuntimeError("S3 down")
+
+        s3.put_object.side_effect = _put
+        log = run_shadow_optimizer(s3_client=s3, **_baseline_inputs())
+        assert log is not None and log["shadow_status"] == "ok"
 
 
 class TestFailureSentinelForensics:
@@ -1072,5 +1130,7 @@ def test_band_dropped_trades_is_on_the_artifact_every_run(monkeypatch):
     assert log["shadow_status"] == "ok"
     assert "band_dropped_trades" in log
     assert isinstance(log["band_dropped_trades"], list)
-    body = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    body = json.loads(
+        _puts_by_key(s3)["predictor/optimizer_shadow/2026-05-11.json"]["Body"]
+    )
     assert "band_dropped_trades" in body

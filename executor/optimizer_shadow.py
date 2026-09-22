@@ -191,6 +191,7 @@ def run_shadow_optimizer(
             s3_client,
         )
         _write_shadow_log_to_s3(log, signals_bucket, run_date, s3_client)
+        _write_healthy_marker(log, signals_bucket, run_date, s3_client)
         logger.info(
             f"Shadow optimizer OK: status={log['diagnostics']['status']} "
             f"n_active={log['diagnostics']['n_active_positions']} "
@@ -207,6 +208,54 @@ def run_shadow_optimizer(
             logger.warning(f"Shadow sentinel write also failed: {inner}")
         _alert_shadow_failure(sentinel, run_date)
         return None
+
+
+def _write_healthy_marker(
+    log: dict, bucket: str, run_date: str, s3_client=None,
+) -> None:
+    """Write the success marker the freshness monitor watches by ABSENCE.
+
+    alpha-engine-config-I11369. Every other detector for "the optimizer did
+    not produce a book" runs INSIDE the process that failed — the ops alert,
+    the sentinel write, the log line. All three are lost together if the
+    executor dies, and the sentinel itself is written by the same code whose
+    failure it is reporting.
+
+    This marker is the out-of-process half, and it is deliberately
+    absence-driven rather than content-driven: `alpha-engine-freshness-monitor`
+    already sweeps S3 every 15 minutes for load-bearing artifacts that failed
+    to appear, and the one thing it does best is notice silence. A marker
+    written ONLY on the `shadow_status: "ok"` path means a missing marker
+    covers every way the day can go wrong — a raised optimizer, a killed
+    process, a half-written log — with no new predicate kind, no second
+    monitor, and no way for a partial write to look healthy.
+
+    Best-effort by construction: it is written AFTER the real artifact, so a
+    failure here costs the detection for one session and nothing else. It
+    must never be the reason a healthy solve is reported as a failure.
+    """
+    try:
+        s3 = s3_client or boto3.client("s3")
+        diag = log.get("diagnostics") or {}
+        s3.put_object(
+            Bucket=bucket,
+            Key=f"predictor/optimizer_shadow/_healthy/{run_date}.json",
+            Body=json.dumps({
+                "run_date": run_date,
+                "shadow_status": log.get("shadow_status"),
+                "solver_status": diag.get("status"),
+                "solver_name": diag.get("solver_name"),
+                "turnover_one_way": diag.get("requested_turnover_one_way"),
+                "n_would_be_trades": len(log.get("would_be_trades") or []),
+                "written_at_utc": datetime.now(UTC).isoformat(),
+            }, default=str).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Optimizer-shadow healthy-marker write failed (non-blocking; the "
+            "shadow log itself is already written): %s", exc,
+        )
 
 
 def _build_failure_sentinel(exc: BaseException, run_date: str) -> dict:
