@@ -162,6 +162,26 @@ class TestAuditWindow:
         assert len(res["corrected"]) == 1
         assert res["corrected"][0]["reason"] == "stale_return"
 
+    def test_ex_date_total_return_is_not_stale(self, tmp_path):
+        # 2026-09-18 as measured: SPY went ex $1.8888. eod_reconcile stores the
+        # TOTAL return (761.69 + 1.8888) / 762.60 - 1 = 0.12835%; the audit must
+        # recompute on the same basis, or the correct row reads 25bp stale and
+        # its re-reconcile never converges (alpha-engine-config-I11346).
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-09-17", 762.60, 0.0, 0.0),
+                       ("2026-09-18", 761.69, 0.12835, 0.0)])
+        conn = init_db(db)
+        conn.execute("UPDATE eod_pnl SET spy_dividend_per_share=? WHERE date=?", (1.8888, "2026-09-18"))
+        conn.commit()
+        conn.close()
+        settled = {"2026-09-17": 762.60, "2026-09-18": 761.69}
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-09-18", end="2026-09-18", config=_cfg(db))
+        assert res["corrected"] == []
+        run_mock.assert_not_called()
+
     def test_dry_run_changes_nothing(self, tmp_path):
         db = str(tmp_path / "t.db")
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])

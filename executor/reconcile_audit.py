@@ -79,6 +79,7 @@ from nousergon_lib.trading_calendar import previous_trading_day
 
 from executor.accepted_gaps import load_accepted_gaps
 from executor.config_loader import load_config
+from executor.dividends import spy_total_return_pct
 from executor.eod_reconcile import _log_paged, _row_close_source, _spy_close
 from executor.eod_reconcile import run as eod_run
 from executor.trade_logger import init_db
@@ -458,8 +459,8 @@ def _detect_stale_legs(
         feeds ``mark_basis`` on every later day via ``prior_positions``.
     """
     row = conn.execute(
-        "SELECT spy_close, spy_return_pct, daily_alpha_pct, positions_snapshot "
-        "FROM eod_pnl WHERE date = ?",
+        "SELECT spy_close, spy_return_pct, daily_alpha_pct, positions_snapshot, "
+        "spy_dividend_per_share FROM eod_pnl WHERE date = ?",
         (run_date,),
     ).fetchone()
     if row is None:
@@ -479,8 +480,17 @@ def _detect_stale_legs(
         "SELECT date FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1", (run_date,)
     ).fetchone()
     settled_prior = _settled_close(prior_row[0], config) if prior_row else None
+    # TOTAL return, the same basis eod_reconcile stores (I8188): the day's
+    # declared SPY distribution is added to the ending close. Recomputing it
+    # as a price return made a correct row on an ex-date diverge by the
+    # distribution itself, so its re-reconcile could never converge and paged
+    # every night (2026-09-18, $1.8888/share, alpha-engine-config-I11346).
     expected_spy_return = (
-        (settled / settled_prior - 1.0) * 100.0 if settled_prior else None)
+        spy_total_return_pct(
+            spy_close=settled,
+            prior_spy_close=settled_prior,
+            spy_dividend_per_share=row[4] or 0.0,
+        ) if settled_prior else None)
     return_div_bps = (
         None if (expected_spy_return is None or stored_spy_return is None)
         else abs(expected_spy_return - float(stored_spy_return)) * 100.0)  # 1% = 100bp
