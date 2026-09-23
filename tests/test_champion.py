@@ -1881,6 +1881,75 @@ class TestServingRegisterIsDerived:
         assert "no_agent_quant" in VALID_CHAMPIONS
         assert "single_agent_quant" in VALID_CHAMPIONS
 
+
+#: crucible-research's `producers.registry.research_slot_producers()` as of
+#: 2026-09-22 (alpha-engine-config-I11393). Restated here because this repo
+#: cannot import that one; alpha-engine-config-I11442 removes the restatement
+#: by deriving it from `arena/research/register.json`.
+RESEARCH_SLOT_ARMS = (
+    "attractiveness_60",
+    "attractiveness_20",
+    "tech_score_20",
+    "predictor_from_60",
+    "thinktank_20",
+)
+
+
+class TestTheResearchSlotIsServable:
+    """alpha-engine-config-I11438. Until this, NOT ONE arm of the live research
+    slot was in `VALID_CHAMPIONS` — every name there was a RETIRED arm.
+
+    The consequence was not a degraded run. `apply_champion_selection` raises
+    `ChampionPointerError` on an unknown champion, at PLANNER START, so the
+    first promotion onto a research arm would have HALTED TRADING — the exact
+    failure this module's -I9299 comment describes having been designed against
+    once already, one slot later.
+
+    VERIFIED RED: with the five names removed from `SHADOW_SERVED_ARMS`, every
+    test in this class fails, and `test_a_research_arm_pointer_does_not_raise`
+    fails with the literal production error.
+    """
+
+    def test_every_research_slot_arm_is_servable(self):
+        from executor.champion import VALID_CHAMPIONS
+
+        missing = [a for a in RESEARCH_SLOT_ARMS if a not in VALID_CHAMPIONS]
+        assert not missing, (
+            f"{missing} are live arms of the research slot and cannot be "
+            "served — a promotion onto one raises at planner start and halts "
+            "trading (alpha-engine-config-I11438)"
+        )
+
+    def test_they_are_served_generically_not_by_new_branches(self):
+        """ONE handler, not five more per-arm branches. A per-arm branch
+        differing only in an S3 prefix is what produced three divergent arm
+        registers (-I9299)."""
+        from executor import champion as champ
+
+        for arm in RESEARCH_SLOT_ARMS:
+            assert arm in champ.SHADOW_SERVED_ARMS
+            assert arm not in champ._DEDICATED_ARM_HANDLERS
+
+    def test_they_get_a_sector_stamped(self):
+        """They synthesize `buy_candidates` from an artifact carrying no sector
+        of its own. Missing this is silent — `Unknown` is a legal value — and it
+        switches the sector-concentration cap off for that arm's entries, which
+        is how `scanner_top20_predictor` went unnoticed for weeks."""
+        from executor.champion import ARMS_REQUIRING_SECTOR_MAP
+
+        for arm in RESEARCH_SLOT_ARMS:
+            assert arm in ARMS_REQUIRING_SECTOR_MAP
+
+    def test_a_research_arm_pointer_does_not_raise(self):
+        """The production failure, directly: resolve the guard the planner hits
+        on its first call with a research champion."""
+        from executor.champion import VALID_CHAMPIONS
+
+        for arm in RESEARCH_SLOT_ARMS:
+            # The same membership test `apply_champion_selection` performs
+            # before dispatching; a miss there is ChampionPointerError.
+            assert arm in VALID_CHAMPIONS, arm
+
     def test_sector_map_arm_set_is_derived_and_covers_every_synthesizing_arm(self):
         from executor.champion import (
             ARMS_REQUIRING_SECTOR_MAP,
