@@ -88,8 +88,82 @@ _FLOW_DOCTOR_YAML = get_flow_doctor_yaml_path()  # experiment-package-first (con
 setup_logging("eod-reconcile-standalone", flow_doctor_yaml=_FLOW_DOCTOR_YAML)
 logger = logging.getLogger(__name__)
 
+import json  # noqa: E402
+import time  # noqa: E402
+
+import boto3  # noqa: E402
+
 from executor import eod_reconcile, snapshot_capturer  # noqa: E402 -- must follow setup_logging above
 from executor.config_loader import load_config  # noqa: E402
+
+# The post-close ArcticDB append writes these two sentinels once run_date's
+# closes are read back from the macro and universe libraries
+# (nousergon-data builders/daily_append.py). The v1 SF gates its own
+# EODReconcile on the same pair (eod-precondition-probe Lambda); this timer
+# fires at a fixed 21:05 UTC and used to read ArcticDB mid-append: on
+# 2026-09-22 the universe library was written 21:05:05-21:08:53 and this run
+# raised at 21:07 with 11 held tickers missing (alpha-engine-config-I11434).
+_MACRO_SENTINEL_KEY = "feature_store/_macro_freshness.json"
+_UNIVERSE_SENTINEL_KEY = "feature_store/_universe_close_freshness.json"
+# Bounded so the reconcile still runs while IB Gateway is up: the v1 SF stops
+# the trading instance at ~21:40 UTC during the coexistence window.
+_CLOSE_WAIT_TIMEOUT_S = 30 * 60
+_CLOSE_WAIT_POLL_S = 60
+
+
+def _read_sentinel(s3, bucket: str, key: str) -> dict | None:
+    try:
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except s3.exceptions.NoSuchKey:
+        return None
+    return json.loads(body)
+
+
+def _closes_landed(macro: dict | None, universe: dict | None, run_date: str) -> bool:
+    """Same rule as the eod-precondition-probe: both sentinels carry
+    run_date, SPY is a verified macro key, and the universe count is non-zero.
+    The run_date equality matters: the morning append rewrites the sentinel
+    with the PREVIOUS trading day."""
+    return bool(
+        macro and macro.get("run_date") == run_date
+        and "SPY" in (macro.get("verified_keys") or [])
+        and universe and universe.get("run_date") == run_date
+        and (universe.get("verified_ticker_count") or 0) > 0
+    )
+
+
+def _wait_for_settled_closes(
+    bucket: str,
+    run_date: str,
+    region: str,
+    *,
+    timeout_s: float = _CLOSE_WAIT_TIMEOUT_S,
+    poll_s: float = _CLOSE_WAIT_POLL_S,
+    s3=None,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> None:
+    """Block until the post-close append has landed run_date's closes, or
+    raise once ``timeout_s`` has passed. Raising keeps this entrypoint's
+    fail-loud contract, with a cause that names the append rather than a
+    half-read ArcticDB panel."""
+    s3 = s3 or boto3.client("s3", region_name=region)
+    deadline = clock() + timeout_s
+    while True:
+        macro = _read_sentinel(s3, bucket, _MACRO_SENTINEL_KEY)
+        universe = _read_sentinel(s3, bucket, _UNIVERSE_SENTINEL_KEY)
+        if _closes_landed(macro, universe, run_date):
+            logger.info("Settled closes for %s have landed (append sentinels current)", run_date)
+            return
+        if clock() >= deadline:
+            raise RuntimeError(
+                f"Post-close ArcticDB append has not landed closes for {run_date} after "
+                f"{timeout_s / 60:.0f} min (macro sentinel run_date="
+                f"{(macro or {}).get('run_date')!r}, universe sentinel run_date="
+                f"{(universe or {}).get('run_date')!r}). EOD reconcile needs settled closes."
+            )
+        logger.info("Waiting for the post-close append to land %s closes", run_date)
+        sleep(poll_s)
 
 
 def run(run_date: str | None = None) -> None:
@@ -105,6 +179,8 @@ def run(run_date: str | None = None) -> None:
 
     config = load_config()
     bucket = config["trades_bucket"]
+
+    _wait_for_settled_closes(bucket, run_date, config.get("aws_region", "us-east-1"))
 
     snapshot = snapshot_capturer.load_snapshot(bucket=bucket, run_date=run_date, region=config.get("aws_region", "us-east-1"))
     if snapshot is None:
