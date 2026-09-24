@@ -1,0 +1,27 @@
+[Unit]
+Description=v2 trader daily session, shadow (alpha-engine-config-I11545) — crucible_trader.daily_session, a separate system from the v1 units in this directory
+After=ibgateway.service network-online.target
+Wants=ibgateway.service network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+# Not the crucible-trader checkout: it may not exist until ExecStartPre has
+# cloned it, and systemd applies WorkingDirectory to ExecStartPre too.
+WorkingDirectory=/home/ec2-user
+# The trader's whole environment: store URI, gateway address, its own IB
+# client id (never v1's 1, 2 or 3), order routing held off, and
+# the AWS profile that assumes the crucible-v2-trader role. It is PRIVATE
+# config, so it lives in alpha-engine-config (pulled by boot-pull.sh) and not
+# in this public repository. No leading '-': a missing file fails the unit
+# rather than running the trader against defaults it does not have.
+EnvironmentFile=/home/ec2-user/alpha-engine-config/crucible-trader/trader.env
+ExecStartPre=/usr/bin/env bash /home/ec2-user/alpha-engine/infrastructure/trader-provision.sh
+# SHADOW: with routing off the session resolves the champion, builds the book,
+# records the served day and files a no_orders shortfall. No order leaves the
+# trader. Its hold-book safeguard reads the paper account through a READ-ONLY
+# gateway session and cannot cancel or close anything.
+ExecStart=/usr/bin/env bash /home/ec2-user/crucible-trader/scripts/trader_pinned.sh daily_session
+TimeoutStartSec=30min
+StandardOutput=journal
+StandardError=journal

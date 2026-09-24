@@ -1,0 +1,19 @@
+[Unit]
+Description=Daily v2 trader shadow-book advance (alpha-engine-config-I11545)
+
+[Timer]
+# 11:00 New York time, weekdays: the MORNING after, not the evening of. The
+# books for the last closed session need that session's panel, which the v2
+# data-daily run publishes at 18:30 New York time -- after the v1 postclose
+# pipeline has stopped this box (17:10-17:50). shadow_books_daily binds to the
+# last closed session, so a morning run advances exactly what an after-close
+# run would have.
+#
+# Persistent=false for the same reason as the session timer: a catch-up at
+# boot and the scheduled run would advance the same session twice.
+OnCalendar=Mon..Fri *-*-* 11:00:00 America/New_York
+Persistent=false
+Unit=alpha-engine-trader-shadow-books.service
+
+[Install]
+WantedBy=timers.target
