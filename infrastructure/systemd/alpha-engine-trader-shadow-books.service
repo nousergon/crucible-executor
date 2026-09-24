@@ -1,0 +1,15 @@
+[Unit]
+Description=v2 trader shadow books for every active S arm (alpha-engine-config-I11545) — crucible_trader.shadow_books_daily, never connects to the broker
+After=network-online.target alpha-engine-trader-session.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user
+EnvironmentFile=/home/ec2-user/alpha-engine-config/crucible-trader/trader.env
+ExecStartPre=/usr/bin/env bash /home/ec2-user/alpha-engine/infrastructure/trader-provision.sh
+ExecStart=/usr/bin/env bash /home/ec2-user/crucible-trader/scripts/trader_pinned.sh shadow_books_daily
+TimeoutStartSec=30min
+StandardOutput=journal
+StandardError=journal

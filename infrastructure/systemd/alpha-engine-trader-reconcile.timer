@@ -2,17 +2,23 @@
 Description=Daily broker reconciliation for the v2 trader (alpha-engine-config-I11071)
 
 [Timer]
-# 21:35 UTC weekdays -- after both alpha-engine-eod-reconcile-standalone.timer
-# (21:05 UTC, v1 component 3's own EOD reconcile) and
-# alpha-engine-reference-rate-publish.timer (21:15 UTC), and well after the
-# 20:00 UTC NYSE close, so today's fills have settled on the IB paper account
-# before crucible_trader.commands reconcile connects and reads them. This is
-# the v2 trader's OWN reconciliation (`trader.reconcile`,
-# alpha-engine-config-I10651/-I11071) -- independent of, and never coupled
-# to, the two v1 timers above; it shares only this directory because
-# boot-pull.sh's sync_systemd_units_from loop installs every `*.timer` here
-# on each boot (nous-ergon-ops-PR1333), needing no operator step.
-OnCalendar=Mon,Tue,Wed,Thu,Fri 21:35:00 UTC
+# 16:45 New York time, weekdays: 45 minutes after the NYSE close, so the
+# day's fills have settled on the IB paper account, and the job binds to
+# TODAY's session (the last closed one).
+#
+# It was 21:35 UTC until alpha-engine-config-I11545. CloudTrail shows the v1
+# postclose pipeline stopping this box between 21:11 and 21:47 UTC
+# (2026-09-11 to -24), so on four of those ten sessions the box was already
+# down at 21:35. 16:45 New York is 20:45 UTC in EDT, clear of every measured
+# stop, and the timezone suffix keeps it after the close in EST. This is the
+# v2 trader's OWN reconciliation (trader.reconcile, alpha-engine-config-
+# I10651/-I11071), independent of the v1 eod-reconcile and reference-rate
+# timers in this directory.
+#
+# Persistent=true: a missed run fires at the next boot, before the next
+# close, and binds to the same last closed session, so it is a late run of
+# the missed day and never a second run of another one.
+OnCalendar=Mon..Fri *-*-* 16:45:00 America/New_York
 Persistent=true
 Unit=alpha-engine-trader-reconcile.service
 
