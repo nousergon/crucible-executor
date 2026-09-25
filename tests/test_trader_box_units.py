@@ -49,7 +49,22 @@ TRADER_UNITS = {
         "Mon..Fri *-*-* 16:45:00 America/New_York",
         "true",
     ),
+    "alpha-engine-trader-pin-smoke": (
+        "scripts/trader_pin_request_smoke.sh",
+        "Mon..Fri *-*-* 12:15:00 America/New_York",
+        "false",
+    ),
 }
+
+#: The units that connect to IB Gateway with the trader's ONE client id
+#: (trader.env). IB refuses a second connection on an id in use, so no two of
+#: these may be scheduled to overlap. Each is a oneshot bounded by
+#: TimeoutStartSec; shadow-books never connects and is not listed.
+BROKER_UNITS = (
+    "alpha-engine-trader-session",
+    "alpha-engine-trader-pin-smoke",
+    "alpha-engine-trader-reconcile",
+)
 
 
 def _unit(path: Path) -> configparser.ConfigParser:
@@ -104,8 +119,42 @@ def test_the_timer_fires_in_new_york_time_inside_the_boxs_up_window(stem: str) -
 
 def test_the_two_day_bound_runs_never_catch_up_at_boot() -> None:
     """A boot catch-up binds to the same last closed session as that day's run."""
-    for stem in ("alpha-engine-trader-session", "alpha-engine-trader-shadow-books"):
+    for stem in (
+        "alpha-engine-trader-session",
+        "alpha-engine-trader-shadow-books",
+        "alpha-engine-trader-pin-smoke",
+    ):
         assert _unit(SYSTEMD / f"{stem}.timer")["Timer"]["Persistent"] == "false"
+
+
+def _start_minutes(stem: str) -> int:
+    hour, minute = map(int, re.search(r"(\d\d):(\d\d):00", TRADER_UNITS[stem][1]).groups())
+    return hour * 60 + minute
+
+
+def _timeout_minutes(stem: str) -> int:
+    value = _unit(SYSTEMD / f"{stem}.service")["Service"]["TimeoutStartSec"]
+    return int(re.fullmatch(r"(\d+)min", value).group(1))
+
+
+def test_no_two_broker_units_can_hold_the_client_id_at_once() -> None:
+    """Each broker unit's worst case (start + TimeoutStartSec) ends before the
+    next one starts: the smoke shares the session's and the reconcile's IB
+    client id, and IB refuses a second connection on an id in use."""
+    windows = sorted(
+        (_start_minutes(stem), _start_minutes(stem) + _timeout_minutes(stem), stem)
+        for stem in BROKER_UNITS
+    )
+    for (_, end, earlier), (start, _, later) in zip(windows, windows[1:], strict=False):
+        assert end < start, f"{earlier} can still hold the client id when {later} starts"
+
+
+def test_the_pin_smoke_runs_after_the_session_and_before_the_close() -> None:
+    session_end = _start_minutes("alpha-engine-trader-session") + _timeout_minutes(
+        "alpha-engine-trader-session"
+    )
+    smoke = _start_minutes("alpha-engine-trader-pin-smoke")
+    assert session_end < smoke < 16 * 60
 
 
 def test_the_calendar_specs_parse(tmp_path: Path) -> None:

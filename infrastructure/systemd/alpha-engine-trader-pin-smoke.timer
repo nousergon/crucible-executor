@@ -1,0 +1,32 @@
+[Unit]
+Description=Daily paper smoke of the queued v2 trader pin request (alpha-engine-config-I11545)
+
+[Timer]
+# 12:15 New York time, weekdays. Brian's ruling on I11545: anyone may queue a
+# sha, and the next clean post-close pins it -- gated on this smoke, so the
+# smoke has to run the same day, while this box is up (started ~08:15,
+# stopped 17:10-17:50 by the v1 postclose pipeline), and before crucible's
+# trader-pin apply at 23:15 UTC.
+#
+# Why 12:15 and not earlier. The smoke connects to IB Gateway paper with the
+# trader's OWN client id from trader.env -- the same id the 10:45 session and
+# the 16:45 reconcile use (v1 holds 1, 2 and 3). IB refuses a second
+# connection on an id already in use, so the smoke must not overlap either.
+# The session is a oneshot with TimeoutStartSec=30min and disconnects when it
+# ends, so it is gone by 11:15 at the latest; the 11:00 shadow-books run never
+# connects to the broker. 12:15 leaves an hour of margin after the session's
+# hard stop and four and a half hours before the reconcile, and it keeps the
+# smoke out of the open and the close, when the v1 daemon (client id 2) is
+# busiest on the same gateway. The smoke itself is read-only and places no
+# order.
+#
+# Persistent=false: a catch-up at boot (~08:15) would smoke before the day's
+# session and could collide with a late session start on the shared client
+# id. A missed smoke is not silent: crucible's apply fails the next evening
+# when a request older than the session still has no smoke.
+OnCalendar=Mon..Fri *-*-* 12:15:00 America/New_York
+Persistent=false
+Unit=alpha-engine-trader-pin-smoke.service
+
+[Install]
+WantedBy=timers.target
