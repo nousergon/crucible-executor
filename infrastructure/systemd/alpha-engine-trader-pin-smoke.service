@@ -1,0 +1,26 @@
+[Unit]
+Description=v2 trader paper smoke of the queued trader pin request (alpha-engine-config-I11545) — crucible-trader's trader_pin_request_smoke.sh, a separate system from the v1 units in this directory
+After=ibgateway.service network-online.target
+Wants=ibgateway.service network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+# Same shape as alpha-engine-trader-reconcile.service: the checkout may not
+# exist until ExecStartPre has cloned it, and systemd applies
+# WorkingDirectory to ExecStartPre too.
+WorkingDirectory=/home/ec2-user
+# The trader's one env file (store URI, gateway address, its own IB client
+# id, the AWS profile for the trader identity). No leading '-': a missing
+# file fails the unit.
+EnvironmentFile=/home/ec2-user/alpha-engine-config/crucible-trader/trader.env
+ExecStartPre=/usr/bin/env bash /home/ec2-user/alpha-engine/infrastructure/trader-provision.sh
+# Reads the queued request and the live pin. Nothing queued, already pinned,
+# or stale: exits 0 with the reason. A fresh request: runs the trader's
+# paper smoke for that sha (READ-ONLY gateway session, no order), whose
+# passing manifest is what crucible's evening trader-pin apply is gated on.
+# An unreadable request fails this unit; it never reads as "no request".
+ExecStart=/usr/bin/env bash /home/ec2-user/crucible-trader/scripts/trader_pin_request_smoke.sh
+TimeoutStartSec=30min
+StandardOutput=journal
+StandardError=journal
