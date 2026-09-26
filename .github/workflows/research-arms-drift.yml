@@ -1,0 +1,48 @@
+name: Research-slot arms drift
+
+# alpha-engine-config-I11442. `executor/_research_arms.py` is GENERATED from the
+# research slot's arm register and committed, so the executor never reads S3 to
+# decide which arms it may serve. This job is the other half of that trade: it
+# fails when the register carries an arm the committed module does not, because
+# a promotion onto such an arm raises ChampionPointerError at planner start and
+# halts trading (alpha-engine-config-I11438).
+#
+# The register source is crucible-research's committed genesis register, which
+# that repo's own suite asserts equals its live producer registry. It is public,
+# so no credential is needed. The schedule exists because an arm added in
+# crucible-research triggers nothing here: the daily run bounds how long such an
+# arm stays unservable, well inside the arena's two-week promotion floor.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "7 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version-file: .python-version
+
+      - name: Every registered research-slot arm must be servable
+        run: python scripts/gen_research_arms.py --check
+
+  # Scheduled runs report on refs/heads/main, so drift found overnight pages the
+  # same way a red main does.
+  notify-main-failure:
+    needs: [check]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@855687d6b264fa7539d27ce7bb4ed8588427c09d
+    secrets: inherit
