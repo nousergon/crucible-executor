@@ -23,6 +23,7 @@ import pandas as pd
 import pytest
 from botocore.exceptions import ClientError
 
+from executor._research_arms import RESEARCH_SLOT_ARMS
 from executor.alpha_contract import AlphaAnchorError
 from executor.champion import (
     CHALLENGER_SELECTION_LATEST_KEY,
@@ -1882,17 +1883,10 @@ class TestServingRegisterIsDerived:
         assert "single_agent_quant" in VALID_CHAMPIONS
 
 
-#: crucible-research's `producers.registry.research_slot_producers()` as of
-#: 2026-09-22 (alpha-engine-config-I11393). Restated here because this repo
-#: cannot import that one; alpha-engine-config-I11442 removes the restatement
-#: by deriving it from `arena/research/register.json`.
-RESEARCH_SLOT_ARMS = (
-    "attractiveness_60",
-    "attractiveness_20",
-    "tech_score_20",
-    "predictor_from_60",
-    "thinktank_20",
-)
+# `RESEARCH_SLOT_ARMS` is GENERATED from the research slot's arm register by
+# `scripts/gen_research_arms.py` (alpha-engine-config-I11442) and imported
+# above — no longer a restatement typed here. `tests/test_gen_research_arms.py`
+# covers the derivation itself.
 
 
 class TestTheResearchSlotIsServable:
@@ -1909,6 +1903,22 @@ class TestTheResearchSlotIsServable:
     test in this class fails, and `test_a_research_arm_pointer_does_not_raise`
     fails with the literal production error.
     """
+
+    def test_the_research_slot_is_not_empty(self):
+        """Every other test here iterates the generated tuple, so an EMPTY one
+        would pass them all vacuously."""
+        assert RESEARCH_SLOT_ARMS
+
+    def test_champion_carries_no_hand_typed_research_arm(self):
+        """alpha-engine-config-I11442: the set is imported from the generated
+        module, never typed into `champion.py` — a typed copy is the fourth
+        register of the same fact, and the shape that went stale twice here."""
+        import pathlib
+
+        src = pathlib.Path(champion_module_path()).read_text()
+        typed = [arm for arm in RESEARCH_SLOT_ARMS if f'"{arm}"' in src or f"'{arm}'" in src]
+        assert not typed, f"{typed} are typed into champion.py; import them from executor._research_arms"
+        assert "+ RESEARCH_SLOT_ARMS" in src
 
     def test_every_research_slot_arm_is_servable(self):
         from executor.champion import VALID_CHAMPIONS
