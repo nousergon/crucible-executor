@@ -872,3 +872,25 @@ def write_eod_report(
     except Exception as e:  # noqa: BLE001 — best-effort archival, page surfaces absence
         logger.warning("EOD report artifact write failed (non-fatal): %s", e)
         return None
+
+
+def reported_snapshot_captured_at(*, trades_bucket: str, run_date: str) -> str | None:
+    """``generated_at`` of the report already written for ``run_date``, or None.
+
+    ``generated_at`` is the snapshot's ``captured_at``, so a match means an
+    earlier reconcile already reported these exact inputs. Two schedulers
+    reconcile the same day during the v1/v2 coexistence window
+    (``eod_reconcile_standalone`` and the v1 postclose SF), and the second must
+    not page or email a second time for the same snapshot. Any read failure
+    answers None: the run then reports as the first, which is the safe side.
+    """
+    if not trades_bucket:
+        return None
+    try:
+        obj = boto3.client("s3").get_object(
+            Bucket=trades_bucket, Key=REPORT_KEY_TEMPLATE.format(run_date=run_date),
+        )
+        return json.loads(obj["Body"].read()).get("generated_at")
+    except Exception as e:  # noqa: BLE001 — absent or unreadable both mean "not yet reported"
+        logger.info("No prior EOD report readable for %s (%s) — reporting as first run", run_date, e)
+        return None

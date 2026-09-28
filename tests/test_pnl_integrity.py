@@ -863,3 +863,41 @@ class TestMacroRoutedHoldingIsDeclaredUncheckable:
         assert MACRO_HOLDABLE_SYMBOLS.isdisjoint({"VIX", "VIX3M", "TNX", "IRX"})
         # Every sector ETF the optimizer can hold is in the declared set.
         assert {"XLK", "XLE", "XLF", "GLD", "USO"} <= MACRO_HOLDABLE_SYMBOLS
+
+
+# ── Paging level for an applied correction (2026-09-28 HOOD) ─────────────────
+
+import logging as _logging  # noqa: E402
+
+from executor.pnl_integrity import (  # noqa: E402
+    MARK_CORRECTION_PAGE_NAV_BPS,
+    mark_correction_log_level,
+)
+
+
+def _hood_plan():
+    # 875 × ($116.46 − $116.01) on a $1,025,587 NAV: 3.8bp, the 09-28 instance.
+    return plan_nav_mark_correction(
+        [{"ticker": "HOOD", "ib_mark": 116.01, "day_low": 116.06, "day_high": 120.0,
+          "shares": 875, "mark_error_usd": -43.75}],
+        settled_closes={"HOOD": 116.46}, day_low={"HOOD": 116.06},
+        day_high={"HOOD": 120.0}, nav=1_025_587.36, run_date="2026-09-28",
+    )
+
+
+def test_a_small_applied_correction_is_tracked_not_paged():
+    plan = _hood_plan()
+    assert plan["applied"]
+    assert mark_correction_log_level(plan) == _logging.WARNING
+
+
+def test_a_material_applied_correction_still_pages():
+    plan = _plan_duol()  # DUOL, 28bp
+    assert plan["applied"]
+    assert abs(plan["correction_usd"]) / plan["nav_raw"] * 1e4 >= MARK_CORRECTION_PAGE_NAV_BPS
+    assert mark_correction_log_level(plan) == _logging.ERROR
+
+
+def test_a_repeat_report_of_the_same_snapshot_is_info_whatever_the_size():
+    assert mark_correction_log_level(_plan_duol(), announce=False) == _logging.INFO
+    assert mark_correction_log_level(_hood_plan(), announce=False) == _logging.INFO
