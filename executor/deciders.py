@@ -576,6 +576,14 @@ def decide_entries(
         key=lambda s: _entry_priority_key(s, predictions_by_ticker, config, run_date),
     )
 
+    # The book as this batch fills it (alpha-engine-config-I11659). Every
+    # risk-guard gate that sums `current_positions` (max_sector, max_equity,
+    # correlation) used to see the book as it stood BEFORE the batch, so a
+    # batch whose entries each fit was approved in full when their sum did
+    # not. Each approved entry is added here before the next candidate is
+    # checked. `current_positions` itself is never mutated.
+    batch_positions: dict[str, dict] = dict(current_positions)
+
     for sig in enter_signals:
         ticker = sig["ticker"]
         sector = sig.get("sector", "Technology")
@@ -953,7 +961,7 @@ def decide_entries(
             dollar_size=sizing["dollar_size"],
             portfolio_nav=portfolio_nav,
             peak_nav=peak_nav,
-            current_positions=current_positions,
+            current_positions=batch_positions,
             sector=sector,
             market_regime=market_regime,
             signal=sig_with_sector,
@@ -988,7 +996,7 @@ def decide_entries(
                     dollar_size=sizing["dollar_size"],
                     portfolio_nav=portfolio_nav,
                     peak_nav=peak_nav,
-                    current_positions=current_positions,
+                    current_positions=batch_positions,
                     sector=sector,
                     market_regime=market_regime,
                     signal=sig_with_sector,
@@ -1030,6 +1038,11 @@ def decide_entries(
         )
 
         plan.n_entered += 1
+        batch_positions[ticker] = {
+            "market_value": float(sizing["dollar_size"]),
+            "sector": sector,
+            "shares": sizing["shares"],
+        }
 
         # Executable order dict — for sim_client.place_market_order or
         # for the live shell's downstream consumers.

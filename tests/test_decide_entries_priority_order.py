@@ -409,3 +409,62 @@ class TestDecideEntriesProcessesInPriorityOrder:
         )
         # Caller's input must remain unmodified.
         assert [s["ticker"] for s in enter] == original_order
+
+
+class TestSameBatchEquityCap:
+    """alpha-engine-config-I11659: the equity cap binds on the batch as it
+    fills, not on the book as it stood before the batch."""
+
+    def _signal(self, ticker: str, score: int):
+        return {
+            "ticker": ticker,
+            "signal": "ENTER",
+            "score": score,
+            "conviction": "rising",
+            "sector": "Technology",
+            "rating": "BUY",
+            "price_target_upside": 0.15,
+            "thesis_summary": "test",
+        }
+
+    def _plan(self, enter, current_positions):
+        tickers = [s["ticker"] for s in enter]
+        config = {**_config(), "max_equity_pct": 0.90}
+        return decide_entries(
+            enter_signals=enter,
+            signals_raw={"date": "2026-09-28"},
+            predictions_by_ticker={},
+            config=config,
+            strategy_config=_strategy_config(),
+            market_regime="neutral",
+            sector_ratings={"Technology": {"rating": "market_weight"}},
+            portfolio_nav=1_000_000.0,
+            peak_nav=1_000_000.0,
+            current_positions=current_positions,
+            prices_now=dict.fromkeys(tickers, 100.0),
+            price_histories={t: _df_history() for t in tickers},
+            atr_map=dict.fromkeys(tickers, 0.02),
+            vwap_map=dict.fromkeys(tickers, 100.0),
+            coverage_map=dict.fromkeys(tickers, 1.0),
+            dd_multiplier=1.0,
+            signal_age_days=0,
+            earnings_by_ticker={},
+            run_date="2026-09-28",
+            predictions_date="2026-09-28",
+        )
+
+    def test_entries_that_each_fit_are_not_all_approved_when_their_sum_breaches(self):
+        held = {"HELD": {"market_value": 830_000.0, "sector": "Utilities", "shares": 8300}}
+        enter = [self._signal("AAA", 90), self._signal("BBB", 80), self._signal("CCC", 70)]
+
+        # Each candidate alone fits under the cap.
+        for sig in enter:
+            alone = self._plan([sig], held)
+            assert [o["ticker"] for o in alone.orders] == [sig["ticker"]]
+
+        plan = self._plan(enter, held)
+        approved = sum(e["dollar_size"] for e in plan.entries_with_meta)
+        assert 830_000.0 + approved <= 0.90 * 1_000_000.0
+        assert [o["ticker"] for o in plan.orders][0] == "AAA", "priority order still wins"
+        assert plan.blocked, "the batch must surrender at least one entry to the cap"
+        assert held == {"HELD": {"market_value": 830_000.0, "sector": "Utilities", "shares": 8300}}
