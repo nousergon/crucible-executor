@@ -405,3 +405,66 @@ class TestHistoricalSweep:
             _sweep_prior_sessions(cfg, "2026-09-14")
         warned = [c.args for c in log.warning.call_args_list]
         assert any("I10824" in a[0] and "2026-05-21" in a[1:] for a in warned)
+
+
+# ── Write-once per run_date (2026-09-28 double capture) ──────────────────────
+
+
+class TestWriteOnce:
+    def _run(self, s3, *, force=False):
+        with patch("executor.snapshot_capturer.now_dual") as mock_now_dual, \
+             patch("executor.snapshot_capturer.load_config") as mock_cfg, \
+             patch("executor.snapshot_capturer.IBKRClient") as mock_ib_cls, \
+             patch("boto3.client", return_value=s3):
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-09-28", calendar_date="2026-09-28"
+            )
+            mock_cfg.return_value = _mock_config()
+            ib = MagicMock()
+            ib.get_account_snapshot.return_value = {"net_liquidation": 1_025_587.36}
+            ib.get_positions.return_value = {}
+            ib.get_accrued_dividends_by_symbol.return_value = {}
+            mock_ib_cls.return_value = ib
+            with _no_fill_reconciliation() as fills:
+                run(run_date="2026-09-28", force=force)
+            return fills
+
+    def test_the_put_is_create_only_by_default(self):
+        s3 = MagicMock()
+        self._run(s3)
+        assert s3.put_object.call_args.kwargs["IfNoneMatch"] == "*"
+
+    def test_an_existing_snapshot_is_kept_and_fills_still_reconcile(self, caplog):
+        from botocore.exceptions import ClientError
+
+        s3 = MagicMock()
+        s3.put_object.side_effect = ClientError(
+            {"Error": {"Code": "PreconditionFailed", "Message": "At least one of the pre-conditions you specified did not hold"}},
+            "PutObject",
+        )
+        s3.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+        body = MagicMock()
+        body.read.return_value = json.dumps({
+            "captured_at": "2026-09-28T21:15:22Z", "account": {"net_liquidation": 1_025_897.49},
+        }).encode()
+        s3.get_object.return_value = {"Body": body}
+        with caplog.at_level("INFO"):
+            fills = self._run(s3)
+        fills.assert_called_once()
+        assert "keeping the first capture" in caplog.text
+        assert "2026-09-28T21:15:22Z" in caplog.text
+
+    def test_force_replaces_without_a_condition(self):
+        s3 = MagicMock()
+        self._run(s3, force=True)
+        assert "IfNoneMatch" not in s3.put_object.call_args.kwargs
+
+    def test_any_other_put_failure_still_raises(self):
+        from botocore.exceptions import ClientError
+
+        s3 = MagicMock()
+        s3.put_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}}, "PutObject",
+        )
+        with pytest.raises(ClientError):
+            self._run(s3)

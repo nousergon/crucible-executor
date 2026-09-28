@@ -32,7 +32,7 @@ from executor.dividends import (
     spy_total_return_pct,
 )
 from executor.eod_emailer import send_eod_email
-from executor.eod_report import build_eod_report, write_eod_report
+from executor.eod_report import build_eod_report, reported_snapshot_captured_at, write_eod_report
 from executor.market_hours import is_trading_day
 from executor.pnl_backfill import backfill_residual_sleeves
 from executor.pnl_integrity import (
@@ -43,6 +43,7 @@ from executor.pnl_integrity import (
     check_mark_coverage,
     check_residual_bounds,
     gross_net_returns,
+    mark_correction_log_level,
     nav_basis_level_usd,
     plan_nav_mark_correction,
     plan_twr_self_heal,
@@ -1479,6 +1480,27 @@ def run(
         snapshot.get("captured_at"),
     )
 
+    # ── First report of these inputs, or a repeat? ─────────────────────────
+    # Two schedulers reconcile the same trading day while v1 and v2 coexist
+    # (`eod_reconcile_standalone` on its own timer, and the v1 postclose SF's
+    # EODReconcile step). The snapshot is write-once, so both see identical
+    # inputs; the second must converge on the same artifacts without paging or
+    # emailing a second time. 2026-09-28: HOOD's mark correction paged twice and
+    # the EOD email went twice, 23 minutes apart.
+    _prior_generated_at = reported_snapshot_captured_at(
+        trades_bucket=trades_bucket, run_date=run_date,
+    )
+    already_reported = bool(
+        _prior_generated_at and _prior_generated_at == snapshot.get("captured_at")
+    )
+    if already_reported:
+        logger.info(
+            "EOD: snapshot captured_at=%s was already reconciled and reported for %s — "
+            "re-emitting artifacts without a second email or page",
+            _prior_generated_at, run_date,
+        )
+        send_email = False
+
     # Enrich positions with sector. Lookup chain:
     #   0. index/ETF core (SPY etc.) → "Broad Market / Index" — not a GICS
     #      constituent, so it must short-circuit before the sector lookups
@@ -1775,10 +1797,15 @@ def run(
     )
     if mark_correction["applied"]:
         nav = mark_correction["nav_corrected"]
-        # ERROR, not WARNING: the broker sent a provably wrong number and the
-        # book was repaired around it. That the pipeline no longer halts does
-        # not make it a routine event, and the alert names every ticker.
-        logger.error("NAV MARK CORRECTION: %s", mark_correction["message"])
+        # Level by size (`mark_correction_log_level`): ERROR pages once the
+        # repair moves NAV by MARK_CORRECTION_PAGE_NAV_BPS or more; below
+        # that it is the broker's after-hours mark drift, recorded at WARNING
+        # and persisted on the report. INFO when this run is a repeat of an
+        # already-reported snapshot (see `already_reported` above).
+        logger.log(
+            mark_correction_log_level(mark_correction, announce=not already_reported),
+            "NAV MARK CORRECTION: %s", mark_correction["message"],
+        )
         data_warnings.append(mark_correction["message"])
         # Verify the action worked, rather than assuming it. A settled close
         # lies inside the day's own traded range by construction, so a repaired

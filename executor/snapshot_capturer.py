@@ -176,7 +176,7 @@ def _sweep_prior_sessions(config: dict, run_date: str) -> None:
         )
 
 
-def run(run_date: str | None = None) -> None:
+def run(run_date: str | None = None, *, force: bool = False) -> None:
     """Capture live IB state and write to S3 keyed by run_date.
 
     Default `run_date` resolves via `now_dual().trading_day` (NYSE-aware,
@@ -194,7 +194,17 @@ def run(run_date: str | None = None) -> None:
     the window (crash before `CaptureSnapshot` runs, or before NYSE-local
     midnight for the day) and that day's snapshot is gone permanently —
     there is no historical source to backfill it from. The cost of a
-    missed day was measured in alpha-engine-config-I5325. Mitigations
+    missed day was measured in alpha-engine-config-I5325.
+
+    WRITE-ONCE per run_date. The first capture after the close is the day's
+    record; a later caller (the v1 postclose SF's ``CaptureSnapshot``, the
+    standalone EOD timer, the reference-rate timer, a retry) still runs the
+    fill-reconciliation backstop but does NOT replace the snapshot. Before
+    this, 2026-09-28 was captured at 21:15Z and again at 21:46Z: two broker
+    NAVs $310 apart for one trading day, two reconciles, two pages. The put is
+    an S3 create-only conditional write (``IfNoneMatch="*"``), so two capturers
+    racing still leave exactly one. ``force=True`` (``--force``) deliberately
+    replaces a snapshot known to be bad. Mitigations
     in place: same-day bounded retry + irreversible-deadline paging
     inside the EOD SF's `CaptureSnapshot` state (nousergon-data-PR1260),
     and an independent pre-midnight positive existence check —
@@ -261,12 +271,28 @@ def run(run_date: str | None = None) -> None:
     # ── Write to S3 ─────────────────────────────────────────────────────────
     s3 = boto3.client("s3", region_name=config.get("aws_region", "us-east-1"))
     key = _snapshot_key(run_date)
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=json.dumps(payload, default=str).encode("utf-8"),
-        ContentType="application/json",
-    )
+    put_kwargs = {
+        "Bucket": bucket,
+        "Key": key,
+        "Body": json.dumps(payload, default=str).encode("utf-8"),
+        "ContentType": "application/json",
+    }
+    if not force:
+        put_kwargs["IfNoneMatch"] = "*"
+    try:
+        s3.put_object(**put_kwargs)
+    except Exception as exc:
+        if force or not _is_precondition_failed(exc):
+            raise
+        existing = load_snapshot(bucket=bucket, run_date=run_date, region=config.get("aws_region", "us-east-1")) or {}
+        logger.info(
+            "Snapshot for %s already captured at %s (NAV=%s) — keeping the first capture as "
+            "the day's record; this capture (NAV=%s) is not written. Pass --force to replace it.",
+            run_date, existing.get("captured_at"),
+            (existing.get("account") or {}).get("net_liquidation"),
+            account.get("net_liquidation"),
+        )
+        return
 
     logger.info(
         "Snapshot written | s3://%s/%s NAV=%s positions=%d dividends=%d",
@@ -276,6 +302,12 @@ def run(run_date: str | None = None) -> None:
         len(positions),
         len(accrued_dividends),
     )
+
+
+def _is_precondition_failed(exc: Exception) -> bool:
+    """True for S3's answer to a create-only put on an existing key."""
+    code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code", "")
+    return code in ("PreconditionFailed", "412") or "PreconditionFailed" in str(exc)
 
 
 def load_snapshot(bucket: str, run_date: str, region: str = "us-east-1") -> dict | None:
@@ -313,5 +345,10 @@ if __name__ == "__main__":
         default=None,
         help="YYYY-MM-DD; must equal today's trading_day or the run aborts.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing snapshot for the date (default: first capture is kept).",
+    )
     args = parser.parse_args()
-    run(run_date=args.date)
+    run(run_date=args.date, force=args.force)

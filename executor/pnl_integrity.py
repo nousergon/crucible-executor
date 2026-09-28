@@ -934,6 +934,38 @@ MARK_CORRECTION_MAX_NAV_BPS = 100.0
 MARK_CORRECTION_MAX_USD_FLOOR = 10_000.0
 
 
+#: Paging threshold for an APPLIED correction. The repair itself is automatic
+#: and sound below ``MARK_CORRECTION_MAX_NAV_BPS``; what an operator needs to be
+#: woken for is a correction large enough to move a reported figure. Below this
+#: it is the routine after-hours drift of the broker's position mark, logged at
+#: WARNING (tracked, persisted on the report, not paged). Measured 2026-09-28:
+#: HOOD's IB mark $116.01 sat $0.05 under a $116.06 session low — IB marks
+#: positions at the last print including extended hours, and the snapshot is
+#: taken after 16:00 ET — a $394 (3.8bp) correction that paged at ERROR. The
+#: instances that justified the correction machinery (DUOL 28bp, AMD 50bp) stay
+#: above it and still page.
+MARK_CORRECTION_PAGE_NAV_BPS = 10.0
+
+
+def mark_correction_log_level(plan: Mapping[str, Any], *, announce: bool = True) -> int:
+    """Logging level for an APPLIED correction's message.
+
+    ``announce`` is False when this reconcile is not the first report of the
+    same inputs (a second scheduler over the same snapshot, or a
+    ``reconcile_audit`` re-reconcile of a past day): the correction was already
+    reported, so it is recorded at INFO rather than paged again.
+    """
+    if not announce:
+        return logging.INFO
+    nav = plan.get("nav_raw")
+    total = abs(float(plan.get("correction_usd") or 0.0))
+    if not nav or not math.isfinite(float(nav)):
+        return logging.ERROR
+    if total / abs(float(nav)) * 10_000.0 >= MARK_CORRECTION_PAGE_NAV_BPS:
+        return logging.ERROR
+    return logging.WARNING
+
+
 def mark_correction_bound_usd(nav: float) -> float:
     """Largest total NAV mark correction that may be applied automatically."""
     return max(
