@@ -192,7 +192,7 @@ class TestCloseWaitDeadline:
 
     @staticmethod
     def _utc(s):
-        return dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc)
+        return dt.datetime.fromisoformat(s).replace(tzinfo=dt.UTC)
 
     def test_the_first_post_cutover_day_waits_past_the_new_append(self):
         # 2026-09-29 as measured: fired 21:05 UTC, raised at 21:35 UTC; the

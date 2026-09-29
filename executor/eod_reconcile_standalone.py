@@ -128,7 +128,7 @@ _CLOSE_WAIT_DEADLINE_ET = dt.time(21, 0)
 def _close_wait_timeout_s(run_date: str, now: dt.datetime | None = None) -> float:
     """Seconds from ``now`` until 21:00 ET on ``run_date``, never less than
     ``_CLOSE_WAIT_TIMEOUT_S``."""
-    now = now or dt.datetime.now(dt.timezone.utc)
+    now = now or dt.datetime.now(dt.UTC)
     deadline = dt.datetime.combine(dt.date.fromisoformat(run_date), _CLOSE_WAIT_DEADLINE_ET, tzinfo=_ET)
     return max((deadline - now).total_seconds(), float(_CLOSE_WAIT_TIMEOUT_S))
 
