@@ -46,6 +46,17 @@ GIT_SYNC_LOCK_WAIT="${AE_GIT_SYNC_LOCK_WAIT:-150}"
 
 say() { echo "trader-provision: $*"; }
 
+# Provisioning runs as the BOX, not as the trader (alpha-engine-config-I11545).
+# The unit's EnvironmentFile (trader.env) sets AWS_PROFILE=crucible-v2-trader
+# for ExecStart, and systemd hands it to this ExecStartPre too. The clone's
+# credential helper (git-credential-nousergon-app) reads the GitHub App from
+# /alpha-engine/groom/ with whatever identity `aws` resolves, and the trader
+# role cannot read it, so every clone died "could not read Username" and no
+# v2 trader unit ever ran (measured 2026-09-29 16:15Z, journal of
+# alpha-engine-trader-pin-smoke.service). Nothing below uses AWS as the
+# trader; ExecStart still gets the trader profile from the env file.
+unset AWS_PROFILE AWS_CONFIG_FILE
+
 # Two trader units never provision at once (a session and a reconcile can
 # overlap on a late boot).
 exec 9>"$PROVISION_LOCK"
