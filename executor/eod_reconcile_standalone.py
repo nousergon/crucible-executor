@@ -88,8 +88,10 @@ _FLOW_DOCTOR_YAML = get_flow_doctor_yaml_path()  # experiment-package-first (con
 setup_logging("eod-reconcile-standalone", flow_doctor_yaml=_FLOW_DOCTOR_YAML)
 logger = logging.getLogger(__name__)
 
+import datetime as dt  # noqa: E402
 import json  # noqa: E402
 import time  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
 
 import boto3  # noqa: E402
 
@@ -105,10 +107,30 @@ from executor.config_loader import load_config  # noqa: E402
 # raised at 21:07 with 11 held tickers missing (alpha-engine-config-I11434).
 _MACRO_SENTINEL_KEY = "feature_store/_macro_freshness.json"
 _UNIVERSE_SENTINEL_KEY = "feature_store/_universe_close_freshness.json"
-# Bounded so the reconcile still runs while IB Gateway is up: the v1 SF stops
-# the trading instance at ~21:40 UTC during the coexistence window.
+# The floor for a wait that starts at or after the deadline below (a manual
+# `--date` re-run): enough to ride out an append that is still writing.
 _CLOSE_WAIT_TIMEOUT_S = 30 * 60
 _CLOSE_WAIT_POLL_S = 60
+# Since the data cutover (alpha-engine-config-I11269, 2026-09-28) run_date's
+# closes are appended by nousergon-data's ne-data-collection-eod, which fires at
+# 18:15 America/New_York and whose declared worst case through its verify units
+# must clear 20:55 ET (data_collection_stack.sameday_ordering_problems). The old
+# fixed 30 minutes from this timer's 21:05 UTC fire assumed the v1 postclose
+# append (~21:05 UTC) and raised on the first post-cutover day, 2026-09-29, an
+# hour before the new append could start. So wait until the collector's own
+# deadline, in ET so DST cannot move it. IB Gateway stays up meanwhile: the v1
+# postclose SF stops the trading instance only after its own EODReconcile, which
+# waits on the same append.
+_ET = ZoneInfo("America/New_York")
+_CLOSE_WAIT_DEADLINE_ET = dt.time(21, 0)
+
+
+def _close_wait_timeout_s(run_date: str, now: dt.datetime | None = None) -> float:
+    """Seconds from ``now`` until 21:00 ET on ``run_date``, never less than
+    ``_CLOSE_WAIT_TIMEOUT_S``."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    deadline = dt.datetime.combine(dt.date.fromisoformat(run_date), _CLOSE_WAIT_DEADLINE_ET, tzinfo=_ET)
+    return max((deadline - now).total_seconds(), float(_CLOSE_WAIT_TIMEOUT_S))
 
 
 def _read_sentinel(s3, bucket: str, key: str) -> dict | None:
@@ -180,7 +202,10 @@ def run(run_date: str | None = None) -> None:
     config = load_config()
     bucket = config["trades_bucket"]
 
-    _wait_for_settled_closes(bucket, run_date, config.get("aws_region", "us-east-1"))
+    _wait_for_settled_closes(
+        bucket, run_date, config.get("aws_region", "us-east-1"),
+        timeout_s=_close_wait_timeout_s(run_date),
+    )
 
     snapshot = snapshot_capturer.load_snapshot(bucket=bucket, run_date=run_date, region=config.get("aws_region", "us-east-1"))
     if snapshot is None:

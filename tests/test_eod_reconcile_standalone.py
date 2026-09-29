@@ -10,6 +10,7 @@ the v1 SF's `EODReconcile` step keeps calling it exactly as it does today.
 """
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -182,3 +183,40 @@ class TestWaitForSettledCloses:
                           side_effect=lambda **k: calls.append("reconcile")):
             standalone.run(run_date="2026-06-18")
         assert calls == ["wait", "reconcile"]
+
+
+class TestCloseWaitDeadline:
+    """alpha-engine-config-I11269: after the data cutover the post-close append
+    comes from ne-data-collection-eod (18:15 ET), so the wait runs to the
+    collector's deadline, 21:00 ET, not 30 minutes from the 21:05 UTC fire."""
+
+    @staticmethod
+    def _utc(s):
+        return dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc)
+
+    def test_the_first_post_cutover_day_waits_past_the_new_append(self):
+        # 2026-09-29 as measured: fired 21:05 UTC, raised at 21:35 UTC; the
+        # collector only starts at 22:15 UTC (18:15 EDT).
+        timeout = standalone._close_wait_timeout_s("2026-09-29", self._utc("2026-09-29T21:05:00"))
+        assert timeout == (self._utc("2026-09-30T01:00:00") - self._utc("2026-09-29T21:05:00")).total_seconds()
+        assert timeout > (self._utc("2026-09-29T22:15:00") - self._utc("2026-09-29T21:05:00")).total_seconds()
+
+    def test_deadline_is_eastern_time_across_dst(self):
+        # EST: 21:00 ET is 02:00 UTC the next day.
+        timeout = standalone._close_wait_timeout_s("2026-12-01", self._utc("2026-12-01T21:05:00"))
+        assert timeout == (self._utc("2026-12-02T02:00:00") - self._utc("2026-12-01T21:05:00")).total_seconds()
+
+    def test_a_late_manual_rerun_still_gets_the_floor(self):
+        timeout = standalone._close_wait_timeout_s("2026-09-29", self._utc("2026-09-30T14:00:00"))
+        assert timeout == standalone._CLOSE_WAIT_TIMEOUT_S
+
+    def test_run_passes_the_deadline_to_the_wait(self):
+        seen = {}
+        with patch("executor.eod_reconcile_standalone.load_config", return_value=_config()), \
+             patch.object(standalone, "_close_wait_timeout_s", return_value=12345.0), \
+             patch.object(standalone, "_wait_for_settled_closes",
+                          side_effect=lambda *a, **k: seen.update(k)), \
+             patch.object(standalone.snapshot_capturer, "load_snapshot", return_value=_snapshot()), \
+             patch.object(standalone.eod_reconcile, "run"):
+            standalone.run(run_date="2026-09-29")
+        assert seen["timeout_s"] == 12345.0
