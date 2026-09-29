@@ -196,3 +196,13 @@ def test_provisioning_is_valid_bash_and_pins_uv() -> None:
     # The same git-sync lock every other git writer on this box takes.
     assert 'flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK"' in text
     assert "--frozen --extra ib" in text
+
+
+def test_provisioning_clones_as_the_box_not_as_the_trader() -> None:
+    """alpha-engine-config-I11545: trader.env's AWS_PROFILE reaches the
+    ExecStartPre too, and the clone's credential helper cannot read the
+    GitHub App as the trader role. The profile is dropped before any git."""
+    text = PROVISION.read_text()
+    unset = text.index("unset AWS_PROFILE AWS_CONFIG_FILE")
+    assert unset < text.index("git clone")
+    assert unset < text.index("fetch --quiet origin main")
