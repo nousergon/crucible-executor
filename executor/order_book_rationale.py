@@ -120,7 +120,7 @@ _STATE_ORDER = {
 # drove the rejection — these map to STATE_PREDICTOR_VETOED so the
 # console can answer "blocked by the ML layer" distinctly from
 # "blocked by a hard risk rule". Sourced from deciders.py emit sites.
-_PREDICTOR_RULES = {"stance_gate", "momentum_gate", "gbm_veto"}
+_PREDICTOR_RULES = {"stance_gate", "momentum_gate", "gbm_veto", "negative_alpha"}
 
 # Mapping from optimizer_shadow eligibility-rejection slugs to the
 # (rule, event_type, human_message) tuple used to synthesize
@@ -133,6 +133,11 @@ _OPTIMIZER_REJECTION_SLUGS = {
         "gbm_veto",
         "override",
         "Predictor high-confidence DOWN veto fired (gbm_veto=true).",
+    ),
+    "negative_alpha": (
+        "negative_alpha",
+        "override",
+        "Predicted alpha below negative_alpha_exit_below; pinned to zero weight.",
     ),
     "score_below_min": (
         "min_score_to_enter",

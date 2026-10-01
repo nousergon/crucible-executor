@@ -59,6 +59,11 @@ drawdown_circuit_breaker: 0.06   # halt new entries if portfolio drawdown exceed
 
 # ── Entry gates ──────────────────────────────────────────────────────────────
 min_score_to_enter: 30           # backstop only — predictor veto is primary gate
+# Pin any name whose predicted alpha (market-relative, the optimizer's anchor)
+# is below this to zero weight, held names included. That makes its exit
+# MANDATORY turnover, which the conviction gate never throttles. null = off.
+# Value is set from the replay in alpha-engine-config's deployed risk.yaml.
+negative_alpha_exit_below: null
 
 # Tighten min_score_to_enter when the predictor batch's mean prediction_confidence
 # is broadly low (degenerate-predictor backstop, per 2026-05-07 audit Phase 1).

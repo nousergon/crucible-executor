@@ -1267,13 +1267,24 @@ def _build_eligibility(
     Reason slugs:
       * ``"signal_exit"`` — research said EXIT.
       * ``"gbm_veto"`` — predictor's high-confidence DOWN veto fired.
+      * ``"negative_alpha"`` — predicted alpha below
+        ``negative_alpha_exit_below`` (held names included).
       * ``"score_below_min"`` — research composite < ``min_score_to_enter``.
       * ``"no_score"`` — no research signal / score for this ticker.
 
     Held tickers stay eligible regardless of score (the optimizer
-    decides whether to reduce them).
+    decides whether to reduce them), except under the three exit gates above.
     """
     min_score = float(config.get("min_score_to_enter", 57))
+    # A name whose predicted alpha sits below this is pinned to zero weight,
+    # held or not, so selling it is MANDATORY turnover: the conviction gate
+    # throttles discretionary turnover only and can no longer trap it in the
+    # book (2026-10-01: 16-34% of NAV sat in negative-alpha names through
+    # September with the gate at its floor). None (the default) disables it.
+    # A name with no numeric alpha (no prediction, or a champion arm's
+    # injected row) is never pinned by this rule.
+    _exit_below = config.get("negative_alpha_exit_below")
+    exit_below = None if _exit_below is None else float(_exit_below)
     eligibility = np.ones(len(tickers), dtype=bool)
     reasons: list[str | None] = [None] * len(tickers)
     for i, t in enumerate(tickers):
@@ -1291,6 +1302,12 @@ def _build_eligibility(
             eligibility[i] = False
             reasons[i] = "gbm_veto"
             continue
+        if exit_below is not None:
+            alpha = _numeric_alpha(pred)
+            if alpha is not None and alpha < exit_below:
+                eligibility[i] = False
+                reasons[i] = "negative_alpha"
+                continue
         if is_held:
             continue
         score = sig.get("score")
