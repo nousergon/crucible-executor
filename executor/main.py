@@ -488,6 +488,7 @@ def _read_signals(
             apply_champion_selection,
             assert_producer_champion_coherence,
             load_champion_pointer,
+            merge_champion_predictions,
         )
 
         _champion_pointer = load_champion_pointer(signals_bucket)
@@ -647,7 +648,7 @@ def _read_signals(
     # visible to the coverage assert below without being clobbered by (or
     # clobbering) the real predictor's own predictions.
     if _champion_injected_predictions:
-        predictions_by_ticker = {**predictions_by_ticker, **_champion_injected_predictions}
+        predictions_by_ticker = merge_champion_predictions(predictions_by_ticker, _champion_injected_predictions)
 
     # Coverage guard: every buy_candidate must have a prediction row, otherwise
     # the GBM veto gate is structurally unreachable for that ticker and we'd

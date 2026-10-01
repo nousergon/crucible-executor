@@ -94,9 +94,9 @@ class TestConsumerExtractsFromSchemaValidFixture:
 
     def _mock_s3_with_body(self, body: dict):
         s3 = MagicMock()
-        s3.list_objects_v2.return_value = {
-            "Contents": [{"Key": "market_data/weekly/2026-09-13/constituents.json"}],
-        }
+        s3.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": "market_data/weekly/2026-09-13/constituents.json"}]},
+        ]
         s3.get_object.return_value = {"Body": io.BytesIO(json.dumps(body).encode())}
         return s3
 
