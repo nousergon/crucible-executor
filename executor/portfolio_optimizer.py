@@ -1357,6 +1357,12 @@ def compute_conviction_budget_multiplier(
     budget) with a reason. Missing data must never produce a TIGHTER budget
     than the operator configured — a gate that silently stops the book on an
     input outage is a worse failure than the churn it exists to stop.
+
+    Unthrottled is not silent, though (alpha-engine-config-I11791): when the
+    turnover budget is live and the predictions carry no usable uncertainty,
+    the gate is OFF, and that logs at ERROR — the alert. A predictor promoted
+    without a sigma (crucible's M slot, before I11791) would otherwise switch
+    the throttle off with no signal at all.
     """
     out: dict = {
         "conviction_gate_applied": False,
@@ -1371,6 +1377,7 @@ def compute_conviction_budget_multiplier(
         return out
     if alpha_uncertainty is None:
         out["conviction_gate_reason"] = "no_alpha_uncertainty_vector"
+        _alert_gate_off_without_sigma(out["conviction_gate_reason"], cfg)
         return out
 
     alpha = np.asarray(alpha_hat, dtype=float)
@@ -1403,6 +1410,7 @@ def compute_conviction_budget_multiplier(
     if int(sig_ok.sum()) < max(2, min_names):
         out["conviction_n_names"] = int(mask.sum())
         out["conviction_gate_reason"] = "no_usable_alpha_uncertainty"
+        _alert_gate_off_without_sigma(out["conviction_gate_reason"], cfg)
         return out
 
     dispersion = float(np.std(alpha[mask]))
@@ -1434,6 +1442,18 @@ def compute_conviction_budget_multiplier(
         "signal_quality_ok" if q >= 1.0 else "alpha_spread_below_own_noise"
     )
     return out
+
+
+def _alert_gate_off_without_sigma(reason: str, cfg: dict) -> None:
+    """ERROR when a live turnover budget loses its conviction gate to a missing sigma."""
+    if cfg.get("max_daily_turnover") is None:
+        return
+    logger.error(
+        "Conviction gate OFF (%s): the predictions carry no usable "
+        "predicted_alpha_std, so today's discretionary turnover is "
+        "UNTHROTTLED. Check the champion predictor emits sigma "
+        "(alpha-engine-config-I11791).", reason,
+    )
 
 
 def _solve_min_attainable_turnover(cp, w, w_prev: np.ndarray, constraints: list):
