@@ -1717,3 +1717,34 @@ def _assert_serving_register_coherent() -> None:
 
 
 _assert_serving_register_coherent()
+
+
+def merge_champion_predictions(real: dict, injected: dict) -> dict:
+    """Overlay a champion arm's injected prediction rows on the real GBM load.
+
+    An injected row with a numeric ``predicted_alpha`` (the predictor-direct
+    arms) still replaces the real row, as before. A row that carries NO alpha
+    (the shadow-signals and Think Tank arms inject ``predicted_alpha: None``
+    on purpose) only fills a gap: when the predictor already scored that
+    ticker, its real row is kept and the arm's forensic fields are added.
+    Before 2026-10-01 the no-alpha row overwrote the real one, so every
+    champion pick reached the optimizer at alpha_hat 0.0 even though the
+    predictor had scored it (``watchlist_source: attractiveness_top_20``),
+    and a pick that was also held (ANF) lost its real alpha.
+    """
+    merged = dict(real)
+    for ticker, row in injected.items():
+        existing = merged.get(ticker)
+        if (
+            row.get("predicted_alpha") is None
+            and existing
+            and existing.get("predicted_alpha") is not None
+        ):
+            merged[ticker] = {
+                **existing,
+                **{k: v for k, v in row.items()
+                   if k not in existing and v is not None},
+            }
+        else:
+            merged[ticker] = row
+    return merged

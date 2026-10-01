@@ -925,9 +925,9 @@ class TestLoadConstituentsSectorMap:
 
     def _mock_s3(self, keys: list[str], sector_map: dict | None):
         s3 = MagicMock()
-        s3.list_objects_v2.return_value = {
-            "Contents": [{"Key": k} for k in keys],
-        }
+        s3.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": k} for k in keys]},
+        ]
         body = {"sector_map": sector_map} if sector_map is not None else {}
         s3.get_object.return_value = {
             "Body": io.BytesIO(json.dumps(body).encode()),
@@ -959,7 +959,7 @@ class TestLoadConstituentsSectorMap:
     @patch("executor.eod_reconcile.boto3")
     def test_empty_when_no_snapshots_listed(self, mock_boto3):
         s3 = MagicMock()
-        s3.list_objects_v2.return_value = {"Contents": []}
+        s3.get_paginator.return_value.paginate.return_value = [{"Contents": []}]
         mock_boto3.client.return_value = s3
         assert _load_constituents_sector_map("bucket") == {}
         s3.get_object.assert_not_called()
@@ -967,7 +967,7 @@ class TestLoadConstituentsSectorMap:
     @patch("executor.eod_reconcile.boto3")
     def test_empty_on_s3_exception(self, mock_boto3):
         s3 = MagicMock()
-        s3.list_objects_v2.side_effect = RuntimeError("boom")
+        s3.get_paginator.return_value.paginate.side_effect = RuntimeError("boom")
         mock_boto3.client.return_value = s3
         assert _load_constituents_sector_map("bucket") == {}
 
