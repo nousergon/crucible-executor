@@ -885,9 +885,17 @@ def _load_constituents_sector_map(bucket: str) -> dict[str, str]:
     """
     s3 = boto3.client("s3")
     try:
-        resp = s3.list_objects_v2(Bucket=bucket, Prefix="market_data/weekly/")
+        # Paginate: the prefix holds >14k objects, and one unpaginated
+        # list_objects_v2 call returns only the first 1,000 keys in lexical
+        # order. Measured 2026-10-01: that stopped at 2026-07-23, so every
+        # caller had been reading a ~10-week-old sector map, and every index
+        # add since then reached the sector caps as "Unknown".
         keys = [
-            obj["Key"] for obj in resp.get("Contents", [])
+            obj["Key"]
+            for page in s3.get_paginator("list_objects_v2").paginate(
+                Bucket=bucket, Prefix="market_data/weekly/",
+            )
+            for obj in page.get("Contents", [])
             if obj["Key"].endswith("/constituents.json")
         ]
         if not keys:
