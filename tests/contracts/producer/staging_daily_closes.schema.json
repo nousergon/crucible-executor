@@ -2,6 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Staging Daily Closes (per-row record)",
   "description": "staging/daily_closes/{date}.parquet — one row per ticker, written by collectors/daily_closes.py::collect(). The parquet is intermediate state (7-day S3 lifecycle expiry), consumed by builders/daily_append.py (ArcticDB ingest) and crucible-executor/executor/upstream_artifact_gate.py (freshness only, no column pin). This schema validates ONE ROW after `df.reset_index().to_dict('records')` — the persisted artifact is the parquet, not a JSON document; the row shape is the contract. v1 adds `source` (already persisted) and `revision` (alpha-engine-config-I10783, additive) so the write records which vendor produced each cell and how many times it has been overwritten, instead of a silent overwrite between vendors. Mirrors sources/contract.py::PriceBar.RECORD_KEYS and sources/SCHEMA.md §2, which remain the authoritative field catalog (this schema is a data-collector-plan-P-16 restatement of that catalog for consumer pinning). PRODUCER TEST: tests/test_staging_daily_closes_contract.py.",
+  "x-settling-bar": {
+    "basis": "key_date",
+    "rationale": "The file is indexed by TICKER, not by date: the whole artifact IS one trading day's bar, named by the date in its own key. When that date is the report's trading_day every value cell in it is the unsettled bar, so the whole file is graded as settling rather than row-by-row. Membership (the ticker set), schema and row count stay strict (alpha-engine-config-I11351)."
+  },
+  "x-key-pattern": "staging/daily_closes/{date}.parquet",
   "type": "object",
   "required": [
     "ticker", "date", "Open", "High", "Low", "Close",
@@ -33,7 +38,13 @@
     "revision": {
       "type": "integer",
       "minimum": 1,
-      "description": "Per-cell write counter, default 1. Incremented only when an existing cell is actually overwritten by an equal-or-higher-priority source (collectors.daily_closes._coalesce_by_source_priority) — an explicit, queryable trail of vendor overwrites instead of a silent one (alpha-engine-config-I10783)."
+      "x-provenance": true,
+      "description": "Per-cell write counter, default 1. Incremented only when an existing cell is actually overwritten by an equal-or-higher-priority source (collectors.daily_closes._coalesce_by_source_priority) — an explicit, queryable trail of vendor overwrites instead of a silent one (alpha-engine-config-I10783). x-provenance (alpha-engine-config-I10894): a run-identity counter, not a data value — shadow/parity.py excludes it from `values.breaches` and reports it under `provenance_diffs` instead, because it is DEFINED to differ between the live and shadow read-modify-write chains (I10891)."
+    },
+    "xsource_provenance": {
+      "type": ["string", "null"],
+      "x-provenance": true,
+      "description": "Cross-source observer audit string (collectors/cross_source_observer.py XSOURCE_PROVENANCE, built by sources/cross_source_gate.py as GateDecision.provenance), e.g. `A@2026-09-22: yfinance=167.2700 single-source PROVISIONAL (no cross-check)`. Optional: only the L1 observer writes it. x-provenance (alpha-engine-config-I11559): the text EMBEDS the vendor and price the row was built from, so grading it as data re-grades the same `Close` a second time, as a string, with no tolerance. shadow/parity.py reports it under `provenance_diffs` instead of `values.breaches`. The price it embeds is still graded, strictly, in its own `Close` column, and the vendor in `source`."
     }
   }
 }

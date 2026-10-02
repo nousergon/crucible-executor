@@ -34,11 +34,16 @@ All three keys now have a producer-side copy, mirrored byte-verbatim under
 |---|---|---|
 | `constituents.schema.json` | `nousergon-data/contracts/constituents.schema.json` | reconciled; no divergence |
 | `arctic_universe.schema.json` | `nousergon-data/contracts/arctic_universe.schema.json` | reconciled; no divergence (closed alpha-engine-config-I10828) |
-| `staging_daily_closes.schema.json` | `nousergon-data/contracts/staging_daily_closes.schema.json` (`nousergon-data-PR1712`) | reconciled; OPEN divergence on OHLC/Volume nullability (alpha-engine-config-I10853) |
+| `staging_daily_closes.schema.json` | `nousergon-data/contracts/staging_daily_closes.schema.json` (`nousergon-data-PR1936`) | byte copy of the producer; divergence closed (alpha-engine-config-I10853) |
 
-The two files per key stay SEPARATE rather than one replacing the other: the
-producer's models the write path (`additionalProperties: false`), this repo's
-records what the trader's read path consumes and what it hard-fails without.
+For constituents and arctic_universe the two files stay SEPARATE rather than
+one replacing the other: the producer's models the write path
+(`additionalProperties: false`), this repo's records what the trader's read
+path consumes and what it hard-fails without. staging_daily_closes is the
+exception: its only reader here is a freshness probe that never parses a row,
+so the pin carries no read-path fact and IS the producer's schema, byte for
+byte. The data gate's `data.D17.schema_contract` and `data.D19.schema_contract`
+clauses compare its validation shape with the producer's on every run.
 
 **Closed: the arctic_universe divergence (alpha-engine-config-I10828).** The
 producer's `arctic_universe.schema.json` used to be `additionalProperties:
@@ -50,18 +55,19 @@ declares both (nullable, additive). Ongoing coverage:
 `test_producer_declares_the_columns_this_repo_hard_depends_on`, which goes red
 if the producer ever drops either column again.
 
-**OPEN: the staging_daily_closes divergence (alpha-engine-config-I10853).**
+**Closed: the staging_daily_closes divergence (alpha-engine-config-I10853).**
 The producer types `Open`/`High`/`Low`/`Close`/`Adj_Close`/`Volume` as
-nullable — a documented, legitimate producer state (a gap day with no vendor
-value). This repo's consumer pin types the same fields as plain
-`number`/`integer` with no null option, so a producer-conformant row
-carrying a real null price fails this repo's own contract. Not fixed here:
-`executor/upstream_artifact_gate.py` only probes freshness (no row parse)
-so nothing live is broken today, but fixing it means loosening a contract
-this repo owns, which needs its own ruling. Pinned as a passing,
-documented-divergence test:
-`test_producer_allows_null_ohlc_but_consumer_pin_rejects_it`.
+nullable (a gap day with no vendor value), and this repo's pin used to type
+them non-null, so a producer-conformant row failed this repo's own contract.
+Since 2026-10-02 the pin is a byte copy of the producer's schema, which also
+picks up the producer's `source` vendor enum and required `revision`.
+`executor/upstream_artifact_gate.py` still only probes freshness, so no
+runtime path changed. Ongoing coverage:
+`test_staging_daily_closes_pin_is_the_producer_schema` and
+`tests/test_contract_staging_daily_closes.py::TestContractIsValid::test_pin_is_a_byte_copy_of_the_producer_schema`.
 
 **Refreshing a producer copy**: copy the file again from `nousergon-data`
 `main` into `tests/contracts/producer/`, bump `PRODUCER_SHA` in the parity
-test, run it, and reconcile whatever it reports.
+test, run it, and reconcile whatever it reports. For
+`staging_daily_closes.schema.json`, copy it into `contracts/` as well, and
+never hand-edit either copy.

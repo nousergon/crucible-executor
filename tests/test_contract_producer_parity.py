@@ -19,21 +19,23 @@ that agreed with the producer once and silently diverged afterwards is the
 
 `nousergon-data-PR1712` (merged 2026-09-15, `3cd646b`) subsequently
 published `contracts/staging_daily_closes.schema.json`, closing the third
-gap this file's own docstring named. Reconciling it surfaced a genuine,
-still-open divergence rather than agreement: the producer types
-`Open`/`High`/`Low`/`Close`/`Adj_Close`/`Volume` as nullable (a documented,
-legitimate producer state — "Null Close is treated as missing by the
-source-priority coalesce"), while this repo's consumer pin types the same
-fields as plain `number`/`integer` with no null option. A producer-valid row
-carrying a real null price fails this repo's own contract. It is pinned as
-a passing, documented-divergence test below (not silently loosened) —
-tracked as `alpha-engine-config-I10853`.
+gap this file's own docstring named. Reconciling it surfaced a divergence:
+the producer types `Open`/`High`/`Low`/`Close`/`Adj_Close`/`Volume` as
+nullable ("Null Close is treated as missing by the source-priority
+coalesce"), while this repo's pin typed them non-null, so a producer-valid
+row carrying a real null price failed this repo's own contract
+(`alpha-engine-config-I10853`). Closed 2026-10-02: this repo's only reader
+of that artifact is a freshness probe that never parses a row, so the pin
+carries no read-path fact the producer's copy lacks, and
+`contracts/staging_daily_closes.schema.json` is now a byte copy of the
+producer's schema (the data gate's D17/D19 `schema_contract` clauses grade
+exactly that shape equality).
 
 `tests/contracts/producer/*.schema.json` are byte-verbatim copies of the
 producer's files at that SHA. Nothing here edits them, and no code path reads
-them at runtime — `contracts/` stays the repo's own consumer pin (it has to:
-it carries the read-path facts the producer's copy does not model, see the
-hard-dependency check below). These copies exist so the DIFFERENCE between the
+them at runtime — `contracts/` stays the repo's own consumer pin for
+constituents and arctic_universe (it has to: it carries the read-path facts
+the producer's copy does not model, see the hard-dependency check below). These copies exist so the DIFFERENCE between the
 two is asserted rather than assumed.
 
 What is pinned:
@@ -69,7 +71,7 @@ _PRODUCER = Path(__file__).parent / "contracts" / "producer"
 # The producer SHA these copies were taken at. Cited so a reviewer can diff
 # them without guessing which revision they mirror.
 PRODUCER_SHA = "nousergon-data-PR1726"  # atr_14_pct + VWAP added, alpha-engine-config-I10828
-STAGING_DAILY_CLOSES_PRODUCER_SHA = "nousergon-data-PR1712"  # source+revision stamp, alpha-engine-config-I10783
+STAGING_DAILY_CLOSES_PRODUCER_SHA = "nousergon-data-PR1936"  # b9b109a2: xsource_provenance, alpha-engine-config-I11559
 
 # ── The divergence is closed ─────────────────────────────────────────────────
 #
@@ -248,20 +250,19 @@ def test_bitemporal_columns_are_additive_not_required(producer_arctic):
     assert additive.isdisjoint(producer_arctic["required"])
 
 
-# ── 2/3. staging_daily_closes: freshness-only reader, no invented columns ──
+# ── 2/3. staging_daily_closes: freshness-only reader, pin == producer ───
 #
 # executor/upstream_artifact_gate.py::EXECUTOR_UPSTREAM_SPECS is the only
 # code path that touches this artifact today, and it is a freshness probe
 # (S3 HEAD/LIST via nousergon_lib.artifact_freshness.check_freshness) — it
-# never parses a row. The set of columns "this repo's staging_daily_closes
-# reader uses" is therefore the pinned consumer contract's own `required`
-# list (contracts/README.md: "the row schema below is pinned so a future
-# content-parsing consumer ... [has] one place to change"), not a set read
-# out of live code. That list must still be a set the producer actually
-# declares — the same invented-requirement check as constituents.
+# never parses a row. So the consumer pin is the producer's schema verbatim
+# (alpha-engine-config-I10853 closed): a content-parsing consumer added later
+# starts from exactly what the producer writes. The column list below is the
+# set a future reader is expected to use; the producer must keep declaring it.
 
 _STAGING_DAILY_CLOSES_COLUMNS_THIS_REPO_PINS = (
-    "ticker", "date", "Open", "High", "Low", "Close", "Adj_Close", "Volume", "source",
+    "ticker", "date", "Open", "High", "Low", "Close", "Adj_Close", "Volume", "VWAP",
+    "source", "revision",
 )
 
 
@@ -321,78 +322,35 @@ def test_a_producer_conformant_staging_daily_closes_row_passes_the_consumer_pin(
     jsonschema.validate(row, consumer_staging_daily_closes)
 
 
-def test_producer_allows_null_ohlc_but_consumer_pin_rejects_it(
+def test_staging_daily_closes_pin_is_the_producer_schema(
     producer_staging_daily_closes, consumer_staging_daily_closes,
 ):
-    """OPEN DIVERGENCE — alpha-engine-config-I10853. The producer types
-    Open/High/Low/Close/Adj_Close/Volume as nullable
-    (`nousergon-data-PR1712`'s own schema description: "Null Close is
-    treated as missing by the source-priority coalesce") — a real, legitimate
-    producer state (a gap day with no vendor value), not an edge case. This
-    repo's consumer pin types the same fields as plain `number`/`integer`
-    with no null option, so a producer-conformant row carrying a real null
-    price is REJECTED by this repo's own contract.
+    """CLOSED — alpha-engine-config-I10853. The consumer pin is a verbatim
+    copy of the producer's schema, so the two cannot disagree on nullability,
+    the `source` enum or `revision`. The data gate grades the same equality
+    (`data.D17.schema_contract`, `data.D19.schema_contract`); this test makes
+    a drift red here first."""
+    assert consumer_staging_daily_closes == producer_staging_daily_closes
 
-    Not fixed here: fixing it means loosening a contract this repo owns
-    without a ruling on whether a future content-parsing consumer needs the
-    stricter (non-null) shape enforced upstream instead. Pinned as a passing,
-    documented-divergence test so it cannot silently drift further in either
-    direction — a fix on either side must touch this test.
-    """
-    for field in ("Open", "High", "Low", "Close", "Adj_Close"):
-        assert producer_staging_daily_closes["properties"][field]["type"] == [
-            "number", "null",
-        ]
-        assert consumer_staging_daily_closes["properties"][field]["type"] == "number"
-    assert producer_staging_daily_closes["properties"]["Volume"]["type"] == [
-        "integer", "null",
-    ]
-    assert consumer_staging_daily_closes["properties"]["Volume"]["type"] == "integer"
 
+def test_a_null_ohlc_row_passes_both_contracts(
+    producer_staging_daily_closes, consumer_staging_daily_closes,
+):
+    """The row that used to be rejected by this repo's pin: a gap day with no
+    vendor price ("Null Close is treated as missing by the source-priority
+    coalesce"). It is producer-valid, so it must be consumer-valid."""
     null_row = _producer_valid_row(
         Open=None, High=None, Low=None, Close=None, Adj_Close=None, Volume=0,
         source="fred",
     )
     jsonschema.validate(null_row, producer_staging_daily_closes)
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(null_row, consumer_staging_daily_closes)
-
-
-def test_producer_source_enum_is_a_subset_of_the_consumers_free_string(
-    producer_staging_daily_closes, consumer_staging_daily_closes,
-):
-    """The producer restricts `source` to a closed enum; the consumer pin
-    types it as a free string. That direction is safe (stricter producer,
-    looser consumer) — pinned so a future consumer tightening does not
-    silently start rejecting a real vendor name."""
-    assert producer_staging_daily_closes["properties"]["source"]["enum"] == [
-        "polygon", "fred", "yfinance",
-    ]
-    assert consumer_staging_daily_closes["properties"]["source"]["type"] == "string"
-    assert "enum" not in consumer_staging_daily_closes["properties"]["source"]
-
-
-def test_revision_is_producer_required_but_additive_on_the_consumer_pin(
-    producer_staging_daily_closes, consumer_staging_daily_closes,
-):
-    """`revision` (alpha-engine-config-I10783) is required by the producer
-    but the consumer pin neither declares nor requires it. That is fine only
-    because the consumer pin is `additionalProperties: true` — a real
-    producer row carrying `revision` still validates. Pinned so a future
-    tightening to `additionalProperties: false` on the consumer side is
-    forced to address this field explicitly rather than silently reject
-    every producer row."""
-    assert "revision" in producer_staging_daily_closes["required"]
-    assert "revision" not in consumer_staging_daily_closes.get("properties", {})
-    assert consumer_staging_daily_closes["additionalProperties"] is True
+    jsonschema.validate(null_row, consumer_staging_daily_closes)
 
 
 # ── The standing instruction the consumer pins carried ──────────────────────
 
 
-@pytest.mark.parametrize(
-    "name", ["constituents", "arctic_universe", "staging_daily_closes"],
-)
+@pytest.mark.parametrize("name", ["constituents", "arctic_universe"])
 def test_consumer_pin_no_longer_claims_the_producer_copy_is_absent(name):
     """Each consumer pin shipped with "no producer-side contracts/ copy of
     this schema exists yet in nousergon-data". That is now false, and a
