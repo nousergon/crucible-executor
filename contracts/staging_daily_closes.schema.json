@@ -1,39 +1,50 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://nousergon.dev/contracts/staging_daily_closes.schema.json",
-  "title": "staging/daily_closes/{trading_day}.parquet — per-row record",
-  "version": 1,
-  "description": "Pinned CONSUMER copy, owned by crucible-executor (alpha-engine-config-I10796 / data_collection_plan_260914.md P-27). The producer is the data collector (nousergon-data), writing a parquet whose row shape is nousergon-data/sources/contract.py::PriceBar.to_record() (RECORD_KEYS). This file is read for FRESHNESS ONLY today by executor/upstream_artifact_gate.py (a HEAD/LIST probe, no parquet parse) — the row schema below is pinned so a future content-parsing consumer, and this contract test, both have one place to change together. A producer schema-version bump is a cross-repo PR per data_collection_plan_260914.md §4.3: the nousergon-data change lands first, naming this file as a consumer to update. nousergon-data published its own contracts/staging_daily_closes.schema.json in nousergon-data-PR1712 (merged 2026-09-15, 3cd646b); this pin is reconciled against it in tests/test_contract_producer_parity.py, which found an open divergence on OHLC/Volume nullability (alpha-engine-config-I10853) — the producer allows null price/volume values this pin does not yet accept.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Staging Daily Closes (per-row record)",
+  "description": "staging/daily_closes/{date}.parquet — one row per ticker, written by collectors/daily_closes.py::collect(). The parquet is intermediate state (7-day S3 lifecycle expiry), consumed by builders/daily_append.py (ArcticDB ingest) and crucible-executor/executor/upstream_artifact_gate.py (freshness only, no column pin). This schema validates ONE ROW after `df.reset_index().to_dict('records')` — the persisted artifact is the parquet, not a JSON document; the row shape is the contract. v1 adds `source` (already persisted) and `revision` (alpha-engine-config-I10783, additive) so the write records which vendor produced each cell and how many times it has been overwritten, instead of a silent overwrite between vendors. Mirrors sources/contract.py::PriceBar.RECORD_KEYS and sources/SCHEMA.md §2, which remain the authoritative field catalog (this schema is a data-collector-plan-P-16 restatement of that catalog for consumer pinning). PRODUCER TEST: tests/test_staging_daily_closes_contract.py.",
+  "x-settling-bar": {
+    "basis": "key_date",
+    "rationale": "The file is indexed by TICKER, not by date: the whole artifact IS one trading day's bar, named by the date in its own key. When that date is the report's trading_day every value cell in it is the unsettled bar, so the whole file is graded as settling rather than row-by-row. Membership (the ticker set), schema and row count stay strict (alpha-engine-config-I11351)."
+  },
+  "x-key-pattern": "staging/daily_closes/{date}.parquet",
   "type": "object",
-  "required": ["ticker", "date", "Open", "High", "Low", "Close", "Adj_Close", "Volume", "source"],
+  "required": [
+    "ticker", "date", "Open", "High", "Low", "Close",
+    "Adj_Close", "Volume", "VWAP", "source", "revision"
+  ],
+  "additionalProperties": true,
   "properties": {
     "ticker": {
       "type": "string",
-      "description": "canonical store-key (dash form: BRK-B), caret-stripped"
+      "description": "Canonical store-key (dash form for US class shares, e.g. BRK-B; caret-stripped for index tickers, e.g. VIX not ^VIX)."
     },
     "date": {
       "type": "string",
-      "format": "date",
-      "description": "YYYY-MM-DD trading day of the bar"
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "Trading day of the bar (YYYY-MM-DD)."
     },
-    "Open": { "type": "number" },
-    "High": { "type": "number" },
-    "Low": { "type": "number" },
-    "Close": { "type": "number" },
-    "Adj_Close": { "type": "number" },
-    "Volume": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "raw shares (0 when the source carries no volume, e.g. FRED)"
-    },
-    "VWAP": {
-      "type": ["number", "null"],
-      "description": "true volume-weighted price; null when the source can't provide it"
-    },
+    "Open": {"type": ["number", "null"], "description": "Price, native currency (currently USD-only persisted)."},
+    "High": {"type": ["number", "null"], "description": "Price, native currency."},
+    "Low": {"type": ["number", "null"], "description": "Price, native currency."},
+    "Close": {"type": ["number", "null"], "description": "Price, native currency. Null Close is treated as missing by the source-priority coalesce."},
+    "Adj_Close": {"type": ["number", "null"], "description": "Split/dividend-adjusted close where the source provides one (yfinance); equals Close where it does not (polygon, FRED)."},
+    "Volume": {"type": ["integer", "null"], "minimum": 0, "description": "Raw shares. 0 when the source carries no volume (FRED single-value closes)."},
+    "VWAP": {"type": ["number", "null"], "description": "True volume-weighted price. Null when the source can't provide it — never a (H+L+C)/3 proxy."},
     "source": {
       "type": "string",
-      "description": "provenance — the producing adapter's name (e.g. yfinance_only, polygon_only)"
+      "enum": ["polygon", "fred", "yfinance"],
+      "description": "Provenance — the vendor that WON this cell under collectors.daily_closes.VENDOR_PRECEDENCE (the declared, reversible champion pointer; polygon is champion per the 2026-09-09 ruling). Not necessarily the only vendor that supplied a value this trading day — see data_collection/metrics/vendor_divergence/{date}.json for the cross-vendor comparison."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "x-provenance": true,
+      "description": "Per-cell write counter, default 1. Incremented only when an existing cell is actually overwritten by an equal-or-higher-priority source (collectors.daily_closes._coalesce_by_source_priority) — an explicit, queryable trail of vendor overwrites instead of a silent one (alpha-engine-config-I10783). x-provenance (alpha-engine-config-I10894): a run-identity counter, not a data value — shadow/parity.py excludes it from `values.breaches` and reports it under `provenance_diffs` instead, because it is DEFINED to differ between the live and shadow read-modify-write chains (I10891)."
+    },
+    "xsource_provenance": {
+      "type": ["string", "null"],
+      "x-provenance": true,
+      "description": "Cross-source observer audit string (collectors/cross_source_observer.py XSOURCE_PROVENANCE, built by sources/cross_source_gate.py as GateDecision.provenance), e.g. `A@2026-09-22: yfinance=167.2700 single-source PROVISIONAL (no cross-check)`. Optional: only the L1 observer writes it. x-provenance (alpha-engine-config-I11559): the text EMBEDS the vendor and price the row was built from, so grading it as data re-grades the same `Close` a second time, as a string, with no tolerance. shadow/parity.py reports it under `provenance_diffs` instead of `values.breaches`. The price it embeds is still graded, strictly, in its own `Close` column, and the vendor in `source`."
     }
-  },
-  "additionalProperties": true
+  }
 }
