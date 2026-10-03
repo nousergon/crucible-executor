@@ -23,9 +23,11 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import deque
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 import requests
@@ -36,6 +38,39 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "https://api.polygon.io"
 _MAX_BARS_PER_REQUEST = 50_000  # polygon limit param max
 _WINDOW_SECONDS = 60.0  # Polygon's free-tier budget is per rolling minute
+
+
+# 429 backoff for every request, paginated pages included. See _request.
+_MAX_429_ATTEMPTS = 4
+_BACKOFF_429_BASE = 15.0
+_BACKOFF_429_CAP = 60.0
+
+# Polygon authenticates via the ``apiKey`` querystring, so the str() of a
+# requests error embeds the live key, and it reached the ERROR alert and the
+# box logs on 2026-10-02. Every error raised from this client is scrubbed.
+_API_KEY_RE = re.compile(r"(?:apiKey|api_key)=[^&\s]+")
+
+
+def _scrub_api_key(msg: object) -> str:
+    """Mask the ``apiKey=...`` (or ``api_key=...``) querystring value."""
+    return _API_KEY_RE.sub(lambda m: m.group(0).split("=", 1)[0] + "=***", str(msg))
+
+
+def _strip_api_key(url: str) -> str:
+    """Drop every ``apiKey`` query parameter from ``url``."""
+    parts = urlsplit(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k not in ("apiKey", "api_key")]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def _scrubbed(exc: requests.RequestException) -> requests.RequestException:
+    """A same-type copy of ``exc`` whose message carries no API key."""
+    response = getattr(exc, "response", None)
+    try:
+        return type(exc)(_scrub_api_key(exc), response=response)
+    except TypeError:
+        return requests.RequestException(_scrub_api_key(exc), response=response)
 
 
 class PolygonRateLimitError(Exception):
@@ -156,23 +191,56 @@ class PolygonClient:
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         """Make a rate-limited GET request. Handles 429 with retry."""
+        return self._request(f"{_BASE_URL}{path}", params or {}, label=path)
+
+    def _get_raw_url(self, url: str) -> dict:
+        """GET a full URL (for pagination ``next_url``).
+
+        Goes through the same 429 retry loop as :meth:`_get`. It used to call
+        ``raise_for_status`` directly, so a 429 on page two of a paginated
+        query failed the whole query on the first try (2026-10-02 postclose:
+        the dividend window's second page 429'd one second after the first
+        page and the day's dividend accrual went unmeasured).
+
+        Any ``apiKey`` already on the URL is dropped: the session's params add
+        it, and the old code appended a second copy on top of that.
+        """
+        # The log label is the path alone: the query is where the key lives.
+        label = urlsplit(url).path
+        return self._request(_strip_api_key(url), {}, label=label)
+
+    def _request(self, url: str, params: dict, *, label: str) -> dict:
+        """One metered GET with bounded 429 backoff; errors are key-scrubbed.
+
+        The key is shared fleet-wide, so a 429 can arrive while this process's
+        own window is nearly empty (the data collector spends the same budget
+        minutes earlier). The wait after the ``n``-th 429 is the longest of the
+        server's ``Retry-After``, an exponential floor (15s, 30s, 60s) and the
+        time until our own window frees a slot; there is no sleep after the
+        final attempt, because nothing follows it. Worst case ~105s, which
+        spans a full rate-limit window before ``PolygonRateLimitError``.
+        """
         self._wait_for_slot()
-        url = f"{_BASE_URL}{path}"
-        for _attempt in range(3):
-            resp = self._session.get(url, params=params or {}, timeout=30)
+        for attempt in range(_MAX_429_ATTEMPTS):
+            try:
+                resp = self._session.get(url, params=params, timeout=30)
+            except requests.RequestException as exc:
+                raise _scrubbed(exc) from None
             if resp.status_code == 429:
-                retry_after = float(resp.headers.get("Retry-After", 15))
-                # Sleep the LONGER of Retry-After and the time until our own
-                # window frees a slot, and do NOT clear the window: the old
-                # code cleared it and retried into a 60s server window it had
-                # just forgotten, so three 15s retries never drained a window
-                # five calls deep (alpha-engine-config-I10047).
+                if attempt == _MAX_429_ATTEMPTS - 1:
+                    break
+                retry_after = float(resp.headers.get("Retry-After", 0) or 0)
+                backoff = min(_BACKOFF_429_BASE * (2 ** attempt), _BACKOFF_429_CAP)
+                # Do NOT clear the window: the old code cleared it and retried
+                # into a 60s server window it had just forgotten
+                # (alpha-engine-config-I10047).
                 window_wait = self._window.seconds_until_slot(self._calls_per_min)
-                wait = max(retry_after, window_wait)
+                wait = max(retry_after, backoff, window_wait)
                 logger.warning(
-                    "Rate limited (429), waiting %.1fs (Retry-After=%.0fs, "
-                    "shared window frees a slot in %.1fs)",
-                    wait, retry_after, window_wait,
+                    "Rate limited (429) on %s, waiting %.1fs (attempt %d/%d, "
+                    "Retry-After=%.0fs, shared window frees a slot in %.1fs)",
+                    label, wait, attempt + 1, _MAX_429_ATTEMPTS, retry_after,
+                    window_wait,
                 )
                 time.sleep(wait)
                 # The retry is another metered call — book it in the window.
@@ -181,11 +249,16 @@ class PolygonClient:
             if resp.status_code == 403:
                 data = resp.json()
                 msg = data.get("message", "Not authorized")
-                logger.warning("Polygon 403: %s (path=%s)", msg, path)
+                logger.warning("Polygon 403: %s (path=%s)", msg, label)
                 return {"results": [], "resultsCount": 0, "status": "FORBIDDEN"}
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                raise _scrubbed(exc) from None
             return resp.json()
-        raise PolygonRateLimitError("Rate limited after 3 retries")
+        raise PolygonRateLimitError(
+            f"Rate limited (429) on {label} after {_MAX_429_ATTEMPTS} attempts"
+        )
 
     # ── Core endpoints ────────────────────────────────────────────────────
 
@@ -405,16 +478,6 @@ class PolygonClient:
             all_splits.extend(resp.get("results", []))
             next_url = resp.get("next_url")
         return all_splits
-
-    def _get_raw_url(self, url: str) -> dict:
-        """GET a full URL (for pagination next_url)."""
-        self._wait_for_slot()
-        # next_url already includes apiKey
-        if "apiKey" not in url:
-            url += f"&apiKey={self._api_key}" if "?" in url else f"?apiKey={self._api_key}"
-        resp = self._session.get(url, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
 
     # ── Dividend adjustment ───────────────────────────────────────────────
 
