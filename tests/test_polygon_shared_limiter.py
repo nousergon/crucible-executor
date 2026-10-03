@@ -217,15 +217,73 @@ class TestRateLimitedRetry:
         # One slot for the original request, one for the retry.
         assert c._window.depth() == 2
 
-    def test_three_consecutive_429s_still_raise(self, clock):
+    def test_four_consecutive_429s_still_raise(self, clock):
         session = _CountingSession([
-            _Response(status_code=429, headers={"Retry-After": "15"}),
-            _Response(status_code=429, headers={"Retry-After": "15"}),
-            _Response(status_code=429, headers={"Retry-After": "15"}),
+            _Response(status_code=429) for _ in range(4)
         ])
         c = _client(calls_per_min=5, session=session)
         with pytest.raises(PolygonRateLimitError):
             c._get("/v3/reference/dividends", params={})
+        assert len(session.requests) == 4
+        # Exponential floor with no sleep after the final attempt.
+        assert clock.sleeps == [pytest.approx(15.0), pytest.approx(30.0),
+                                pytest.approx(60.0)]
+
+
+class TestPaginationPage:
+    """2026-10-02 postclose: page two of the dividend window 429'd one second
+    after page one, ``_get_raw_url`` had no retry, the whole window query
+    failed, and the HTTPError carried the API key (twice) into the alert."""
+
+    _NEXT = ("https://api.polygon.io/v3/reference/dividends?cursor=YXA9MTAw"
+             "&apiKey=SECRET")
+
+    def test_a_429_on_a_next_url_page_is_retried(self, clock):
+        session = _CountingSession([
+            _Response(status_code=429),
+            _Response({"results": [{"ticker": "B"}]}),
+        ])
+        c = _client(session=session)
+        assert c._get_raw_url(self._NEXT) == {"results": [{"ticker": "B"}]}
+        assert len(session.requests) == 2
+
+    def test_the_page_url_carries_no_api_key_of_its_own(self, clock):
+        session = _CountingSession()
+        c = _client(session=session)
+        c._get_raw_url("https://api.polygon.io/v3/reference/dividends?cursor=abc")
+        c._get_raw_url(self._NEXT)
+        for url, params in session.requests:
+            assert "apiKey" not in url and "apiKey" not in params
+            assert "cursor=" in url
+
+    def test_http_errors_never_carry_the_key(self, clock):
+        import requests
+
+        class _Err(_Response):
+            def raise_for_status(self):
+                raise requests.HTTPError(
+                    "500 Server Error for url: https://api.polygon.io/x?"
+                    f"cursor=a&apiKey={_KEY}", response=self)
+
+        session = _CountingSession([_Err(status_code=500)])
+        c = _client(session=session)
+        with pytest.raises(requests.HTTPError) as info:
+            c._get_raw_url(self._NEXT)
+        assert _KEY not in str(info.value)
+        assert "apiKey=***" in str(info.value)
+        assert info.value.__cause__ is None and info.value.__suppress_context__
+
+    def test_transport_errors_never_carry_the_key(self, clock):
+        import requests
+
+        class _Boom(_CountingSession):
+            def get(self, url, params=None, timeout=None):
+                raise requests.ConnectionError(f"Max retries exceeded with url: /x?apiKey={_KEY}")
+
+        c = _client(session=_Boom())
+        with pytest.raises(requests.ConnectionError) as info:
+            c._get("/x")
+        assert _KEY not in str(info.value)
 
 
 class TestDividendWindowQuery:
