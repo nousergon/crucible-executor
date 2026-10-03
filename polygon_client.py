@@ -205,8 +205,9 @@ class PolygonClient:
         Any ``apiKey`` already on the URL is dropped: the session's params add
         it, and the old code appended a second copy on top of that.
         """
-        url = _strip_api_key(url)
-        return self._request(url, {}, label=_scrub_api_key(url.split("?", 1)[0]))
+        # The log label is the path alone: the query is where the key lives.
+        label = urlsplit(url).path
+        return self._request(_strip_api_key(url), {}, label=label)
 
     def _request(self, url: str, params: dict, *, label: str) -> dict:
         """One metered GET with bounded 429 backoff; errors are key-scrubbed.
