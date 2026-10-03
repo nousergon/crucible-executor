@@ -48,15 +48,15 @@ _BACKOFF_429_CAP = 60.0
 # Polygon authenticates via the ``apiKey`` querystring, so the str() of a
 # requests error embeds the live key, and it reached the ERROR alert and the
 # box logs on 2026-10-02. Every error raised from this client is scrubbed.
-_API_KEY_RE = re.compile(r"(?:apiKey|api_key)=[^&\s]+")
+_AUTH_QUERY_RE = re.compile(r"(?:apiKey|api_key)=[^&\s]+")
 
 
-def _scrub_api_key(msg: object) -> str:
+def _redact_auth_query(msg: object) -> str:
     """Mask the ``apiKey=...`` (or ``api_key=...``) querystring value."""
-    return _API_KEY_RE.sub(lambda m: m.group(0).split("=", 1)[0] + "=***", str(msg))
+    return _AUTH_QUERY_RE.sub(lambda m: m.group(0).split("=", 1)[0] + "=***", str(msg))
 
 
-def _strip_api_key(url: str) -> str:
+def _without_auth_query(url: str) -> str:
     """Drop every ``apiKey`` query parameter from ``url``."""
     parts = urlsplit(url)
     query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
@@ -68,9 +68,9 @@ def _scrubbed(exc: requests.RequestException) -> requests.RequestException:
     """A same-type copy of ``exc`` whose message carries no API key."""
     response = getattr(exc, "response", None)
     try:
-        return type(exc)(_scrub_api_key(exc), response=response)
+        return type(exc)(_redact_auth_query(exc), response=response)
     except TypeError:
-        return requests.RequestException(_scrub_api_key(exc), response=response)
+        return requests.RequestException(_redact_auth_query(exc), response=response)
 
 
 class PolygonRateLimitError(Exception):
@@ -207,7 +207,7 @@ class PolygonClient:
         """
         # The log label is the path alone: the query is where the key lives.
         label = urlsplit(url).path
-        return self._request(_strip_api_key(url), {}, label=label)
+        return self._request(_without_auth_query(url), {}, label=label)
 
     def _request(self, url: str, params: dict, *, label: str) -> dict:
         """One metered GET with bounded 429 backoff; errors are key-scrubbed.
