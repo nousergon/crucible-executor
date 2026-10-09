@@ -73,9 +73,101 @@ GIT_SYNC_LOCK_WAIT="${AE_GIT_SYNC_LOCK_WAIT:-150}"
 # and the exit code still suppressed the self-heal. A concurrent git writer on
 # this box wins that race whenever it interleaves, so the exit code cannot be
 # the gate no matter how narrow the refspec is.
+# ── Transient-remote retry class (alpha-engine-config-I10950) ───────────────
+# The one-shot retry inside sync_repo_to_main() below answers a ref
+# compare-and-swap race. It does NOT answer the other failure this box has
+# hit: a credential-helper cache MISS that mints a token GitHub then refuses
+# ("Repository not found") for about a minute, while the same fetch succeeds
+# seconds later. The immediate retry re-serves the same bad token, so it fails
+# identically, and boot-pull reports the repo FAILED.
+#
+# Measured on THIS box, i-018eb3307a21329bf: 2026-09-17 12:15Z, and again
+# 2026-10-02 12:16Z ("boot-pull FAILED on the TRADING box: 1 repo(s) could not
+# be updated — /home/ec2-user/alpha-engine-config (git)"). The preopen's
+# CodeFreshnessGate absorbed the 10-02 occurrence only because
+# nousergon-data-PR1776 gave the gate's git_retry() this class. The dashboard
+# box's boot-pull got the same class in crucible-dashboard-PR869. This ports
+# it to the third and last git writer on the path.
+#
+# This class is deliberately narrow. Every attempt re-runs the WHOLE sync below
+# (fetch with its CAS retry, then checkout/reset). An attempt is retried only
+# when the fetch failed twice (inner rc=10) AND the output matches a named
+# transient-remote signature. The total is bounded at 3 attempts, with a
+# 5s-then-10s backoff and a credential-cache erase before each retry, so the
+# retry re-mints a token instead of being served the same one. Any other
+# failure keeps exactly its previous behaviour:
+#   - a flock timeout (rc=1)
+#   - a checkout/reset failure (rc=2)
+#   - a cd failure (rc=3)
+#   - an unmatched fetch error
+# The backoff sleeps OUTSIDE the shared git-sync flock, so a retry never makes
+# the CodeFreshnessGate wait on a sleeping lock holder.
+#
+# The signature list is the same list the gate (nousergon-data
+# step_function_daily.json git_retry) and the dashboard's boot-pull use. If
+# you change one, change all three.
+_BOOT_PULL_TRANSIENT_SIGNATURES=(
+    'Repository not found'
+    'Authentication failed'
+    'could not read Username'
+    'The requested URL returned error: 5'
+    'Could not resolve host'
+    'Failed to connect'
+    'Connection timed out'
+    'RPC failed'
+    'early EOF'
+    'remote end hung up'
+    'unable to access'
+)
+
+# _boot_pull_transient_signature <sync output> — echoes the first matching
+# signature and returns 0. Returns 1 if nothing matched, which means the
+# failure is not believed to clear on its own and must not be retried.
+_boot_pull_transient_signature() {
+    local text="$1" sig
+    for sig in "${_BOOT_PULL_TRANSIENT_SIGNATURES[@]}"; do
+        if grep -qF -- "$sig" <<<"$text"; then
+            printf '%s' "$sig"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# _boot_pull_erase_credential <checkout-dir> — invalidates that repo's cached
+# GitHub App token so the retry re-mints instead of re-serving it. The cache
+# key is the slug from the checkout's OWN origin remote, never the directory
+# name: /home/ec2-user/alpha-engine-data is nousergon/nousergon-data. A
+# missing helper or an unresolvable remote is logged and SKIPPED, never
+# failed. This step exists to help a retry succeed and must never turn a
+# retryable failure into a hard one. boot-pull.service runs as ec2-user,
+# whose per-uid cache this is, so no sudo is needed.
+_boot_pull_erase_credential() {
+    local repo="$1" helper url slug
+    helper="${AE_CRED_HELPER:-/usr/local/bin/git-credential-nousergon-app}"
+    if [ ! -x "$helper" ]; then
+        log "SKIP credential erase for $repo — $helper missing or not executable"
+        return 0
+    fi
+    url=$(git -C "$repo" remote get-url origin 2>/dev/null || echo "")
+    slug=$(printf '%s' "$url" | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git/?$##')
+    if [ -z "$url" ] || [ -z "$slug" ]; then
+        log "WARN could not resolve repo slug for $repo from its origin remote — skipping credential erase"
+        return 0
+    fi
+    if printf 'protocol=https\nhost=github.com\npath=%s\n\n' "$slug" \
+            | "$helper" erase >> "$LOG" 2>&1; then
+        log "OK   erased cached credential for $slug ($repo)"
+    else
+        log "WARN credential erase for $slug ($repo) failed — retry proceeds anyway"
+    fi
+    return 0
+}
+
 sync_repo_to_main() {
     local repo="$1"
     local rc=0
+    local attempt=1 max_attempts=3 out sig="" backoff
 
     # The fetch's status is captured SEPARATELY from the checkout/reset, and the
     # two are chained with `;` rather than `&&`, for a reason the group's single
@@ -120,7 +212,13 @@ sync_repo_to_main() {
     #   3  cd failed
     # flock's own `-w` timeout surfaces as 1, which is why 10 is used for the
     # fetch rather than 1 — the two must stay distinguishable.
-    flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c '
+    #
+    # The whole sync is wrapped in the bounded transient-remote retry
+    # (alpha-engine-config-I10950, see _BOOT_PULL_TRANSIENT_SIGNATURES above).
+    # Only rc=10 whose output names a transient signature goes round again.
+    while :; do
+        rc=0
+        out=$(flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c '
         cd "$1" || exit 3
         fetch_rc=0
         if ! git fetch origin main --prune; then
@@ -129,7 +227,30 @@ sync_repo_to_main() {
         fi
         git checkout -f main && git reset --hard origin/main || exit 2
         exit $fetch_rc
-    ' _ "$repo" >> "$LOG" 2>&1 || rc=$?
+    ' _ "$repo" 2>&1) || rc=$?
+        [ -n "$out" ] && printf '%s\n' "$out" >> "$LOG"
+
+        [ "$rc" -eq 10 ] || break
+        if ! sig=$(_boot_pull_transient_signature "$out"); then
+            sig=""
+            break
+        fi
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            log "FAIL $repo — attempt $attempt/$max_attempts exhausted retrying transient class '$sig'"
+            break
+        fi
+        # AE_BOOT_PULL_RETRY_BACKOFF_{1,2} exist so tests can drive this to 0s;
+        # production never sets them.
+        backoff="${AE_BOOT_PULL_RETRY_BACKOFF_1:-5}"
+        [ "$attempt" -gt 1 ] && backoff="${AE_BOOT_PULL_RETRY_BACKOFF_2:-10}"
+        log "RETRY $repo — attempt $attempt/$max_attempts failed matching transient class '$sig'; erasing cached credential and retrying in ${backoff}s"
+        _boot_pull_erase_credential "$repo"
+        sleep "$backoff"
+        attempt=$((attempt + 1))
+    done
+    if [ "$rc" -eq 0 ] && [ "$attempt" -gt 1 ]; then
+        log "OK   $repo — recovered on attempt $attempt/$max_attempts after transient '$sig'"
+    fi
 
     # A flock timeout keeps its established fail-loud semantics (config#1944): a
     # stuck git writer on this box is worth an alert on its own, independent of
