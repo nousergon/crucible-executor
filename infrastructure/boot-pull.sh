@@ -914,7 +914,18 @@ sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "" 
 # re-enable it right back onto trading via the reconcile loop above
 # (orphan-removal alone can't catch this: the unit is NOT absent from
 # $SYSTEMD_SRC, it's merely unwanted on THIS box).
-sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" "metron-intraday.service metron-intraday.timer" "systemd-unit-drift-check"
+#
+# daily-news.{service,timer} are excluded for the same reason (alpha-engine-
+# config-I11036). nousergon-data ships them for the DASHBOARD box
+# (deploy-daily-news-units.yml installs them there), but this pass installed
+# and `enable --now`-ed them here too. With `Persistent=true` on a 04:00 PT
+# calendar and a box that is stopped overnight, the timer fires a catch-up run
+# shortly after every weekday boot. Measured in the CloudTrail archive
+# 2026-09-29..10-02: the dashboard box wrote data/news_{aggregates,articles,
+# digest}_daily/ at ~11:21Z, then this box rewrote the same keys, latest.json
+# included, at ~12:36Z as alpha-engine-executor-role. That is a second
+# producer of a collection artifact, running on the trading box.
+sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" "metron-intraday.service metron-intraday.timer daily-news.service daily-news.timer" "systemd-unit-drift-check"
 
 # One-time (idempotent) self-heal for boxes that already had metron-intraday
 # installed+enabled from before the exclude above existed: the exclude only
@@ -942,19 +953,23 @@ sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd
 # The old condition was also always-true — `systemctl list-unit-files <name>`
 # exits 0 with "0 unit files listed" when nothing matches — so the NOTE printed
 # on every boot of every box regardless. Test the files.
-_metron_leftovers=()
-for _u in metron-intraday.timer metron-intraday.service; do
-    [ -f "/etc/systemd/system/$_u" ] && _metron_leftovers+=("$_u")
+#
+# daily-news.{timer,service} take the same path (alpha-engine-config-I11036):
+# excluding them above stops future installs, and this removes the copies the
+# sync pass already installed.
+_dashboard_only_leftovers=()
+for _u in metron-intraday.timer metron-intraday.service daily-news.timer daily-news.service; do
+    [ -f "/etc/systemd/system/$_u" ] && _dashboard_only_leftovers+=("$_u")
 done
-if [ ${#_metron_leftovers[@]} -gt 0 ]; then
-    log "NOTE metron-intraday leftover unit(s) on trading: ${_metron_leftovers[*]} — retiring (config#1768: moved to ae-dashboard)"
-    sudo systemctl disable --now "${_metron_leftovers[@]}" 2>> "$LOG" || true
-    for _u in "${_metron_leftovers[@]}"; do
-        sudo rm -f "/etc/systemd/system/$_u" && log "OK   systemd: retired $_u (decommissioned, moved to ae-dashboard)"
+if [ ${#_dashboard_only_leftovers[@]} -gt 0 ]; then
+    log "NOTE dashboard-box unit(s) left on trading: ${_dashboard_only_leftovers[*]} — retiring (config#1768 metron-intraday, alpha-engine-config-I11036 daily-news: both run on ae-dashboard)"
+    sudo systemctl disable --now "${_dashboard_only_leftovers[@]}" 2>> "$LOG" || true
+    for _u in "${_dashboard_only_leftovers[@]}"; do
+        sudo rm -f "/etc/systemd/system/$_u" && log "OK   systemd: retired $_u (runs on ae-dashboard, not trading)"
     done
     sudo systemctl daemon-reload
 fi
-unset _metron_leftovers _u
+unset _dashboard_only_leftovers _u
 
 # Config files are now in the alpha-engine-config private repo (pulled above).
 # Each module's config loader searches ~/alpha-engine-config/ first.
