@@ -14,6 +14,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import socket
+import time
+from collections.abc import Callable
 from datetime import datetime
 
 from ib_insync import IB, MarketOrder, Stock
@@ -37,6 +40,46 @@ ACCOUNT_SUMMARY_ATTEMPTS = 3
 Each retry reconnects first, which is what actually clears the condition:
 the stalled subscription is registered against this clientId on the
 gateway, so a fresh request on the same socket inherits the stall."""
+
+
+GATEWAY_READY_POLL_SECONDS = 5.0
+"""Seconds between two readiness probes while waiting for a cold gateway."""
+
+GATEWAY_CONNECT_TIMEOUT_SECONDS = 20.0
+"""One API handshake attempt. Same value the plain connect path uses."""
+
+IB_ERROR_PAPER_DISCLAIMER = 10141
+"""IB's "Paper trading disclaimer must first be accepted for API connection".
+
+IBC clicks the disclaimer away as part of a paper login, so seeing this code
+means the gateway is up and its login is still in progress. Measured on the
+2026-10-09 cold start: the API port opened about 71 s after StartInstances
+and this error arrived 0.5 s after the first accepted connect."""
+
+
+class GatewayNotReadyError(RuntimeError):
+    """IB Gateway did not become READY inside the wait budget.
+
+    Ready means two things, both required: the API port accepts a TCP
+    connect, and an API session completes its handshake on a gateway that
+    has logged in (past the paper-trading disclaimer, managing an account).
+    A listening port alone is not ready: on 2026-10-09 the port was open
+    while the login was still at the disclaimer.
+    """
+
+
+def gateway_port_listening(host: str, port: int, timeout_s: float = 2.0) -> bool:
+    """True when a TCP connect to ``host:port`` is accepted.
+
+    Only a refusal or a timeout reads as "not listening yet". Any other
+    socket error (an unresolvable host, say) is a configuration defect and
+    propagates.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except (ConnectionRefusedError, TimeoutError):
+        return False
 
 
 def fill_commission_usd(fills) -> float | None:
@@ -74,8 +117,35 @@ def fill_commission_usd(fills) -> float | None:
     return total if seen else None
 
 
+_DISCLAIMER_STATE = (
+    f"paper-trading disclaimer not accepted yet (IB error {IB_ERROR_PAPER_DISCLAIMER}): "
+    "the gateway's login is still completing"
+)
+
+
+def _saw_disclaimer(errors: list[tuple[int, str]]) -> bool:
+    return any(code == IB_ERROR_PAPER_DISCLAIMER for code, _msg in errors)
+
+
 class IBKRClient:
-    def __init__(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 1, reconnect_attempts: int = 3):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 4002,
+        client_id: int = 1,
+        reconnect_attempts: int = 3,
+        ready_timeout_s: float | None = None,
+    ):
+        """Connect to IB Gateway.
+
+        ``ready_timeout_s`` (opt-in): first wait up to this many seconds for
+        the gateway to be READY (API port open and logged in, see
+        :class:`GatewayNotReadyError`), probing every
+        :data:`GATEWAY_READY_POLL_SECONDS`. For a job that can land on a box
+        that was just cold-started. ``None`` keeps the plain connect with its
+        short exponential-backoff retry, for callers that run on a box whose
+        gateway is already up.
+        """
         self.ib = IB()
         self._host = host
         self._port = port
@@ -86,7 +156,10 @@ class IBKRClient:
         # re-issue the request rather than trust a stale prime.
         self._account_summary_primed = False
         logger.info(f"Connecting to IB Gateway at {host}:{port} (clientId={client_id})")
-        self._connect()
+        if ready_timeout_s is None:
+            self._connect()
+        else:
+            self._connect_when_ready(ready_timeout_s)
         logger.info("Connected to IB Gateway")
 
     def ensure_connected(self) -> None:
@@ -125,6 +198,99 @@ class IBKRClient:
         _attempt()
         # A new socket means a new (empty) wrapper cache on the gateway side.
         self._account_summary_primed = False
+
+    def _connect_when_ready(
+        self,
+        budget_s: float,
+        *,
+        probe: Callable[[str, int], bool] = gateway_port_listening,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+        poll_s: float = GATEWAY_READY_POLL_SECONDS,
+    ) -> None:
+        """Wait, bounded by ``budget_s``, for a READY gateway, then stay connected.
+
+        Each round probes the API port and, once it listens, tries one API
+        session. A refused or timed-out handshake, IB error 10141 (paper
+        disclaimer not yet accepted) or a session that manages no account
+        means the gateway is still logging in: the session is dropped and the
+        round repeats after ``poll_s``. Never sleeps past the budget. When the
+        budget runs out, raises :class:`GatewayNotReadyError` naming the last
+        state seen. Any other exception is a defect and propagates as itself.
+        """
+        start = monotonic()
+        errors: list[tuple[int, str]] = []
+
+        def _on_error(_req_id, code, message, *_rest) -> None:
+            errors.append((code, message))
+
+        error_event = getattr(self.ib, "errorEvent", None)
+        if error_event is not None:
+            error_event.connect(_on_error)
+        attempts = 0
+        try:
+            while True:
+                attempts += 1
+                errors.clear()
+                not_ready = self._readiness_attempt(probe, errors)
+                elapsed = monotonic() - start
+                if not_ready is None:
+                    logger.info(
+                        "IB Gateway ready at %s:%s after %.0fs (%d probe(s))",
+                        self._host, self._port, elapsed, attempts,
+                    )
+                    break
+                remaining = budget_s - elapsed
+                if remaining <= 0:
+                    raise GatewayNotReadyError(
+                        f"gateway_not_ready: IB Gateway at {self._host}:{self._port} was not ready "
+                        f"after {elapsed:.0f}s ({attempts} probe(s), budget {budget_s:.0f}s). "
+                        f"Last state: {not_ready}. Ready means the API port is open AND the "
+                        "gateway has logged in past the paper-trading disclaimer; a cold start "
+                        "that never gets there needs the gateway (ibgateway.service / IBC) "
+                        "looked at on the box."
+                    )
+                logger.info(
+                    "IB Gateway not ready yet (%s) — %.0fs of %.0fs budget used, re-probing",
+                    not_ready, elapsed, budget_s,
+                )
+                sleep(min(poll_s, remaining))
+        finally:
+            if error_event is not None:
+                error_event.disconnect(_on_error)
+        self._account_summary_primed = False
+
+    def _readiness_attempt(
+        self, probe: Callable[[str, int], bool], errors: list[tuple[int, str]]
+    ) -> str | None:
+        """One readiness round. None when connected to a logged-in gateway,
+        else why not (the session, if any, is already dropped)."""
+        if not probe(self._host, self._port):
+            return f"API port {self._port} not listening yet (gateway still starting)"
+        self.ib.disconnect()  # clean slate, so the clientId is free
+        try:
+            self.ib.connect(
+                self._host, self._port, clientId=self._client_id,
+                timeout=GATEWAY_CONNECT_TIMEOUT_SECONDS,
+            )
+        except (ConnectionError, TimeoutError) as exc:
+            self.ib.disconnect()
+            if _saw_disclaimer(errors):
+                return _DISCLAIMER_STATE
+            return (
+                f"API handshake refused or timed out ({type(exc).__name__}): "
+                "the gateway is still logging in"
+            )
+        if _saw_disclaimer(errors):
+            self.ib.disconnect()
+            return _DISCLAIMER_STATE
+        if not self.ib.isConnected():
+            self.ib.disconnect()
+            return "connect returned but isConnected() is False"
+        if not list(self.ib.managedAccounts() or []):
+            self.ib.disconnect()
+            return "API session open but it manages no account (gateway not logged in)"
+        return None
 
     # ── Account ───────────────────────────────────────────────────────────────
 

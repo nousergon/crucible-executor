@@ -285,3 +285,193 @@ class TestAccountSummaryStallGuard:
         client._account_summary_primed = True
         client._connect()
         assert client._account_summary_primed is False
+
+
+class _ColdGateway:
+    """A stand-in for ``ib_insync.IB`` that plays a cold-started gateway.
+
+    ``script`` is one entry per API connect attempt: ``"refused"``,
+    ``"disclaimer"`` (IB error 10141, then the handshake times out, exactly
+    as on 2026-10-09), ``"timeout"``, ``"no_account"`` or ``"ready"``.
+    """
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+        self._connected = False
+        self._accounts = []
+        self._handlers = []
+        self.errorEvent = SimpleNamespace(
+            connect=self._handlers.append, disconnect=self._handlers.remove,
+        )
+
+    def connect(self, host, port, clientId, timeout):  # noqa: N803 - SDK spelling
+        self.connect_calls += 1
+        step = self.script.pop(0)
+        if step == "refused":
+            raise ConnectionRefusedError(111, f"Connect call failed ('{host}', {port})")
+        if step == "disclaimer":
+            for handler in self._handlers:
+                handler(-1, 10141, "Paper trading disclaimer must first be accepted for API connection.", None)
+            raise TimeoutError()
+        if step == "timeout":
+            raise TimeoutError()
+        self._connected = True
+        self._accounts = [] if step == "no_account" else ["DU1234567"]
+
+    def disconnect(self):
+        self.disconnect_calls += 1
+        self._connected = False
+        self._accounts = []
+
+    def isConnected(self):  # noqa: N802 - SDK spelling
+        return self._connected
+
+    def managedAccounts(self):  # noqa: N802 - SDK spelling
+        return list(self._accounts)
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _ready_client(gateway, *, port_open):
+    """An IBKRClient wired to ``gateway`` without running the constructor."""
+    client = IBKRClient.__new__(IBKRClient)
+    client.ib = gateway
+    client._host, client._port, client._client_id = "127.0.0.1", 4002, 1
+    client._reconnect_attempts = 3
+    client._account_summary_primed = True
+    probes = list(port_open)
+    return client, (lambda _h, _p: probes.pop(0) if len(probes) > 1 else probes[0])
+
+
+class TestGatewayReadinessWait:
+    """alpha-engine-config-I12220: a capture on a cold-started box waits for the
+    gateway to be READY (port open AND logged in past the paper disclaimer)
+    instead of failing inside a ~30 s connect retry."""
+
+    def test_cold_start_waits_through_closed_port_and_disclaimer_then_succeeds(self):
+        """The 2026-10-09 sequence: port refused, then open but at the disclaimer,
+        then logged in. The wait rides it out and leaves a live session."""
+        gateway = _ColdGateway(["disclaimer", "disclaimer", "ready"])
+        client, probe = _ready_client(gateway, port_open=[False, False, True])
+        clock = _Clock()
+
+        client._connect_when_ready(420, probe=probe, sleep=clock.sleep, monotonic=clock.monotonic)
+
+        assert gateway.connect_calls == 3  # no API connect while the port was closed
+        assert gateway.isConnected()
+        assert gateway.managedAccounts() == ["DU1234567"]
+        assert clock.sleeps == [5.0, 5.0, 5.0, 5.0]
+        assert client._account_summary_primed is False  # a new socket is never primed
+        assert gateway._handlers == []  # the error listener is detached
+
+    def test_account_less_session_is_not_ready(self):
+        gateway = _ColdGateway(["no_account", "ready"])
+        client, probe = _ready_client(gateway, port_open=[True])
+        clock = _Clock()
+
+        client._connect_when_ready(420, probe=probe, sleep=clock.sleep, monotonic=clock.monotonic)
+
+        assert gateway.connect_calls == 2
+        assert gateway.isConnected()
+
+    def test_warm_gateway_connects_on_the_first_probe_with_no_sleep(self):
+        gateway = _ColdGateway(["ready"])
+        client, probe = _ready_client(gateway, port_open=[True])
+        clock = _Clock()
+
+        client._connect_when_ready(420, probe=probe, sleep=clock.sleep, monotonic=clock.monotonic)
+
+        assert gateway.connect_calls == 1
+        assert clock.sleeps == []
+
+    def test_never_ready_fails_with_the_readiness_reason(self):
+        """Stuck at the disclaimer for the whole budget: GatewayNotReadyError,
+        naming the disclaimer, the budget and the attempt count. No sleep runs
+        past the budget."""
+        from executor.ibkr import GatewayNotReadyError
+
+        gateway = _ColdGateway(["disclaimer"] * 100)
+        client, probe = _ready_client(gateway, port_open=[True])
+        clock = _Clock()
+
+        with pytest.raises(GatewayNotReadyError) as exc:
+            client._connect_when_ready(12, probe=probe, sleep=clock.sleep, monotonic=clock.monotonic)
+
+        message = str(exc.value)
+        assert message.startswith("gateway_not_ready:")
+        assert "10141" in message and "disclaimer" in message
+        assert "budget 12s" in message
+        assert clock.sleeps == [5.0, 5.0, 2.0]
+        assert clock.now == 12.0
+        assert not gateway.isConnected()
+        assert gateway._handlers == []
+
+    def test_port_never_opens_fails_naming_the_port(self):
+        from executor.ibkr import GatewayNotReadyError
+
+        gateway = _ColdGateway([])
+        client, probe = _ready_client(gateway, port_open=[False])
+        clock = _Clock()
+
+        with pytest.raises(GatewayNotReadyError, match="API port 4002 not listening"):
+            client._connect_when_ready(30, probe=probe, sleep=clock.sleep, monotonic=clock.monotonic)
+
+        assert gateway.connect_calls == 0
+
+    def test_a_defect_propagates_as_itself(self):
+        gateway = _ColdGateway([])
+        gateway.connect = MagicMock(side_effect=ValueError("bad clientId"))
+        client, probe = _ready_client(gateway, port_open=[True])
+
+        with pytest.raises(ValueError, match="bad clientId"):
+            client._connect_when_ready(420, probe=probe, sleep=lambda _s: None, monotonic=lambda: 0.0)
+
+    def test_constructor_routes_through_the_wait_only_when_asked(self, monkeypatch):
+        import executor.ibkr as ibkr_mod
+
+        calls = []
+        monkeypatch.setattr(ibkr_mod, "IB", MagicMock)
+        monkeypatch.setattr(IBKRClient, "_connect", lambda self: calls.append("plain"))
+        monkeypatch.setattr(
+            IBKRClient, "_connect_when_ready", lambda self, budget: calls.append(("ready", budget)),
+        )
+
+        IBKRClient()
+        IBKRClient(ready_timeout_s=420)
+
+        assert calls == ["plain", ("ready", 420)]
+
+
+class TestGatewayPortListening:
+    def test_refused_port_is_not_listening(self):
+        import socket
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            free_port = s.getsockname()[1]
+        from executor.ibkr import gateway_port_listening
+
+        assert gateway_port_listening("127.0.0.1", free_port) is False
+
+    def test_listening_port_is_listening(self):
+        import socket
+
+        from executor.ibkr import gateway_port_listening
+
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            assert gateway_port_listening("127.0.0.1", server.getsockname()[1]) is True

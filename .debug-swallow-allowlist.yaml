@@ -65,7 +65,7 @@ entries:
 
   # ── Connection teardown (ibkr.py, price_monitor.py, polygon_price_monitor.py, daemon.py) ──
   - path: executor/ibkr.py
-    line: 334
+    line: 500
     reason: >-
       cancelMktData teardown failure. No recording surface -- connection
       teardown must never block the caller.

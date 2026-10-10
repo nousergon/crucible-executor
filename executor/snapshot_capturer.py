@@ -20,6 +20,12 @@ SF orchestration: this script runs as the `CaptureSnapshot` step in
 `StopTradingInstance` step (which kills IB) only fires after
 EODReconcile completes.
 
+Since 2026-10-10 (alpha-engine-config-I12220) the capture first waits, bounded
+by ``GATEWAY_READY_TIMEOUT_S``, for IB Gateway to be ready, because both
+pipelines that run it (``ne-postclose-trading-pipeline``'s CaptureSnapshot and
+``ne-postclose-reconcile-pipeline``'s missing-snapshot self-heal) can reach it
+seconds after cold-starting the box.
+
 S3 path: s3://alpha-engine-research/trades/snapshots/{run_date}.json
 
 Schema (additive-only per CLAUDE.md S3 contract):
@@ -66,6 +72,20 @@ setup_logging(
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
+
+GATEWAY_READY_TIMEOUT_S = 420.0
+"""How long the capture waits for IB Gateway to be READY before connecting.
+
+The post-close pipelines start a stopped box and reach this step about 25 s
+after ``StartInstances``. On 2026-10-09 that was too early: the API port
+opened ~71 s after the start (22:32:08Z) and the login was still at the
+paper-trading disclaimer, so both attempts of the old ~30 s connect retry
+failed and the day's snapshot was never written. Measured bounds on a cold
+login: not done at 82 s of uptime (2026-10-08, crucible-trader-PR35), done by
+280 s after the start (the 2026-10-10 01:27:58Z manual start, captured at
+01:32:38Z). 420 s is 1.5x that upper bound. A warm gateway answers the first
+probe, so a box that is already up pays nothing. The SSM ``executionTimeout``
+on both CaptureSnapshot states is sized above this plus the capture itself."""
 
 
 def _snapshot_key(run_date: str) -> str:
@@ -176,7 +196,12 @@ def _sweep_prior_sessions(config: dict, run_date: str) -> None:
         )
 
 
-def run(run_date: str | None = None, *, force: bool = False) -> None:
+def run(
+    run_date: str | None = None,
+    *,
+    force: bool = False,
+    ready_timeout_s: float = GATEWAY_READY_TIMEOUT_S,
+) -> None:
     """Capture live IB state and write to S3 keyed by run_date.
 
     Default `run_date` resolves via `now_dual().trading_day` (NYSE-aware,
@@ -237,10 +262,14 @@ def run(run_date: str | None = None, *, force: bool = False) -> None:
     bucket = config["trades_bucket"]
 
     # ── Connect to IB Gateway ─────────────────────────────────────────────
+    # Wait for READINESS first (port open AND logged in), bounded: this step
+    # runs on a box the pipeline may have cold-started seconds ago. A gateway
+    # that never gets there raises GatewayNotReadyError naming what it saw.
     ibkr = IBKRClient(
         host=config["ibkr_host"],
         port=config["ibkr_port"],
         client_id=config["ibkr_client_id"],
+        ready_timeout_s=ready_timeout_s,
     )
 
     try:
@@ -350,5 +379,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Replace an existing snapshot for the date (default: first capture is kept).",
     )
+    parser.add_argument(
+        "--ready-timeout-s",
+        type=float,
+        default=GATEWAY_READY_TIMEOUT_S,
+        help=(
+            "Seconds to wait for IB Gateway to be ready (API port open and logged in) "
+            f"before giving up (default {GATEWAY_READY_TIMEOUT_S:.0f})."
+        ),
+    )
     args = parser.parse_args()
-    run(run_date=args.date, force=args.force)
+    run(run_date=args.date, force=args.force, ready_timeout_s=args.ready_timeout_s)
