@@ -468,3 +468,59 @@ class TestWriteOnce:
         )
         with pytest.raises(ClientError):
             self._run(s3)
+
+
+# ── Gateway readiness on a cold-started box (alpha-engine-config-I12220) ─────
+
+
+class TestGatewayReadiness:
+    def _run(self, s3, mock_ib_cls, **kwargs):
+        with patch("executor.snapshot_capturer.now_dual") as mock_now_dual, \
+             patch("executor.snapshot_capturer.load_config") as mock_cfg, \
+             patch("executor.snapshot_capturer.IBKRClient", mock_ib_cls), \
+             patch("boto3.client", return_value=s3):
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-10-09", calendar_date="2026-10-09"
+            )
+            mock_cfg.return_value = _mock_config()
+            with _no_fill_reconciliation():
+                run(run_date="2026-10-09", **kwargs)
+
+    def test_the_capture_waits_for_a_ready_gateway_with_the_cold_start_budget(self):
+        from executor.snapshot_capturer import GATEWAY_READY_TIMEOUT_S
+
+        ib = MagicMock()
+        ib.get_account_snapshot.return_value = {"net_liquidation": 1.0}
+        ib.get_positions.return_value = {}
+        ib.get_accrued_dividends_by_symbol.return_value = {}
+        mock_ib_cls = MagicMock(return_value=ib)
+
+        self._run(MagicMock(), mock_ib_cls)
+
+        assert mock_ib_cls.call_args.kwargs["ready_timeout_s"] == GATEWAY_READY_TIMEOUT_S
+        # sized for a cold login (measured done by 280 s), never the old ~30 s
+        assert GATEWAY_READY_TIMEOUT_S >= 280
+
+    def test_an_explicit_budget_is_passed_through(self):
+        ib = MagicMock()
+        ib.get_account_snapshot.return_value = {}
+        ib.get_positions.return_value = {}
+        ib.get_accrued_dividends_by_symbol.return_value = {}
+        mock_ib_cls = MagicMock(return_value=ib)
+
+        self._run(MagicMock(), mock_ib_cls, ready_timeout_s=60)
+
+        assert mock_ib_cls.call_args.kwargs["ready_timeout_s"] == 60
+
+    def test_a_gateway_that_never_gets_ready_fails_loud_and_writes_nothing(self):
+        from executor.ibkr import GatewayNotReadyError
+
+        s3 = MagicMock()
+        mock_ib_cls = MagicMock(side_effect=GatewayNotReadyError(
+            "gateway_not_ready: ... Last state: paper-trading disclaimer not accepted yet (IB error 10141)"
+        ))
+
+        with pytest.raises(GatewayNotReadyError, match="10141"):
+            self._run(s3, mock_ib_cls)
+
+        s3.put_object.assert_not_called()
