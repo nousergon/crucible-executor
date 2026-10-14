@@ -1694,11 +1694,13 @@ def _write_stops_and_finalize(
             blocked_lines += f"  {b['ticker']}: {b.get('block_reason', b.get('reason', 'unknown'))}\n"
 
     try:
+        from executor.alert_rationale import order_book_rationale
         from executor.notifier import send_daemon_status
         send_daemon_status(
             f"\u2705 *Order book written*\n"
             f"Date: {run_date}\n"
             f"Entries: {n_entries} | Urgent exits: {n_urgent} | Stops: {n_stops}"
+            f"{order_book_rationale(ob)}"
             f"{blocked_lines}"
         )
     except Exception:
