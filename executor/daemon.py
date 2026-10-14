@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from nousergon_lib.logging import guard_entrypoint, setup_logging
 
+from executor.alert_rationale import order_book_rationale
 from executor.correctness_verdict import (
     evaluate_correctness_verdict,
     operator_message,
@@ -1011,6 +1012,7 @@ def run_daemon(dry_run: bool = False) -> None:
         f"Urgent exits: {n_urgent}\n"
         f"Entries: {len(order_book.pending_entries())}\n"
         f"Stops: {len(order_book.active_stops())}"
+        f"{order_book_rationale(order_book)}"
     )
 
     trades_executed = 0

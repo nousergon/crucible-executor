@@ -28,7 +28,7 @@ entries:
   # site's underlying condition is already visible via other logging or an
   # immediately-following raise.
   - path: executor/main.py
-    line: 625
+    line: 635
     reason: >-
       Stale-signals Telegram notification transport failure. No recording
       surface -- Telegram-transport carve-out (a failed notification must
@@ -37,7 +37,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/main.py
-    line: 1634
+    line: 1706
     reason: >-
       Order-book Telegram notification transport failure. No recording
       surface -- Telegram-transport carve-out; the order book is already
@@ -46,7 +46,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/main.py
-    line: 1745
+    line: 1817
     reason: >-
       Upstream-failure Telegram notification transport failure. No
       recording surface -- secondary to the RuntimeError raised
@@ -55,7 +55,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/main.py
-    line: 1789
+    line: 1861
     reason: >-
       ArcticDB-freshness Telegram notification transport failure. No
       recording surface -- secondary to the RuntimeError raised
@@ -97,7 +97,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/daemon.py
-    line: 184
+    line: 185
     reason: >-
       Price-monitor unsubscribe teardown failure during cleanup. No
       recording surface -- teardown must never block shutdown.
@@ -105,7 +105,7 @@ entries:
     tracking: alpha-engine-config-I10031
 
   - path: executor/daemon.py
-    line: 193
+    line: 194
     reason: >-
       IBKR disconnect teardown failure during cleanup. No recording
       surface -- teardown must never block shutdown.
