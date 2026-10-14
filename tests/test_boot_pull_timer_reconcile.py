@@ -169,7 +169,8 @@ def test_nousergon_data_systemd_sync_call_site_exists():
     src = _source()
     assert (
         'sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" '
-        '"metron-intraday.service metron-intraday.timer" "systemd-unit-drift-check"' in src
+        '"metron-intraday.service metron-intraday.timer daily-news.service daily-news.timer" '
+        '"systemd-unit-drift-check"' in src
     ), (
         "boot-pull.sh must sync nousergon-data's infrastructure/systemd/ "
         "(systemd-unit-drift-check orphan prefix) while excluding "
@@ -235,3 +236,23 @@ def test_metron_intraday_cleanup_removes_the_unit_files_not_just_disables():
         "when nothing matches, so the old guard was always true and the NOTE "
         "printed on every boot. Test for the FILES."
     )
+
+
+# ── daily-news never runs on trading (alpha-engine-config-I11036) ────────────
+
+
+def test_daily_news_excluded_from_trading_sync():
+    """daily-news.{service,timer} ship in nousergon-data's shared systemd dir
+    for the DASHBOARD box. Without the exclude, this box's sync pass installed
+    and enabled them, and the Persistent=true timer re-ran the news collector
+    after every weekday boot as alpha-engine-executor-role, overwriting the
+    dashboard box's data/news_*_daily/ output (CloudTrail, 2026-09-29..10-02)."""
+    src = _source()
+    assert "daily-news.service daily-news.timer" in src
+
+
+def test_daily_news_leftovers_are_retired_not_just_excluded():
+    """The exclude stops future installs only; units already in
+    /etc/systemd/system/ must be disabled AND removed, like metron-intraday."""
+    src = _source()
+    assert "for _u in metron-intraday.timer metron-intraday.service daily-news.timer daily-news.service; do" in src
