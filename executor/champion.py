@@ -264,6 +264,25 @@ DEFAULT_NOOP_CHAMPION_ARMS = frozenset(NOOP_CHAMPION_ARMS_SERVED)
 def load_champion_pointer(bucket: str, s3_client=None) -> dict:
     """Read ``s3://{bucket}/config/producer_champion.json``.
 
+    Thin wrapper over :func:`load_champion_pointer_versioned` for callers
+    that need the pointer only. Same semantics, same errors.
+    """
+    pointer, _version_id = load_champion_pointer_versioned(bucket, s3_client=s3_client)
+    return pointer
+
+
+def load_champion_pointer_versioned(bucket: str, s3_client=None) -> tuple[dict, str | None]:
+    """Read ``s3://{bucket}/config/producer_champion.json`` and its S3 VersionId.
+
+    Returns ``(pointer, version_id)``. ``version_id`` is the ``VersionId``
+    of the exact object this call read (alpha-engine-config-I11089), so the
+    order-book summary can name WHICH pointer version a session traded on
+    rather than leaving it to be reconstructed from the version history by
+    plan-time timestamp. It is ``None`` on the 404 default (no object was
+    read) and when the response carries no ``VersionId`` (an unversioned
+    bucket); S3 returns the literal string ``"null"`` for an object written
+    while versioning was suspended, and that is passed through unchanged.
+
     Semantics:
       * S3 404 / NoSuchKey → ``_DEFAULT_POINTER`` (agentic, pre-bootstrap).
         This is the one legitimate "pointer doesn't exist yet" case.
@@ -288,7 +307,7 @@ def load_champion_pointer(bucket: str, s3_client=None) -> dict:
                 bucket,
                 CHAMPION_POINTER_KEY,
             )
-            return dict(_DEFAULT_POINTER)
+            return dict(_DEFAULT_POINTER), None
         raise ChampionPointerError(f"Failed to read champion pointer s3://{bucket}/{CHAMPION_POINTER_KEY}: {e}") from e
 
     try:
@@ -311,7 +330,7 @@ def load_champion_pointer(bucket: str, s3_client=None) -> dict:
             "Refusing to start a trading day on an ambiguous champion."
         )
 
-    return pointer
+    return pointer, obj.get("VersionId")
 
 
 def assert_producer_champion_coherence(

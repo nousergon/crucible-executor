@@ -143,7 +143,7 @@ class TestSimulateModeSkipsArcticDBFilter:
         # Use an injected signals_override so we don't need real S3.
         # Mock the filter to a passthrough so we just verify it was called.
         # Also passthrough the champion adapter (config#2366) — both the
-        # pointer read (_read_signals calls load_champion_pointer directly
+        # pointer read (_read_signals calls load_champion_pointer_versioned directly
         # to decide whether to pay for a sector-map load) and the adapter
         # itself are real S3 round-trips unrelated to what this test pins,
         # and this suite deliberately avoids live AWS calls.
@@ -151,8 +151,11 @@ class TestSimulateModeSkipsArcticDBFilter:
             "executor.signal_reader.filter_buy_candidates_to_universe",
             side_effect=lambda s, b: s,  # passthrough
         ) as mock_filter, patch(
-            "executor.champion.load_champion_pointer",
-            return_value={"schema_version": 1, "champion": "agentic", "promotion_source": "test"},
+            "executor.champion.load_champion_pointer_versioned",
+            return_value=(
+                {"schema_version": 1, "champion": "agentic", "promotion_source": "test"},
+                None,
+            ),
         ), patch(
             "executor.champion.apply_champion_selection",
             side_effect=lambda signals_raw, preds, **kw: (signals_raw, preds),

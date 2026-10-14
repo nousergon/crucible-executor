@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -487,11 +488,13 @@ def _read_signals(
             ARMS_REQUIRING_SECTOR_MAP,
             apply_champion_selection,
             assert_producer_champion_coherence,
-            load_champion_pointer,
+            load_champion_pointer_versioned,
             merge_champion_predictions,
         )
 
-        _champion_pointer = load_champion_pointer(signals_bucket)
+        _champion_pointer, _champion_pointer_version = load_champion_pointer_versioned(
+            signals_bucket
+        )
         # Coherence guard (config#5713): refuse to start a trading day when
         # the signals producer's buy_candidates is empty BY CONTRACT and the
         # resolved champion arm is a no-op passthrough (agentic) — that
@@ -522,6 +525,13 @@ def _read_signals(
             sector_map=sector_map,
             pointer=_champion_pointer,
         )
+        # Strategy identity (alpha-engine-config-I11089): carry the S3
+        # VersionId of the pointer object this run actually read, so the
+        # order-book summary names the pointer version the session traded on.
+        # Stamped on EVERY live run, including the agentic passthrough (which
+        # stamps no ``champion``) — the version is a fact about the read, not
+        # about the arm. A new dict, so the caller's object is not mutated.
+        signals_raw = {**signals_raw, "champion_pointer_version": _champion_pointer_version}
 
     # Defense-in-depth universe filter — drop buy_candidates whose tickers
     # aren't in the ArcticDB universe library. Research's population_selector
@@ -846,6 +856,44 @@ def _plan_exits_and_reduces(
     return plan.orders
 
 
+def _config_sha256(config: dict | None) -> str | None:
+    """SHA-256 of the EFFECTIVE run config, canonical JSON (I11089).
+
+    Hashes the dict the run actually planned with — ``risk.yaml`` after the
+    S3 ``executor_params`` merge in :func:`run` — not the file on disk, so a
+    tuned-parameter change moves the hash even when ``risk.yaml`` did not.
+    Canonical form: ``json.dumps(config, sort_keys=True,
+    separators=(",", ":"), default=str)``, UTF-8. ``None`` when there is no
+    config or it cannot be serialized (e.g. mixed-type keys) — logged, never
+    raised: the summary write is best-effort (see its swallow below).
+    """
+    if config is None:
+        return None
+    try:
+        canonical = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError) as exc:
+        logger.warning("order-book summary: config_sha256 not computable (%s)", exc)
+        return None
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _executor_sha() -> str | None:
+    """The executor checkout's HEAD, via the preflight's own reader (I11089).
+
+    The same ``git rev-parse HEAD`` that ``ExecutorPreflight.check_deploy_drift``
+    already validated against the pipeline-pinned SHA earlier in this run.
+    ``None`` (logged) if it cannot be read — the preflight hard-fails on that
+    first in a live run, so ``None`` here means an off-pipeline invocation.
+    """
+    from executor.preflight import _REPO_ROOT, _read_deployed_git_sha
+
+    try:
+        return _read_deployed_git_sha(_REPO_ROOT)
+    except RuntimeError as exc:
+        logger.warning("order-book summary: executor_sha not readable (%s)", exc)
+        return None
+
+
 def _write_order_book_summary(
     ob: OrderBook,
     blocked_entries: list[dict] | None,
@@ -854,6 +902,9 @@ def _write_order_book_summary(
     champion: str | None = None,
     promotion_source: str | None = None,
     risk_flags_off: list[str] | None = None,
+    executor_sha: str | None = None,
+    config_sha256: str | None = None,
+    champion_pointer_version: str | None = None,
 ) -> None:
     """Write a public-safe order book summary to S3 for the dashboard.
 
@@ -876,6 +927,19 @@ def _write_order_book_summary(
     never confused (principle 7: a component emitting nothing is
     unobserved, not healthy). ``None`` only when the caller couldn't
     compute it (defensive) — never silently omitted.
+
+    Strategy identity (alpha-engine-config-I11089) — additive, always
+    written, ``None`` when unknown, so a reader can tell "not recorded" from
+    "absent in an older summary" by key presence:
+
+    * ``executor_sha`` — the executor checkout's git HEAD (:func:`_executor_sha`).
+    * ``config_sha256`` — hash of the effective run config (:func:`_config_sha256`).
+    * ``champion_pointer_version`` — S3 ``VersionId`` of the
+      ``config/producer_champion.json`` object this run read
+      (``executor.champion.load_champion_pointer_versioned``).
+
+    Together with ``champion``/``promotion_source`` these name the code,
+    the configuration and the arm-selection record a session traded on.
     """
     import boto3
 
@@ -883,6 +947,9 @@ def _write_order_book_summary(
         "date": run_date,
         "champion": champion,
         "promotion_source": promotion_source,
+        "executor_sha": executor_sha,
+        "config_sha256": config_sha256,
+        "champion_pointer_version": champion_pointer_version,
         "risk_flags_off": risk_flags_off if risk_flags_off is not None else [],
         "entries_approved": [
             {"ticker": e["ticker"]} for e in ob.pending_entries()
@@ -1588,6 +1655,9 @@ def _write_stops_and_finalize(
             champion=(signals_raw or {}).get("champion"),
             promotion_source=(signals_raw or {}).get("promotion_source"),
             risk_flags_off=off_flags,
+            executor_sha=_executor_sha(),
+            config_sha256=_config_sha256(config),
+            champion_pointer_version=(signals_raw or {}).get("champion_pointer_version"),
         )
 
     # Consecutive zero-entries floor alarm (config#5713) — general-case
