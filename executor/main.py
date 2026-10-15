@@ -60,6 +60,7 @@ from executor.strategies.exit_manager import (
 from executor.trade_logger import (
     backup_to_s3,
     get_entry_dates,
+    get_hard_risk_exits_since,
     init_db,
     log_risk_event,
     log_shadow_book_block,
@@ -854,6 +855,32 @@ def _plan_exits_and_reduces(
             ob.add_urgent_exit(entry)
 
     return plan.orders
+
+
+def _reentry_lockouts(conn, run_date: str, config: dict) -> dict[str, dict]:
+    """Names locked out of re-entry after a recent hard-risk EXIT.
+
+    Precedence (highest first): hard-risk overrides (loss floor, catastrophic
+    gap stop, drawdown forced exit) > eligibility gates (research EXIT,
+    gbm veto, negative alpha) > optimizer rebalance > entry timing. A name the
+    risk layer cut stays out for ``hard_risk_reentry_lockout_days`` sessions,
+    counting the exit session, so the optimizer cannot buy it back the next
+    morning on the same alpha that held it into the loss. ``0`` or ``None``
+    disables the lockout. Returns ``{ticker: {"date", "exit_reason"}}``.
+    """
+    days = config.get("hard_risk_reentry_lockout_days", 5)
+    if conn is None or not days or int(days) <= 0:
+        return {}
+    from krepis.trading_calendar import is_trading_day, previous_trading_day
+
+    start = date.fromisoformat(run_date)
+    while not is_trading_day(start):
+        start = previous_trading_day(start)
+    # Window of ``days`` sessions ending at the session before run_date: an
+    # exit on day D blocks D+1 .. D+days.
+    for _ in range(int(days)):
+        start = previous_trading_day(start)
+    return get_hard_risk_exits_since(conn, start.isoformat())
 
 
 def _config_sha256(config: dict | None) -> str | None:
@@ -2692,6 +2719,16 @@ def run(
             )
         )
         if run_optimizer_now:
+            _lockouts = _reentry_lockouts(conn, run_date, config)
+            if _lockouts:
+                logger.info(
+                    "Re-entry lockout after hard-risk exit (pinned to zero "
+                    "weight): %s",
+                    ", ".join(
+                        f"{t} ({v['exit_reason']} {v['date']})"
+                        for t, v in sorted(_lockouts.items())
+                    ),
+                )
             try:
                 from executor.optimizer_shadow import run_shadow_optimizer
                 shadow_log = run_shadow_optimizer(
@@ -2717,6 +2754,7 @@ def run(
                         u["ticker"] for u in ob.pending_urgent_exits()
                         if u.get("signal") == "EXIT" and u.get("ticker")
                     },
+                    reentry_lockout_tickers=set(_lockouts),
                 )
             except Exception as _shadow_err:
                 logger.warning(

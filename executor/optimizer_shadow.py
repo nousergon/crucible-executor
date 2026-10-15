@@ -158,6 +158,7 @@ def run_shadow_optimizer(
     s3_client=None,
     price_histories_requested: set[str] | None = None,
     hard_exit_tickers: set[str] | None = None,
+    reentry_lockout_tickers: set[str] | None = None,
 ) -> dict | None:
     """
     Run the optimizer in shadow mode and write the result to S3.
@@ -179,6 +180,7 @@ def run_shadow_optimizer(
             signals_bucket=signals_bucket,
             price_histories_requested=price_histories_requested,
             hard_exit_tickers=hard_exit_tickers,
+            reentry_lockout_tickers=reentry_lockout_tickers,
         )
         # L4515 turnover tripwire: band-check the executed turnover (daily +
         # rolling) BEFORE the artifact write so the verdict rides the daily
@@ -344,6 +346,7 @@ def _build_and_solve(
     signals_bucket: str | None = None,
     price_histories_requested: set[str] | None = None,
     hard_exit_tickers: set[str] | None = None,
+    reentry_lockout_tickers: set[str] | None = None,
 ) -> dict:
     optimizer_cfg = {
         **OPTIMIZER_CONFIG_DEFAULTS,
@@ -449,6 +452,7 @@ def _build_and_solve(
         spy_idx,
         cash_idx,
         hard_exit_tickers=hard_exit_tickers,
+        reentry_lockout_tickers=reentry_lockout_tickers,
     )
     # Per-name ADV$ from the scanner tradeability artifact (crucible-research#343)
     # drives the participation-aware √-impact cost term + max-%-ADV constraint
@@ -1257,6 +1261,7 @@ def _build_eligibility(
     spy_idx: int,
     cash_idx: int,
     hard_exit_tickers: set[str] | None = None,
+    reentry_lockout_tickers: set[str] | None = None,
 ) -> tuple[np.ndarray, list[str | None]]:
     """Compute per-ticker eligibility for new entries + the gate that
     excluded each ineligible ticker.
@@ -1276,6 +1281,11 @@ def _build_eligibility(
         about to sell in full: on 2026-10-15 SMCI breached the -15% loss
         floor and was queued for urgent EXIT while the optimizer, unaware,
         targeted 10% and planned a +$6,683 BUY in the same order book.
+      * ``"hard_risk_lockout"`` — a hard-risk EXIT filled within the last
+        ``hard_risk_reentry_lockout_days`` sessions. The name may not be
+        re-bought until the window passes, so the optimizer cannot undo a
+        risk cut the next morning on the same alpha that held it into the
+        loss.
       * ``"signal_exit"`` — research said EXIT.
       * ``"gbm_veto"`` — predictor's high-confidence DOWN veto fired.
       * ``"negative_alpha"`` — predicted alpha below
@@ -1287,6 +1297,7 @@ def _build_eligibility(
     decides whether to reduce them), except under the exit gates above.
     """
     hard_exits = hard_exit_tickers or set()
+    lockouts = reentry_lockout_tickers or set()
     min_score = float(config.get("min_score_to_enter", 57))
     # A name whose predicted alpha sits below this is pinned to zero weight,
     # held or not, so selling it is MANDATORY turnover: the conviction gate
@@ -1309,6 +1320,10 @@ def _build_eligibility(
         if t in hard_exits:
             eligibility[i] = False
             reasons[i] = "hard_risk_exit"
+            continue
+        if t in lockouts:
+            eligibility[i] = False
+            reasons[i] = "hard_risk_lockout"
             continue
         if sig.get("signal") == "EXIT":
             eligibility[i] = False

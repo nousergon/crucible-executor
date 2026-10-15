@@ -701,6 +701,44 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
     conn.commit()
 
 
+# Exit reasons that are hard-risk overrides, not alpha decisions. A name cut
+# by one of these is locked out of re-entry for a cooling-off window so the
+# optimizer cannot buy back what the risk layer just sold (SMCI: loss-floor
+# EXIT 2026-10-15 with the optimizer still targeting 10%).
+HARD_RISK_EXIT_REASONS = (
+    "position_loss_floor",
+    "catastrophic_gap_stop",
+    "drawdown_forced_exit",
+)
+
+
+def get_hard_risk_exits_since(
+    conn: sqlite3.Connection,
+    since_date: str,
+    reasons: tuple[str, ...] = HARD_RISK_EXIT_REASONS,
+) -> dict[str, dict]:
+    """Most recent filled hard-risk EXIT per ticker with ``date >= since_date``.
+
+    ``date`` is the session axis. Returns ``{ticker: {"date", "exit_reason"}}``.
+    A row counts once it filled (``status`` Filled/PartialFill); an unfilled
+    EXIT sold nothing and locks nothing out.
+    """
+    if not reasons:
+        return {}
+    rows = conn.execute(
+        "SELECT ticker, date, exit_reason FROM trades "
+        "WHERE action='EXIT' AND date>=? "
+        "AND (status IS NULL OR status IN ('Filled', 'PartialFill')) "
+        "ORDER BY date",
+        (since_date,),
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for ticker, date_, reason in rows:
+        if reason in reasons:
+            out[ticker] = {"date": date_, "exit_reason": reason}
+    return out
+
+
 def get_entry_dates(conn: sqlite3.Connection, tickers: list[str]) -> dict[str, str]:
     """
     Look up the most recent ENTER date for each ticker from trades.db.

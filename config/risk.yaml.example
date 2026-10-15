@@ -64,6 +64,11 @@ min_score_to_enter: 30           # backstop only — predictor veto is primary g
 # MANDATORY turnover, which the conviction gate never throttles. null = off.
 # Value is set from the replay in alpha-engine-config's deployed risk.yaml.
 negative_alpha_exit_below: null
+# Sessions a name stays out of the book after a hard-risk EXIT (loss floor,
+# catastrophic gap stop, drawdown forced exit). An exit on day D blocks
+# D+1..D+N. Hard-risk overrides outrank the optimizer; this stops the next
+# morning's solve buying back what the risk layer just cut. 0/null disables.
+hard_risk_reentry_lockout_days: 5
 
 # Tighten min_score_to_enter when the predictor batch's mean prediction_confidence
 # is broadly low (degenerate-predictor backstop, per 2026-05-07 audit Phase 1).

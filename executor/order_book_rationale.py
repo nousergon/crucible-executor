@@ -144,6 +144,13 @@ _OPTIMIZER_REJECTION_SLUGS = {
         "block",
         "Research composite score below configured min_score_to_enter.",
     ),
+    "hard_risk_lockout": (
+        "hard_risk_lockout",
+        "block",
+        "Re-entry locked out after a recent hard-risk exit (loss floor, gap "
+        "stop or drawdown forced exit); pinned to zero weight until the "
+        "lockout window passes.",
+    ),
     "no_score": (
         "missing_score",
         "block",
