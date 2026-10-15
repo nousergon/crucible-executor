@@ -150,7 +150,7 @@ _OPTIMIZER_REJECTION_SLUGS = {
         "No research score available for this ticker (universe entry but signals "
         "missing).",
     ),
-    # ``signal_exit`` is intentionally not surfaced as a block — research-EXIT
+    # ``signal_exit`` and ``hard_risk_exit`` are intentionally not surfaced as blocks — research-EXIT
     # tickers flow through urgent_exits in the order book and are handled by
     # the existing exit_path branch in build_order_book_rationale.
 }
