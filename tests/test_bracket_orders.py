@@ -291,3 +291,36 @@ def test_trailing_stop_carries_explicit_routing_fields():
     assert stop.tif == "DAY"
     assert stop.outsideRth is False
     assert stop.transmit is True
+
+
+# ── Optimizer book: hard-risk backstop instead of an alpha trail ───────────
+
+
+def test_stop_pct_places_plain_stop_below_fill_not_a_trail():
+    ib = _make_ib(buy_status="Filled", fills=[_FakeFill(100, 40.00)])
+    result = place_bracket_with_stop(
+        ib_client=_ib_client(ib),
+        ticker="SMCI",
+        quantity=100,
+        atr_value=2.37,
+        timeout_seconds=10,
+        stop_pct=0.20,
+    )
+    stop_order = ib.placeOrder.call_args_list[1].args[1]
+    assert stop_order.orderType == "STP"
+    assert stop_order.action == "SELL"
+    assert stop_order.totalQuantity == 100
+    assert stop_order.auxPrice == 32.00
+    assert result["stop_price"] == 32.00
+    assert result["trail_amount"] is None
+    assert result["stop_order_id"] == stop_order.orderId
+
+
+def test_stop_pct_works_without_atr():
+    ib = _make_ib(buy_status="Filled", fills=[_FakeFill(10, 50.00)])
+    result = place_bracket_with_stop(
+        ib_client=_ib_client(ib), ticker="NEW", quantity=10, atr_value=0.0,
+        timeout_seconds=10, stop_pct=0.20,
+    )
+    assert ib.placeOrder.call_count == 2
+    assert result["stop_price"] == 40.00

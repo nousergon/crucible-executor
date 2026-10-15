@@ -384,6 +384,9 @@ strategy:
   bracket:
     enabled: true
     trail_atr_multiple: 2.0             # trailing stop = ATR(14) * this value
+    # Optimizer book only: the child is a STP at catastrophic_gap_stop_pct +
+    # this below fill (a backstop for when the daemon is down), not a trail.
+    backstop_extra_pct: 0.05
 
 # ── Intraday Daemon ─────────────────────────────────────────────────────────
 # The daemon is the sole order executor. main.py writes the order book (entries,

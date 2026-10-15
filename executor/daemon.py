@@ -2428,6 +2428,23 @@ def _execute_entry(
     atr_value = entry.get("atr_value")
     use_bracket = atr_value and atr_value > 0 and strategy_config.get("bracket_stop_enabled", True)
     bracket_mult = strategy_config.get("bracket_trail_atr_multiple", 2.0) if use_bracket else None
+    bracket_kwargs = (
+        {"atr_value": atr_value, "atr_multiple": bracket_mult} if use_bracket else None
+    )
+    if use_optimizer and strategy_config.get("bracket_stop_enabled", True):
+        # Optimizer owns the book: the 2x ATR broker TRAIL is an alpha stop the
+        # cutover retired everywhere else, and its fills reached no trade log.
+        # Replace it with a hard-risk backstop set wider than the daemon's
+        # catastrophic gap stop, so the daemon exits first (logged, feeds the
+        # re-entry lockout) and the broker only acts if the daemon is down.
+        use_bracket = True
+        bracket_kwargs = {
+            "atr_value": atr_value or 0.0,
+            "stop_pct": (
+                float(strategy_config.get("catastrophic_gap_stop_pct", 0.15))
+                + float(strategy_config.get("bracket_backstop_extra_pct", 0.05))
+            ),
+        }
 
     # Write-ahead the intent to disk BEFORE placing the order (config#2328).
     # If the daemon crashes anywhere after this point, the entry is durably
@@ -2444,7 +2461,7 @@ def _execute_entry(
         shares,
         "ENTER",
         use_bracket=bool(use_bracket),
-        bracket_kwargs={"atr_value": atr_value, "atr_multiple": bracket_mult} if use_bracket else None,
+        bracket_kwargs=bracket_kwargs,
     )
 
     if order_result["status"] == "Rejected":
