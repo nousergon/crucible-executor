@@ -26,9 +26,20 @@ def place_bracket_with_stop(
     atr_value: float,
     atr_multiple: float = 2.0,
     timeout_seconds: float = 30.0,
+    stop_pct: float | None = None,
 ) -> dict:
     """
-    Place a market BUY order with a trailing stop child order.
+    Place a market BUY order with a protective stop child order.
+
+    Two child shapes:
+      * ``stop_pct`` None (legacy alpha book): a TRAIL of ``atr_value *
+        atr_multiple`` dollars.
+      * ``stop_pct`` set (optimizer owns the book): a plain STP at
+        ``fill_price * (1 - stop_pct)``. Under the optimizer, alpha stops are
+        retired; the broker child is only a hard-risk backstop for when the
+        daemon is not running, set wider than the daemon's catastrophic gap
+        stop so the daemon (which logs the exit and feeds the re-entry
+        lockout) acts first.
 
     The trailing stop amount = atr_value * atr_multiple, in dollars.
     IB Gateway activates the child stop after the parent fills.
@@ -65,7 +76,7 @@ def place_bracket_with_stop(
         }
 
     trail_amount = round(atr_value * atr_multiple, 2)
-    if trail_amount <= 0:
+    if stop_pct is None and trail_amount <= 0:
         logger.warning(
             f"Trail amount <= 0 for {ticker} (ATR={atr_value}, mult={atr_multiple}) — placing plain market order"
         )
@@ -120,15 +131,24 @@ def place_bracket_with_stop(
     else:
         result_status = status
 
-    # Step 2: Place independent trailing stop if BUY filled
+    # Step 2: Place independent protective stop if BUY filled
     stop_order_id = None
-    if result_status == "Filled" and filled_shares:
+    stop_price = None
+    if stop_pct is not None:
+        trail_amount = None
+        if fill_price:
+            stop_price = round(fill_price * (1.0 - float(stop_pct)), 2)
+    if result_status == "Filled" and filled_shares and (stop_pct is None or stop_price):
         stop = Order()
         stop.orderId = ib.client.getReqId()
         stop.action = "SELL"
-        stop.orderType = "TRAIL"
         stop.totalQuantity = filled_shares
-        stop.auxPrice = trail_amount
+        if stop_price is not None:
+            stop.orderType = "STP"
+            stop.auxPrice = stop_price
+        else:
+            stop.orderType = "TRAIL"
+            stop.auxPrice = trail_amount
         # Same explicit routing fields as the BUY leg above and
         # ibkr.py:place_market_order — without them the paper-account order
         # preset reinterprets the order and cancels it with Error 10349
@@ -149,11 +169,20 @@ def place_bracket_with_stop(
 
         ib.placeOrder(contract, stop)
         stop_order_id = stop.orderId
-        logger.info(
-            f"Trailing stop placed: SELL {filled_shares} {ticker} trail=${trail_amount:.2f} | orderId={stop_order_id}"
-        )
+        if stop_price is not None:
+            logger.info(
+                f"Backstop stop placed: SELL {filled_shares} {ticker} stop=${stop_price:.2f} "
+                f"({float(stop_pct):.0%} below fill) | orderId={stop_order_id}"
+            )
+        else:
+            logger.info(
+                f"Trailing stop placed: SELL {filled_shares} {ticker} trail=${trail_amount:.2f} | orderId={stop_order_id}"
+            )
 
-    logger.info(f"BUY {result_status}: {quantity} {ticker} | fill_price={fill_price} trail=${trail_amount:.2f}")
+    logger.info(
+        f"BUY {result_status}: {quantity} {ticker} | fill_price={fill_price} "
+        f"trail={trail_amount} stop={stop_price}"
+    )
 
     return {
         "ib_order_id": buy_order.orderId,
@@ -163,5 +192,6 @@ def place_bracket_with_stop(
         "filled_shares": filled_shares,
         "fill_time": fill_time,
         "trail_amount": trail_amount,
+        "stop_price": stop_price,
         "commission_usd": commission_usd,
     }

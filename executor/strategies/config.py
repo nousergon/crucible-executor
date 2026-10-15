@@ -58,6 +58,9 @@ POSITION_LOSS_FLOOR_PCT = -0.15  # loss from avg cost (<= this, a negative decim
 # ── Bracket stop defaults ────────────────────────────────────────────────────
 BRACKET_STOP_ENABLED = True
 BRACKET_TRAIL_ATR_MULTIPLE = 2.0   # trailing stop = ATR * this value
+# Optimizer book: the broker child is a STP this far BEYOND the catastrophic
+# gap stop, so the daemon's gap stop always fires first.
+BRACKET_BACKSTOP_EXTRA_PCT = 0.05
 
 # ── Intraday daemon defaults ────────────────────────────────────────────────
 INTRADAY_ENABLED = False           # must opt-in via risk.yaml
@@ -178,6 +181,7 @@ def load_strategy_config(config: dict) -> dict:
         # Bracket stop
         "bracket_stop_enabled": bracket_cfg.get("enabled", BRACKET_STOP_ENABLED),
         "bracket_trail_atr_multiple": bracket_cfg.get("trail_atr_multiple", BRACKET_TRAIL_ATR_MULTIPLE),
+        "bracket_backstop_extra_pct": bracket_cfg.get("backstop_extra_pct", BRACKET_BACKSTOP_EXTRA_PCT),
 
         # Intraday daemon
         "intraday_enabled": intraday_cfg.get("enabled", INTRADAY_ENABLED),
