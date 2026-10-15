@@ -157,6 +157,7 @@ def run_shadow_optimizer(
     legacy_orders: list[dict] | None = None,
     s3_client=None,
     price_histories_requested: set[str] | None = None,
+    hard_exit_tickers: set[str] | None = None,
 ) -> dict | None:
     """
     Run the optimizer in shadow mode and write the result to S3.
@@ -177,6 +178,7 @@ def run_shadow_optimizer(
             legacy_orders=legacy_orders or [],
             signals_bucket=signals_bucket,
             price_histories_requested=price_histories_requested,
+            hard_exit_tickers=hard_exit_tickers,
         )
         # L4515 turnover tripwire: band-check the executed turnover (daily +
         # rolling) BEFORE the artifact write so the verdict rides the daily
@@ -341,6 +343,7 @@ def _build_and_solve(
     legacy_orders: list[dict],
     signals_bucket: str | None = None,
     price_histories_requested: set[str] | None = None,
+    hard_exit_tickers: set[str] | None = None,
 ) -> dict:
     optimizer_cfg = {
         **OPTIMIZER_CONFIG_DEFAULTS,
@@ -445,6 +448,7 @@ def _build_and_solve(
         config,
         spy_idx,
         cash_idx,
+        hard_exit_tickers=hard_exit_tickers,
     )
     # Per-name ADV$ from the scanner tradeability artifact (crucible-research#343)
     # drives the participation-aware √-impact cost term + max-%-ADV constraint
@@ -1252,6 +1256,7 @@ def _build_eligibility(
     config: dict,
     spy_idx: int,
     cash_idx: int,
+    hard_exit_tickers: set[str] | None = None,
 ) -> tuple[np.ndarray, list[str | None]]:
     """Compute per-ticker eligibility for new entries + the gate that
     excluded each ineligible ticker.
@@ -1265,6 +1270,12 @@ def _build_eligibility(
     and produces no ``blocked_entries`` / ``risk_events`` itself).
 
     Reason slugs:
+      * ``"hard_risk_exit"`` — the planner already queued a full EXIT for
+        this name from a hard-risk override (position loss floor, drawdown
+        forced exit). The optimizer must not target a name the daemon is
+        about to sell in full: on 2026-10-15 SMCI breached the -15% loss
+        floor and was queued for urgent EXIT while the optimizer, unaware,
+        targeted 10% and planned a +$6,683 BUY in the same order book.
       * ``"signal_exit"`` — research said EXIT.
       * ``"gbm_veto"`` — predictor's high-confidence DOWN veto fired.
       * ``"negative_alpha"`` — predicted alpha below
@@ -1273,8 +1284,9 @@ def _build_eligibility(
       * ``"no_score"`` — no research signal / score for this ticker.
 
     Held tickers stay eligible regardless of score (the optimizer
-    decides whether to reduce them), except under the three exit gates above.
+    decides whether to reduce them), except under the exit gates above.
     """
+    hard_exits = hard_exit_tickers or set()
     min_score = float(config.get("min_score_to_enter", 57))
     # A name whose predicted alpha sits below this is pinned to zero weight,
     # held or not, so selling it is MANDATORY turnover: the conviction gate
@@ -1294,6 +1306,10 @@ def _build_eligibility(
         pred = predictions_by_ticker.get(t, {})
         is_held = t in current_positions
 
+        if t in hard_exits:
+            eligibility[i] = False
+            reasons[i] = "hard_risk_exit"
+            continue
         if sig.get("signal") == "EXIT":
             eligibility[i] = False
             reasons[i] = "signal_exit"

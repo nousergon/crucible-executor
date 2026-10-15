@@ -2709,6 +2709,14 @@ def run(
                     # never requested → raise) from a data condition (requested,
                     # cache empty → record). config-I7337.
                     price_histories_requested=price_histories_requested,
+                    # Full EXITs already queued by the hard-risk overrides
+                    # above (loss floor, drawdown forced exit) are pinned to
+                    # zero weight, so the optimizer cannot plan a BUY into a
+                    # name the daemon sells at the open (SMCI 2026-10-15).
+                    hard_exit_tickers={
+                        u["ticker"] for u in ob.pending_urgent_exits()
+                        if u.get("signal") == "EXIT" and u.get("ticker")
+                    },
                 )
             except Exception as _shadow_err:
                 logger.warning(
