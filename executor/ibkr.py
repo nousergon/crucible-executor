@@ -12,6 +12,7 @@ IB Gateway must be running locally on port 4002 in paper mode.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import socket
@@ -127,6 +128,52 @@ def _saw_disclaimer(errors: list[tuple[int, str]]) -> bool:
     return any(code == IB_ERROR_PAPER_DISCLAIMER for code, _msg in errors)
 
 
+IB_CLIENT_LOGGERS = ("ib_insync.client", "ib_insync.wrapper", "ib_insync.ib")
+"""The loggers the IB client library writes its own connect errors to.
+
+Each readiness round on a cold gateway makes the library log, at ERROR, the
+very states the wait exists to ride out: ``Peer closed connection. clientId 1
+already in use?``, ``API connection failed: TimeoutError()`` and ``Error 10141
+... Paper trading disclaimer``. The root flow-doctor handler is attached at
+ERROR, so a healthy cold start filed alpha-engine-config-I12349 and I12350
+and bumped I12217 (the 2026-10-16 cold-start drill, nous-ergon-ops-I1661)."""
+
+_TRANSIENT_PREFIX = "gateway readiness wait (transient, inside budget): "
+
+
+class _ReadinessRoundFilter(logging.Filter):
+    """Demote the IB client's own ERROR records to WARNING during one round.
+
+    A logger's filters run before its records propagate, so the demoted level
+    is what every root handler sees, flow-doctor's included. Only the IB
+    client's loggers carry it, and only while a round runs. A wait that runs
+    out of budget logs its own ERROR (see ``_connect_when_ready``), so the
+    real failure still reaches flow-doctor.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno > logging.WARNING:
+            record.levelno = logging.WARNING
+            record.levelname = logging.getLevelName(logging.WARNING)
+            record.msg = _TRANSIENT_PREFIX + str(record.msg)
+        return True
+
+
+@contextlib.contextmanager
+def _ib_client_errors_as_transient():
+    """Attach :class:`_ReadinessRoundFilter` to the IB client's loggers for
+    the duration of the block, and always detach it."""
+    flt = _ReadinessRoundFilter()
+    loggers = [logging.getLogger(name) for name in IB_CLIENT_LOGGERS]
+    for lg in loggers:
+        lg.addFilter(flt)
+    try:
+        yield
+    finally:
+        for lg in loggers:
+            lg.removeFilter(flt)
+
+
 class IBKRClient:
     def __init__(
         self,
@@ -217,6 +264,14 @@ class IBKRClient:
         round repeats after ``poll_s``. Never sleeps past the budget. When the
         budget runs out, raises :class:`GatewayNotReadyError` naming the last
         state seen. Any other exception is a defect and propagates as itself.
+
+        Logging: inside a round, the IB client's own ERROR records (refused or
+        timed-out handshakes, IB error 10141) are demoted to WARNING, because
+        they are the expected states of a gateway still starting and the root
+        flow-doctor handler files every ERROR. A budget that runs out logs one
+        ERROR naming the reason before raising, so a real failure still reaches
+        flow-doctor. A defect that propagates is not demoted by the wait either:
+        only records written while a round runs are, and only the IB client's.
         """
         start = monotonic()
         errors: list[tuple[int, str]] = []
@@ -232,7 +287,8 @@ class IBKRClient:
             while True:
                 attempts += 1
                 errors.clear()
-                not_ready = self._readiness_attempt(probe, errors)
+                with _ib_client_errors_as_transient():
+                    not_ready = self._readiness_attempt(probe, errors)
                 elapsed = monotonic() - start
                 if not_ready is None:
                     logger.info(
@@ -242,7 +298,7 @@ class IBKRClient:
                     break
                 remaining = budget_s - elapsed
                 if remaining <= 0:
-                    raise GatewayNotReadyError(
+                    message = (
                         f"gateway_not_ready: IB Gateway at {self._host}:{self._port} was not ready "
                         f"after {elapsed:.0f}s ({attempts} probe(s), budget {budget_s:.0f}s). "
                         f"Last state: {not_ready}. Ready means the API port is open AND the "
@@ -250,6 +306,12 @@ class IBKRClient:
                         "that never gets there needs the gateway (ibgateway.service / IBC) "
                         "looked at on the box."
                     )
+                    # The rounds' own IB client errors were demoted to WARNING,
+                    # so this ERROR is what carries the real failure to the
+                    # root flow-doctor handler. Logged, then raised: the caller
+                    # still fails loud.
+                    logger.error(message)
+                    raise GatewayNotReadyError(message)
                 logger.info(
                     "IB Gateway not ready yet (%s) — %.0fs of %.0fs budget used, re-probing",
                     not_ready, elapsed, budget_s,

@@ -3,6 +3,7 @@
 IB connection logic is mocked; these tests cover the parsing layer only.
 """
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -307,15 +308,27 @@ class _ColdGateway:
         )
 
     def connect(self, host, port, clientId, timeout):  # noqa: N803 - SDK spelling
+        # Each failing step also writes what the real IB client library logs,
+        # at the level it logs it (ERROR), to the loggers it uses — the
+        # records the 2026-10-16 cold-start drill filed as flow-doctor issues.
         self.connect_calls += 1
         step = self.script.pop(0)
         if step == "refused":
+            logging.getLogger("ib_insync.client").error(
+                "API connection failed: ConnectionRefusedError(111, \"Connect call failed\")"
+            )
             raise ConnectionRefusedError(111, f"Connect call failed ('{host}', {port})")
         if step == "disclaimer":
             for handler in self._handlers:
                 handler(-1, 10141, "Paper trading disclaimer must first be accepted for API connection.", None)
+            logging.getLogger("ib_insync.wrapper").error(
+                "Error 10141, reqId -1: Paper trading disclaimer must first be accepted for API connection."
+            )
+            logging.getLogger("ib_insync.client").error("Peer closed connection. clientId 1 already in use?")
+            logging.getLogger("ib_insync.client").error("API connection failed: TimeoutError()")
             raise TimeoutError()
         if step == "timeout":
+            logging.getLogger("ib_insync.client").error("API connection failed: TimeoutError()")
             raise TimeoutError()
         self._connected = True
         self._accounts = [] if step == "no_account" else ["DU1234567"]
@@ -453,6 +466,117 @@ class TestGatewayReadinessWait:
         IBKRClient(ready_timeout_s=420)
 
         assert calls == ["plain", ("ready", 420)]
+
+
+class TestReadinessWaitLogLevels:
+    """alpha-engine-config-I12349 / I12350 / I12217: a healthy cold start must
+    not reach flow-doctor. Its handler sits on the root logger at ERROR, so the
+    test stands one up the same way and counts what it receives."""
+
+    @pytest.fixture
+    def flow_doctor_like(self):
+        records = []
+
+        class _Handler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Handler(level=logging.ERROR)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        try:
+            yield records
+        finally:
+            root.removeHandler(handler)
+
+    def test_healthy_cold_start_sends_nothing_at_error(self, flow_doctor_like, caplog):
+        """The drill's sequence: refused port, disclaimer, timeout, then ready."""
+        caplog.set_level(logging.DEBUG)
+        gateway = _ColdGateway(["refused", "disclaimer", "timeout", "ready"])
+        client, probe = _ready_client(gateway, port_open=[True])
+        clock = _Clock()
+
+        client._connect_when_ready(420, probe=probe, sleep=clock.sleep, monotonic=clock.monotonic)
+
+        assert gateway.isConnected()
+        assert flow_doctor_like == []
+        transient = [r for r in caplog.records if r.name.startswith("ib_insync.")]
+        messages = [r.getMessage() for r in transient]
+        assert any("clientId 1 already in use?" in m for m in messages)
+        assert any("API connection failed: TimeoutError()" in m for m in messages)
+        assert any("Error 10141" in m for m in messages)
+        assert {r.levelno for r in transient} == {logging.WARNING}
+        assert all(m.startswith("gateway readiness wait (transient, inside budget): ") for m in messages)
+
+    def test_exhausted_budget_still_reaches_flow_doctor_once(self, flow_doctor_like):
+        from executor.ibkr import GatewayNotReadyError
+
+        gateway = _ColdGateway(["disclaimer"] * 100)
+        client, probe = _ready_client(gateway, port_open=[True])
+        clock = _Clock()
+
+        with pytest.raises(GatewayNotReadyError):
+            client._connect_when_ready(12, probe=probe, sleep=clock.sleep, monotonic=clock.monotonic)
+
+        assert len(flow_doctor_like) == 1
+        record = flow_doctor_like[0]
+        assert record.name == "executor.ibkr"
+        assert record.levelno == logging.ERROR
+        assert record.getMessage().startswith("gateway_not_ready:")
+        assert "10141" in record.getMessage()
+
+    def test_port_never_opening_still_reaches_flow_doctor(self, flow_doctor_like):
+        from executor.ibkr import GatewayNotReadyError
+
+        gateway = _ColdGateway([])
+        client, probe = _ready_client(gateway, port_open=[False])
+        clock = _Clock()
+
+        with pytest.raises(GatewayNotReadyError):
+            client._connect_when_ready(30, probe=probe, sleep=clock.sleep, monotonic=clock.monotonic)
+
+        assert [r.getMessage()[:18] for r in flow_doctor_like] == ["gateway_not_ready:"]
+
+    def test_demotion_ends_with_the_wait(self, flow_doctor_like):
+        """After the wait, an IB client error is an error again: a gateway that
+        drops a live session must still page."""
+        gateway = _ColdGateway(["disclaimer", "ready"])
+        client, probe = _ready_client(gateway, port_open=[True])
+        clock = _Clock()
+        client._connect_when_ready(420, probe=probe, sleep=clock.sleep, monotonic=clock.monotonic)
+
+        logging.getLogger("ib_insync.client").error("Peer closed connection.")
+
+        assert [(r.name, r.levelno) for r in flow_doctor_like] == [("ib_insync.client", logging.ERROR)]
+        for name in ("ib_insync.client", "ib_insync.wrapper", "ib_insync.ib"):
+            assert logging.getLogger(name).filters == []
+
+    def test_demotion_is_removed_when_a_round_raises_a_defect(self, flow_doctor_like):
+        gateway = _ColdGateway([])
+        gateway.connect = MagicMock(side_effect=ValueError("bad clientId"))
+        client, probe = _ready_client(gateway, port_open=[True])
+
+        with pytest.raises(ValueError, match="bad clientId"):
+            client._connect_when_ready(420, probe=probe, sleep=lambda _s: None, monotonic=lambda: 0.0)
+
+        for name in ("ib_insync.client", "ib_insync.wrapper", "ib_insync.ib"):
+            assert logging.getLogger(name).filters == []
+
+    def test_plain_connect_path_is_not_demoted(self, flow_doctor_like, monkeypatch):
+        """Callers that do not opt in to the wait (daemon, planner) keep the
+        IB client's ERROR records exactly as before."""
+        gateway = _ColdGateway(["timeout", "ready"])
+        client, _probe = _ready_client(gateway, port_open=[True])
+        client.ib = gateway
+
+        import executor.retry as retry_mod
+
+        monkeypatch.setattr(retry_mod.time, "sleep", lambda _s: None)
+        client._connect()
+
+        assert any(
+            r.name == "ib_insync.client" and r.levelno == logging.ERROR for r in flow_doctor_like
+        )
 
 
 class TestGatewayPortListening:
