@@ -183,6 +183,35 @@ class TestCheckOrder:
         approved, _ = self._call(signal=_base_signal(score=70))
         assert approved
 
+    # ── Missing score (alpha-engine-config-I11504) ──
+
+    def test_missing_score_rejected_and_labelled_missing(self):
+        """A null score is a data gap: blocked, but not reported as a 0.0 score."""
+        sig = _base_signal()
+        sig["score"] = None
+        approved, reason = self._call(signal=sig)
+        assert not approved
+        assert reason == "Score missing (minimum 70)"
+        assert "0.0" not in reason
+
+    def test_absent_score_key_rejected_and_labelled_missing(self):
+        sig = _base_signal()
+        del sig["score"]
+        approved, reason = self._call(signal=sig)
+        assert not approved
+        assert reason.startswith("Score missing")
+
+    def test_nan_score_rejected_not_passed(self):
+        """NaN compares False against the minimum; it must fail closed, not open."""
+        approved, reason = self._call(signal=_base_signal(score=float("nan")))
+        assert not approved
+        assert reason.startswith("Score missing")
+
+    def test_real_zero_score_still_reported_as_score(self):
+        approved, reason = self._call(signal=_base_signal(score=0))
+        assert not approved
+        assert reason == "Score 0.0 < minimum 70"
+
     # ── Conviction (no hard gate — sizing adjustment only) ──
 
     def test_declining_conviction_approved(self):
@@ -209,6 +238,38 @@ class TestCheckOrder:
     def test_position_within_max_position_pct_approved(self):
         approved, _ = self._call(dollar_size=4000)  # 4%
         assert approved
+
+    # ── Cent rounding at the cap (alpha-engine-config-I11504) ──
+
+    def test_full_size_entry_rounded_to_cent_approved(self):
+        """The sizer rounds nav * max_pct to the cent; that must not read as a breach.
+
+        At this NAV, round(nav * 0.05, 2) / nav lands above 0.05 by ~4e-9 —
+        past a 1e-9 ratio tolerance — and the old strict ``>`` blocked it as
+        "Position size 5.0% exceeds max 5.0%".
+        """
+        nav = 123_456.79
+        dollar_size = round(nav * 0.05, 2)
+        assert dollar_size / nav > 0.05 + 1e-9  # the case the old guard blocked
+        approved, reason = self._call(
+            dollar_size=dollar_size, portfolio_nav=nav, peak_nav=nav,
+        )
+        assert approved, reason
+
+    def test_full_size_entries_approved_across_navs(self):
+        for i in range(2_000):
+            nav = 50_000 + i * 1_234.567
+            dollar_size = round(nav * 0.05, 2)
+            approved, reason = self._call(
+                dollar_size=dollar_size, portfolio_nav=nav, peak_nav=nav,
+            )
+            assert approved, (nav, dollar_size, reason)
+
+    def test_two_cents_over_max_position_rejected(self):
+        """The tolerance is the cent rounding and nothing more."""
+        approved, reason = self._call(dollar_size=5_000.02)  # 5% of 100k + $0.02
+        assert not approved
+        assert "Position size" in reason
 
     # ── Bear regime uses lower max_position_pct ──
 
