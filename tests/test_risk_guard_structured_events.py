@@ -146,6 +146,22 @@ class TestCheckOrderEventEmission:
         assert ev["value"] == 50
         assert ev["threshold"] == 70
 
+    def test_missing_score_emits_min_score_veto_with_null_value(self):
+        """alpha-engine-config-I11504: rule stays min_score so consumers keep
+        filtering on it; the value is null and the context says why."""
+        events: list[dict] = []
+        sig = _base_signal()
+        sig["score"] = None
+        approved, reason = _call(events=events, signal=sig)
+        assert not approved
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["rule"] == "min_score"
+        assert ev["value"] is None
+        assert ev["threshold"] == 70
+        assert ev["context"]["score_missing"] is True
+        assert ev["reason"] == reason == "Score missing (minimum 70)"
+
     def test_max_position_emits_veto(self):
         events: list[dict] = []
         approved, _ = _call(events=events, dollar_size=6000)  # 6% of 100k > 5%

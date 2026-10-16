@@ -22,6 +22,7 @@ inventory — *risk decisions* row):
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 import pandas as pd
@@ -154,6 +155,33 @@ def regime_conditional_threshold_scale(
 # zero price, `dropna` does NOT remove it, `np.corrcoef` propagates it to NaN,
 # and the caller's `pd.notna(corr)` drops the pair. `_pearson` returns NaN in
 # the same cases (non-finite input, zero variance, n < 2).
+# The position sizer rounds ``dollar_size`` to the cent
+# (``position_sizer.compute_position_size``), and check_order re-derives the
+# position's weight from that rounded figure. A full-size entry can therefore
+# land up to half a cent over ``max_position_pct * NAV`` — which a strict ``>``
+# on the re-derived ratio blocked as "Position size 5.0% exceeds max 5.0%"
+# (alpha-engine-config-I11504). The max-position rule compares in dollars and
+# forgives exactly that rounding: one cent, independent of NAV. A ratio
+# tolerance cannot do this — half a cent is 1e-7 of a $50k book and 1e-9 of
+# a $5M one.
+_MAX_POSITION_ROUNDING_DOLLARS = 0.01
+
+
+def _score_is_missing(score) -> bool:
+    """A score the signal does not carry: absent, null, or NaN.
+
+    Distinct from a real 0.0. A NaN would otherwise compare False against the
+    minimum and PASS the score gate; a None used to be coerced to 0 and
+    reported as "Score 0.0 < minimum" — a data gap mislabelled as a score.
+    """
+    if score is None:
+        return True
+    try:
+        return math.isnan(float(score))
+    except (TypeError, ValueError):
+        return True
+
+
 _CORR_CACHE_OWNER: dict | None = None
 _CORR_CACHE: dict[tuple[str, int], np.ndarray] = {}
 
@@ -491,7 +519,7 @@ def check_order(
     # ── ENTER rules ───────────────────────────────────────────────────────────
 
     # 1. Score minimum (Stage D' Wire 5: optionally regime-conditional)
-    score = signal.get("score") or 0
+    score = signal.get("score")
     base_min_score = config.get("min_score_to_enter", 70)
     if config.get("regime_min_score_enabled", False):
         min_score = regime_conditional_min_score(
@@ -504,6 +532,25 @@ def check_order(
         )
     else:
         min_score = base_min_score
+    if _score_is_missing(score):
+        # Fail closed, but say why: a missing score is a signal-data gap, not
+        # a score of zero (alpha-engine-config-I11504).
+        reason = f"Score missing (minimum {min_score})"
+        logger.warning(f"{ticker}: signal carries no usable score ({score!r}) — entry blocked")
+        _emit(events, {**base_event_ctx,
+            "event_type": "veto", "rule": "min_score",
+            "reason": reason, "value": None, "threshold": float(min_score),
+            "context": {
+                "score_missing": True,
+                "base_min_score": float(base_min_score),
+                "regime_intensity_z": (
+                    float(regime_intensity_z)
+                    if regime_intensity_z is not None
+                    else None
+                ),
+            },
+        })
+        return False, reason
     if score < min_score:
         reason = f"Score {score:.1f} < minimum {min_score}"
         _emit(events, {**base_event_ctx,
@@ -545,7 +592,7 @@ def check_order(
         if market_regime == "bear"
         else config.get("max_position_pct", 0.05)
     )
-    if position_pct > effective_max_pct:
+    if dollar_size > effective_max_pct * portfolio_nav + _MAX_POSITION_ROUNDING_DOLLARS:
         reason = f"Position size {position_pct:.1%} exceeds max {effective_max_pct:.1%}"
         _emit(events, {**base_event_ctx,
             "event_type": "veto", "rule": "max_position",
