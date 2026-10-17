@@ -7,6 +7,11 @@ Requires=xvfb.service
 Type=simple
 User=ec2-user
 WorkingDirectory=/home/ec2-user
+# The v2 reconcile's Master API client ID (alpha-engine-config-I12376), set in
+# IBC's config.ini from the trader's env file before every gateway start. The
+# leading `-` is load-bearing: v1 trades through this gateway, so a failure
+# here is logged and never stops it.
+ExecStartPre=-/usr/bin/env bash /home/ec2-user/alpha-engine/infrastructure/ibc-master-client-id.sh
 ExecStart=/bin/bash /home/ec2-user/ibc/gatewaystart.sh -inline
 Environment=DISPLAY=:1
 Restart=always
