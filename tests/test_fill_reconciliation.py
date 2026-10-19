@@ -24,6 +24,7 @@ from executor.fill_reconciliation import (
     reconcile_from_daemon_log_file,
     reconcile_from_ib,
     reconcile_unfilled_trades,
+    requested_shares,
     sweep_unresolved_sessions,
     unresolved_session_dates,
     unresolved_trades,
@@ -159,6 +160,62 @@ class TestRoundtripRecompute:
         _log(conn, action="ENTER", ticker="DOCS", ib_order_id=695, realized_pnl=None)
         res = reconcile_unfilled_trades(conn, "2026-09-14", {695: [_ex(695, "DOCS", "BOT", 775, 26.44, "a")]})
         assert "realized_pnl" not in res["patched"][0]["after"]
+
+
+# ── A partial fill reconciled before the order finished (I12411) ─────────────
+
+
+class TestPartialFillCompletesAgainstTheOrderQuantity:
+    """CRUS 2026-10-12, verbatim from the daemon log: URGENT EXIT SELL 347,
+    order 696. 101 + 110 shares executed by 13:30:42Z, so the row was logged
+    ``PartialFill`` with ``shares`` = ``filled_shares`` = 211. The 13:31:52Z
+    reconcile compared 211 executions against ``shares`` (211), flipped the
+    row to ``Filled`` and made it terminal; 100 + 36 more shares executed on
+    the same order at 13:33:09-13Z and the ledger never recorded them."""
+
+    @staticmethod
+    def _crus(conn, rationale):
+        return _log(
+            conn, date="2026-10-12", ticker="CRUS", action="EXIT", shares=211,
+            filled_shares=211, fill_price=106.5, ib_order_id=696, status="PartialFill",
+            exit_reason="optimizer_target_zero", rationale_json=rationale,
+        )
+
+    _FIRST = [
+        _ex(696, "CRUS", "SLD", 101, 106.5, "01", t="2026-10-12T13:30:22+00:00"),
+        _ex(696, "CRUS", "SLD", 110, 106.5, "02", t="2026-10-12T13:30:42+00:00"),
+    ]
+    _REST = [
+        _ex(696, "CRUS", "SLD", 100, 106.5, "03", t="2026-10-12T13:33:09+00:00"),
+        _ex(696, "CRUS", "SLD", 36, 106.5, "04", t="2026-10-12T13:33:13+00:00"),
+    ]
+
+    def test_a_partial_fill_stays_open_until_the_order_quantity_is_reached(self, conn):
+        tid = self._crus(conn, json.dumps({"action": "EXIT", "requested_shares": 347}))
+
+        first = reconcile_unfilled_trades(conn, "2026-10-12", {696: list(self._FIRST)})
+        assert first["patched"][0]["after"]["status"] == "PartialFill"
+        assert len(unresolved_trades(conn, "2026-10-12")) == 1
+
+        reconcile_unfilled_trades(conn, "2026-10-12", {696: self._FIRST + self._REST})
+        row = conn.execute(
+            "SELECT status, filled_shares, fill_time FROM trades WHERE trade_id=?", (tid,)
+        ).fetchone()
+        assert row == ("Filled", 347, "2026-10-12T13:33:13+00:00")
+        assert unresolved_trades(conn, "2026-10-12") == []
+
+    def test_a_legacy_row_without_the_key_reconciles_as_before(self, conn):
+        self._crus(conn, json.dumps({"action": "EXIT"}))
+        res = reconcile_unfilled_trades(conn, "2026-10-12", {696: list(self._FIRST)})
+        assert res["patched"][0]["after"]["status"] == "Filled"
+
+    @pytest.mark.parametrize("rationale", [None, "not json", "[1, 2]", json.dumps({"requested_shares": "347"})])
+    def test_an_unusable_rationale_falls_back_to_the_shares_column(self, conn, rationale):
+        row = {"trade_id": "t", "shares": 211, "rationale_json": rationale}
+        assert requested_shares(row) == 211
+
+    def test_the_rationale_quantity_wins_over_the_shares_column(self):
+        assert requested_shares({"shares": 211, "rationale_json": json.dumps({"requested_shares": 347})}) == 347
 
 
 # ── Sources ───────────────────────────────────────────────────────────────────

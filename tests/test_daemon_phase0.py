@@ -506,3 +506,19 @@ class TestRationaleJsonEnrichmentSourceShape:
             "L133 ENTER rationale must include position_pct in "
             "signal_context so the audit log captures the sizing math."
         )
+
+    def test_every_log_trade_site_records_the_order_quantity(self):
+        """fill_reconciliation needs the ORDER quantity to tell a complete
+        fill from a partial one; the row's ``shares`` column holds the
+        quantity filled by the end of the poll window. Each daemon
+        log_trade site must put the requested quantity in rationale_json
+        (alpha-engine-config-I12411: CRUS 2026-10-12, 136 of 347 shares
+        never reached the ledger)."""
+        import inspect
+
+        import executor.daemon as daemon
+
+        src = inspect.getsource(daemon)
+        n_sites = src.count("log_trade(\n")
+        assert n_sites == 3, "a log_trade site was added or removed — pin it here"
+        assert src.count('"requested_shares": shares,') == n_sites

@@ -222,6 +222,39 @@ def unresolved_trades(conn: sqlite3.Connection, run_date: str) -> list[dict[str,
     return [dict(r) for r in rows]
 
 
+def requested_shares(row: Mapping[str, Any]) -> int:
+    """The quantity the order ASKED for — what a fill must reach to be complete.
+
+    Not the row's ``shares`` column: the daemon writes the quantity filled by
+    the end of its 30 s poll window there (``actual_shares``), so on a partial
+    fill ``shares`` already equals the partial count. Comparing the broker's
+    executions against it declared the order complete on the first pass, the
+    row went terminal, and every later execution of the same order was never
+    written back. Measured on CRUS 2026-10-12 (order 696, SELL 347): 211 shares
+    by 13:30:42Z, row logged ``PartialFill`` 211, reconciled to ``Filled`` 211
+    at 13:31:52Z, then 136 more shares executed at 13:33:09-13Z on the same
+    order and the ledger never saw them (alpha-engine-config-I12411).
+
+    The daemon records the order quantity as ``rationale_json.requested_shares``.
+    A row written before that key existed falls back to ``shares``, which is
+    the old behaviour, so a legacy row reconciles exactly as it did.
+    """
+    raw = row.get("rationale_json")
+    if raw:
+        try:
+            value = json.loads(raw).get("requested_shares")
+        except (TypeError, ValueError, AttributeError) as exc:
+            logger.warning(
+                "fill reconciliation: unreadable rationale_json on %s (%s); "
+                "falling back to the shares column as the requested quantity",
+                row.get("trade_id"), exc,
+            )
+            value = None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return int(value)
+    return int(row.get("shares") or 0)
+
+
 def _side_matches(action: str, side: str | None) -> bool:
     if not side:
         return True
@@ -310,7 +343,7 @@ def reconcile_unfilled_trades(
         if summary["fill_price"] is None:
             unresolved.append(row)
             continue
-        requested = int(row.get("shares") or 0)
+        requested = requested_shares(row)
         new_status = "Filled" if summary["filled_shares"] >= requested else "PartialFill"
         patch: dict[str, Any] = {
             "fill_price": summary["fill_price"],
