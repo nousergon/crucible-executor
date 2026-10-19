@@ -1243,6 +1243,11 @@ def run_daemon(dry_run: bool = False) -> None:
                                 # success.
                                 "retry_count": order_result.get("retry_count", 0),
                                 "attempts": order_result.get("attempts", []),
+                                # The ORDER quantity. The row's `shares` column carries the
+                                # quantity filled by the end of the poll window, so it cannot
+                                # tell fill_reconciliation when a partial fill is complete
+                                # (alpha-engine-config-I12411).
+                                "requested_shares": shares,
                             }
                         ),
                         "entry_trade_id": _entry_id,
@@ -2229,6 +2234,11 @@ def _execute_exit(
                     },
                     "retry_count": order_result.get("retry_count", 0),
                     "attempts": order_result.get("attempts", []),
+                    # The ORDER quantity. The row's `shares` column carries the
+                    # quantity filled by the end of the poll window, so it cannot
+                    # tell fill_reconciliation when a partial fill is complete
+                    # (alpha-engine-config-I12411).
+                    "requested_shares": shares,
                 }
             ),
             "entry_trade_id": _entry_id,
@@ -2571,6 +2581,11 @@ def _execute_entry(
                     # L133 retry chain audit — see _place_order_with_retry docstring.
                     "retry_count": order_result.get("retry_count", 0),
                     "attempts": order_result.get("attempts", []),
+                    # The ORDER quantity. The row's `shares` column carries the
+                    # quantity filled by the end of the poll window, so it cannot
+                    # tell fill_reconciliation when a partial fill is complete
+                    # (alpha-engine-config-I12411).
+                    "requested_shares": shares,
                 }
             ),
             "execution_latency_ms": _latency_ms,
