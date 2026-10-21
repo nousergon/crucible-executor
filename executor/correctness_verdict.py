@@ -103,6 +103,28 @@ neither is used. A verdict stamped with any other ``run_date`` is
 :data:`STALE_BINDING` and blocks, because it says nothing about the numbers in
 the file the executor just read.
 
+**Which attestation is "the params' cycle's" is a lookup, not an assumption**
+(``alpha-engine-config-I12440``). ``backtest/latest/attestation.json`` moves
+on EVERY weekly run; ``config/executor_params.json`` moves only when that run's
+optimizer output is PROMOTED. The two diverge every time promotion is
+legitimately declined — the evaluator's apply loop held back (measured
+2026-10-19/20: latest attests ``2026-10-16``, params are ``2026-10-09``'s
+because the apply loop was blocked), or an operator rolled the params back to
+the last PASSing cycle, which is the documented FAIL remedy below. Reading only
+``latest/`` turned each of those into a permanent STALE_BINDING until the next
+promotion — in enforce mode a week of withheld entries over parameters whose
+own cycle WAS attested.
+
+So when ``latest/`` names a different cycle, the gate reads the attestation the
+backtester always writes for the params' own cycle,
+``backtest/{executor_params.updated_at}/attestation.json``, and binds to THAT.
+The predicate is unchanged — the verdict used must carry ``run_date ==
+executor_params.updated_at`` — only the place it is looked for widens to the
+one key that can satisfy it. Nothing is inherited: a newer cycle's PASS never
+covers older params, the params' own cycle must have written a literal
+``"PASS"`` itself, and when that object is absent or names another run_date the
+answer is still :data:`STALE_BINDING`.
+
 FAIL-CLOSED, AND THE THREE NON-PASS STATES STAY DISTINCT
 ---------------------------------------------------------
 Only the literal string ``"PASS"`` grants the guarantee. ``"ok"``, ``"pass"``,
@@ -144,6 +166,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
 import boto3
@@ -169,6 +192,15 @@ ATTESTATION_KEY = "backtest/latest/attestation.json"
 
 #: The artifact whose contents the verdict above attests.
 EXECUTOR_PARAMS_KEY = "config/executor_params.json"
+
+#: The backtester's DATED attestation — ``reporter.save`` always emits it for
+#: every run, beside the ``latest/`` pointer, with the same body. Read only
+#: when ``latest/`` belongs to a different cycle than the params in use, and
+#: only ever for the params' own ``updated_at`` (alpha-engine-config-I12440).
+DATED_ATTESTATION_KEY_TEMPLATE = "backtest/{run_date}/attestation.json"
+
+#: ``updated_at`` is templated into an S3 key, so it must be a bare cycle date.
+_CYCLE_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 #: The closed vocabulary. ``STALE_BINDING`` is assigned by this module alone
 #: and no producer may ever write it — it is a fact about the RELATIONSHIP
@@ -333,15 +365,20 @@ def _get_json(bucket: str, key: str, s3_client=None) -> tuple[dict | None, str |
     return doc, None
 
 
-def read_verdict(bucket: str, s3_client=None) -> tuple[str, str | None, object, str]:
-    """Normalize ``backtest/latest/attestation.json`` onto the vocabulary.
+def read_verdict(
+    bucket: str, s3_client=None, key: str = ATTESTATION_KEY,
+) -> tuple[str, str | None, object, str]:
+    """Normalize one attestation object onto the vocabulary.
+
+    ``key`` defaults to ``backtest/latest/attestation.json``; the gate passes
+    the params' own dated key when ``latest/`` belongs to another cycle.
 
     Returns ``(verdict, attested_run_date, raw_verdict, reason)``. Every
     degenerate input — absent, unreadable, non-JSON, non-object, a verdict key
     that is missing or is any value other than the literal ``"PASS"`` /
     ``"FAIL"`` — resolves to a NON-PASS value with the cause recorded.
     """
-    doc, err = _get_json(bucket, ATTESTATION_KEY, s3_client=s3_client)
+    doc, err = _get_json(bucket, key, s3_client=s3_client)
     if doc is None:
         return UNKNOWN, None, None, f"{err} — a verdict that was never read is not a pass."
     raw = doc.get("verdict")
@@ -385,9 +422,60 @@ def evaluate_correctness_verdict(
         mode = MODE_ENFORCE
 
     verdict, attested_run_date, raw, reason = read_verdict(bucket, s3_client=s3_client)
+    attestation_key = ATTESTATION_KEY
+    latest_seen = {"run_date": attested_run_date, "verdict": raw}
 
     params, params_err = _get_json(bucket, EXECUTOR_PARAMS_KEY, s3_client=s3_client)
     params_updated_at = params.get("updated_at") if params else None
+
+    if (
+        params is not None
+        and attested_run_date is not None
+        and attested_run_date != params_updated_at
+    ):
+        # latest/ was read and belongs to ANOTHER cycle. The verdict that can
+        # bind these params is the one their own cycle wrote — look there,
+        # never anywhere else (alpha-engine-config-I12440).
+        if not (isinstance(params_updated_at, str)
+                and _CYCLE_DATE_RE.match(params_updated_at)):
+            verdict = STALE_BINDING
+            reason = (
+                f"the attestation attests run_date {attested_run_date!r} but "
+                f"{EXECUTOR_PARAMS_KEY} carries updated_at "
+                f"{params_updated_at!r}, which is not a cycle date — there is "
+                "no cycle to bind its parameters to, so they are unattested."
+            )
+        else:
+            dated_key = DATED_ATTESTATION_KEY_TEMPLATE.format(run_date=params_updated_at)
+            d_verdict, d_run_date, d_raw, d_reason = read_verdict(
+                bucket, s3_client=s3_client, key=dated_key,
+            )
+            newer = (
+                f"backtest/latest/ attests run_date {attested_run_date!r} "
+                f"(verdict {raw!r}), a cycle whose parameters are NOT the ones "
+                f"in {EXECUTOR_PARAMS_KEY} (updated_at {params_updated_at!r})"
+            )
+            if d_run_date is None and d_verdict == UNKNOWN:
+                # The params' own cycle left no readable attestation. latest/
+                # is another cycle's, and a verdict is never inherited.
+                verdict = STALE_BINDING
+                reason = (
+                    f"{newer}; and the params' own cycle's attestation is not "
+                    f"usable: {d_reason} A verdict is never inherited across "
+                    "cycles: the parameters in use this session are unattested."
+                )
+            elif d_run_date != params_updated_at:
+                verdict = STALE_BINDING
+                reason = (
+                    f"{newer}; and s3://{bucket}/{dated_key} itself attests "
+                    f"run_date {d_run_date!r}, not {params_updated_at!r}. A "
+                    "verdict is never inherited across cycles: the parameters "
+                    "in use this session are unattested."
+                )
+            else:
+                verdict, attested_run_date, raw = d_verdict, d_run_date, d_raw
+                attestation_key = dated_key
+                reason = f"{d_reason} Bound via s3://{bucket}/{dated_key}: {newer}."
 
     if verdict == PASS:
         if params is None:
@@ -403,6 +491,9 @@ def evaluate_correctness_verdict(
                 "use this session."
             )
         elif attested_run_date != params_updated_at:
+            # Reached when latest/ PASSes but carries no run_date (no cycle to
+            # look up). The last line of the predicate either way: a PASS is
+            # only ever granted over a provenance-matched pair.
             verdict = STALE_BINDING
             reason = (
                 f"the attestation attests run_date {attested_run_date!r} but "
@@ -423,7 +514,8 @@ def evaluate_correctness_verdict(
         reason=reason,
         raw_verdict=raw,
         context={
-            "attestation_key": ATTESTATION_KEY,
+            "attestation_key": attestation_key,
+            "latest_attestation": latest_seen,
             "params_key": EXECUTOR_PARAMS_KEY,
             "promotion_criterion": PROMOTION_CRITERION,
         },
@@ -455,7 +547,8 @@ def operator_message(state: CorrectnessVerdictState) -> str:
     """
     if state.is_pass:
         return (
-            f"CORRECTNESS VERDICT PASS — s3://.../{ATTESTATION_KEY} attests "
+            f"CORRECTNESS VERDICT PASS — s3://.../"
+            f"{state.context.get('attestation_key', ATTESTATION_KEY)} attests "
             f"run_date {state.attested_run_date}, matching "
             f"{EXECUTOR_PARAMS_KEY} (updated_at {state.params_updated_at}). "
             "New entries permitted."
@@ -479,8 +572,10 @@ def operator_message(state: CorrectnessVerdictState) -> str:
             "older verdict; there is nothing to fall back to."
         ),
         STALE_BINDING: (
-            "The attestation and the parameters came from different weekly "
-            "cycles, which is a pipeline-ordering defect, not a numbers "
+            "The parameters in use have no attestation from their OWN cycle: "
+            "backtest/latest/ belongs to a different weekly cycle and "
+            "backtest/{updated_at}/attestation.json is absent or names another "
+            "run_date. That is a pipeline-ordering defect, not a numbers "
             "defect: one of the two artifacts was written without the other. "
             "UNBLOCK: re-run the weekly Backtester stage so both are written "
             "by one execution, then re-run the preopen for today."
