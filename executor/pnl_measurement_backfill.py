@@ -652,6 +652,7 @@ def audit_history(
     prior_session_of: Any | None = None,
     is_trading_day: Any | None = None,
     next_trading_day: Any | None = None,
+    accepted_gaps: Any = None,
 ) -> dict[str, Any]:
     """Run the integrity gates over the WHOLE persisted series and report breaches.
 
@@ -668,7 +669,11 @@ def audit_history(
     docstring. Both absent SKIPS the coverage gate (reported as
     ``session_axis_coverage_status: "NOT EVALUATED"``) rather than reporting a
     pass; a gate that did not run has not agreed with anything, same
-    convention as the vendor anchor below.
+    convention as the vendor anchor below. ``accepted_gaps`` is the
+    ``config/accepted_gaps.json`` registry (raw ``gaps`` list); a missing
+    session with a valid, ruled entry there is reported under
+    ``session_axis_coverage["accepted_gaps"]`` instead of as a breach, and an
+    invalid entry is itself a breach (alpha-engine-config-I11087).
 
     Returns a dict with ``breach_count``; the CLI exits NON-ZERO when it is
     nonzero, so a breach in the history is a failure rather than a paragraph in
@@ -683,6 +688,7 @@ def audit_history(
     if is_trading_day is not None and next_trading_day is not None:
         coverage = check_session_axis_coverage(
             rows, is_trading_day=is_trading_day, next_trading_day=next_trading_day,
+            accepted_gaps=accepted_gaps,
         )
         coverage_status = "evaluated"
     else:
@@ -1673,7 +1679,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--trades-bucket", default=DEFAULT_TRADES_BUCKET,
-        help="bucket backing the ArcticDB libraries for --range-source arcticdb",
+        help="bucket backing the ArcticDB libraries for --range-source arcticdb, "
+             "and holding config/accepted_gaps.json for --audit",
     )
     ap.add_argument("--audit", action="store_true", help="run the retroactive gates")
     ap.add_argument(
@@ -1856,10 +1863,13 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     if args.audit:
         rows = _rows(conn)  # re-read so the audit sees anything just written
+        from executor.accepted_gaps import load_accepted_gap_entries
+
         audit = audit_history(
             rows, spy_ex_dividends=spy_map, vendor_closes=vendor_closes,
             prior_session_of=_prior_session_of,
             is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+            accepted_gaps=load_accepted_gap_entries(args.trades_bucket),
         )
         report["audit"] = audit
         if audit["breach_count"]:

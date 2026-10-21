@@ -390,6 +390,27 @@ def test_audit_history_flags_the_live_good_friday_row():
     assert audit["breach_count"] >= 1
 
 
+def test_audit_history_passes_the_accepted_gaps_registry_to_the_coverage_gate():
+    """alpha-engine-config-I11087: a ruled gap stops counting; an unruled one
+    still does."""
+    rows = [_row("2026-07-23", 100.0, None), _row("2026-07-24", 100.0, 0.0),
+            _row("2026-07-28", 100.0, 0.0)]
+    cal = {"is_trading_day": _fake_is_trading_day,
+           "next_trading_day": _fake_next_trading_day}
+    entry = {"date": "2026-07-27", "ruling": "nousergon/alpha-engine-config#5325"}
+
+    ruled = B.audit_history(rows, accepted_gaps=[entry], **cal)
+    assert ruled["session_axis_coverage"]["breaches"] == []
+    assert [a["date"] for a in ruled["session_axis_coverage"]["accepted_gaps"]] == [
+        "2026-07-27"
+    ]
+
+    unruled = B.audit_history(rows, accepted_gaps=[{"date": "2026-07-27"}], **cal)
+    kinds = {b["kind"] for b in unruled["session_axis_coverage"]["breaches"]}
+    assert {"missing_session", "accepted_gap_without_ruling"} <= kinds
+    assert unruled["breach_count"] >= ruled["breach_count"] + 2
+
+
 def test_plan_non_trading_day_flags_only_takes_that_breach_kind():
     coverage = {
         "breaches": [
