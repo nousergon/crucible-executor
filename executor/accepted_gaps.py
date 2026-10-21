@@ -81,3 +81,44 @@ def load_accepted_gaps(
             trades_bucket, ACCEPTED_GAPS_KEY, exc_info=True,
         )
         return {}
+
+
+def load_accepted_gap_entries(
+    trades_bucket: str,
+    region: str = "us-east-1",
+) -> list:
+    """Load the registry's RAW ``gaps`` list, malformed entries included.
+
+    ``load_accepted_gaps`` drops an entry with no ``date`` and collapses a
+    duplicated date, which is right for a pager but wrong for a gate: the
+    session-axis contiguity gate
+    (``executor.pnl_integrity.check_session_axis_coverage``,
+    alpha-engine-config-I11087) must SEE a malformed entry to reject it loudly.
+
+    Fails closed in the gate's direction: a missing or unreadable registry
+    returns ``[]``, which accepts no gap, so every gap still breaches.
+    """
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        obj = s3.get_object(Bucket=trades_bucket, Key=ACCEPTED_GAPS_KEY)
+        data = json.loads(obj["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        logger.info(
+            "[accepted_gaps] no registry at s3://%s/%s — no gaps accepted.",
+            trades_bucket, ACCEPTED_GAPS_KEY,
+        )
+        return []
+    except Exception:
+        logger.warning(
+            "[accepted_gaps] failed to load from s3://%s/%s — accepting no gaps.",
+            trades_bucket, ACCEPTED_GAPS_KEY, exc_info=True,
+        )
+        return []
+    raw_gaps = data.get("gaps", []) if isinstance(data, dict) else None
+    if not isinstance(raw_gaps, list):
+        logger.warning(
+            "[accepted_gaps] 'gaps' is not a list in s3://%s/%s — accepting no gaps.",
+            trades_bucket, ACCEPTED_GAPS_KEY,
+        )
+        return []
+    return raw_gaps

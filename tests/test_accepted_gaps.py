@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import boto3
 
-from executor.accepted_gaps import load_accepted_gaps
+from executor.accepted_gaps import load_accepted_gap_entries, load_accepted_gaps
 
 
 # A fake NoSuchKey exception class — must inherit from BaseException so that
@@ -149,3 +149,31 @@ class TestLoadAcceptedGaps:
         assert len(gaps) == 2
         assert "2026-07-27" in gaps
         assert "2026-07-28" in gaps
+
+
+class TestLoadAcceptedGapEntries:
+    """The gate's loader keeps malformed entries so the gate can reject them
+    (alpha-engine-config-I11087), and fails closed to [] (accepts nothing)."""
+
+    def test_returns_the_raw_list_including_dateless_entries(self):
+        gaps = [{"date": "2026-07-27", "ruling": "nousergon/alpha-engine-config#5325"},
+                {"reason": "no date"}]
+        s3 = _mock_s3(get_object_rv=_s3_body({"schema_version": 1, "gaps": gaps}))
+        with patch.object(boto3, "client", return_value=s3):
+            assert load_accepted_gap_entries("b") == gaps
+
+    def test_missing_registry_accepts_nothing(self):
+        s3 = _mock_s3(no_such_key=True)
+        with patch.object(boto3, "client", return_value=s3):
+            assert load_accepted_gap_entries("b") == []
+
+    def test_unreadable_registry_accepts_nothing(self):
+        s3 = _mock_s3()
+        s3.get_object.side_effect = RuntimeError("boom")
+        with patch.object(boto3, "client", return_value=s3):
+            assert load_accepted_gap_entries("b") == []
+
+    def test_non_list_gaps_accepts_nothing(self):
+        s3 = _mock_s3(get_object_rv=_s3_body({"gaps": {"2026-07-27": {}}}))
+        with patch.object(boto3, "client", return_value=s3):
+            assert load_accepted_gap_entries("b") == []

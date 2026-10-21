@@ -569,6 +569,124 @@ class TestSessionAxisCoverage:
         assert out["closes"] is False
         assert all(b["kind"] == "calendar_lookup_failed" for b in out["breaches"])
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Accepted gaps on the contiguity gate (alpha-engine-config-I11087)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 2026-07-27 is a recorded exception (ruling alpha-engine-config#5325) and is
+# registered in config/accepted_gaps.json; the gate must read it. Everything
+# else about the gate stays as strict as before.
+
+_GAP_0727 = {
+    "date": "2026-07-27",
+    "reason": "CaptureSnapshot failed permanently — snapshot never existed",
+    "ruling": "nousergon/alpha-engine-config#5325",
+    "accepted_at": "2026-07-29T00:00:00Z",
+}
+# 07-24 (Fri), 07-27 (Mon) missing, 07-28 (Tue) — the live shape.
+_ROWS_0727 = _axis_rows("2026-07-23", "2026-07-24", "2026-07-28", "2026-07-29")
+
+
+def _coverage(rows, accepted_gaps):
+    return check_session_axis_coverage(
+        rows, is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        accepted_gaps=accepted_gaps,
+    )
+
+
+class TestSessionAxisAcceptedGaps:
+    def test_without_the_registry_0727_is_still_a_missing_session(self):
+        out = _coverage(_ROWS_0727, None)
+        assert out["closes"] is False
+        assert [(b["kind"], b["date"]) for b in out["breaches"]] == [
+            ("missing_session", "2026-07-27")
+        ]
+
+    def test_0727_with_its_ruled_entry_passes_and_stays_visible(self):
+        out = _coverage(_ROWS_0727, [_GAP_0727])
+        assert out["closes"] is True
+        assert out["breaches"] == []
+        assert out["accepted_gaps"] == [
+            {"date": "2026-07-27", "ruling": "nousergon/alpha-engine-config#5325"}
+        ]
+        assert "2026-07-27" in out["message"]
+
+    def test_the_date_keyed_dict_from_load_accepted_gaps_also_works(self):
+        out = _coverage(_ROWS_0727, {"2026-07-27": _GAP_0727})
+        assert out["closes"] is True
+
+    def test_the_fleet_reference_form_is_a_ruling_id(self):
+        entry = dict(_GAP_0727, ruling="alpha-engine-config-I5325")
+        assert _coverage(_ROWS_0727, [entry])["closes"] is True
+
+    def test_an_unrecorded_gap_still_fails_beside_an_accepted_one(self):
+        """03-12-shaped: a second gap with no registry entry is never excused
+        by the presence of an unrelated accepted one."""
+        rows = _axis_rows("2026-07-23", "2026-07-28", "2026-07-29")  # 07-24 AND 07-27
+        out = _coverage(rows, [_GAP_0727])
+        assert out["closes"] is False
+        assert [(b["kind"], b["date"]) for b in out["breaches"]] == [
+            ("missing_session", "2026-07-24")
+        ]
+        assert [a["date"] for a in out["accepted_gaps"]] == ["2026-07-27"]
+
+    @pytest.mark.parametrize("ruling", [None, "", "   ", "per Brian", "#5325", 5325])
+    def test_an_entry_without_a_ruling_id_fails_and_accepts_nothing(self, ruling):
+        entry = {k: v for k, v in _GAP_0727.items() if k != "ruling"}
+        if ruling is not None:
+            entry["ruling"] = ruling
+        out = _coverage(_ROWS_0727, [entry])
+        assert out["closes"] is False
+        kinds = {(b["kind"], b["date"]) for b in out["breaches"]}
+        assert ("accepted_gap_without_ruling", "2026-07-27") in kinds
+        assert ("missing_session", "2026-07-27") in kinds
+        assert out["accepted_gaps"] == []
+
+    def test_an_entry_for_a_date_with_a_row_fails(self):
+        entry = dict(_GAP_0727, date="2026-07-24")
+        out = _coverage(_ROWS_0727, [_GAP_0727, entry])
+        assert out["closes"] is False
+        not_gap = [b for b in out["breaches"] if b["kind"] == "accepted_gap_not_a_gap"]
+        assert [(b["date"], b["reason"]) for b in not_gap] == [("2026-07-24", "row_present")]
+
+    def test_an_entry_for_a_non_session_date_fails(self):
+        """A weekend inside the window is not a gap."""
+        entry = dict(_GAP_0727, date="2026-07-25")
+        out = _coverage(_ROWS_0727, [_GAP_0727, entry])
+        assert out["closes"] is False
+        not_gap = [b for b in out["breaches"] if b["kind"] == "accepted_gap_not_a_gap"]
+        assert [(b["date"], b["reason"]) for b in not_gap] == [
+            ("2026-07-25", "not_a_trading_session")
+        ]
+
+    def test_an_entry_outside_the_persisted_window_fails(self):
+        entry = dict(_GAP_0727, date="2026-03-12")
+        out = _coverage(_ROWS_0727, [_GAP_0727, entry])
+        assert out["closes"] is False
+        not_gap = [b for b in out["breaches"] if b["kind"] == "accepted_gap_not_a_gap"]
+        assert [(b["date"], b["reason"]) for b in not_gap] == [("2026-03-12", "outside_window")]
+
+    @pytest.mark.parametrize("entry", [
+        "2026-07-27",
+        {"ruling": "nousergon/alpha-engine-config#5325"},
+        {"date": "07/27/2026", "ruling": "nousergon/alpha-engine-config#5325"},
+    ])
+    def test_a_malformed_entry_fails_loudly(self, entry):
+        out = _coverage(_ROWS_0727, [entry])
+        assert out["closes"] is False
+        kinds = {b["kind"] for b in out["breaches"]}
+        assert "accepted_gap_malformed" in kinds
+        assert "missing_session" in kinds
+
+    def test_a_duplicated_date_accepts_nothing(self):
+        out = _coverage(_ROWS_0727, [_GAP_0727, dict(_GAP_0727)])
+        assert out["closes"] is False
+        kinds = [(b["kind"], b["date"]) for b in out["breaches"]]
+        assert kinds.count(("accepted_gap_malformed", "2026-07-27")) == 2
+        assert ("missing_session", "2026-07-27") in kinds
+
 # NAV mark correction (alpha-engine-config-I9627)
 # ─────────────────────────────────────────────────────────────────────────────
 
