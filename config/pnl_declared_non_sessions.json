@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "_comment": "Declared non-session rows for the P&L history audit (executor/pnl_integrity.py check_session_axis_coverage and check_benchmark_vendor_anchor). Each entry excuses ONE persisted eod_pnl row on a date the NYSE calendar says was never a session; the row itself is never edited. An entry needs a ruling id, and a date that really is a non-session row of the series, or it is its own breach. The set is closed: eod_reconcile refuses a non-session run_date since crucible-executor PR531, so this list can only shrink.",
+  "declarations": [
+    {
+      "date": "2026-04-03",
+      "ruling": "alpha-engine-config-I9613",
+      "ruled_by": "Brian 2026-09-08 and 2026-10-21T16:22Z",
+      "reason": "Good Friday. A live EOD run marked the book against IB holiday quotes (alpha-engine-config-I9615), so the row carries +2.16bp of alpha from a day the market never opened; the vendor has no session. The ruled restatement refuses this session and leaves the row as stored; no edit or delete was authorised."
+    }
+  ]
+}

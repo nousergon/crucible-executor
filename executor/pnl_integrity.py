@@ -1703,6 +1703,7 @@ def check_benchmark_vendor_anchor(
     vendor_dividends: Mapping[str, float] | None = None,
     close_tolerance_bps: float = BENCHMARK_CLOSE_DIVERGENCE_TOLERANCE_BPS,
     anchor_tolerance_bps: float = BENCHMARK_ANCHOR_TOLERANCE_BPS,
+    declared_non_sessions: Any = None,
 ) -> list[dict[str, Any]]:
     """A SECOND, INDEPENDENT measurement of the benchmark leg. Returns breaches.
 
@@ -1732,15 +1733,25 @@ def check_benchmark_vendor_anchor(
 
     ``vendor_closes`` missing a session the book persisted is itself reported,
     as ``benchmark_vendor_coverage`` — an anchor with holes is not an anchor,
-    and it is never treated as agreement.
+    and it is never treated as agreement. The one exception is a persisted row
+    DECLARED a non-session under a ruling (``declared_non_sessions``, the list
+    in config/pnl_declared_non_sessions.json): the vendor has no close for it because the
+    market never opened, so its absence there is the correct state, not a hole.
+    Only a declaration with a valid ruling id excuses a date; whether the date
+    really is a non-session row is checked by ``check_session_axis_coverage``,
+    which has the calendar.
     """
     vendor_dividends = vendor_dividends or {}
+    declared = declared_non_session_dates(declared_non_sessions)
     breaches: list[dict[str, Any]] = []
     dated = [r for r in rows if r.get("date")]
     if not dated or not vendor_closes:
         return breaches
 
-    missing = [str(r["date"]) for r in dated if str(r["date"]) not in vendor_closes]
+    missing = [
+        str(r["date"]) for r in dated
+        if str(r["date"]) not in vendor_closes and str(r["date"]) not in declared
+    ]
     if missing:
         breaches.append({
             "kind": "benchmark_vendor_coverage",
@@ -1857,6 +1868,110 @@ ACCEPTED_GAP_RULING_RE = re.compile(
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Declared non-session rows (alpha-engine-config-I9613). The accepted-gaps
+# registry above excuses a MISSING session; a declaration excuses the opposite
+# defect, a persisted row for a date the NYSE calendar says was never a session.
+# Same rules: it excuses its row only with a ruling id, the exception stays
+# visible in the result, and nothing about the row is edited. The live list is
+# config/pnl_declared_non_sessions.json (``accepted_gaps.load_declared_non_sessions``).
+# It is a checked-in file, not an S3 registry entry, because the set is CLOSED:
+# ``eod_reconcile.run`` refuses a non-session run_date since crucible-executor
+# PR531, so the list can only shrink, and a reviewed file deploys with the merge.
+
+
+def _validate_declared_non_sessions(
+    entries: Any,
+    *,
+    non_sessions: set[str],
+    present: set[str],
+    first: str,
+    last: str,
+    breaches: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Return ``{date: ruling}`` for the declarations that excuse a row.
+
+    A declaration excuses a ``non_trading_day_row`` only when it is well formed,
+    names its date once, carries a ruling id matching ``ACCEPTED_GAP_RULING_RE``
+    and its date really is a non-session row of this series. A declaration
+    dated outside ``first..last`` applies to no row of this series and is
+    ignored. Every other declaration is its own breach and excuses nothing:
+    ``declared_non_session_malformed``, ``declared_non_session_without_ruling``
+    and ``declared_non_session_not_a_non_session`` (no row for that date, or
+    the calendar says it was a session).
+    """
+    raw = list(entries or ())
+    declared: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for e in raw:
+        if isinstance(e, Mapping) and isinstance(e.get("date"), str):
+            counts[e["date"]] = counts.get(e["date"], 0) + 1
+    for e in raw:
+        if not isinstance(e, Mapping) or not isinstance(e.get("date"), str) \
+                or not _ISO_DATE_RE.match(e["date"]) or counts[e["date"]] > 1:
+            breaches.append({
+                "kind": "declared_non_session_malformed",
+                "date": (e.get("date") if isinstance(e, Mapping) else None),
+                "entry": e,
+                "message": (
+                    f"Declared non-session row {e!r} has no ISO date or is "
+                    "declared twice; it excuses nothing."
+                ),
+            })
+            continue
+        d = e["date"]
+        if d < first or d > last:
+            continue
+        ruling = e.get("ruling")
+        if not isinstance(ruling, str) or not ACCEPTED_GAP_RULING_RE.match(ruling.strip()):
+            breaches.append({
+                "kind": "declared_non_session_without_ruling",
+                "date": d,
+                "ruling": ruling,
+                "message": (
+                    f"The non-session row declared for {d} carries no ruling "
+                    f"id (ruling={ruling!r}); it excuses nothing and the row "
+                    "still reports as non_trading_day_row."
+                ),
+            })
+            continue
+        if d in non_sessions:
+            declared[d] = ruling.strip()
+            continue
+        reason = "trading_session" if d in present else "no_row"
+        breaches.append({
+            "kind": "declared_non_session_not_a_non_session",
+            "date": d,
+            "ruling": ruling.strip(),
+            "reason": reason,
+            "message": (
+                f"{d} is declared a non-session row, but "
+                + ("the calendar says it was a trading session"
+                   if reason == "trading_session" else
+                   "the series has no row for it")
+                + f" over {first} → {last}. Remove the declaration, or fix "
+                "the series it was recorded against."
+            ),
+        })
+    return declared
+
+
+def declared_non_session_dates(declared_non_sessions: Any) -> dict[str, str]:
+    """``{date: ruling}`` for declarations carrying a valid ruling id. PURE.
+
+    For a gate with no trading calendar (the vendor anchor). It does not check
+    that the date is a non-session row; ``check_session_axis_coverage`` does,
+    and reports a declaration that is not one as a breach.
+    """
+    out: dict[str, str] = {}
+    for e in declared_non_sessions or ():
+        if not isinstance(e, Mapping):
+            continue
+        d, ruling = e.get("date"), e.get("ruling")
+        if isinstance(d, str) and _ISO_DATE_RE.match(d) and isinstance(ruling, str) \
+                and ACCEPTED_GAP_RULING_RE.match(ruling.strip()):
+            out[d] = ruling.strip()
+    return out
+
 
 def _accepted_gap_entries(accepted_gaps: Any) -> list[Any]:
     """Normalise the registry to a list of raw entries.
@@ -1877,6 +1992,7 @@ def check_session_axis_coverage(
     is_trading_day: Any,
     next_trading_day: Any,
     accepted_gaps: Any = None,
+    declared_non_sessions: Any = None,
 ) -> dict[str, Any]:
     """Assert the persisted ``date`` axis is exactly the NYSE trading calendar.
 
@@ -1930,6 +2046,13 @@ def check_session_axis_coverage(
 
     An absent or empty registry accepts nothing — every gap still breaches.
 
+    ``declared_non_sessions`` is the same idea for the opposite defect: a list
+    of ``{"date", "ruling", "reason"}`` declarations (the live list is
+    config/pnl_declared_non_sessions.json). A ``non_trading_day_row`` whose date carries
+    a valid declaration is listed under ``declared_non_sessions`` in the result
+    instead of breaching; see ``_validate_declared_non_sessions`` for what makes
+    one valid. ``None`` declares nothing.
+
     ``status`` is ``"n/a"`` on an empty series (nothing to walk).
     """
     dated = sorted({str(r["date"]) for r in rows if r.get("date")})
@@ -1937,6 +2060,7 @@ def check_session_axis_coverage(
         return {"status": "n/a", "closes": None, "breaches": []}
 
     breaches: list[dict[str, Any]] = []
+    non_sessions: list[str] = []
 
     for d in dated:
         try:
@@ -1954,18 +2078,28 @@ def check_session_axis_coverage(
             })
             continue
         if not trading:
-            breaches.append({
-                "kind": "non_trading_day_row",
-                "date": d,
-                "message": (
-                    f"eod_pnl carries a row for {d}, which the NYSE trading "
-                    "calendar says was never a session. Every chain-linked "
-                    "gate (TWR closure, nav_change basis, benchmark closure) "
-                    "treats adjacent rows as adjacent sessions unless this row "
-                    "is excluded — it contributes a spurious session to all "
-                    "of them."
-                ),
-            })
+            non_sessions.append(d)
+
+    declared = _validate_declared_non_sessions(
+        declared_non_sessions,
+        non_sessions=set(non_sessions), present=set(dated),
+        first=dated[0], last=dated[-1], breaches=breaches,
+    )
+    for d in non_sessions:
+        if d in declared:
+            continue
+        breaches.append({
+            "kind": "non_trading_day_row",
+            "date": d,
+            "message": (
+                f"eod_pnl carries a row for {d}, which the NYSE trading "
+                "calendar says was never a session. Every chain-linked "
+                "gate (TWR closure, nav_change basis, benchmark closure) "
+                "treats adjacent rows as adjacent sessions unless this row "
+                "is excluded — it contributes a spurious session to all "
+                "of them."
+            ),
+        })
 
     present = set(dated)
     missing: list[str] = []
@@ -2030,6 +2164,12 @@ def check_session_axis_coverage(
     accepted_list = [
         {"date": d, "ruling": accepted[d]} for d in missing if d in accepted
     ]
+    declared_list = [
+        {"date": d, "ruling": declared[d]} for d in non_sessions if d in declared
+    ]
+    exceptions = [
+        f"{a['date']} ({a['ruling']})" for a in accepted_list
+    ] + [f"{a['date']} non-session, declared ({a['ruling']})" for a in declared_list]
 
     return {
         "status": "ok",
@@ -2039,13 +2179,14 @@ def check_session_axis_coverage(
         "n_rows": len(dated),
         "breaches": breaches,
         "accepted_gaps": accepted_list,
+        "declared_non_sessions": declared_list,
         "message": (
             "eod_pnl date axis matches the NYSE trading calendar over "
             f"{dated[0]} → {dated[-1]} ({len(dated)} sessions)"
             + (
-                "." if not accepted_list else
-                ", with " + str(len(accepted_list)) + " ruled exception(s): "
-                + ", ".join(f"{a['date']} ({a['ruling']})" for a in accepted_list)
+                "." if not exceptions else
+                ", with " + str(len(exceptions)) + " ruled exception(s): "
+                + ", ".join(exceptions)
                 + "."
             )
             if not breaches else

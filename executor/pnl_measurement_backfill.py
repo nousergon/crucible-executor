@@ -653,6 +653,7 @@ def audit_history(
     is_trading_day: Any | None = None,
     next_trading_day: Any | None = None,
     accepted_gaps: Any = None,
+    declared_non_sessions: Any = None,
 ) -> dict[str, Any]:
     """Run the integrity gates over the WHOLE persisted series and report breaches.
 
@@ -674,6 +675,12 @@ def audit_history(
     session with a valid, ruled entry there is reported under
     ``session_axis_coverage["accepted_gaps"]`` instead of as a breach, and an
     invalid entry is itself a breach (alpha-engine-config-I11087).
+    ``declared_non_sessions`` (the CLI passes
+    config/pnl_declared_non_sessions.json) does the same for a persisted
+    row on a non-session date: a ruled declaration moves its
+    ``non_trading_day_row`` breach to
+    ``session_axis_coverage["declared_non_sessions"]`` and excuses its
+    ``benchmark_vendor_coverage`` hole (alpha-engine-config-I9613).
 
     Returns a dict with ``breach_count``; the CLI exits NON-ZERO when it is
     nonzero, so a breach in the history is a failure rather than a paragraph in
@@ -688,7 +695,7 @@ def audit_history(
     if is_trading_day is not None and next_trading_day is not None:
         coverage = check_session_axis_coverage(
             rows, is_trading_day=is_trading_day, next_trading_day=next_trading_day,
-            accepted_gaps=accepted_gaps,
+            accepted_gaps=accepted_gaps, declared_non_sessions=declared_non_sessions,
         )
         coverage_status = "evaluated"
     else:
@@ -702,6 +709,7 @@ def audit_history(
             rows,
             vendor_closes=vendor_closes,
             vendor_dividends=spy_ex_dividends or {},
+            declared_non_sessions=declared_non_sessions,
         )
         anchor_status = "evaluated"
     else:
@@ -1897,13 +1905,17 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     if args.audit:
         rows = _rows(conn)  # re-read so the audit sees anything just written
-        from executor.accepted_gaps import load_accepted_gap_entries
+        from executor.accepted_gaps import (
+            load_accepted_gap_entries,
+            load_declared_non_sessions,
+        )
 
         audit = audit_history(
             rows, spy_ex_dividends=spy_map, vendor_closes=vendor_closes,
             prior_session_of=_prior_session_of,
             is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
             accepted_gaps=load_accepted_gap_entries(args.trades_bucket),
+            declared_non_sessions=load_declared_non_sessions(),
         )
         report["audit"] = audit
         if audit["breach_count"]:

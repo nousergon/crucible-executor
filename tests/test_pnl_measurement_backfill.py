@@ -179,6 +179,28 @@ def test_vendor_anchor_reports_its_own_coverage_holes():
     assert coverage and coverage[0]["missing_sessions"] == ["2026-04-03"]
 
 
+def test_vendor_anchor_excuses_only_a_ruled_non_session_declaration():
+    """alpha-engine-config-I9613: the declared Good Friday row is not a hole in
+    the anchor (the market never opened), and nothing else is excused."""
+    rows = [_row("2026-04-02", 100.0, None), _row("2026-04-03", 100.0, 0.0),
+            _row("2026-04-06", 100.0, 0.0)]
+    vendor = {"2026-04-02": 100.0}
+    declared = check_benchmark_vendor_anchor(
+        rows, vendor_closes=vendor,
+        declared_non_sessions=[{"date": "2026-04-03",
+                                "ruling": "alpha-engine-config-I9613"}],
+    )
+    coverage = [b for b in declared if b["kind"] == "benchmark_vendor_coverage"]
+    assert coverage and coverage[0]["missing_sessions"] == ["2026-04-06"]
+
+    unruled = check_benchmark_vendor_anchor(
+        rows, vendor_closes=vendor,
+        declared_non_sessions=[{"date": "2026-04-03", "ruling": "per Brian"}],
+    )
+    coverage = [b for b in unruled if b["kind"] == "benchmark_vendor_coverage"]
+    assert coverage[0]["missing_sessions"] == ["2026-04-03", "2026-04-06"]
+
+
 def test_vendor_anchor_not_evaluated_is_not_a_pass():
     audit = B.audit_history(
         [_row("2026-03-09", 100.0, None), _row("2026-03-10", 101.0, 1.0)],
@@ -409,6 +431,28 @@ def test_audit_history_passes_the_accepted_gaps_registry_to_the_coverage_gate():
     kinds = {b["kind"] for b in unruled["session_axis_coverage"]["breaches"]}
     assert {"missing_session", "accepted_gap_without_ruling"} <= kinds
     assert unruled["breach_count"] >= ruled["breach_count"] + 2
+
+
+def test_audit_history_passes_the_declared_non_sessions_to_both_gates():
+    """alpha-engine-config-I9613: the declared 04-03 row stops counting in the
+    coverage gate AND the vendor anchor, and stays visible."""
+    from executor.accepted_gaps import load_declared_non_sessions
+
+    rows = [_row("2026-04-02", 100.0, None), _row("2026-04-03", 100.0, 0.0)]
+    kw = {"is_trading_day": _fake_is_trading_day,
+          "next_trading_day": _fake_next_trading_day,
+          "vendor_closes": {"2026-04-02": 100.0}}
+    bare = B.audit_history(rows, **kw)
+    declared = B.audit_history(rows, declared_non_sessions=load_declared_non_sessions(), **kw)
+    assert {b["kind"] for b in bare["benchmark_vendor_anchor_breaches"]} == {
+        "benchmark_vendor_coverage"
+    }
+    assert declared["benchmark_vendor_anchor_breaches"] == []
+    assert declared["session_axis_coverage"]["breaches"] == []
+    assert declared["session_axis_coverage"]["declared_non_sessions"] == [
+        {"date": "2026-04-03", "ruling": "alpha-engine-config-I9613"}
+    ]
+    assert declared["breach_count"] == bare["breach_count"] - 2
 
 
 def test_plan_non_trading_day_flags_only_takes_that_breach_kind():
