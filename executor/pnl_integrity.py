@@ -820,6 +820,15 @@ def mark_materiality_usd(nav: float) -> float:
     )
 
 
+def _is_number(value: Any) -> bool:
+    """True for a finite real number (bools excluded) — safe to ``:,.2f``."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
 def check_custodian_marks(
     mark_range_flags: Sequence[Mapping[str, Any]] | None,
     *,
@@ -865,6 +874,25 @@ def check_custodian_marks(
             continue
         if not math.isfinite(error_usd) or abs(error_usd) <= materiality_usd:
             continue
+        ib_mark, day_low, day_high = (
+            flag.get("ib_mark"), flag.get("day_low"), flag.get("day_high")
+        )
+        if _is_number(ib_mark) and _is_number(day_low) and _is_number(day_high):
+            where = (
+                f"broker mark ${ib_mark:,.2f} fell outside the day's traded range "
+                f"[${day_low:,.2f}, ${day_high:,.2f}]"
+            )
+        else:
+            # The history audit reconstructs flags from the persisted eod_pnl
+            # row, which carries the signed error but NOT the mark or the
+            # day's [Low, High] (alpha-engine-config-I9613). Say so rather
+            # than formatting a None — which raised TypeError and took the
+            # whole full-history audit down with it.
+            where = (
+                "broker mark fell outside the day's traded range (mark and "
+                "range not persisted on this row; error is the recorded "
+                "ib_mark_range_error_usd)"
+            )
         breaches.append({
             "kind": "custodian_mark",
             "run_date": run_date,
@@ -878,9 +906,7 @@ def check_custodian_marks(
             "pct_of_nav": error_usd / nav * 100.0,
             "message": (
                 f"Custodian mark failure for {flag.get('ticker')} on {run_date}: "
-                f"broker mark ${flag.get('ib_mark'):,.2f} fell outside the day's "
-                f"traded range [${flag.get('day_low'):,.2f}, "
-                f"${flag.get('day_high'):,.2f}] — ${error_usd:+,.0f} "
+                f"{where} — ${error_usd:+,.0f} "
                 f"({error_usd / nav * 100:+.3f}% of NAV) past the breached bound, "
                 f"above the ${materiality_usd:,.0f} materiality floor "
                 f"({MARK_HARD_MATERIALITY_NAV_BPS:.0f}bps of NAV). A mark outside "
