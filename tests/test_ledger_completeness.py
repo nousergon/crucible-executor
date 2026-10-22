@@ -1,7 +1,9 @@
 """Tests for executor/ledger_completeness.py (alpha-engine-config-I12411).
 
-The seven historical gaps are declared exceptions (Brian 2026-10-21 16:34Z);
-any other divergence must still fail the check.
+Thirteen historical gaps are declared exceptions under one ruling id: seven
+(Brian 2026-10-21 16:34Z) and six more (Brian 2026-10-22 15:37Z). Any other
+divergence must still fail the check -- including CRUS +136, which is restated
+by its own script and deliberately NOT declared.
 """
 
 from __future__ import annotations
@@ -26,6 +28,15 @@ SEVEN = {
     "ABBV": ("2026-04-13", 218), "PFE": ("2026-04-22", 231), "CME": ("2026-05-26", 5),
     "BRO": ("2026-05-26", -1089),
 }
+SIX = {
+    "AKAM": ("2026-03-20", 382), "CIEN": ("2026-03-20", 118), "COST": ("2026-03-25", 60),
+    "PLTR": ("2026-03-27", 130), "TER": ("2026-04-02", -86), "VRTX": ("2026-04-06", -312),
+}
+DECLARED = {**SEVEN, **SIX}
+RULED_BY = {**dict.fromkeys(SEVEN, "Brian 2026-10-21T16:34Z"),
+            **dict.fromkeys(SIX, "Brian 2026-10-22T15:37Z")}
+# CRUS +136 (the 2026-10-12 EXIT) is restated by its own script, not declared.
+CRUS_DELTA = 136
 AS_OF = "2026-10-20"
 
 
@@ -34,60 +45,79 @@ def _trade(ticker, action, shares, date="2026-03-02", filled=None):
             "action": action, "shares": shares, "filled_shares": filled}
 
 
-def _ledger_with_seven():
-    """Ledger rows reproducing each of the seven divergences against an empty snapshot."""
+def _ledger_with(gaps):
+    """Ledger rows reproducing each divergence in ``gaps`` against an empty snapshot."""
     rows = []
-    for t, (d, delta) in SEVEN.items():
+    for t, (d, delta) in gaps.items():
         if delta > 0:
             rows += [_trade(t, "ENTER", delta + 100, "2026-03-02"), _trade(t, "EXIT", 100, d)]
-        else:  # BRO: an unlogged BUY leaves the logged EXIT larger than the logged ENTER
+        else:  # BRO/TER/VRTX: an unlogged BUY leaves the logged EXIT larger than the logged ENTER
             rows += [_trade(t, "ENTER", 170, "2026-03-02"), _trade(t, "EXIT", 170 - delta, d)]
     return rows
 
 
+def _ledger_declared():
+    """Ledger rows reproducing every declared divergence."""
+    return _ledger_with(DECLARED)
+
+
 class TestDeclaredFile:
-    def test_file_declares_exactly_the_seven_with_ruling(self):
+    def test_file_declares_exactly_the_thirteen_with_ruling(self):
         entries = load_declared_exceptions()
-        assert {e["ticker"]: (e["date"], e["delta_shares"]) for e in entries} == SEVEN
+        assert {e["ticker"]: (e["date"], e["delta_shares"]) for e in entries} == DECLARED
         for e in entries:
             assert e["ruling"] == RULING
-            assert e["ruled_by"] == "Brian 2026-10-21T16:34Z"
+            assert e["ruled_by"] == RULED_BY[e["ticker"]]
             assert e["reason"].strip()
+
+    def test_crus_is_not_declared(self):
+        assert "CRUS" not in {e["ticker"] for e in load_declared_exceptions()}
 
     def test_missing_file_declares_nothing(self, tmp_path):
         assert load_declared_exceptions(tmp_path / "absent.json") == []
 
 
-class TestSevenDeclaredGapsPass:
-    def test_seven_pass_with_the_shipped_declarations(self):
+class TestDeclaredGapsPass:
+    def test_declared_pass_with_the_shipped_declarations(self):
         res = check_ledger_completeness(
-            _ledger_with_seven(), {}, as_of=AS_OF, declared_exceptions=load_declared_exceptions())
+            _ledger_declared(), {}, as_of=AS_OF, declared_exceptions=load_declared_exceptions())
         assert res["status"] == "ok", res["message"]
         assert res["breaches"] == []
-        assert {d["ticker"] for d in res["declared"]} == set(SEVEN)
+        assert {d["ticker"] for d in res["declared"]} == set(DECLARED)
         assert all(d["ruling"] == RULING for d in res["declared"])
         assert RULING in res["message"]
 
-    def test_seven_fail_without_declarations(self):
-        res = check_ledger_completeness(_ledger_with_seven(), {}, as_of=AS_OF, declared_exceptions=[])
+    def test_declared_fail_without_declarations(self):
+        res = check_ledger_completeness(_ledger_declared(), {}, as_of=AS_OF, declared_exceptions=[])
         assert res["status"] == "breach"
-        assert {b["ticker"] for b in res["breaches"]} == set(SEVEN)
+        assert {b["ticker"] for b in res["breaches"]} == set(DECLARED)
         assert {b["kind"] for b in res["breaches"]} == {"undeclared_gap"}
 
 
-class TestEighthGapFails:
-    def test_eighth_synthetic_gap_fails_while_the_seven_still_pass(self):
-        rows = _ledger_with_seven() + [_trade("ZZZZ", "ENTER", 40, "2026-09-01")]
+class TestUndeclaredGapFails:
+    def test_synthetic_gap_fails_while_the_declared_still_pass(self):
+        rows = _ledger_declared() + [_trade("ZZZZ", "ENTER", 40, "2026-09-01")]
         res = check_ledger_completeness(
             rows, {}, as_of=AS_OF, declared_exceptions=load_declared_exceptions())
         assert res["status"] == "breach"
         assert [(b["kind"], b["ticker"], b["delta_shares"]) for b in res["breaches"]] == [
             ("undeclared_gap", "ZZZZ", 40)]
-        assert {d["ticker"] for d in res["declared"]} == set(SEVEN)
+        assert {d["ticker"] for d in res["declared"]} == set(DECLARED)
+
+    def test_crus_still_shows_as_undeclared(self):
+        """The live 2026-10-20 shape: all thirteen declared gaps plus CRUS +136.
+        Only CRUS breaches until its restatement script runs."""
+        rows = _ledger_with(DECLARED) + _ledger_with({"CRUS": ("2026-10-12", CRUS_DELTA)})
+        res = check_ledger_completeness(
+            rows, {}, as_of=AS_OF, declared_exceptions=load_declared_exceptions())
+        assert res["status"] == "breach"
+        assert [(b["kind"], b["ticker"], b["delta_shares"]) for b in res["breaches"]] == [
+            ("undeclared_gap", "CRUS", CRUS_DELTA)]
+        assert {d["ticker"] for d in res["declared"]} == set(DECLARED)
 
     def test_snapshot_position_with_no_ledger_backing_fails(self):
         res = check_ledger_completeness(
-            _ledger_with_seven(), {"ZZZZ": {"shares": 10}}, as_of=AS_OF,
+            _ledger_declared(), {"ZZZZ": {"shares": 10}}, as_of=AS_OF,
             declared_exceptions=load_declared_exceptions())
         assert [(b["kind"], b["ticker"], b["delta_shares"]) for b in res["breaches"]] == [
             ("undeclared_gap", "ZZZZ", -10)]
@@ -95,7 +125,7 @@ class TestEighthGapFails:
     def test_second_gap_on_a_declared_ticker_fails(self):
         """The exception is the exact delta, not the ticker: a further unlogged
         fill on COKE changes the delta and is a NEW gap."""
-        rows = _ledger_with_seven() + [_trade("COKE", "ENTER", 7, "2026-06-01")]
+        rows = _ledger_declared() + [_trade("COKE", "ENTER", 7, "2026-06-01")]
         res = check_ledger_completeness(
             rows, {}, as_of=AS_OF, declared_exceptions=load_declared_exceptions())
         kinds = {(b["kind"], b["ticker"]) for b in res["breaches"]}
@@ -132,7 +162,7 @@ class TestExceptionValidation:
         return copy.deepcopy(load_declared_exceptions())
 
     def _run(self, decl):
-        return check_ledger_completeness(_ledger_with_seven(), {}, as_of=AS_OF, declared_exceptions=decl)
+        return check_ledger_completeness(_ledger_declared(), {}, as_of=AS_OF, declared_exceptions=decl)
 
     @pytest.mark.parametrize("bad", [None, "", "per Brian", "alpha-engine-config#12411"])
     def test_entry_without_a_ruling_id_excuses_nothing(self, bad):
@@ -191,10 +221,10 @@ def _make_db(path, trades, snapshot, snap_date=AS_OF):
 
 
 class TestDbRunnerAndCli:
-    def test_db_run_passes_with_the_seven_and_fails_with_an_eighth(self, tmp_path, capsys):
+    def test_db_run_passes_with_the_declared_and_fails_with_another(self, tmp_path, capsys):
         ok_db, bad_db = tmp_path / "ok.db", tmp_path / "bad.db"
-        _make_db(ok_db, _ledger_with_seven(), {})
-        _make_db(bad_db, _ledger_with_seven() + [_trade("ZZZZ", "ENTER", 40, "2026-09-01")], {})
+        _make_db(ok_db, _ledger_declared(), {})
+        _make_db(bad_db, _ledger_declared() + [_trade("ZZZZ", "ENTER", 40, "2026-09-01")], {})
         assert run_on_db(ok_db)["status"] == "ok"
         assert main(["--db", str(ok_db)]) == 0
         assert main(["--db", str(bad_db)]) == 1
@@ -202,7 +232,7 @@ class TestDbRunnerAndCli:
 
     def test_db_is_opened_read_only(self, tmp_path):
         db = tmp_path / "ro.db"
-        _make_db(db, _ledger_with_seven(), {})
+        _make_db(db, _ledger_declared(), {})
         before = db.read_bytes()
         run_on_db(db)
         assert db.read_bytes() == before
