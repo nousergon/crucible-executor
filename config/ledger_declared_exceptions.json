@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "_comment": "Declared exceptions to the trade-ledger completeness check (executor/ledger_completeness.py). Each entry excuses ONE known divergence between the trades ledger and the EOD positions_snapshot, and only that divergence: it is matched on ticker AND the exact signed share delta (ledger net minus snapshot shares). A different delta on the same ticker is a new gap and fails. An entry needs a ruling id; the rows themselves are never edited. Ruling: nousergon/alpha-engine-config#12411, Brian 2026-10-21 16:34Z, 'Declare all'.",
+  "exceptions": [
+    {
+      "ticker": "COKE", "date": "2026-04-01", "delta_shares": 315,
+      "ruling": "nousergon/alpha-engine-config#12411",
+      "ruled_by": "Brian 2026-10-21T16:34Z",
+      "reason": "315-share SELL executed at IB but never logged; position went to -105 and only the auto-cover was logged. Snapshot matches IB."
+    },
+    {
+      "ticker": "UNH", "date": "2026-04-07", "delta_shares": 156,
+      "ruling": "nousergon/alpha-engine-config#12411",
+      "ruled_by": "Brian 2026-10-21T16:34Z",
+      "reason": "Duplicate-order oversell (retry duplicated a live order, since fixed in _place_order_with_retry): 313 sold, 157 logged. Snapshot matches IB."
+    },
+    {
+      "ticker": "NVT", "date": "2026-04-10", "delta_shares": 62,
+      "ruling": "nousergon/alpha-engine-config#12411",
+      "ruled_by": "Brian 2026-10-21T16:34Z",
+      "reason": "Duplicate-order oversell (retry defect, since fixed): 124 sold, 62 logged. Snapshot matches IB."
+    },
+    {
+      "ticker": "ABBV", "date": "2026-04-13", "delta_shares": 218,
+      "ruling": "nousergon/alpha-engine-config#12411",
+      "ruled_by": "Brian 2026-10-21T16:34Z",
+      "reason": "Duplicate-order oversell (retry defect, since fixed): 436 sold, 218 logged. Snapshot matches IB."
+    },
+    {
+      "ticker": "PFE", "date": "2026-04-22", "delta_shares": 231,
+      "ruling": "nousergon/alpha-engine-config#12411",
+      "ruled_by": "Brian 2026-10-21T16:34Z",
+      "reason": "The 'PFE incident 2026-04-22' (retry duplicated a live order; went short 76, then auto-covered). Fixed in _place_order_with_retry. Snapshot matches IB."
+    },
+    {
+      "ticker": "CME", "date": "2026-05-26", "delta_shares": 5,
+      "ruling": "nousergon/alpha-engine-config#12411",
+      "ruled_by": "Brian 2026-10-21T16:34Z",
+      "reason": "EXIT filled 280 of 285 held; 5 shares unlogged, immaterial. Snapshot matches IB."
+    },
+    {
+      "ticker": "BRO", "date": "2026-05-26", "delta_shares": -1089,
+      "ruling": "nousergon/alpha-engine-config#12411",
+      "ruled_by": "Brian 2026-10-21T16:34Z",
+      "reason": "BUY of 1,089 shares never logged (snapshot 170 -> 1,259 with no ENTER); the later EXIT of 1,259 is logged, so the ledger nets negative. Snapshot matches IB."
+    }
+  ]
+}
