@@ -20,7 +20,8 @@ Declared exceptions
 A known, ruled divergence is excused by a record in
 ``config/ledger_declared_exceptions.json`` — never by editing a ledger row.
 The ruling that created the first seven is ``nousergon/alpha-engine-config#12411``
-(Brian, 2026-10-21 16:34Z, "Declare all"). An exception excuses exactly one
+(Brian, 2026-10-21 16:34Z, "Declare all"); the same issue's second ruling
+(Brian, 2026-10-22 15:37Z, "Declare all") added six more. An exception excuses exactly one
 divergence: it matches on ticker AND the exact signed ``delta_shares`` (ledger
 net minus snapshot shares). Anything else still fails:
 
