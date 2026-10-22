@@ -1171,3 +1171,56 @@ def test_live_anchor_window_propagates_a_vendor_outage(monkeypatch):
     monkeypatch.setattr(B, "fetch_vendor_closes", _boom)
     with pytest.raises(RuntimeError, match="no SPY bars"):
         B.fetch_live_anchor_window([{"date": "2026-09-04"}, {"date": "2026-09-08"}])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# alpha-engine-config-I9613 — the full-history audit crashed in
+# check_custodian_marks on a material flag rebuilt from a persisted row
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _flagged_row(date, error_usd, *, nav=1_017_000.0):
+    row = _row(date, 100.0, 0.0, nav=nav)
+    row["positions_snapshot"] = json.dumps({"DUOL": {
+        "shares": 708, "market_value": 105_039.0, "ib_market_value": 107_899.2,
+        "ib_mark_outside_range": True, "ib_mark_range_error_usd": error_usd,
+    }})
+    return row
+
+
+def test_audit_history_reports_a_material_persisted_flag_instead_of_crashing():
+    """The live 2026-08-31 DUOL shape: +$1,972 past the bound, above the
+    $1,526 floor at that NAV, with no mark or range on the row."""
+    audit = B.audit_history([_row("2026-08-28", 100.0, None),
+                             _flagged_row("2026-08-31", 1_971.78)])
+    assert [(b["kind"], b["ticker"]) for b in audit["mark_breaches"]] == [
+        ("custodian_mark", "DUOL")]
+    assert audit["mark_unevaluated"] == []
+    assert audit["breach_count"] >= 1
+
+
+@pytest.mark.parametrize("error_usd", [None, "", "nan", float("nan"), "n/a"])
+def test_audit_history_reports_an_uncheckable_flag_as_a_finding(error_usd):
+    """A flagged mark whose size the row does not carry is neither a pass nor
+    a breach — and never a silent skip."""
+    audit = B.audit_history([_row("2026-08-28", 100.0, None),
+                             _flagged_row("2026-08-31", error_usd)])
+    assert audit["mark_breaches"] == []
+    assert [(b["kind"], b["ticker"], b["run_date"])
+            for b in audit["mark_unevaluated"]] == [
+        ("custodian_mark_unevaluated", "DUOL", "2026-08-31")]
+    assert audit["breach_count"] >= 1
+
+
+def test_audit_history_reports_a_flag_on_a_row_without_nav():
+    audit = B.audit_history([_flagged_row("2026-08-31", 1_971.78, nav=None)])
+    assert audit["mark_breaches"] == []
+    assert len(audit["mark_unevaluated"]) == 1
+    assert "no portfolio_nav" in audit["mark_unevaluated"][0]["message"]
+
+
+def test_audit_history_checks_marks_on_rows_without_a_true_residual():
+    """The mark leg no longer rides on ``unattributed_true_usd`` being present."""
+    row = _flagged_row("2026-08-31", 1_971.78)
+    assert "unattributed_true_usd" not in row
+    audit = B.audit_history([row])
+    assert len(audit["mark_breaches"]) == 1

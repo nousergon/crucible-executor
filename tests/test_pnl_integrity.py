@@ -461,6 +461,27 @@ class TestCustodianMarks:
         assert check_custodian_marks(
             [_flag("AMD", 479.0, 502.2, 530.13, 225, -5_220.0)], nav=None) == []
 
+    def test_a_flag_without_mark_or_range_still_breaches_and_does_not_crash(self):
+        """alpha-engine-config-I9613. The full-history audit rebuilds flags from
+        the persisted eod_pnl row, which carries ``ib_mark_range_error_usd`` but
+        not the mark or the day's [Low, High]. Formatting those Nones raised
+        TypeError on the live 2026-08-31 DUOL row and killed the whole audit.
+        The breach must still be returned, at its recorded size."""
+        flag = {"ticker": "DUOL", "mark_error_usd": 1_971.78, "shares": 708}
+        breaches = check_custodian_marks([flag], nav=NAV, run_date="2026-08-31")
+        assert len(breaches) == 1
+        assert breaches[0]["kind"] == "custodian_mark"
+        assert breaches[0]["error_usd"] == pytest.approx(1_971.78)
+        assert breaches[0]["ib_mark"] is None
+        assert "not persisted" in breaches[0]["message"]
+
+    def test_message_names_mark_and_range_when_present(self):
+        breaches = check_custodian_marks(
+            [_flag("AMD", 479.0, 502.2, 530.13, 225, -5_220.0)],
+            nav=NAV, run_date="2026-08-04")
+        assert "broker mark $479.00 fell outside the day's traded range " \
+            "[$502.20, $530.13]" in breaches[0]["message"]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session-axis coverage — alpha-engine-config-I9615
