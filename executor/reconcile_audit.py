@@ -77,8 +77,9 @@ from nousergon_lib.dates import now_dual
 from nousergon_lib.logging import get_flow_doctor
 from nousergon_lib.trading_calendar import previous_trading_day
 
+from executor import money_ledger
 from executor.accepted_gaps import load_accepted_gaps
-from executor.config_loader import load_config
+from executor.config_loader import NAV_BASIS_IB_NETLIQ, load_config, resolve_nav_basis
 from executor.dividends import spy_total_return_pct
 from executor.eod_reconcile import _log_paged, _row_close_source, _spy_close
 from executor.eod_reconcile import run as eod_run
@@ -224,6 +225,7 @@ _LEG_REASON = {
     "spy_return_pct": "stale_return",
     "position_close": "stale_position_close",
     "prior_corrected": "stale_prior_basis",
+    "nav_basis": "stale_nav_basis",
 }
 
 
@@ -460,7 +462,8 @@ def _detect_stale_legs(
     """
     row = conn.execute(
         "SELECT spy_close, spy_return_pct, daily_alpha_pct, positions_snapshot, "
-        "spy_dividend_per_share FROM eod_pnl WHERE date = ?",
+        "spy_dividend_per_share, nav_basis, nav_basis_diff_bps FROM eod_pnl "
+        "WHERE date = ?",
         (run_date,),
     ).fetchone()
     if row is None:
@@ -525,8 +528,85 @@ def _detect_stale_legs(
                              "stored_source": pos.get("close_source") or _SOURCE_UNKNOWN,
                              "settled_source": settled_source})
 
+    # ── NAV basis (ground-truth ruling 2026-10-22, alpha-engine-config-I10052).
+    # A windowed row still struck on the broker's marks while the configured
+    # basis is the settled close is re-struck onto it, so every published day
+    # inside the window carries IB holdings x Polygon settled closes. The two
+    # sides are different SOURCES (the broker's mark vs polygon), so the leg
+    # classifies as a scheduled substitution, and pages only past
+    # SOURCE_SUBSTITUTION_PAGE_BPS like any other substituted price.
+    configured_basis = resolve_nav_basis(config)
+    stored_basis = row[5] or NAV_BASIS_IB_NETLIQ
+    if stored_basis != configured_basis:
+        legs.append({"leg": "nav_basis",
+                     "divergence_bps": None if row[6] is None else abs(float(row[6])),
+                     "stored": stored_basis, "settled": configured_basis,
+                     "stored_source": "ib_mark", "settled_source": _SOURCE_CANONICAL})
+
     legs.sort(key=lambda leg: -_mag(leg["divergence_bps"]))
     return row, legs
+
+
+def _row_view(conn, run_date: str) -> tuple[dict | None, dict | None]:
+    """``(balance view, raw columns)`` of the stored row, or ``(None, None)``."""
+    row = conn.execute(
+        "SELECT portfolio_nav, total_cash, accrued_interest, positions_snapshot, "
+        "nav_basis FROM eod_pnl WHERE date = ?",
+        (run_date,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    cols = {"portfolio_nav": row[0], "total_cash": row[1], "accrued_interest": row[2],
+            "positions_snapshot": row[3], "nav_basis": row[4]}
+    try:
+        return money_ledger.view_from_eod_row(**cols), cols
+    except ValueError as e:
+        logger.warning("[reconcile_audit] %s has no balance view (%s)", run_date, e)
+        return None, cols
+
+
+def _post_restrike_entry(
+    conn,
+    *,
+    run_date: str,
+    before_view: dict | None,
+    before_cols: dict | None,
+    classification: str,
+    reasons: list[str],
+    trades_bucket: str | None,
+    region: str,
+) -> dict | None:
+    """Journal the re-strike of a published row: old view -> new view.
+
+    Raises when either side has no view: a restated NAV with no journal entry
+    is exactly the unrecorded correction the ledger exists to prevent.
+    """
+    after_view, after_cols = _row_view(conn, run_date)
+    if before_view is None or after_view is None:
+        raise money_ledger.LedgerIntegrityError(
+            f"{run_date} was re-struck but its "
+            f"{'old' if before_view is None else 'new'} row has no balance view "
+            "(no NAV or no cash), so the correction cannot be journaled"
+        )
+    entry = money_ledger.correction_entry(
+        effective_date=run_date,
+        kind=money_ledger.KIND_SETTLED_RESTRIKE,
+        reason=(
+            f"Daily auto-correct: {run_date} re-struck on settled data "
+            f"[{classification}; {'+'.join(reasons)}]. IB holdings and cash, "
+            "Polygon settled closes (ground-truth ruling 2026-10-22)."
+        ),
+        before=before_view,
+        after=after_view,
+        evidence={
+            "classification": classification,
+            "reasons": reasons,
+            "nav_basis_before": (before_cols or {}).get("nav_basis") or NAV_BASIS_IB_NETLIQ,
+            "nav_basis_after": (after_cols or {}).get("nav_basis"),
+        },
+    )
+    s3_client = boto3.client("s3", region_name=region) if trades_bucket else None
+    return money_ledger.post(conn, entry, s3_client=s3_client, bucket=trades_bucket)
 
 
 def _write_audit_record(
@@ -766,14 +846,30 @@ def audit_window(
             continue
 
         # ── Apply the canonical correction (re-price + re-emit from settled data).
+        before_view, before_cols = _row_view(conn, d)
         try:
-            eod_run(d, send_email=send_email, run_audit=False)
+            eod_run(d, send_email=send_email, run_audit=False, post_journal=False)
         except Exception as e:  # noqa: BLE001 — per-date isolation: one bad day must not abort the sweep
             _log_paged("[reconcile_audit] correction FAILED for %s: %s", d, e)
             if fd:
                 fd.report(e, severity="error", context={"site": "reconcile_audit_apply", "run_date": d})
             skipped.append({"date": d, "reason": f"apply_failed: {e.__class__.__name__}"})
             continue
+
+        # ── The correction is a journal entry (Brian, 2026-10-22). A failure
+        # here is a NON-converged correction: the NAV moved and the ledger does
+        # not say so, which no later pass repairs on its own.
+        journal_doc = None
+        journal_error = None
+        try:
+            journal_doc = _post_restrike_entry(
+                conn, run_date=d, before_view=before_view, before_cols=before_cols,
+                classification=classification, reasons=reasons,
+                trades_bucket=trades_bucket, region=region,
+            )
+        except Exception as e:  # noqa: BLE001 — collected and raised after the window
+            journal_error = f"{e.__class__.__name__}: {e}"
+            _log_paged("[reconcile_audit] money-ledger entry FAILED for %s: %s", d, journal_error)
 
         after_row = conn.execute(
             "SELECT spy_close, spy_return_pct, daily_alpha_pct FROM eod_pnl WHERE date = ?",
@@ -793,6 +889,10 @@ def audit_window(
         # records every finding first.
         _, residual_legs = _detect_stale_legs(
             conn, d, config, tolerance_bps=tolerance_bps, settled=settled)
+        if journal_error:
+            residual_legs = [*residual_legs, {
+                "leg": "money_ledger", "divergence_bps": None,
+                "stored": "NAV re-struck", "settled": f"no journal entry ({journal_error})"}]
 
         # Page-worthiness: a CORRUPTION-classified correction (the same
         # at/above-PAGE_THRESHOLD_BPS band as before), OR a correction that
@@ -852,6 +952,8 @@ def audit_window(
             "settled_spy_close": settled,
             "before": before,
             "after": after,
+            "journal_entry_id": (journal_doc or {}).get("entry_id"),
+            "journal_postings": (journal_doc or {}).get("postings"),
             "downstream": DOWNSTREAM_ON_CORRECTION,
             "source": "arcticdb_macro",
             "corrected_at": datetime.now(UTC).isoformat(),

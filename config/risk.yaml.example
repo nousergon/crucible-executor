@@ -27,10 +27,11 @@ allow_shorts: false              # true = allow sells that create short position
 # daily_alpha_pct and position weights are struck on.
 #
 #   ib_netliq      IB Gateway's NetLiquidation, after the I9627 broker-mark
-#                  correction. Today's behaviour, and the default when the key
-#                  is absent entirely.
+#                  correction. The headline until 2026-10-22.
 #   settled_close  total_cash + accrued_interest + Σ shares × settled close,
-#                  rebuilt from broker cash and ArcticDB settled closes.
+#                  rebuilt from broker cash and ArcticDB settled closes. The
+#                  default since 2026-10-22 (alpha-engine-config-I10052): IB
+#                  for holdings and cash, Polygon settled data for prices.
 #
 # BOTH figures are computed and published every run under either value
 # (eod_pnl.nav_ib_usd / nav_settled_usd / nav_basis_diff_usd /
@@ -42,8 +43,9 @@ allow_shorts: false              # true = allow sells that create short position
 #
 # Ruled 2026-08-31 (alpha-engine-config#9638), option (b) STAGED: publish the
 # difference for two weeks, then flip this default in a separate change.
-# An unrecognised value RAISES at load — it never falls back to the default.
-nav_basis: ib_netliq
+# Flipped 2026-10-22. An unrecognised value RAISES at load — it never falls
+# back to the default.
+nav_basis: settled_close
 
 # ── Position limits ──────────────────────────────────────────────────────────
 max_position_pct: 0.05           # 5% NAV per position (hard cap)
