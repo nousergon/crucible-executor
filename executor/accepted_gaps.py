@@ -33,12 +33,22 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
+from typing import Any
 
 import boto3
 
 logger = logging.getLogger(__name__)
 
 ACCEPTED_GAPS_KEY = "config/accepted_gaps.json"
+
+# Declared non-session ROWS (alpha-engine-config-I9613): the opposite defect to
+# a gap, a persisted row on a date that was never a session. Checked in rather
+# than in S3 because the set is closed (eod_reconcile refuses a non-session
+# run_date since PR531). See pnl_integrity._validate_declared_non_sessions.
+DECLARED_NON_SESSIONS_PATH = (
+    Path(__file__).resolve().parent.parent / "config" / "pnl_declared_non_sessions.json"
+)
 
 
 def load_accepted_gaps(
@@ -122,3 +132,18 @@ def load_accepted_gap_entries(
         )
         return []
     return raw_gaps
+
+
+def load_declared_non_sessions(path: Path | str = DECLARED_NON_SESSIONS_PATH) -> list[Any]:
+    """Return the raw ``declarations`` list, malformed entries included.
+
+    Fails closed: a missing or unreadable file returns ``[]``, which excuses
+    nothing, so the declared row breaches again rather than passing silently.
+    """
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        logger.warning("[accepted_gaps] cannot read %s — declaring no non-session rows.", path)
+        return []
+    raw = data.get("declarations") if isinstance(data, dict) else None
+    return raw if isinstance(raw, list) else []
