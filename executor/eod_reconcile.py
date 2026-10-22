@@ -1258,13 +1258,73 @@ def _apply_dividend_delta(
         pos["dividend_paid_usd"] = -div_delta
 
 
+def _post_mark_to_settled_entry(
+    conn,
+    *,
+    run_date: str,
+    nav_ib_raw,
+    nav,
+    cash,
+    accrued,
+    ib_raw_market_values: dict,
+    positions: dict,
+    trades_bucket: str | None,
+):
+    """Post the day's IB-mark -> settled-close move to the money ledger.
+
+    ``before`` is the broker's view: its raw marks and NetLiquidation. ``after``
+    is the published view: the settled close for every held name and the
+    headline NAV. Returns the posted document, or None when the two agree.
+    """
+    from executor import money_ledger
+
+    if cash is None or nav_ib_raw is None or nav is None:
+        raise ValueError("no cash balance or NAV to strike the views from")
+    held = [t for t, mv in ib_raw_market_values.items() if mv is not None]
+    before = money_ledger.balance_view(
+        nav=nav_ib_raw, cash=cash, accrued=accrued,
+        securities={t: ib_raw_market_values[t] for t in held},
+    )
+    after = money_ledger.balance_view(
+        nav=nav, cash=cash, accrued=accrued,
+        securities={t: positions[t].get("market_value") for t in held},
+    )
+    entry = money_ledger.correction_entry(
+        effective_date=run_date,
+        kind=money_ledger.KIND_IB_MARK_TO_SETTLED,
+        reason=(
+            "Daily auto-correct: IB holdings and cash re-marked from the broker's "
+            "marks to Polygon settled closes (ground-truth ruling 2026-10-22)."
+        ),
+        before=before,
+        after=after,
+        evidence={
+            "nav_basis": NAV_BASIS_SETTLED_CLOSE,
+            "nav_ib_raw_usd": nav_ib_raw,
+            "close_sources": {
+                t: positions[t].get("close_source") for t in held
+            },
+        },
+    )
+    s3_client = boto3.client("s3") if trades_bucket else None
+    return money_ledger.post(conn, entry, s3_client=s3_client, bucket=trades_bucket)
+
+
 def run(
     run_date: str | None = None,
     *,
     send_email: bool = True,
     run_audit: bool = True,
+    post_journal: bool = True,
 ) -> None:
     """Reconcile EOD P&L for ``run_date`` against the settled ArcticDB closes.
+
+    ``post_journal``: when True (the live run), the day's move from the
+    broker's marks to the settled closes is posted to the money ledger as one
+    balanced ``daily_auto_correct`` journal entry (``executor.money_ledger``).
+    ``reconcile_audit`` passes False when it re-strikes a published day: it
+    posts the delta between the old and new row itself, so the same move is
+    never journaled twice.
 
     ``send_email``: when False, the outbound EOD email is suppressed. A
     re-reconcile / correction pass (``reconcile_audit``) re-runs this for a
@@ -1758,6 +1818,11 @@ def run(
     # being fixed, one layer up.
     for _tkr, _pos in positions.items():
         _pos["ib_market_value"] = _pos.get("market_value")
+    # The broker's own marks, frozen before ANY correction touches them: the
+    # "before" side of the day's money-ledger correction entry.
+    ib_raw_market_values = {
+        _tkr: _pos.get("market_value") for _tkr, _pos in positions.items()
+    }
 
     # IB mark-outside-range detection (config#6349/#6818) — flags positions,
     # used below to name culprits in the hard-gate alert and classify a
@@ -3008,6 +3073,38 @@ def run(
             else None
         ),
     })
+
+    # ── Money ledger: the day's correction as one balanced journal entry ─────
+    # Brian, 2026-10-22: the daily correction is a journal entry in a ledger
+    # that always balances. IB supplies holdings and cash; Polygon's settled
+    # closes supply prices. The entry moves the books from the broker's view
+    # (IB marks, IB NetLiquidation) to the published one (settled closes).
+    if post_journal and nav_basis == NAV_BASIS_SETTLED_CLOSE:
+        try:
+            journal_doc = _post_mark_to_settled_entry(
+                conn,
+                run_date=run_date,
+                nav_ib_raw=nav_ib_raw,
+                nav=nav,
+                cash=account.get("total_cash"),
+                accrued=account.get("accrued_interest"),
+                ib_raw_market_values=ib_raw_market_values,
+                positions=positions,
+                trades_bucket=trades_bucket,
+            )
+            if journal_doc is not None and journal_doc.get("s3_error"):
+                data_warnings.append(
+                    f"Money ledger entry {journal_doc['entry_id']} for {run_date} is in "
+                    f"trades.db but its S3 copy failed ({journal_doc['s3_error']})."
+                )
+        except Exception as e:  # noqa: BLE001 — a ledger break is paged, never swallowed
+            msg = (
+                f"MONEY LEDGER: the {run_date} mark-to-settled journal entry was NOT "
+                f"posted: {e.__class__.__name__}: {e}"
+            )
+            _log_paged(msg)
+            data_warnings.append(msg)
+            integrity_breaches.append({"kind": "money_ledger", "message": msg})
 
     # ── TWR closure + self-heal (alpha-engine-config-I8188, defect 4) ────────
     # Runs AFTER today's row is persisted so the check covers the session being

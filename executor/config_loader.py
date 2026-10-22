@@ -159,15 +159,21 @@ def get_flow_doctor_yaml_path() -> str:
 NAV_BASIS_IB_NETLIQ = "ib_netliq"
 NAV_BASIS_SETTLED_CLOSE = "settled_close"
 NAV_BASES = (NAV_BASIS_IB_NETLIQ, NAV_BASIS_SETTLED_CLOSE)
-NAV_BASIS_DEFAULT = NAV_BASIS_IB_NETLIQ
+# Cut over 2026-10-22 (alpha-engine-config-I10052, stage 2 of I9638). Shadow
+# series 2026-09-08..10-20, 31 sessions: |nav_basis_diff_usd| p50 $271, p90
+# $1,392, max $2,405 (10-20, UAL marked on an after-hours earnings print, inside
+# the day's range so the I9627 correction could not see it). Every large gap
+# was a broker mark, never the settled rebuild. Brian's ground-truth ruling the
+# same day: IB for holdings and cash, Polygon settled data for prices.
+NAV_BASIS_DEFAULT = NAV_BASIS_SETTLED_CLOSE
 
 
 def resolve_nav_basis(config: dict | None) -> str:
     """Validate and return the configured ``nav_basis``.
 
-    An ABSENT key resolves to :data:`NAV_BASIS_DEFAULT` — every risk.yaml
-    deployed before this flag existed lacks it, and the default is today's
-    behaviour, so absence is a known state rather than a misconfiguration.
+    An ABSENT key resolves to :data:`NAV_BASIS_DEFAULT` (``settled_close``
+    since 2026-10-22) — no deployed risk.yaml sets the key, so absence is a
+    known state rather than a misconfiguration.
 
     Anything else that is not one of :data:`NAV_BASES` RAISES. A typo
     (``settled-close``, ``ib_netliquidation``) must never silently fall back to
@@ -183,5 +189,5 @@ def resolve_nav_basis(config: dict | None) -> str:
     raise ValueError(
         f"risk.yaml nav_basis={value!r} is not a recognised NAV basis. "
         f"Valid values: {', '.join(NAV_BASES)}. Remove the key to take the "
-        f"default ({NAV_BASIS_DEFAULT}, IB NetLiquidation — today's behaviour)."
+        f"default ({NAV_BASIS_DEFAULT})."
     )
