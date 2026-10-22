@@ -15,11 +15,23 @@ Description=Daily broker reconciliation for the v2 trader (alpha-engine-config-I
 # I10651/-I11071), independent of the v1 eod-reconcile and reference-rate
 # timers in this directory.
 #
-# Persistent=true: a missed run fires at the next boot, before the next
-# close, and binds to the same last closed session, so it is a late run of
-# the missed day and never a second run of another one.
+# Persistent=false since alpha-engine-config-I12376. The v1 postclose
+# pipeline (nousergon-data ne-postclose-trading-pipeline) now stops this box
+# at ~16:01 New York, before 16:45, so this timer almost never fires on time:
+# the reconcile used to run only as a boot catch-up at the evening
+# ne-postclose-reconcile-pipeline boot, and when that boot landed after
+# 00:00 UTC IB returned none of the session's executions, so every share and
+# cash delta of the day read as a discrepancy (10-19 and 10-20). The
+# postclose pipeline now STARTS alpha-engine-trader-reconcile.service itself,
+# after CaptureSnapshot and before it stops the box, and waits for it
+# (step_function_eod.json DrainTraderReconcile). A boot catch-up after that
+# is not idempotent: `trader.reconcile` writes one manifest per trading day
+# and a run after 00:00 UTC would overwrite the good one with a run that saw
+# no fills. So no catch-up. The 16:45 schedule stays as an on-time backstop
+# for a day the box is still up then, when a second same-day run re-files
+# the same result.
 OnCalendar=Mon..Fri *-*-* 16:45:00 America/New_York
-Persistent=true
+Persistent=false
 Unit=alpha-engine-trader-reconcile.service
 
 [Install]
