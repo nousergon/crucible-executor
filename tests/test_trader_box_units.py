@@ -47,7 +47,8 @@ TRADER_UNITS = {
     "alpha-engine-trader-reconcile": (
         "scripts/trader_reconcile.sh",
         "Mon..Fri *-*-* 16:45:00 America/New_York",
-        "true",
+        # alpha-engine-config-I12376: no boot catch-up (see the timer).
+        "false",
     ),
     "alpha-engine-trader-pin-smoke": (
         "scripts/trader_pin_request_smoke.sh",
@@ -118,11 +119,16 @@ def test_the_timer_fires_in_new_york_time_inside_the_boxs_up_window(stem: str) -
 
 
 def test_the_two_day_bound_runs_never_catch_up_at_boot() -> None:
-    """A boot catch-up binds to the same last closed session as that day's run."""
+    """A boot catch-up binds to the same last closed session as that day's run.
+
+    The reconcile is in the list since alpha-engine-config-I12376: the v1
+    postclose pipeline runs it at the close, and a catch-up at an evening boot
+    after 00:00 UTC would re-file that session with none of its executions."""
     for stem in (
         "alpha-engine-trader-session",
         "alpha-engine-trader-shadow-books",
         "alpha-engine-trader-pin-smoke",
+        "alpha-engine-trader-reconcile",
     ):
         assert _unit(SYSTEMD / f"{stem}.timer")["Timer"]["Persistent"] == "false"
 
