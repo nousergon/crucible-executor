@@ -25,6 +25,7 @@ import json
 import os
 import sqlite3
 import tempfile
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -66,14 +67,14 @@ PRIOR_DATE = "2026-09-02"
 
 
 class TestResolveNavBasis:
-    def test_absent_key_takes_the_pre_flag_default(self):
-        """Every risk.yaml deployed before I9638 lacks the key, and the
-        default is today's behaviour — absence is a known state."""
+    def test_absent_key_takes_the_settled_close_default(self):
+        """No deployed risk.yaml sets the key, so absence is a known state.
+        The default is settled_close since the I10052 cut-over (2026-10-22)."""
         assert resolve_nav_basis({"db_path": "/tmp/x.db"}) == NAV_BASIS_DEFAULT
-        assert NAV_BASIS_DEFAULT == NAV_BASIS_IB_NETLIQ
+        assert NAV_BASIS_DEFAULT == NAV_BASIS_SETTLED_CLOSE
 
     def test_none_config_takes_the_default(self):
-        assert resolve_nav_basis(None) == NAV_BASIS_IB_NETLIQ
+        assert resolve_nav_basis(None) == NAV_BASIS_SETTLED_CLOSE
 
     @pytest.mark.parametrize(
         "value", [NAV_BASIS_IB_NETLIQ, NAV_BASIS_SETTLED_CLOSE],
@@ -259,11 +260,13 @@ def _seed_prior_row(conn: sqlite3.Connection) -> None:
 
 class _RunResult:
     def __init__(self, row: dict, report: dict, warnings: list[str],
-                 fd_sites: list[str]):
+                 fd_sites: list[str], ledger: list[dict] | None = None):
         self.row = row
         self.report = report
         self.warnings = warnings
         self.fd_sites = fd_sites
+        # Every money-ledger entry the run posted, with its postings.
+        self.ledger = ledger or []
 
 
 def _vendor_unavailable(_rows):
@@ -346,13 +349,34 @@ def _run_eod(
         ).fetchone()
         read.close()
         row = dict(zip(cols, raw, strict=True))
+        ledger: list[dict] = []
+        read = sqlite3.connect(db_path)
+        if read.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='ledger_journal_entries'"
+        ).fetchone():
+            for entry_id, kind, eff, evidence in read.execute(
+                "SELECT entry_id, kind, effective_date, evidence_json "
+                "FROM ledger_journal_entries"
+            ).fetchall():
+                ledger.append({
+                    "entry_id": entry_id, "kind": kind, "effective_date": eff,
+                    "evidence": json.loads(evidence),
+                    "postings": [
+                        {"account": a, "amount": Decimal(amt), "currency": c}
+                        for a, amt, c in read.execute(
+                            "SELECT account, amount, currency FROM ledger_postings "
+                            "WHERE entry_id = ? ORDER BY line_no", (entry_id,),
+                        )
+                    ],
+                })
+        read.close()
         fd_sites = [
             (c.kwargs.get("context") or {}).get("site")
             for c in fd.report.call_args_list
         ]
         return _RunResult(
             row, captured.get("report", {}), captured.get("warnings", []),
-            fd_sites,
+            fd_sites, ledger,
         )
     finally:
         try:
@@ -376,12 +400,16 @@ def settled_basis_run() -> _RunResult:
 
 
 class TestDefaultBasisPublishesBothFigures:
-    """Nothing load-bearing changes under the default basis — the shadow
-    figures ride along beside an unchanged headline NAV."""
+    """Under the ib_netliq basis (the default until 2026-10-22, still
+    selectable) the shadow figures ride along beside an unchanged headline."""
 
     @pytest.fixture(autouse=True)
     def result(self, default_basis_run):
         return default_basis_run
+
+    def test_no_journal_entry_when_the_headline_is_the_broker_figure(self, result):
+        """Nothing was corrected, so nothing is journaled."""
+        assert result.ledger == []
 
     def test_headline_nav_is_still_ib_netliquidation(self, result):
         assert result.row["portfolio_nav"] == pytest.approx(
@@ -471,6 +499,28 @@ class TestSettledCloseBasis:
     @pytest.fixture(autouse=True)
     def result(self, settled_basis_run):
         return settled_basis_run
+
+    def test_the_correction_is_one_balanced_journal_entry(self, result):
+        """Brian, 2026-10-22: the daily correction is a journal entry in a
+        ledger that always balances. The broker marked the book $5,000 above
+        the settled closes, so the entry writes the securities down by exactly
+        that and credits nothing it cannot name."""
+        assert len(result.ledger) == 1
+        entry = result.ledger[0]
+        assert entry["kind"] == "ib_mark_to_settled_close"
+        assert entry["effective_date"] == RUN_DATE
+        assert sum(p["amount"] for p in entry["postings"]) == Decimal("0")
+        assets = sum(
+            p["amount"] for p in entry["postings"]
+            if p["account"].startswith("assets:")
+        )
+        assert assets == Decimal("-5000.00")
+        offset = [p for p in entry["postings"]
+                  if p["account"] == "income:unrealized_gain:valuation_correction"]
+        assert [p["amount"] for p in offset] == [Decimal("5000.00")]
+        assert Decimal(entry["evidence"]["nav_after_usd"]) == Decimal(
+            f"{result.row['portfolio_nav']:.2f}"
+        )
 
     def test_headline_nav_equals_the_settled_sum(self, result):
         assert result.row["portfolio_nav"] == pytest.approx(

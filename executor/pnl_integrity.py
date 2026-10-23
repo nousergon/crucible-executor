@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -819,6 +820,15 @@ def mark_materiality_usd(nav: float) -> float:
     )
 
 
+def _is_number(value: Any) -> bool:
+    """True for a finite real number (bools excluded) — safe to ``:,.2f``."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
 def check_custodian_marks(
     mark_range_flags: Sequence[Mapping[str, Any]] | None,
     *,
@@ -864,6 +874,25 @@ def check_custodian_marks(
             continue
         if not math.isfinite(error_usd) or abs(error_usd) <= materiality_usd:
             continue
+        ib_mark, day_low, day_high = (
+            flag.get("ib_mark"), flag.get("day_low"), flag.get("day_high")
+        )
+        if _is_number(ib_mark) and _is_number(day_low) and _is_number(day_high):
+            where = (
+                f"broker mark ${ib_mark:,.2f} fell outside the day's traded range "
+                f"[${day_low:,.2f}, ${day_high:,.2f}]"
+            )
+        else:
+            # The history audit reconstructs flags from the persisted eod_pnl
+            # row, which carries the signed error but NOT the mark or the
+            # day's [Low, High] (alpha-engine-config-I9613). Say so rather
+            # than formatting a None — which raised TypeError and took the
+            # whole full-history audit down with it.
+            where = (
+                "broker mark fell outside the day's traded range (mark and "
+                "range not persisted on this row; error is the recorded "
+                "ib_mark_range_error_usd)"
+            )
         breaches.append({
             "kind": "custodian_mark",
             "run_date": run_date,
@@ -877,9 +906,7 @@ def check_custodian_marks(
             "pct_of_nav": error_usd / nav * 100.0,
             "message": (
                 f"Custodian mark failure for {flag.get('ticker')} on {run_date}: "
-                f"broker mark ${flag.get('ib_mark'):,.2f} fell outside the day's "
-                f"traded range [${flag.get('day_low'):,.2f}, "
-                f"${flag.get('day_high'):,.2f}] — ${error_usd:+,.0f} "
+                f"{where} — ${error_usd:+,.0f} "
                 f"({error_usd / nav * 100:+.3f}% of NAV) past the breached bound, "
                 f"above the ${materiality_usd:,.0f} materiality floor "
                 f"({MARK_HARD_MATERIALITY_NAV_BPS:.0f}bps of NAV). A mark outside "
@@ -1676,6 +1703,7 @@ def check_benchmark_vendor_anchor(
     vendor_dividends: Mapping[str, float] | None = None,
     close_tolerance_bps: float = BENCHMARK_CLOSE_DIVERGENCE_TOLERANCE_BPS,
     anchor_tolerance_bps: float = BENCHMARK_ANCHOR_TOLERANCE_BPS,
+    declared_non_sessions: Any = None,
 ) -> list[dict[str, Any]]:
     """A SECOND, INDEPENDENT measurement of the benchmark leg. Returns breaches.
 
@@ -1705,15 +1733,25 @@ def check_benchmark_vendor_anchor(
 
     ``vendor_closes`` missing a session the book persisted is itself reported,
     as ``benchmark_vendor_coverage`` — an anchor with holes is not an anchor,
-    and it is never treated as agreement.
+    and it is never treated as agreement. The one exception is a persisted row
+    DECLARED a non-session under a ruling (``declared_non_sessions``, the list
+    in config/pnl_declared_non_sessions.json): the vendor has no close for it because the
+    market never opened, so its absence there is the correct state, not a hole.
+    Only a declaration with a valid ruling id excuses a date; whether the date
+    really is a non-session row is checked by ``check_session_axis_coverage``,
+    which has the calendar.
     """
     vendor_dividends = vendor_dividends or {}
+    declared = declared_non_session_dates(declared_non_sessions)
     breaches: list[dict[str, Any]] = []
     dated = [r for r in rows if r.get("date")]
     if not dated or not vendor_closes:
         return breaches
 
-    missing = [str(r["date"]) for r in dated if str(r["date"]) not in vendor_closes]
+    missing = [
+        str(r["date"]) for r in dated
+        if str(r["date"]) not in vendor_closes and str(r["date"]) not in declared
+    ]
     if missing:
         breaches.append({
             "kind": "benchmark_vendor_coverage",
@@ -1819,11 +1857,142 @@ def check_benchmark_vendor_anchor(
 # into a persisted, reviewable flag rather than a silent delete: "Retain all
 # archives" applies to a spurious row as much as a correct one, and the
 # production write is a manual, in-region call in any case).
+# A ruling reference an accepted gap must carry: either the GitHub form
+# (``nousergon/alpha-engine-config#5325``) or the fleet reference form
+# (``alpha-engine-config-I5325``). A free-text "per Brian" is not a ruling id —
+# it cannot be followed back to the decision that accepted the gap.
+ACCEPTED_GAP_RULING_RE = re.compile(
+    r"^(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*"
+    r"|[A-Za-z0-9_.-]+-I[1-9][0-9]*)$"
+)
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Declared non-session rows (alpha-engine-config-I9613). The accepted-gaps
+# registry above excuses a MISSING session; a declaration excuses the opposite
+# defect, a persisted row for a date the NYSE calendar says was never a session.
+# Same rules: it excuses its row only with a ruling id, the exception stays
+# visible in the result, and nothing about the row is edited. The live list is
+# config/pnl_declared_non_sessions.json (``accepted_gaps.load_declared_non_sessions``).
+# It is a checked-in file, not an S3 registry entry, because the set is CLOSED:
+# ``eod_reconcile.run`` refuses a non-session run_date since crucible-executor
+# PR531, so the list can only shrink, and a reviewed file deploys with the merge.
+
+
+def _validate_declared_non_sessions(
+    entries: Any,
+    *,
+    non_sessions: set[str],
+    present: set[str],
+    first: str,
+    last: str,
+    breaches: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Return ``{date: ruling}`` for the declarations that excuse a row.
+
+    A declaration excuses a ``non_trading_day_row`` only when it is well formed,
+    names its date once, carries a ruling id matching ``ACCEPTED_GAP_RULING_RE``
+    and its date really is a non-session row of this series. A declaration
+    dated outside ``first..last`` applies to no row of this series and is
+    ignored. Every other declaration is its own breach and excuses nothing:
+    ``declared_non_session_malformed``, ``declared_non_session_without_ruling``
+    and ``declared_non_session_not_a_non_session`` (no row for that date, or
+    the calendar says it was a session).
+    """
+    raw = list(entries or ())
+    declared: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for e in raw:
+        if isinstance(e, Mapping) and isinstance(e.get("date"), str):
+            counts[e["date"]] = counts.get(e["date"], 0) + 1
+    for e in raw:
+        if not isinstance(e, Mapping) or not isinstance(e.get("date"), str) \
+                or not _ISO_DATE_RE.match(e["date"]) or counts[e["date"]] > 1:
+            breaches.append({
+                "kind": "declared_non_session_malformed",
+                "date": (e.get("date") if isinstance(e, Mapping) else None),
+                "entry": e,
+                "message": (
+                    f"Declared non-session row {e!r} has no ISO date or is "
+                    "declared twice; it excuses nothing."
+                ),
+            })
+            continue
+        d = e["date"]
+        if d < first or d > last:
+            continue
+        ruling = e.get("ruling")
+        if not isinstance(ruling, str) or not ACCEPTED_GAP_RULING_RE.match(ruling.strip()):
+            breaches.append({
+                "kind": "declared_non_session_without_ruling",
+                "date": d,
+                "ruling": ruling,
+                "message": (
+                    f"The non-session row declared for {d} carries no ruling "
+                    f"id (ruling={ruling!r}); it excuses nothing and the row "
+                    "still reports as non_trading_day_row."
+                ),
+            })
+            continue
+        if d in non_sessions:
+            declared[d] = ruling.strip()
+            continue
+        reason = "trading_session" if d in present else "no_row"
+        breaches.append({
+            "kind": "declared_non_session_not_a_non_session",
+            "date": d,
+            "ruling": ruling.strip(),
+            "reason": reason,
+            "message": (
+                f"{d} is declared a non-session row, but "
+                + ("the calendar says it was a trading session"
+                   if reason == "trading_session" else
+                   "the series has no row for it")
+                + f" over {first} → {last}. Remove the declaration, or fix "
+                "the series it was recorded against."
+            ),
+        })
+    return declared
+
+
+def declared_non_session_dates(declared_non_sessions: Any) -> dict[str, str]:
+    """``{date: ruling}`` for declarations carrying a valid ruling id. PURE.
+
+    For a gate with no trading calendar (the vendor anchor). It does not check
+    that the date is a non-session row; ``check_session_axis_coverage`` does,
+    and reports a declaration that is not one as a breach.
+    """
+    out: dict[str, str] = {}
+    for e in declared_non_sessions or ():
+        if not isinstance(e, Mapping):
+            continue
+        d, ruling = e.get("date"), e.get("ruling")
+        if isinstance(d, str) and _ISO_DATE_RE.match(d) and isinstance(ruling, str) \
+                and ACCEPTED_GAP_RULING_RE.match(ruling.strip()):
+            out[d] = ruling.strip()
+    return out
+
+
+def _accepted_gap_entries(accepted_gaps: Any) -> list[Any]:
+    """Normalise the registry to a list of raw entries.
+
+    Accepts the raw ``gaps`` list from ``config/accepted_gaps.json`` or the
+    date-keyed dict ``executor.accepted_gaps.load_accepted_gaps`` returns.
+    """
+    if accepted_gaps is None:
+        return []
+    if isinstance(accepted_gaps, Mapping):
+        return list(accepted_gaps.values())
+    return list(accepted_gaps)
+
+
 def check_session_axis_coverage(
     rows: Sequence[Mapping[str, Any]],
     *,
     is_trading_day: Any,
     next_trading_day: Any,
+    accepted_gaps: Any = None,
+    declared_non_sessions: Any = None,
 ) -> dict[str, Any]:
     """Assert the persisted ``date`` axis is exactly the NYSE trading calendar.
 
@@ -1853,6 +2022,37 @@ def check_session_axis_coverage(
     (``calendar_lookup_failed``) so a malformed date string is visible rather
     than indistinguishable from a clean session.
 
+    ``accepted_gaps`` is the ``config/accepted_gaps.json`` registry
+    (alpha-engine-config-I5570; wired here by alpha-engine-config-I11087): a
+    ``missing_session`` whose date carries a VALID entry is not a breach — it
+    is listed under ``accepted_gaps`` in the result instead, so the exception
+    stays visible. A gap is accepted only by a ruling, so an entry is valid
+    only when it carries a ruling id matching ``ACCEPTED_GAP_RULING_RE`` AND
+    names a date that really is a missing session of this series. Every other
+    entry is rejected LOUDLY, as its own breach, and accepts nothing:
+
+    ``accepted_gap_without_ruling``
+        The entry's ``ruling`` is absent, empty or not a ruling id. The gap it
+        names still reports as ``missing_session`` as well.
+
+    ``accepted_gap_not_a_gap``
+        The entry's date is not a missing session: a row exists for it, it is
+        outside the persisted window, or the calendar says it was never a
+        session. An exception recorded for a gap that does not exist is a
+        registry nobody can trust.
+
+    ``accepted_gap_malformed``
+        Not a mapping, no ISO ``date``, or a date registered twice.
+
+    An absent or empty registry accepts nothing — every gap still breaches.
+
+    ``declared_non_sessions`` is the same idea for the opposite defect: a list
+    of ``{"date", "ruling", "reason"}`` declarations (the live list is
+    config/pnl_declared_non_sessions.json). A ``non_trading_day_row`` whose date carries
+    a valid declaration is listed under ``declared_non_sessions`` in the result
+    instead of breaching; see ``_validate_declared_non_sessions`` for what makes
+    one valid. ``None`` declares nothing.
+
     ``status`` is ``"n/a"`` on an empty series (nothing to walk).
     """
     dated = sorted({str(r["date"]) for r in rows if r.get("date")})
@@ -1860,6 +2060,7 @@ def check_session_axis_coverage(
         return {"status": "n/a", "closes": None, "breaches": []}
 
     breaches: list[dict[str, Any]] = []
+    non_sessions: list[str] = []
 
     for d in dated:
         try:
@@ -1877,22 +2078,34 @@ def check_session_axis_coverage(
             })
             continue
         if not trading:
-            breaches.append({
-                "kind": "non_trading_day_row",
-                "date": d,
-                "message": (
-                    f"eod_pnl carries a row for {d}, which the NYSE trading "
-                    "calendar says was never a session. Every chain-linked "
-                    "gate (TWR closure, nav_change basis, benchmark closure) "
-                    "treats adjacent rows as adjacent sessions unless this row "
-                    "is excluded — it contributes a spurious session to all "
-                    "of them."
-                ),
-            })
+            non_sessions.append(d)
 
+    declared = _validate_declared_non_sessions(
+        declared_non_sessions,
+        non_sessions=set(non_sessions), present=set(dated),
+        first=dated[0], last=dated[-1], breaches=breaches,
+    )
+    for d in non_sessions:
+        if d in declared:
+            continue
+        breaches.append({
+            "kind": "non_trading_day_row",
+            "date": d,
+            "message": (
+                f"eod_pnl carries a row for {d}, which the NYSE trading "
+                "calendar says was never a session. Every chain-linked "
+                "gate (TWR closure, nav_change basis, benchmark closure) "
+                "treats adjacent rows as adjacent sessions unless this row "
+                "is excluded — it contributes a spurious session to all "
+                "of them."
+            ),
+        })
+
+    present = set(dated)
+    missing: list[str] = []
+    walk_complete = True
     if len(dated) >= 2:
         cursor = dated[0]
-        present = set(dated)
         seen = {cursor}
         while cursor < dated[-1]:
             try:
@@ -1905,6 +2118,7 @@ def check_session_axis_coverage(
                     "reason": str(exc),
                     "message": f"Calendar lookup failed walking forward from {cursor}: {exc}",
                 })
+                walk_complete = False
                 break
             if nxt in seen:
                 # A calendar that does not advance would spin forever; treat as
@@ -1918,23 +2132,44 @@ def check_session_axis_coverage(
                         "seen while walking the window — refusing to loop."
                     ),
                 })
+                walk_complete = False
                 break
             cursor = nxt
             seen.add(cursor)
             if cursor > dated[-1]:
                 break
             if cursor not in present:
-                breaches.append({
-                    "kind": "missing_session",
-                    "date": cursor,
-                    "message": (
-                        f"NYSE trading session {cursor} has no eod_pnl row. "
-                        "Every chain-linked gate treats its neighbors as "
-                        "adjacent sessions unless this gap is named — it is "
-                        "what let a two-session close-price move be compared "
-                        "against a one-session stored return."
-                    ),
-                })
+                missing.append(cursor)
+
+    accepted = _validate_accepted_gaps(
+        _accepted_gap_entries(accepted_gaps),
+        missing=set(missing), present=present,
+        first=dated[0], last=dated[-1], walk_complete=walk_complete,
+        breaches=breaches,
+    )
+    for d in missing:
+        if d in accepted:
+            continue
+        breaches.append({
+            "kind": "missing_session",
+            "date": d,
+            "message": (
+                f"NYSE trading session {d} has no eod_pnl row and no valid "
+                "entry in config/accepted_gaps.json. Every chain-linked gate "
+                "treats its neighbors as adjacent sessions unless this gap is "
+                "named — it is what let a two-session close-price move be "
+                "compared against a one-session stored return."
+            ),
+        })
+    accepted_list = [
+        {"date": d, "ruling": accepted[d]} for d in missing if d in accepted
+    ]
+    declared_list = [
+        {"date": d, "ruling": declared[d]} for d in non_sessions if d in declared
+    ]
+    exceptions = [
+        f"{a['date']} ({a['ruling']})" for a in accepted_list
+    ] + [f"{a['date']} non-session, declared ({a['ruling']})" for a in declared_list]
 
     return {
         "status": "ok",
@@ -1943,9 +2178,17 @@ def check_session_axis_coverage(
         "last_date": dated[-1],
         "n_rows": len(dated),
         "breaches": breaches,
+        "accepted_gaps": accepted_list,
+        "declared_non_sessions": declared_list,
         "message": (
-            "eod_pnl date axis matches the NYSE trading calendar exactly over "
-            f"{dated[0]} → {dated[-1]} ({len(dated)} sessions)."
+            "eod_pnl date axis matches the NYSE trading calendar over "
+            f"{dated[0]} → {dated[-1]} ({len(dated)} sessions)"
+            + (
+                "." if not exceptions else
+                ", with " + str(len(exceptions)) + " ruled exception(s): "
+                + ", ".join(exceptions)
+                + "."
+            )
             if not breaches else
             f"eod_pnl date axis diverges from the NYSE trading calendar over "
             f"{dated[0]} → {dated[-1]}: {len(breaches)} breach(es) — "
@@ -1953,3 +2196,92 @@ def check_session_axis_coverage(
             + ("" if len(breaches) <= 8 else f" (+{len(breaches) - 8} more)")
         ),
     }
+
+
+def _validate_accepted_gaps(
+    entries: list[Any],
+    *,
+    missing: set[str],
+    present: set[str],
+    first: str,
+    last: str,
+    walk_complete: bool,
+    breaches: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Return ``{date: ruling}`` for the entries that may excuse a gap.
+
+    Appends one breach per rejected entry to ``breaches``. An entry is accepted
+    only when it is well formed, carries a ruling id, names its date once, and
+    that date is a missing session of the walked window.
+    """
+    accepted: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for e in entries:
+        if isinstance(e, Mapping) and isinstance(e.get("date"), str):
+            counts[e["date"]] = counts.get(e["date"], 0) + 1
+
+    for e in entries:
+        if not isinstance(e, Mapping) or not isinstance(e.get("date"), str) \
+                or not _ISO_DATE_RE.match(e["date"]):
+            breaches.append({
+                "kind": "accepted_gap_malformed",
+                "date": (e.get("date") if isinstance(e, Mapping) else None),
+                "entry": e,
+                "message": (
+                    "config/accepted_gaps.json carries an entry with no ISO "
+                    f"date ({e!r}); it accepts nothing."
+                ),
+            })
+            continue
+        d = e["date"]
+        if counts.get(d, 0) > 1:
+            breaches.append({
+                "kind": "accepted_gap_malformed",
+                "date": d,
+                "entry": e,
+                "message": (
+                    f"config/accepted_gaps.json registers {d} {counts[d]} "
+                    "times; a duplicated exception is ambiguous and accepts "
+                    "nothing."
+                ),
+            })
+            continue
+        ruling = e.get("ruling")
+        if not isinstance(ruling, str) or not ACCEPTED_GAP_RULING_RE.match(ruling.strip()):
+            breaches.append({
+                "kind": "accepted_gap_without_ruling",
+                "date": d,
+                "ruling": ruling,
+                "message": (
+                    f"config/accepted_gaps.json entry for {d} carries no ruling "
+                    f"id (ruling={ruling!r}). A gap is accepted only by a "
+                    "ruling (e.g. 'nousergon/alpha-engine-config#5325' or "
+                    "'alpha-engine-config-I5325'); this entry accepts nothing "
+                    "and the session still reports as missing."
+                ),
+            })
+            continue
+        if d in missing:
+            accepted[d] = ruling.strip()
+            continue
+        if d in present:
+            reason = "row_present"
+        elif d < first or d > last:
+            reason = "outside_window"
+        elif not walk_complete:
+            reason = "calendar_walk_aborted"
+        else:
+            reason = "not_a_trading_session"
+        breaches.append({
+            "kind": "accepted_gap_not_a_gap",
+            "date": d,
+            "ruling": ruling.strip(),
+            "reason": reason,
+            "message": (
+                f"config/accepted_gaps.json accepts {d} as a gap, but it is not "
+                f"a missing session of the eod_pnl series {first} → {last} "
+                f"({reason}). Remove the entry, or fix the series it was "
+                "recorded against."
+            ),
+        })
+    return accepted

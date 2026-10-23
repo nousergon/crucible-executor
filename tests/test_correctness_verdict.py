@@ -198,6 +198,111 @@ def test_absent_params_make_a_PASS_say_nothing():
     assert state.blocks_new_entries is True
 
 
+# ── alpha-engine-config-I12440: latest/ moved on, the params did not ─────────
+# Live shape 2026-10-19/20: latest/ attests 2026-10-16 (PASS), the params are
+# 2026-10-09's because the apply loop declined to promote, and
+# backtest/2026-10-09/attestation.json PASSed for run_date 2026-10-09.
+
+_PARAMS_CYCLE = "2026-10-09"
+_NEWER_CYCLE = "2026-10-16"
+_DATED_KEY = f"backtest/{_PARAMS_CYCLE}/attestation.json"
+
+
+def _apply_loop_held_back(**dated) -> dict:
+    objects = {cv.ATTESTATION_KEY: _attestation(run_date=_NEWER_CYCLE),
+               cv.EXECUTOR_PARAMS_KEY: _params(updated_at=_PARAMS_CYCLE)}
+    objects[_DATED_KEY] = _attestation(**{"run_date": _PARAMS_CYCLE, **dated})
+    return objects
+
+
+def test_params_held_back_by_the_apply_loop_bind_to_THEIR_OWN_cycle():
+    """The I12440 false positive. The params' own cycle wrote a PASS for
+    exactly these parameters; latest/ moving on to an unpromoted cycle does
+    not make them unattested."""
+    state = _evaluate(_apply_loop_held_back())
+    assert state.verdict == cv.PASS
+    assert state.blocks_new_entries is False
+    assert state.attested_run_date == _PARAMS_CYCLE == state.params_updated_at
+    assert state.context["attestation_key"] == _DATED_KEY
+    # The newer, unpromoted cycle stays visible rather than vanishing.
+    assert state.context["latest_attestation"]["run_date"] == _NEWER_CYCLE
+    assert _NEWER_CYCLE in state.reason
+    assert _DATED_KEY in cv.operator_message(state)
+
+
+def test_params_rolled_back_after_a_FAIL_bind_to_the_PASSing_cycle():
+    """The FAIL remedy is 'roll executor_params back to the last cycle whose
+    attestation PASSed'. Reading only latest/ made that remedy itself a
+    permanent STALE_BINDING."""
+    objects = _apply_loop_held_back()
+    objects[cv.ATTESTATION_KEY] = _attestation(
+        verdict="FAIL", run_date=_NEWER_CYCLE, n_failed=2)
+    state = _evaluate(objects)
+    assert state.verdict == cv.PASS
+    assert state.context["latest_attestation"]["verdict"] == "FAIL"
+
+
+def test_held_back_params_whose_own_cycle_has_NO_attestation_stay_STALE():
+    """The gate must still fire: latest/ is another cycle's PASS and the
+    params' cycle wrote nothing. Never inherited."""
+    objects = _apply_loop_held_back()
+    del objects[_DATED_KEY]
+    state = _evaluate(objects)
+    assert state.verdict == cv.STALE_BINDING
+    assert state.blocks_new_entries is True
+    assert "ABSENT" in state.reason and _NEWER_CYCLE in state.reason
+
+
+def test_held_back_params_whose_own_cycle_FAILED_are_FAIL():
+    state = _evaluate(_apply_loop_held_back(verdict="FAIL", n_failed=1))
+    assert state.verdict == cv.FAIL
+    assert state.blocks_new_entries is True
+    assert state.attested_run_date == _PARAMS_CYCLE
+
+
+@pytest.mark.parametrize("raw", ["ok", "pass", True, None])
+def test_held_back_params_own_cycle_needs_the_literal_PASS(raw):
+    state = _evaluate(_apply_loop_held_back(verdict=raw))
+    assert state.verdict == cv.UNKNOWN
+    assert state.blocks_new_entries is True
+
+
+def test_a_dated_object_naming_ANOTHER_run_date_is_STALE():
+    """The dated key is a lookup, not a grant: its body must itself attest the
+    params' cycle."""
+    state = _evaluate(_apply_loop_held_back(run_date="2026-10-02"))
+    assert state.verdict == cv.STALE_BINDING
+    assert state.blocks_new_entries is True
+    assert "2026-10-02" in state.reason
+
+
+def test_a_NEWER_PASS_never_covers_older_params_via_the_dated_key():
+    """Only backtest/{updated_at}/ is consulted — a PASS stored under the
+    newer cycle's dated key grants nothing to the older params."""
+    objects = _apply_loop_held_back()
+    del objects[_DATED_KEY]
+    objects[f"backtest/{_NEWER_CYCLE}/attestation.json"] = _attestation(
+        run_date=_NEWER_CYCLE)
+    state = _evaluate(objects)
+    assert state.verdict == cv.STALE_BINDING
+
+
+@pytest.mark.parametrize("updated_at", [None, "", "../latest", "2026-10-09/x", 20261009])
+def test_a_params_updated_at_that_is_not_a_cycle_date_is_STALE(updated_at):
+    """updated_at is templated into an S3 key; anything but a bare date is no
+    cycle to bind to, and is never used to build a key."""
+    objects = _apply_loop_held_back()
+    objects[cv.EXECUTOR_PARAMS_KEY] = _params(updated_at=updated_at)
+    state = _evaluate(objects)
+    assert state.verdict == cv.STALE_BINDING
+    assert state.blocks_new_entries is True
+
+
+def test_held_back_params_observe_mode_reports_PASS_without_blocking():
+    state = _evaluate(_apply_loop_held_back(), mode=cv.MODE_OBSERVE)
+    assert state.verdict == cv.PASS and state.blocks_new_entries is False
+
+
 def test_a_daily_run_between_weekly_cycles_is_NOT_a_false_positive():
     """The predicate that makes this a guard rather than an outage on a timer.
     executor_params is written weekly and the preopen runs daily; requiring the

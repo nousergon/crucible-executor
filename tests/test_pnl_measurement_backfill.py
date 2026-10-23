@@ -179,6 +179,28 @@ def test_vendor_anchor_reports_its_own_coverage_holes():
     assert coverage and coverage[0]["missing_sessions"] == ["2026-04-03"]
 
 
+def test_vendor_anchor_excuses_only_a_ruled_non_session_declaration():
+    """alpha-engine-config-I9613: the declared Good Friday row is not a hole in
+    the anchor (the market never opened), and nothing else is excused."""
+    rows = [_row("2026-04-02", 100.0, None), _row("2026-04-03", 100.0, 0.0),
+            _row("2026-04-06", 100.0, 0.0)]
+    vendor = {"2026-04-02": 100.0}
+    declared = check_benchmark_vendor_anchor(
+        rows, vendor_closes=vendor,
+        declared_non_sessions=[{"date": "2026-04-03",
+                                "ruling": "alpha-engine-config-I9613"}],
+    )
+    coverage = [b for b in declared if b["kind"] == "benchmark_vendor_coverage"]
+    assert coverage and coverage[0]["missing_sessions"] == ["2026-04-06"]
+
+    unruled = check_benchmark_vendor_anchor(
+        rows, vendor_closes=vendor,
+        declared_non_sessions=[{"date": "2026-04-03", "ruling": "per Brian"}],
+    )
+    coverage = [b for b in unruled if b["kind"] == "benchmark_vendor_coverage"]
+    assert coverage[0]["missing_sessions"] == ["2026-04-03", "2026-04-06"]
+
+
 def test_vendor_anchor_not_evaluated_is_not_a_pass():
     audit = B.audit_history(
         [_row("2026-03-09", 100.0, None), _row("2026-03-10", 101.0, 1.0)],
@@ -388,6 +410,49 @@ def test_audit_history_flags_the_live_good_friday_row():
     kinds = {(b["kind"], b["date"]) for b in audit["session_axis_coverage"]["breaches"]}
     assert ("non_trading_day_row", "2026-04-03") in kinds
     assert audit["breach_count"] >= 1
+
+
+def test_audit_history_passes_the_accepted_gaps_registry_to_the_coverage_gate():
+    """alpha-engine-config-I11087: a ruled gap stops counting; an unruled one
+    still does."""
+    rows = [_row("2026-07-23", 100.0, None), _row("2026-07-24", 100.0, 0.0),
+            _row("2026-07-28", 100.0, 0.0)]
+    cal = {"is_trading_day": _fake_is_trading_day,
+           "next_trading_day": _fake_next_trading_day}
+    entry = {"date": "2026-07-27", "ruling": "nousergon/alpha-engine-config#5325"}
+
+    ruled = B.audit_history(rows, accepted_gaps=[entry], **cal)
+    assert ruled["session_axis_coverage"]["breaches"] == []
+    assert [a["date"] for a in ruled["session_axis_coverage"]["accepted_gaps"]] == [
+        "2026-07-27"
+    ]
+
+    unruled = B.audit_history(rows, accepted_gaps=[{"date": "2026-07-27"}], **cal)
+    kinds = {b["kind"] for b in unruled["session_axis_coverage"]["breaches"]}
+    assert {"missing_session", "accepted_gap_without_ruling"} <= kinds
+    assert unruled["breach_count"] >= ruled["breach_count"] + 2
+
+
+def test_audit_history_passes_the_declared_non_sessions_to_both_gates():
+    """alpha-engine-config-I9613: the declared 04-03 row stops counting in the
+    coverage gate AND the vendor anchor, and stays visible."""
+    from executor.accepted_gaps import load_declared_non_sessions
+
+    rows = [_row("2026-04-02", 100.0, None), _row("2026-04-03", 100.0, 0.0)]
+    kw = {"is_trading_day": _fake_is_trading_day,
+          "next_trading_day": _fake_next_trading_day,
+          "vendor_closes": {"2026-04-02": 100.0}}
+    bare = B.audit_history(rows, **kw)
+    declared = B.audit_history(rows, declared_non_sessions=load_declared_non_sessions(), **kw)
+    assert {b["kind"] for b in bare["benchmark_vendor_anchor_breaches"]} == {
+        "benchmark_vendor_coverage"
+    }
+    assert declared["benchmark_vendor_anchor_breaches"] == []
+    assert declared["session_axis_coverage"]["breaches"] == []
+    assert declared["session_axis_coverage"]["declared_non_sessions"] == [
+        {"date": "2026-04-03", "ruling": "alpha-engine-config-I9613"}
+    ]
+    assert declared["breach_count"] == bare["breach_count"] - 2
 
 
 def test_plan_non_trading_day_flags_only_takes_that_breach_kind():
@@ -1150,3 +1215,56 @@ def test_live_anchor_window_propagates_a_vendor_outage(monkeypatch):
     monkeypatch.setattr(B, "fetch_vendor_closes", _boom)
     with pytest.raises(RuntimeError, match="no SPY bars"):
         B.fetch_live_anchor_window([{"date": "2026-09-04"}, {"date": "2026-09-08"}])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# alpha-engine-config-I9613 — the full-history audit crashed in
+# check_custodian_marks on a material flag rebuilt from a persisted row
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _flagged_row(date, error_usd, *, nav=1_017_000.0):
+    row = _row(date, 100.0, 0.0, nav=nav)
+    row["positions_snapshot"] = json.dumps({"DUOL": {
+        "shares": 708, "market_value": 105_039.0, "ib_market_value": 107_899.2,
+        "ib_mark_outside_range": True, "ib_mark_range_error_usd": error_usd,
+    }})
+    return row
+
+
+def test_audit_history_reports_a_material_persisted_flag_instead_of_crashing():
+    """The live 2026-08-31 DUOL shape: +$1,972 past the bound, above the
+    $1,526 floor at that NAV, with no mark or range on the row."""
+    audit = B.audit_history([_row("2026-08-28", 100.0, None),
+                             _flagged_row("2026-08-31", 1_971.78)])
+    assert [(b["kind"], b["ticker"]) for b in audit["mark_breaches"]] == [
+        ("custodian_mark", "DUOL")]
+    assert audit["mark_unevaluated"] == []
+    assert audit["breach_count"] >= 1
+
+
+@pytest.mark.parametrize("error_usd", [None, "", "nan", float("nan"), "n/a"])
+def test_audit_history_reports_an_uncheckable_flag_as_a_finding(error_usd):
+    """A flagged mark whose size the row does not carry is neither a pass nor
+    a breach — and never a silent skip."""
+    audit = B.audit_history([_row("2026-08-28", 100.0, None),
+                             _flagged_row("2026-08-31", error_usd)])
+    assert audit["mark_breaches"] == []
+    assert [(b["kind"], b["ticker"], b["run_date"])
+            for b in audit["mark_unevaluated"]] == [
+        ("custodian_mark_unevaluated", "DUOL", "2026-08-31")]
+    assert audit["breach_count"] >= 1
+
+
+def test_audit_history_reports_a_flag_on_a_row_without_nav():
+    audit = B.audit_history([_flagged_row("2026-08-31", 1_971.78, nav=None)])
+    assert audit["mark_breaches"] == []
+    assert len(audit["mark_unevaluated"]) == 1
+    assert "no portfolio_nav" in audit["mark_unevaluated"][0]["message"]
+
+
+def test_audit_history_checks_marks_on_rows_without_a_true_residual():
+    """The mark leg no longer rides on ``unattributed_true_usd`` being present."""
+    row = _flagged_row("2026-08-31", 1_971.78)
+    assert "unattributed_true_usd" not in row
+    audit = B.audit_history([row])
+    assert len(audit["mark_breaches"]) == 1

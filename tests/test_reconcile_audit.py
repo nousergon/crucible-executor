@@ -4,6 +4,8 @@ that were frozen pre-settlement (config#1276)."""
 from __future__ import annotations
 
 import json
+import sqlite3
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,9 +21,10 @@ def _seed_eod(db_path, rows):
     for d, sc, sr, da in rows:
         conn.execute(
             "INSERT OR REPLACE INTO eod_pnl (date, portfolio_nav, spy_close, "
-            "spy_return_pct, daily_return_pct, daily_alpha_pct, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (d, 1_000_000.0, sc, sr, 0.0, da, f"{d}T20:00:00"),
+            "spy_return_pct, daily_return_pct, daily_alpha_pct, created_at, "
+            "total_cash, nav_basis) VALUES (?,?,?,?,?,?,?,?,?)",
+            (d, 1_000_000.0, sc, sr, 0.0, da, f"{d}T20:00:00",
+             1_000_000.0, "settled_close"),
         )
     conn.commit()
     conn.close()
@@ -36,10 +39,10 @@ def _seed_eod_with_positions(db_path, date_, spy_close, spy_return_pct, daily_al
     conn = init_db(db_path)
     conn.execute(
         "INSERT OR REPLACE INTO eod_pnl (date, portfolio_nav, spy_close, "
-        "spy_return_pct, daily_return_pct, daily_alpha_pct, positions_snapshot, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
+        "spy_return_pct, daily_return_pct, daily_alpha_pct, positions_snapshot, created_at, "
+        "total_cash, nav_basis) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (date_, 1_000_000.0, spy_close, spy_return_pct, 0.0, daily_alpha_pct,
-         _json.dumps(positions), f"{date_}T20:00:00"),
+         _json.dumps(positions), f"{date_}T20:00:00", 1_000_000.0, "settled_close"),
     )
     conn.commit()
     conn.close()
@@ -85,7 +88,7 @@ class TestAuditWindow:
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
         settled = {"2026-06-25": 734.30}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             assert send_email is False and run_audit is False  # never resend / never recurse
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=?, spy_return_pct=?, daily_alpha_pct=? WHERE date=?",
@@ -145,7 +148,7 @@ class TestAuditWindow:
         settled = {"2026-06-25": 734.30, "2026-06-26": 728.99}
         calls = []
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             assert send_email is False and run_audit is False
             calls.append(d)
             conn = init_db(db)
@@ -202,7 +205,7 @@ class TestAuditWindow:
         settled = {"2026-06-25": 734.30, "2026-06-26": 728.99}
         seen = []
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             # Must actually converge — an eod_run mock that changes nothing now
             # trips the post-correction verification (I10288).
             conn = init_db(db)
@@ -231,7 +234,7 @@ class TestAuditWindow:
         _seed_eod(db, [("2026-07-09", 751.60, -0.01, 1.52)])
         settled = {"2026-07-09": 751.71}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (751.71, d))
             conn.commit()
@@ -259,7 +262,7 @@ class TestAuditWindow:
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
         settled = {"2026-06-25": 734.30}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (734.30, d))
             conn.commit()
@@ -283,7 +286,7 @@ class TestAuditWindow:
         _seed_eod(db, [("2026-06-25", 734.20, 0.10, 1.40), ("2026-06-26", 728.90, -0.72, 0.33)])
         settled = {"2026-06-25": 734.30, "2026-06-26": 728.99}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (settled[d], d))
             conn.commit()
@@ -449,7 +452,7 @@ class TestHeldPositionStaleness:
         settled_spy = {"2026-06-25": 734.30}
         settled_tickers = {("AMD", "2026-06-25"): (101.50, "polygon")}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             assert send_email is False and run_audit is False
             conn = init_db(db)
             conn.execute(
@@ -527,7 +530,7 @@ class TestClassification:
         _seed_eod(db, [("2026-07-09", 751.60, -0.01, 1.52)])  # 1.46bp
         settled = {"2026-07-09": 751.71}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (751.71, d))
             conn.commit()
@@ -547,7 +550,7 @@ class TestClassification:
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])  # 10.9bp
         settled = {"2026-06-25": 734.30}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (734.30, d))
             conn.commit()
@@ -583,7 +586,7 @@ class TestAlertTextNamesTheDivergentLeg:
         settled_spy = {"2026-09-04": 770.19}          # 0.65bp — BELOW tolerance
         settled_tickers = {("AMD", "2026-09-04"): (100.60, "polygon")}  # 60bp — the real finding
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute(
                 "UPDATE eod_pnl SET spy_close=?, positions_snapshot=? WHERE date=?",
@@ -627,7 +630,7 @@ class TestAlertTextNamesTheDivergentLeg:
         settled_spy = {"2026-09-04": 770.19}               # ~1.17bp
         settled_tickers = {("AMD", "2026-09-04"): (100.60, "polygon")}  # ~60bp
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute(
                 "UPDATE eod_pnl SET spy_close=?, positions_snapshot=? WHERE date=?",
@@ -664,7 +667,7 @@ class TestConvergenceVerification:
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
         settled = {"2026-06-25": 734.30}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (733.90, d))  # still 5.4bp off
             conn.commit()
@@ -692,7 +695,7 @@ class TestConvergenceVerification:
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
         settled = {"2026-06-25": 734.30}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (734.30, d))
             conn.commit()
@@ -714,7 +717,7 @@ class TestConvergenceVerification:
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52), ("2026-06-26", 728.00, -0.72, 0.33)])
         settled = {"2026-06-25": 734.30, "2026-06-26": 728.99}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             # 06-25 does not converge; 06-26 does.
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?",
@@ -741,7 +744,7 @@ class TestAuditRecordStatesBlastRadius:
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
         settled = {"2026-06-25": 734.30}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute("UPDATE eod_pnl SET spy_close=? WHERE date=?", (734.30, d))
             conn.commit()
@@ -774,10 +777,10 @@ class TestPositionLevelCascade:
                            ("AMD", "2026-06-26"): (102.00, "polygon")}
         calls = []
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             calls.append(d)
             conn = init_db(db)
-            snap = f'{{"AMD": {{"closing_price": {settled_tickers[("AMD", d)]}, "shares": 10}}}}'
+            snap = f'{{"AMD": {{"closing_price": {settled_tickers[("AMD", d)][0]}, "shares": 10}}}}'
             conn.execute("UPDATE eod_pnl SET positions_snapshot=? WHERE date=?", (snap, d))
             conn.commit()
             conn.close()
@@ -837,7 +840,7 @@ class TestSourceSubstitutionClassification:
         )
 
     def _fake_run(self, db, ticker, new_close):
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute(
                 "UPDATE eod_pnl SET positions_snapshot=? WHERE date=?",
@@ -972,7 +975,7 @@ class TestSourceSubstitutionClassification:
             )
         settled = {"2026-09-04": 150.90, "2026-09-08": 151.43}
 
-        def fake_run(d, *, send_email, run_audit):
+        def fake_run(d, *, send_email, run_audit, post_journal=True):
             conn = init_db(db)
             conn.execute(
                 "UPDATE eod_pnl SET positions_snapshot=? WHERE date=?",
@@ -1013,3 +1016,85 @@ class TestSourceSubstitutionClassification:
             {"divergence_bps": 10.0, "stored_source": "polygon",
              "settled_source": "yfinance"}, page_threshold_bps=5.0) == \
             reconcile_audit.CLASSIFICATION_CORRUPTION
+
+
+# ── Ground-truth ruling 2026-10-22: settled basis + journal entries ──────────
+
+
+class TestSettledBasisRestrike:
+    """A windowed row still struck on the broker's marks is re-struck onto
+    the settled close, and the correction is ONE balanced journal entry
+    (alpha-engine-config-I10052; Brian 2026-10-22 on the money ledger)."""
+
+    def _seed_ual_row(self, db):
+        conn = init_db(db)
+        snap = {"UAL": {"shares": 100, "closing_price": 97.77, "close_source": "polygon",
+                        "market_value": 9777.0, "ib_market_value": 9544.0}}
+        conn.execute(
+            "INSERT OR REPLACE INTO eod_pnl (date, portfolio_nav, spy_close, spy_return_pct, "
+            "daily_return_pct, daily_alpha_pct, positions_snapshot, created_at, total_cash, "
+            "accrued_interest, nav_basis, nav_basis_diff_bps) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-10-20", 19544.0, 700.0, 0.0, 0.0, 0.0, json.dumps(snap),
+             "2026-10-20T20:00:00", 10000.0, 0.0, "ib_netliq", -23.0),  # 10-20 real gap: -23bp
+        )
+        conn.commit()
+        conn.close()
+
+    def _restrike(self, d, *, send_email, run_audit, post_journal=True):
+        assert post_journal is False  # the audit journals the delta itself
+        conn = init_db(self.db)
+        conn.execute("UPDATE eod_pnl SET portfolio_nav=19777.0, nav_basis='settled_close', "
+                     "nav_basis_diff_bps=0 WHERE date=?", (d,))
+        conn.commit()
+        conn.close()
+
+    def _audit(self, db, fake_run):
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: 700.0), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                          lambda t, d, c: (97.77, "polygon")), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run), \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k") as rec, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-10-20", end="2026-10-20", config=_cfg(db))
+        return res, rec
+
+    def test_ib_row_is_restruck_and_journaled(self, tmp_path):
+        self.db = str(tmp_path / "t.db")
+        self._seed_ual_row(self.db)
+        res, rec = self._audit(self.db, self._restrike)
+        (c,) = res["corrected"]
+        assert c["reason"] == "stale_nav_basis"
+        assert c["classification"] == "source_substitution"  # broker mark -> polygon, not paged
+        assert c["converged"] is True and c["paged"] is False
+        record = rec.call_args.kwargs["record"]
+        assert record["journal_entry_id"].startswith("je_")
+        conn = sqlite3.connect(self.db)
+        rows = conn.execute("SELECT account, amount FROM ledger_postings").fetchall()
+        conn.close()
+        assert sum(Decimal(a) for _, a in rows) == 0
+        assert dict(rows)["assets:securities:UAL"] == "233.00"
+
+    def test_restrike_without_a_journal_entry_does_not_converge(self, tmp_path):
+        self.db = str(tmp_path / "t.db")
+        self._seed_ual_row(self.db)
+
+        def wipe_cash(d, **kwargs):
+            self._restrike(d, **kwargs)
+            conn = init_db(self.db)
+            conn.execute("UPDATE eod_pnl SET total_cash=NULL WHERE date=?", (d,))
+            conn.commit()
+            conn.close()
+
+        with pytest.raises(reconcile_audit.ReconciliationUnconvergedError,
+                           match="no journal entry"):
+            self._audit(self.db, wipe_cash)
+
+    def test_settled_row_raises_no_basis_leg(self, tmp_path):
+        self.db = str(tmp_path / "t.db")
+        self._seed_ual_row(self.db)
+        conn = init_db(self.db)
+        conn.execute("UPDATE eod_pnl SET nav_basis='settled_close', portfolio_nav=19777.0")
+        conn.commit()
+        conn.close()
+        res, _ = self._audit(self.db, self._restrike)
+        assert res["corrected"] == []

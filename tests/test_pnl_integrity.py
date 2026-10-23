@@ -461,6 +461,27 @@ class TestCustodianMarks:
         assert check_custodian_marks(
             [_flag("AMD", 479.0, 502.2, 530.13, 225, -5_220.0)], nav=None) == []
 
+    def test_a_flag_without_mark_or_range_still_breaches_and_does_not_crash(self):
+        """alpha-engine-config-I9613. The full-history audit rebuilds flags from
+        the persisted eod_pnl row, which carries ``ib_mark_range_error_usd`` but
+        not the mark or the day's [Low, High]. Formatting those Nones raised
+        TypeError on the live 2026-08-31 DUOL row and killed the whole audit.
+        The breach must still be returned, at its recorded size."""
+        flag = {"ticker": "DUOL", "mark_error_usd": 1_971.78, "shares": 708}
+        breaches = check_custodian_marks([flag], nav=NAV, run_date="2026-08-31")
+        assert len(breaches) == 1
+        assert breaches[0]["kind"] == "custodian_mark"
+        assert breaches[0]["error_usd"] == pytest.approx(1_971.78)
+        assert breaches[0]["ib_mark"] is None
+        assert "not persisted" in breaches[0]["message"]
+
+    def test_message_names_mark_and_range_when_present(self):
+        breaches = check_custodian_marks(
+            [_flag("AMD", 479.0, 502.2, 530.13, 225, -5_220.0)],
+            nav=NAV, run_date="2026-08-04")
+        assert "broker mark $479.00 fell outside the day's traded range " \
+            "[$502.20, $530.13]" in breaches[0]["message"]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session-axis coverage — alpha-engine-config-I9615
@@ -568,6 +589,238 @@ class TestSessionAxisCoverage:
         )
         assert out["closes"] is False
         assert all(b["kind"] == "calendar_lookup_failed" for b in out["breaches"])
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Accepted gaps on the contiguity gate (alpha-engine-config-I11087)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 2026-07-27 is a recorded exception (ruling alpha-engine-config#5325) and is
+# registered in config/accepted_gaps.json; the gate must read it. Everything
+# else about the gate stays as strict as before.
+
+_GAP_0727 = {
+    "date": "2026-07-27",
+    "reason": "CaptureSnapshot failed permanently — snapshot never existed",
+    "ruling": "nousergon/alpha-engine-config#5325",
+    "accepted_at": "2026-07-29T00:00:00Z",
+}
+# 07-24 (Fri), 07-27 (Mon) missing, 07-28 (Tue) — the live shape.
+_ROWS_0727 = _axis_rows("2026-07-23", "2026-07-24", "2026-07-28", "2026-07-29")
+
+
+def _coverage(rows, accepted_gaps):
+    return check_session_axis_coverage(
+        rows, is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        accepted_gaps=accepted_gaps,
+    )
+
+
+class TestSessionAxisAcceptedGaps:
+    def test_without_the_registry_0727_is_still_a_missing_session(self):
+        out = _coverage(_ROWS_0727, None)
+        assert out["closes"] is False
+        assert [(b["kind"], b["date"]) for b in out["breaches"]] == [
+            ("missing_session", "2026-07-27")
+        ]
+
+    def test_0727_with_its_ruled_entry_passes_and_stays_visible(self):
+        out = _coverage(_ROWS_0727, [_GAP_0727])
+        assert out["closes"] is True
+        assert out["breaches"] == []
+        assert out["accepted_gaps"] == [
+            {"date": "2026-07-27", "ruling": "nousergon/alpha-engine-config#5325"}
+        ]
+        assert "2026-07-27" in out["message"]
+
+    def test_the_date_keyed_dict_from_load_accepted_gaps_also_works(self):
+        out = _coverage(_ROWS_0727, {"2026-07-27": _GAP_0727})
+        assert out["closes"] is True
+
+    def test_the_fleet_reference_form_is_a_ruling_id(self):
+        entry = dict(_GAP_0727, ruling="alpha-engine-config-I5325")
+        assert _coverage(_ROWS_0727, [entry])["closes"] is True
+
+    def test_an_unrecorded_gap_still_fails_beside_an_accepted_one(self):
+        """03-12-shaped: a second gap with no registry entry is never excused
+        by the presence of an unrelated accepted one."""
+        rows = _axis_rows("2026-07-23", "2026-07-28", "2026-07-29")  # 07-24 AND 07-27
+        out = _coverage(rows, [_GAP_0727])
+        assert out["closes"] is False
+        assert [(b["kind"], b["date"]) for b in out["breaches"]] == [
+            ("missing_session", "2026-07-24")
+        ]
+        assert [a["date"] for a in out["accepted_gaps"]] == ["2026-07-27"]
+
+    @pytest.mark.parametrize("ruling", [None, "", "   ", "per Brian", "#5325", 5325])
+    def test_an_entry_without_a_ruling_id_fails_and_accepts_nothing(self, ruling):
+        entry = {k: v for k, v in _GAP_0727.items() if k != "ruling"}
+        if ruling is not None:
+            entry["ruling"] = ruling
+        out = _coverage(_ROWS_0727, [entry])
+        assert out["closes"] is False
+        kinds = {(b["kind"], b["date"]) for b in out["breaches"]}
+        assert ("accepted_gap_without_ruling", "2026-07-27") in kinds
+        assert ("missing_session", "2026-07-27") in kinds
+        assert out["accepted_gaps"] == []
+
+    def test_an_entry_for_a_date_with_a_row_fails(self):
+        entry = dict(_GAP_0727, date="2026-07-24")
+        out = _coverage(_ROWS_0727, [_GAP_0727, entry])
+        assert out["closes"] is False
+        not_gap = [b for b in out["breaches"] if b["kind"] == "accepted_gap_not_a_gap"]
+        assert [(b["date"], b["reason"]) for b in not_gap] == [("2026-07-24", "row_present")]
+
+    def test_an_entry_for_a_non_session_date_fails(self):
+        """A weekend inside the window is not a gap."""
+        entry = dict(_GAP_0727, date="2026-07-25")
+        out = _coverage(_ROWS_0727, [_GAP_0727, entry])
+        assert out["closes"] is False
+        not_gap = [b for b in out["breaches"] if b["kind"] == "accepted_gap_not_a_gap"]
+        assert [(b["date"], b["reason"]) for b in not_gap] == [
+            ("2026-07-25", "not_a_trading_session")
+        ]
+
+    def test_an_entry_outside_the_persisted_window_fails(self):
+        entry = dict(_GAP_0727, date="2026-03-12")
+        out = _coverage(_ROWS_0727, [_GAP_0727, entry])
+        assert out["closes"] is False
+        not_gap = [b for b in out["breaches"] if b["kind"] == "accepted_gap_not_a_gap"]
+        assert [(b["date"], b["reason"]) for b in not_gap] == [("2026-03-12", "outside_window")]
+
+    @pytest.mark.parametrize("entry", [
+        "2026-07-27",
+        {"ruling": "nousergon/alpha-engine-config#5325"},
+        {"date": "07/27/2026", "ruling": "nousergon/alpha-engine-config#5325"},
+    ])
+    def test_a_malformed_entry_fails_loudly(self, entry):
+        out = _coverage(_ROWS_0727, [entry])
+        assert out["closes"] is False
+        kinds = {b["kind"] for b in out["breaches"]}
+        assert "accepted_gap_malformed" in kinds
+        assert "missing_session" in kinds
+
+    def test_a_duplicated_date_accepts_nothing(self):
+        out = _coverage(_ROWS_0727, [_GAP_0727, dict(_GAP_0727)])
+        assert out["closes"] is False
+        kinds = [(b["kind"], b["date"]) for b in out["breaches"]]
+        assert kinds.count(("accepted_gap_malformed", "2026-07-27")) == 2
+        assert ("missing_session", "2026-07-27") in kinds
+
+
+# Declared non-session rows (alpha-engine-config-I9613): the 2026-04-03 Good
+# Friday row is ruled left as stored, so it is declared, never edited.
+_GOOD_FRIDAY_ROWS = _axis_rows("2026-04-02", "2026-04-03", "2026-04-06")
+_DECL_0403 = {"date": "2026-04-03", "ruling": "alpha-engine-config-I9613",
+              "reason": "Good Friday, ruled left as stored"}
+
+
+from executor.accepted_gaps import load_declared_non_sessions  # noqa: E402
+
+_SHIPPED = load_declared_non_sessions()
+
+
+def _declared(rows, declared):
+    return check_session_axis_coverage(
+        rows, is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        declared_non_sessions=declared,
+    )
+
+
+class TestDeclaredNonSessionRows:
+    def test_the_shipped_declaration_is_the_ruled_good_friday_row(self):
+        assert [(e["date"], e["ruling"]) for e in _SHIPPED] == [
+            ("2026-04-03", "alpha-engine-config-I9613")
+        ]
+        assert all(e.get("reason") for e in _SHIPPED)
+
+    def test_a_missing_file_declares_nothing(self, tmp_path):
+        assert load_declared_non_sessions(tmp_path / "absent.json") == []
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        assert load_declared_non_sessions(bad) == []
+
+    def test_without_a_declaration_the_row_still_breaches(self):
+        out = _declared(_GOOD_FRIDAY_ROWS, None)
+        assert out["closes"] is False
+        assert [(b["kind"], b["date"]) for b in out["breaches"]] == [
+            ("non_trading_day_row", "2026-04-03")
+        ]
+        assert out["declared_non_sessions"] == []
+
+    def test_the_shipped_declaration_excuses_0403_and_stays_visible(self):
+        out = _declared(_GOOD_FRIDAY_ROWS, _SHIPPED)
+        assert out["closes"] is True
+        assert out["breaches"] == []
+        assert out["declared_non_sessions"] == [
+            {"date": "2026-04-03", "ruling": "alpha-engine-config-I9613"}
+        ]
+        assert "2026-04-03" in out["message"]
+
+    def test_a_declaration_never_excuses_a_missing_session(self):
+        """Declaring 04-03 changes nothing about a genuine gap beside it."""
+        rows = _axis_rows("2026-04-01", "2026-04-03", "2026-04-06")  # 04-02 gone
+        out = _declared(rows, [_DECL_0403])
+        assert [(b["kind"], b["date"]) for b in out["breaches"]] == [
+            ("missing_session", "2026-04-02")
+        ]
+
+    def test_an_undeclared_non_session_row_still_breaches_beside_a_declared_one(self):
+        rows = _axis_rows("2026-04-02", "2026-04-03", "2026-04-04", "2026-04-06")
+        out = _declared(rows, [_DECL_0403])
+        assert [(b["kind"], b["date"]) for b in out["breaches"]] == [
+            ("non_trading_day_row", "2026-04-04")
+        ]
+
+    @pytest.mark.parametrize("ruling", [None, "", "per Brian", "#9613", 9613])
+    def test_a_declaration_without_a_ruling_id_excuses_nothing(self, ruling):
+        entry = {k: v for k, v in _DECL_0403.items() if k != "ruling"}
+        if ruling is not None:
+            entry["ruling"] = ruling
+        out = _declared(_GOOD_FRIDAY_ROWS, [entry])
+        kinds = {(b["kind"], b["date"]) for b in out["breaches"]}
+        assert ("declared_non_session_without_ruling", "2026-04-03") in kinds
+        assert ("non_trading_day_row", "2026-04-03") in kinds
+        assert out["declared_non_sessions"] == []
+
+    def test_a_declaration_whose_row_is_gone_fails(self):
+        """If the row is later removed, the stale declaration is loud."""
+        out = _declared(_axis_rows("2026-04-02", "2026-04-06"), [_DECL_0403])
+        assert out["closes"] is False
+        assert [(b["kind"], b["reason"]) for b in out["breaches"]] == [
+            ("declared_non_session_not_a_non_session", "no_row")
+        ]
+
+    def test_a_declaration_for_a_trading_session_fails(self):
+        entry = dict(_DECL_0403, date="2026-04-02")
+        out = _declared(_GOOD_FRIDAY_ROWS, [_DECL_0403, entry])
+        assert [(b["kind"], b["date"], b.get("reason")) for b in out["breaches"]] == [
+            ("declared_non_session_not_a_non_session", "2026-04-02", "trading_session")
+        ]
+
+    def test_a_declaration_outside_the_window_is_ignored(self):
+        """Declarations are fleet-wide; one dated outside this series applies
+        to no row of it."""
+        out = _declared(_axis_rows("2026-04-06", "2026-04-07"), [_DECL_0403])
+        assert out["closes"] is True
+        assert out["declared_non_sessions"] == []
+
+    @pytest.mark.parametrize("entry", [
+        "2026-04-03",
+        {"ruling": "alpha-engine-config-I9613"},
+        {"date": "04/03/2026", "ruling": "alpha-engine-config-I9613"},
+    ])
+    def test_a_malformed_declaration_fails_loudly(self, entry):
+        out = _declared(_GOOD_FRIDAY_ROWS, [entry])
+        kinds = {b["kind"] for b in out["breaches"]}
+        assert {"declared_non_session_malformed", "non_trading_day_row"} <= kinds
+
+    def test_a_duplicated_declaration_excuses_nothing(self):
+        out = _declared(_GOOD_FRIDAY_ROWS, [_DECL_0403, dict(_DECL_0403)])
+        kinds = [(b["kind"], b["date"]) for b in out["breaches"]]
+        assert kinds.count(("declared_non_session_malformed", "2026-04-03")) == 2
+        assert ("non_trading_day_row", "2026-04-03") in kinds
 
 # NAV mark correction (alpha-engine-config-I9627)
 # ─────────────────────────────────────────────────────────────────────────────

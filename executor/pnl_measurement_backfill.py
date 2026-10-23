@@ -652,6 +652,8 @@ def audit_history(
     prior_session_of: Any | None = None,
     is_trading_day: Any | None = None,
     next_trading_day: Any | None = None,
+    accepted_gaps: Any = None,
+    declared_non_sessions: Any = None,
 ) -> dict[str, Any]:
     """Run the integrity gates over the WHOLE persisted series and report breaches.
 
@@ -668,7 +670,17 @@ def audit_history(
     docstring. Both absent SKIPS the coverage gate (reported as
     ``session_axis_coverage_status: "NOT EVALUATED"``) rather than reporting a
     pass; a gate that did not run has not agreed with anything, same
-    convention as the vendor anchor below.
+    convention as the vendor anchor below. ``accepted_gaps`` is the
+    ``config/accepted_gaps.json`` registry (raw ``gaps`` list); a missing
+    session with a valid, ruled entry there is reported under
+    ``session_axis_coverage["accepted_gaps"]`` instead of as a breach, and an
+    invalid entry is itself a breach (alpha-engine-config-I11087).
+    ``declared_non_sessions`` (the CLI passes
+    config/pnl_declared_non_sessions.json) does the same for a persisted
+    row on a non-session date: a ruled declaration moves its
+    ``non_trading_day_row`` breach to
+    ``session_axis_coverage["declared_non_sessions"]`` and excuses its
+    ``benchmark_vendor_coverage`` hole (alpha-engine-config-I9613).
 
     Returns a dict with ``breach_count``; the CLI exits NON-ZERO when it is
     nonzero, so a breach in the history is a failure rather than a paragraph in
@@ -683,6 +695,7 @@ def audit_history(
     if is_trading_day is not None and next_trading_day is not None:
         coverage = check_session_axis_coverage(
             rows, is_trading_day=is_trading_day, next_trading_day=next_trading_day,
+            accepted_gaps=accepted_gaps, declared_non_sessions=declared_non_sessions,
         )
         coverage_status = "evaluated"
     else:
@@ -696,6 +709,7 @@ def audit_history(
             rows,
             vendor_closes=vendor_closes,
             vendor_dividends=spy_ex_dividends or {},
+            declared_non_sessions=declared_non_sessions,
         )
         anchor_status = "evaluated"
     else:
@@ -704,24 +718,55 @@ def audit_history(
 
     residual_breaches: list[dict[str, Any]] = []
     mark_breaches: list[dict[str, Any]] = []
+    mark_unevaluated: list[dict[str, Any]] = []
     divergence_breaches: list[dict[str, Any]] = []
     true_window: list[float] = []
     for row in rows:
         nav = _f(row.get("portfolio_nav"))
         date = str(row.get("date"))
         true_residual = _f(row.get("unattributed_true_usd"))
-        if nav is None or true_residual is None:
-            continue
-        true_window.append(true_residual)
-        residual_breaches.extend(
-            check_residual_bounds(
-                unattributed_true_usd=true_residual,
-                nav=nav,
-                trailing_residuals_usd=true_window[:-1],
-                run_date=date,
+        if nav is not None and true_residual is not None:
+            true_window.append(true_residual)
+            residual_breaches.extend(
+                check_residual_bounds(
+                    unattributed_true_usd=true_residual,
+                    nav=nav,
+                    trailing_residuals_usd=true_window[:-1],
+                    run_date=date,
+                )
             )
-        )
         positions = _positions(row) or {}
+        # A position the producer flagged out of range whose materiality this
+        # pass cannot evaluate — no finite recorded error, or no NAV to size it
+        # against — is a FINDING, never a silent skip (alpha-engine-config-I9613).
+        # ``check_custodian_marks`` drops a non-numeric error without a trace,
+        # which is right for the live gate's own computed flags and wrong for a
+        # history audit reading back whatever the row happens to carry.
+        for t, p in positions.items():
+            if not p.get("ib_mark_outside_range"):
+                continue
+            err = _f(p.get("ib_mark_range_error_usd"))
+            if nav is not None and err is not None and math.isfinite(err):
+                continue
+            mark_unevaluated.append({
+                "kind": "custodian_mark_unevaluated",
+                "severity": "unevaluated",
+                "run_date": date,
+                "ticker": t,
+                "mark_error_usd": p.get("ib_mark_range_error_usd"),
+                "portfolio_nav": row.get("portfolio_nav"),
+                "message": (
+                    f"Custodian mark NOT EVALUATED for {t} on {date}: the row "
+                    "flags the broker mark outside the day's traded range but "
+                    + ("carries no portfolio_nav to size it against"
+                       if nav is None else
+                       "carries no finite ib_mark_range_error_usd")
+                    + " — materiality unknown, so neither a pass nor a breach."
+                ),
+            })
+        if nav is None:
+            divergence_breaches.extend(reconstruct_mark_divergences(row))
+            continue
         flags = [
             {
                 "ticker": t,
@@ -739,7 +784,8 @@ def audit_history(
             }
             for t, p in positions.items()
             if p.get("ib_mark_outside_range")
-            and p.get("ib_mark_range_error_usd") is not None
+            and _f(p.get("ib_mark_range_error_usd")) is not None
+            and math.isfinite(_f(p.get("ib_mark_range_error_usd")))
         ]
         mark_breaches.extend(check_custodian_marks(flags, nav=nav, run_date=date))
         divergence_breaches.extend(reconstruct_mark_divergences(row))
@@ -749,6 +795,7 @@ def audit_history(
         + (0 if bench.get("closes") is not False else 1)
         + len(residual_breaches)
         + len(mark_breaches)
+        + len(mark_unevaluated)
         + len(divergence_breaches)
         + len(anchor_breaches)
         + len(coverage.get("breaches", []))
@@ -763,6 +810,7 @@ def audit_history(
         "session_axis_coverage": coverage,
         "residual_breaches": residual_breaches,
         "mark_breaches": mark_breaches,
+        "mark_unevaluated": mark_unevaluated,
         "mark_divergence_breaches": divergence_breaches,
         "breach_count": breach_count,
     }
@@ -1673,7 +1721,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--trades-bucket", default=DEFAULT_TRADES_BUCKET,
-        help="bucket backing the ArcticDB libraries for --range-source arcticdb",
+        help="bucket backing the ArcticDB libraries for --range-source arcticdb, "
+             "and holding config/accepted_gaps.json for --audit",
     )
     ap.add_argument("--audit", action="store_true", help="run the retroactive gates")
     ap.add_argument(
@@ -1856,10 +1905,17 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     if args.audit:
         rows = _rows(conn)  # re-read so the audit sees anything just written
+        from executor.accepted_gaps import (
+            load_accepted_gap_entries,
+            load_declared_non_sessions,
+        )
+
         audit = audit_history(
             rows, spy_ex_dividends=spy_map, vendor_closes=vendor_closes,
             prior_session_of=_prior_session_of,
             is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+            accepted_gaps=load_accepted_gap_entries(args.trades_bucket),
+            declared_non_sessions=load_declared_non_sessions(),
         )
         report["audit"] = audit
         if audit["breach_count"]:
@@ -1867,7 +1923,7 @@ def main(argv: list[str] | None = None) -> int:
                 "HISTORICAL INTEGRITY: %d breach(es) over %d sessions — "
                 "TWR closes=%s, benchmark columns agree=%s, vendor anchor=%s "
                 "(%d breach), session axis=%s (%d breach), residual=%d, "
-                "mark flags=%d, mark divergences=%d",
+                "mark flags=%d, mark unevaluated=%d, mark divergences=%d",
                 audit["breach_count"], audit["n_sessions"],
                 audit["twr_closure"].get("closes"),
                 audit["benchmark_closure"].get("closes"),
@@ -1876,6 +1932,7 @@ def main(argv: list[str] | None = None) -> int:
                 audit["session_axis_coverage_status"],
                 len(audit["session_axis_coverage"].get("breaches", [])),
                 len(audit["residual_breaches"]), len(audit["mark_breaches"]),
+                len(audit["mark_unevaluated"]),
                 len(audit["mark_divergence_breaches"]),
             )
             exit_code = 1
