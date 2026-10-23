@@ -45,6 +45,20 @@ Invariants, enforced here and NOT by the caller
    correction re-run (a repeated reconcile) is one entry, not two.
 4. **Trial balance is zero.** :func:`trial_balance` sums every posting ever
    written; a non-zero total is a broken ledger and raises.
+5. **Balanced at commit, by the store** (policy Rule 2; alpha-engine-config-
+   I12558). An entry's postings are written first and its header LAST, and
+   the header is what makes an entry posted. A ``BEFORE INSERT`` trigger on
+   ``ledger_journal_entries`` refuses a header unless the entry already has
+   at least two postings summing to exactly zero per currency (in integer
+   cents). A ``BEFORE INSERT`` trigger on ``ledger_postings`` refuses a line
+   for an entry whose header exists, so a posted entry is sealed. Both hold
+   for a raw ``sqlite3`` write that never calls :func:`record_entry`: an
+   unbalanced or partial entry cannot become posted through ANY write path.
+6. **Every entry verified, not only the total.** :func:`verify_entries`
+   checks each stored entry in exact :class:`~decimal.Decimal` (balanced per
+   currency, two or more lines) and that no posting lacks a header and no
+   header lacks postings. It runs inside every append, next to the trial
+   balance; a zero total over two offsetting broken entries is still a break.
 """
 
 from __future__ import annotations
@@ -348,7 +362,27 @@ CREATE TRIGGER IF NOT EXISTS ledger_postings_no_update
 CREATE TRIGGER IF NOT EXISTS ledger_postings_no_delete
     BEFORE DELETE ON ledger_postings
     BEGIN SELECT RAISE(ABORT, 'ledger_postings is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS ledger_postings_sealed_once_posted
+    BEFORE INSERT ON ledger_postings
+    WHEN EXISTS (SELECT 1 FROM ledger_journal_entries WHERE entry_id = NEW.entry_id)
+    BEGIN SELECT RAISE(ABORT, 'ledger entry is already posted; its postings are sealed'); END;
+CREATE TRIGGER IF NOT EXISTS ledger_entries_balanced_at_post
+    BEFORE INSERT ON ledger_journal_entries
+    WHEN (SELECT COUNT(*) FROM ledger_postings WHERE entry_id = NEW.entry_id) < 2
+      OR EXISTS (
+        SELECT 1 FROM ledger_postings WHERE entry_id = NEW.entry_id
+        GROUP BY currency
+        HAVING SUM(CAST(ROUND(CAST(amount AS REAL) * 100) AS INTEGER)) != 0
+      )
+    BEGIN SELECT RAISE(ABORT, 'ledger entry does not balance: postings must sum to zero per currency'); END;
 """
+
+#: The triggers that make the store, not the caller, refuse an unbalanced or
+#: partial entry. Named so a test can assert each one is installed.
+STORE_GUARD_TRIGGERS: tuple[str, ...] = (
+    "ledger_postings_sealed_once_posted",
+    "ledger_entries_balanced_at_post",
+)
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -359,8 +393,10 @@ def record_entry(conn: sqlite3.Connection, entry: JournalEntry) -> tuple[dict, b
     """Append ``entry`` to ``trades.db``. Returns ``(document, newly_written)``.
 
     Idempotent on ``entry_id``. The entry and its postings commit together or
-    not at all, and the stored ledger's trial balance is re-checked inside the
-    same transaction, so an unbalanced ledger can never be committed.
+    not at all. Postings go in first and the header last, because the header
+    is what the store checks for balance (invariant 5). The stored ledger's
+    trial balance and every entry's own balance are re-checked inside the same
+    transaction, so an unbalanced ledger can never be committed.
     """
     ensure_schema(conn)
     doc = entry.to_document()
@@ -373,6 +409,15 @@ def record_entry(conn: sqlite3.Connection, entry: JournalEntry) -> tuple[dict, b
         return doc, False
     try:
         conn.execute("SAVEPOINT ledger_append")
+        conn.executemany(
+            "INSERT INTO ledger_postings (entry_id, line_no, account, amount, currency) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (doc["entry_id"], i, p.account, str(p.amount), p.currency)
+                for i, p in enumerate(entry.postings)
+            ],
+        )
+        # The header LAST: its insert is the posting boundary the store checks.
         conn.execute(
             "INSERT INTO ledger_journal_entries (entry_id, effective_date, posted_at, "
             "source, kind, reason, reverses_entry_id, evidence_json) "
@@ -383,15 +428,8 @@ def record_entry(conn: sqlite3.Connection, entry: JournalEntry) -> tuple[dict, b
                 json.dumps(doc["evidence"], sort_keys=True, default=str),
             ),
         )
-        conn.executemany(
-            "INSERT INTO ledger_postings (entry_id, line_no, account, amount, currency) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [
-                (doc["entry_id"], i, p.account, str(p.amount), p.currency)
-                for i, p in enumerate(entry.postings)
-            ],
-        )
         trial_balance(conn)
+        verify_entries(conn)
         conn.execute("RELEASE SAVEPOINT ledger_append")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT ledger_append")
@@ -422,6 +460,50 @@ def trial_balance(conn: sqlite3.Connection) -> dict[str, Decimal]:
             + ", ".join(f"{c} {t:+}" for c, t in sorted(broken.items()))
         )
     return totals
+
+
+def verify_entries(conn: sqlite3.Connection) -> int:
+    """Check every stored entry on its own. Returns the number of entries.
+
+    Raises :class:`LedgerIntegrityError` naming every offender when:
+
+    * an entry's postings do not sum to exactly zero in some currency;
+    * an entry has fewer than two postings (a header with none is a partial
+      entry);
+    * a posting names an entry with no header (an orphan line, which only a
+      write bypassing :func:`record_entry` can produce).
+
+    The trial balance alone cannot see two broken entries that offset each
+    other; this can. Summed as Decimal from the stored text, never as REAL.
+    Like :func:`trial_balance`, it never runs DDL, so it is safe inside
+    :func:`record_entry`'s savepoint.
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_postings'"
+    ).fetchone():
+        return 0
+    headers = {row[0] for row in conn.execute("SELECT entry_id FROM ledger_journal_entries")}
+    lines: dict[str, int] = {}
+    sums: dict[tuple[str, str], Decimal] = {}
+    for entry_id, amount, currency in conn.execute(
+        "SELECT entry_id, amount, currency FROM ledger_postings"
+    ):
+        lines[entry_id] = lines.get(entry_id, 0) + 1
+        sums[(entry_id, currency)] = sums.get((entry_id, currency), Decimal("0")) + Decimal(amount)
+    offenders: list[str] = []
+    for entry_id in sorted(set(lines) - headers):
+        offenders.append(f"{entry_id}: {lines[entry_id]} posting(s) with no entry header")
+    for entry_id in sorted(headers):
+        if lines.get(entry_id, 0) < 2:
+            offenders.append(f"{entry_id}: {lines.get(entry_id, 0)} posting(s), needs two or more")
+    for (entry_id, currency), total in sorted(sums.items()):
+        if total != 0 and entry_id in headers:
+            offenders.append(f"{entry_id}: {currency} {total:+} does not balance")
+    if offenders:
+        raise LedgerIntegrityError(
+            f"money ledger has {len(offenders)} broken entr(y/ies): " + "; ".join(offenders)
+        )
+    return len(headers)
 
 
 def entries_for_date(conn: sqlite3.Connection, effective_date: str) -> list[dict]:
