@@ -152,3 +152,47 @@ def test_publish_ops_alert_routes_telegram_via_flow_doctor(mock_get_fd):
     mock_fd.notify_event.assert_called_once()
     assert mock_fd.notify_event.call_args.kwargs["severity"] == "error"
     assert mock_fd.notify_event.call_args.kwargs["dedup_key"] == "k2"
+
+
+def _rate_limited_fd():
+    fd = MagicMock()
+    fd.notify_event.return_value = "report-id"
+    fd.last_dispatched.return_value = False
+    fd.last_dispatch_reason.return_value = "rate_limited"
+    return fd
+
+
+def test_essential_daemon_status_sent_past_daily_cap(monkeypatch):
+    """2026-10-23: the order-book message was dropped as rate_limited after
+    overnight reruns used the executor's 10/day budget. Essential messages
+    go straight to the same forum topic instead."""
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH", "3")
+    with patch("executor.notifier.get_flow_doctor", return_value=_rate_limited_fd()), \
+            patch("executor.notifier.send_message", return_value=True) as mock_send:
+        assert send_daemon_status("*Order book written*\nDate: x", essential=True) is True
+    mock_send.assert_called_once()
+    assert mock_send.call_args.kwargs["message_thread_id"] == 3
+
+
+def test_non_essential_daemon_status_still_capped():
+    with patch("executor.notifier.get_flow_doctor", return_value=_rate_limited_fd()), \
+            patch("executor.notifier.send_message", return_value=True) as mock_send:
+        assert send_daemon_status("*IB Gateway reconnected*") is False
+    mock_send.assert_not_called()
+
+
+def test_essential_status_not_resent_for_other_reasons():
+    fd = _rate_limited_fd()
+    fd.last_dispatch_reason.return_value = "severity_filtered"
+    with patch("executor.notifier.get_flow_doctor", return_value=fd), \
+            patch("executor.notifier.send_message", return_value=True) as mock_send:
+        assert send_daemon_status("*Daemon crashed*", essential=True) is False
+    mock_send.assert_not_called()
+
+
+def test_trade_alert_sent_past_daily_cap(monkeypatch):
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_TRADES", "5")
+    with patch("executor.notifier.get_flow_doctor", return_value=_rate_limited_fd()), \
+            patch("executor.notifier.send_message", return_value=True) as mock_send:
+        assert send_trade_alert("BUY", "DUOL", 10, 300.0, "pullback", "daemon") is True
+    assert mock_send.call_args.kwargs["message_thread_id"] == 5

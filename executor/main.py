@@ -1728,7 +1728,8 @@ def _write_stops_and_finalize(
             f"Date: {run_date}\n"
             f"Entries: {n_entries} | Urgent exits: {n_urgent} | Stops: {n_stops}"
             f"{order_book_rationale(ob)}"
-            f"{blocked_lines}"
+            f"{blocked_lines}",
+            essential=True,
         )
     except Exception:
         # (a) Telegram transport failed for the order-book summary.
