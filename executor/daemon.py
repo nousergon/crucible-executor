@@ -1860,7 +1860,7 @@ def run_daemon(dry_run: bool = False) -> None:
             fd.report(
                 _exc, severity="critical", context={"site": "daemon_main", "dry_run": dry_run, "run_date": run_date}
             )
-        send_daemon_status("\u274c *Daemon crashed* — check logs")
+        send_daemon_status("\u274c *Daemon crashed* — check logs", essential=True)
         raise
     finally:
         # ── L139(a) — flush intraday decision capture for replay parity ──
@@ -2155,7 +2155,7 @@ def _execute_exit(
     order_result = _place_order_with_retry(ibkr, ticker, sell_action, shares, action)
     if order_result["status"] in ("Rejected", "Timeout"):
         logger.error("%s %s FAILED after %d attempts: %s", action, ticker, MAX_ORDER_RETRIES, order_result["status"])
-        send_daemon_status(f"\u26a0\ufe0f *{action} {ticker} FAILED*: {order_result['status']}")
+        send_daemon_status(f"\u26a0\ufe0f *{action} {ticker} FAILED*: {order_result['status']}", essential=True)
         return
 
     # Use actual filled quantity (handles PartialFill)
@@ -2479,7 +2479,7 @@ def _execute_entry(
         # Roll the WAL entry back to 'pending' so the legitimate entry can
         # retry on a later tick.
         logger.error("ENTER %s REJECTED after %d attempts", ticker, MAX_ORDER_RETRIES)
-        send_daemon_status(f"\u26a0\ufe0f *ENTER {ticker} FAILED*: Rejected")
+        send_daemon_status(f"\u26a0\ufe0f *ENTER {ticker} FAILED*: Rejected", essential=True)
         order_book.revert_entry_to_pending(ticker)
         order_book.save()
         return

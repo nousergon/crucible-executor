@@ -20,6 +20,7 @@ nousergon-lib[flow-doctor] pin) instead of trusting a non-None report id.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 
 import pytz
@@ -30,6 +31,47 @@ from nousergon_lib.telegram import send_message
 logger = logging.getLogger(__name__)
 
 _ET = pytz.timezone("US/Eastern")
+
+
+# Messages Brian acts on every day must never be dropped by flow-doctor's
+# daily alert cap. On 2026-10-23 the 12:37Z "Order book written" message was
+# dropped as `rate_limited` because overnight reconcile reruns had used the
+# executor's 10/day budget after UTC midnight. When flow-doctor reports
+# `rate_limited` for an ESSENTIAL message, we send it straight to the same
+# forum topic instead. Repeats are still bounded by flow-doctor's dedup, which
+# runs before the cap.
+_RATE_LIMITED = "rate_limited"
+_TOPIC_ENV_BY_SEVERITY = {
+    "critical": "FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL",
+    "error": "FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH",
+    "warning": "FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH",
+    "info": "FLOW_DOCTOR_TELEGRAM_THREAD_TRADES",
+}
+
+
+def _topic_thread_id(severity: str) -> int | None:
+    raw = os.environ.get(_TOPIC_ENV_BY_SEVERITY.get(severity, ""), "")
+    try:
+        return int(raw) if raw.strip() else None
+    except ValueError:
+        return None
+
+
+def _send_past_cap(message: str, severity: str, label: str) -> bool:
+    """Deliver an essential message that flow-doctor's daily cap held back."""
+    ok = send_message(message, message_thread_id=_topic_thread_id(severity))
+    if ok:
+        logger.warning(
+            "Essential Telegram message sent past the flow-doctor daily cap: %s",
+            label,
+        )
+    else:
+        logger.error(
+            "Essential Telegram message held by the daily cap AND the direct "
+            "send failed: %s",
+            label,
+        )
+    return ok
 
 
 def _format_fill_time(fill_time: str | None) -> str:
@@ -148,6 +190,8 @@ def send_trade_alert(
                 )
                 return False
             if not fd.last_dispatched():
+                if fd.last_dispatch_reason() == _RATE_LIMITED:
+                    return _send_past_cap(msg, "info", f"{action} {ticker}")
                 logger.warning(
                     "Telegram trade alert NOT delivered by flow-doctor (reason=%s): %s %s",
                     fd.last_dispatch_reason(),
@@ -173,15 +217,25 @@ def send_trade_alert(
     return ok
 
 
-def send_daemon_status(message: str) -> bool:
-    """Send a general status message (daemon start/stop, errors, IB events)."""
+def send_daemon_status(message: str, *, essential: bool = False) -> bool:
+    """Send a general status message (daemon start/stop, errors, IB events).
+
+    ``essential=True`` marks a message the operator acts on (the daily order
+    book, a crash, a failed order): if flow-doctor's daily cap holds it back,
+    it is sent directly instead of being dropped.
+    """
     fd = get_flow_doctor()
     if fd is not None:
         try:
             rid = fd.notify_event(message, severity="warning")
             if rid is None:
                 return False
-            return fd.last_dispatched()
+            if fd.last_dispatched():
+                return True
+            if essential and fd.last_dispatch_reason() == _RATE_LIMITED:
+                label = message.split("\n", 1)[0].replace("*", "").strip()
+                return _send_past_cap(message, "warning", label)
+            return False
         except Exception as e:
             # (a) flow-doctor's own notify_event transport failed.
             # (c) not recorded elsewhere — deliberate carve-out
