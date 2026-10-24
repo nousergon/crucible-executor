@@ -5,7 +5,8 @@ pyyaml~=6.0
 # started failing 2026-07-14 against the default 79.0.1 bundled by the
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
 # pin exists solely to satisfy the security-audit gate.
-setuptools>=83.0.0
+# Raised to 84.1.0 on 2026-10-24 for GHSA-xmj3-9gf7-h52w (84.0.0 flagged).
+setuptools>=84.1.0
 yfinance~=1.7.0
 numpy<3
 # pandas is CEILINGED BELOW 3 BY arcticdb, not by choice: arcticdb 6.23 (the

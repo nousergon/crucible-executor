@@ -185,7 +185,7 @@ scipy==1.17.1
     #   scs
 scs==3.3.1
     # via cvxpy
-setuptools==84.0.0
+setuptools==84.1.0
     # via
     #   -r requirements.in
     #   osqp
