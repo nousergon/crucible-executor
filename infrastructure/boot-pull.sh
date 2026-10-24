@@ -307,6 +307,43 @@ log "=== boot-pull started ==="
 PULL_FAILURES=0
 FAILED_REPOS=()
 
+# ── Whole-run serialization (alpha-engine-config-I12615) ───────────────────
+# Two boot-pulls can run at once on this box: boot-pull.service at boot, and
+# the postclose/preopen SF's RefreshExecutorDeploy, which re-runs this script
+# over SSM whenever the executor checkout has drifted — seconds after the SF
+# started the instance, so while the boot-time run is still in flight.
+# GIT_SYNC_LOCK above serializes their git; nothing serialized their
+# `pip install -r` into the SAME venvs. 2026-10-24 00:31:17Z: with real
+# upgrades pending in alpha-engine-data (boto3/botocore, edgartools, certifi)
+# the two pips raced on the same uninstall/install and the loser paged
+# "boot-pull FAILED ... alpha-engine-data (pip)" while the winner left the
+# venv fine. So the WHOLE run takes its own lock: a second run waits for the
+# first, then finds every dependency already satisfied.
+#
+# Deliberately NOT GIT_SYNC_LOCK: this script takes that one per repo inside
+# the run (a nested flock on the same file from a child would self-deadlock),
+# and the data SF's CodeFreshnessGate shares it. boot-pull.service's
+# TimeoutStartSec bounds the boot-time holder at 120s and the refresh's SSM
+# executionTimeout is 600s, so a 300s wait covers the real holder with room.
+# A timeout is a holder that is genuinely stuck: it is recorded as a failure
+# (so the end-of-run alert pages) and the run proceeds unserialized rather
+# than leaving the box on stale code.
+BOOT_PULL_RUN_LOCK="${AE_BOOT_PULL_RUN_LOCK:-/home/ec2-user/.ae-boot-pull-run.lock}"
+BOOT_PULL_RUN_LOCK_WAIT="${AE_BOOT_PULL_RUN_LOCK_WAIT:-300}"
+if exec 9>>"$BOOT_PULL_RUN_LOCK"; then
+    if flock -w "$BOOT_PULL_RUN_LOCK_WAIT" 9; then
+        log "OK   boot-pull run lock acquired ($BOOT_PULL_RUN_LOCK)"
+    else
+        log "FAIL boot-pull run lock $BOOT_PULL_RUN_LOCK still held after ${BOOT_PULL_RUN_LOCK_WAIT}s by another boot-pull — proceeding UNSERIALIZED (pip may race)"
+        PULL_FAILURES=$((PULL_FAILURES + 1))
+        FAILED_REPOS+=("boot-pull run lock")
+    fi
+else
+    log "FAIL could not open boot-pull run lock $BOOT_PULL_RUN_LOCK — proceeding UNSERIALIZED (pip may race)"
+    PULL_FAILURES=$((PULL_FAILURES + 1))
+    FAILED_REPOS+=("boot-pull run lock")
+fi
+
 # ── Refuse the long-lived PAT; assert the credential helper instead ────────
 # alpha-engine-config-I9739 deliverable 3. This block used to hydrate the
 # netrc file on every boot from /alpha-engine/GITHUB_TOKEN (a fine-grained
