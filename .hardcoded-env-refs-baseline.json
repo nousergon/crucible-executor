@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "guard": "hardcoded-env-refs",
+  "tracker": "alpha-engine-config-I12492",
+  "note": "Shrink-only ceiling of hard-coded account/bucket literals per file. Never raise an entry; lower it with `python3 hardcoded_env_refs.py --repo . --update` when a literal is removed.",
+  "totals": {
+    "account_hits": 8,
+    "account_files": 6,
+    "bucket_hits": 167,
+    "bucket_files": 59,
+    "files": 61
+  },
+  "files": {
+    ".github/workflows/alert-class-pr-guard.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/changelog.yml": {
+      "account": 1,
+      "bucket": 1
+    },
+    "console.descriptor.yaml": {
+      "bucket": 19
+    },
+    "contracts/arctic_universe.schema.json": {
+      "bucket": 1
+    },
+    "executor/backfill_uptime.py": {
+      "bucket": 1
+    },
+    "executor/config_loader.py": {
+      "bucket": 1
+    },
+    "executor/daemon.py": {
+      "account": 2,
+      "bucket": 4
+    },
+    "executor/decision_capture.py": {
+      "bucket": 6
+    },
+    "executor/emergency_shutdown.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "executor/eod_reconcile.py": {
+      "bucket": 3
+    },
+    "executor/intraday_snapshot.py": {
+      "bucket": 2
+    },
+    "executor/main.py": {
+      "bucket": 7
+    },
+    "executor/pnl_integrity.py": {
+      "bucket": 2
+    },
+    "executor/pnl_measurement_backfill.py": {
+      "bucket": 3
+    },
+    "executor/price_cache.py": {
+      "bucket": 1
+    },
+    "executor/reconcile_audit.py": {
+      "bucket": 2
+    },
+    "executor/reference_rate.py": {
+      "bucket": 1
+    },
+    "executor/signal_reader.py": {
+      "bucket": 2
+    },
+    "executor/snapshot_capturer.py": {
+      "bucket": 1
+    },
+    "executor/upstream_artifact_gate.py": {
+      "bucket": 2
+    },
+    "flow-doctor.yaml": {
+      "bucket": 1
+    },
+    "infrastructure/ops/upstream-gate-dryrun-validation.sh": {
+      "bucket": 1
+    },
+    "scripts/aec9613_spy_close_restate.py": {
+      "account": 1,
+      "bucket": 2
+    },
+    "scripts/backfill_eod_pnl_historical_state.py": {
+      "bucket": 2
+    },
+    "scripts/backfill_eod_pnl_spy.py": {
+      "bucket": 2
+    },
+    "scripts/backfill_trades_sector.py": {
+      "bucket": 3
+    },
+    "scripts/backfill_trading_day.py": {
+      "bucket": 2
+    },
+    "scripts/derive_alpha_uncertainty_penalty.py": {
+      "bucket": 2
+    },
+    "scripts/gen_research_arms.py": {
+      "bucket": 3
+    },
+    "tests/test_aec9613_spy_close_restate.py": {
+      "account": 1
+    },
+    "tests/test_backfill_trades_sector.py": {
+      "bucket": 9
+    },
+    "tests/test_contract_constituents.py": {
+      "bucket": 2
+    },
+    "tests/test_correctness_verdict.py": {
+      "bucket": 1
+    },
+    "tests/test_daemon_heartbeat.py": {
+      "bucket": 3
+    },
+    "tests/test_daemon_phase0.py": {
+      "account": 2
+    },
+    "tests/test_daemon_state_logger.py": {
+      "bucket": 2
+    },
+    "tests/test_decision_capture.py": {
+      "bucket": 4
+    },
+    "tests/test_eod_reconcile.py": {
+      "bucket": 5
+    },
+    "tests/test_eod_reconcile_logic.py": {
+      "bucket": 3
+    },
+    "tests/test_eod_reconcile_standalone.py": {
+      "bucket": 3
+    },
+    "tests/test_executor_params_staleness.py": {
+      "bucket": 1
+    },
+    "tests/test_forced_turnover_decomposition.py": {
+      "bucket": 1
+    },
+    "tests/test_nav_basis_shadow.py": {
+      "bucket": 2
+    },
+    "tests/test_open_orders_artifact.py": {
+      "bucket": 2
+    },
+    "tests/test_order_book_rationale.py": {
+      "bucket": 4
+    },
+    "tests/test_publish_reference_rate.py": {
+      "bucket": 5
+    },
+    "tests/test_reconcile_audit.py": {
+      "bucket": 1
+    },
+    "tests/test_reconciliation_audit.py": {
+      "bucket": 1
+    },
+    "tests/test_reference_rate_artifact.py": {
+      "bucket": 2
+    },
+    "tests/test_regime_drawdown_executor.py": {
+      "bucket": 2
+    },
+    "tests/test_regime_fast_signal_executor.py": {
+      "bucket": 2
+    },
+    "tests/test_regime_stage_d_prime_wire_2_position_sizing.py": {
+      "bucket": 3
+    },
+    "tests/test_signal_reader_consumer_contract.py": {
+      "bucket": 4
+    },
+    "tests/test_signal_reader_predictions_date.py": {
+      "bucket": 3
+    },
+    "tests/test_signal_reader_sector_patch.py": {
+      "bucket": 1
+    },
+    "tests/test_signal_reader_universe_filter.py": {
+      "bucket": 3
+    },
+    "tests/test_snapshot_capturer.py": {
+      "bucket": 6
+    },
+    "tests/test_stop_write_is_loud.py": {
+      "bucket": 8
+    },
+    "tests/test_universe_tradeability_walk.py": {
+      "bucket": 1
+    },
+    "tests/test_upstream_artifact_gate.py": {
+      "bucket": 3
+    },
+    "tests/validate_signals.py": {
+      "bucket": 1
+    }
+  }
+}

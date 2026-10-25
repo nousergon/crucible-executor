@@ -1,0 +1,75 @@
+name: Trading-window merge check
+
+# alpha-engine-config-I12640, option 2: the post-merge DETECTOR.
+#
+# The run rule (change-control-policy § Merge permission; Brian 2026-10-16):
+# no trading-path merge lands between 13:30 and 20:30 UTC on an NYSE trading
+# day. Until this existed only the merging session enforced it, and nothing
+# flagged crucible-executor#621 merging at 20:12Z on Fri 2026-10-23.
+#
+# What it watches: this repo's main (on push, so a merge here pages within a
+# minute) and crucible-trader's main (on the hourly schedule — crucible-trader
+# is public and holds no AWS identity, so it cannot page for itself; adding
+# one would widen an IAM trust policy). The detector is
+# scripts/trading_window_merge_check.py; its window and calendar logic are in
+# tests/test_trading_window_merge_check.py.
+#
+# Prevention (a required trading-window check under a merge queue) is option
+# 1 on the same issue: a repo-admin settings change. This job is the backstop
+# for it, not a replacement.
+#
+# Not a required check and no pull_request trigger, so the merge queue is not
+# involved (merge-group-required-check-guard has nothing to require here).
+# Cost: one ~1-minute run per weekday hour 13-21Z, plus one per push.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "5 13-21 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: trading-window-merge-check
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: "3.11"
+
+      # Runner-only install. 0.59.81 is the first krepis whose publish()
+      # takes auto_fix / resolution (krepis#262); the executor's own
+      # requirements pin is untouched by this job.
+      - name: Install krepis
+        run: python -m pip install --quiet "krepis==0.59.81"
+
+      # Same identity this repo's changelog.yml already assumes; it holds
+      # sns:Publish on alpha-engine-alerts. No new grant.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Page on any in-window trading-path merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/trading_window_merge_check.py \
+            --repo nousergon/crucible-executor \
+            --repo nousergon/crucible-trader \
+            --lookback-minutes 70 \
+            --publish
