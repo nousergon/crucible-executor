@@ -154,7 +154,10 @@ def main(argv: list[str] | None = None) -> int:
             alerts.publish(
                 message,
                 severity="error",
-                source=ALERT_SOURCE,
+                # A literal, not ALERT_SOURCE: the fleet alert-class guard
+                # registers publish sources by literal (playbooks.yaml row
+                # executor_trading_window_merge). The test ties the two.
+                source="crucible-executor/scripts/trading_window_merge_check.py",
                 dedup_key=f"trading-window-merge-{m.repo}-{m.sha}",
                 dedup_window_min=None,
                 auto_fix=auto_fix,
