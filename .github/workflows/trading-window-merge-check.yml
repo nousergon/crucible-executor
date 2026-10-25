@@ -66,7 +66,7 @@ jobs:
 
       - name: Page on any in-window trading-path merge
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python scripts/trading_window_merge_check.py \
             --repo nousergon/crucible-executor \

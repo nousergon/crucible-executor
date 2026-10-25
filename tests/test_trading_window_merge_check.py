@@ -1,8 +1,6 @@
 """alpha-engine-config-I12640: the trading-window merge detector."""
 
 import importlib.util
-import io
-import json
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -48,39 +46,37 @@ def test_window_is_utc_not_eastern():
     assert twm.in_trading_window(datetime.fromisoformat("2026-10-23T16:12:00-04:00"))
 
 
-def _commits_payload(*rows):
-    return json.dumps(
-        [{"sha": sha, "commit": {"committer": {"date": d}, "message": msg}} for sha, d, msg in rows]
-    ).encode()
-
-
-class _Resp(io.BytesIO):
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
+def _rows(*rows):
+    return [{"sha": sha, "commit": {"committer": {"date": d}, "message": msg}} for sha, d, msg in rows]
 
 
 def test_list_merges_reads_committer_date_and_filters():
     seen = {}
 
-    def opener(req, timeout):
-        seen["url"] = req.full_url
-        seen["auth"] = req.get_header("Authorization")
-        return _Resp(
-            _commits_payload(
-                ("a" * 40, "2026-10-23T20:12:00Z", "feat(notifier): order-book telegram (#621)\n\nbody"),
-                ("b" * 40, "2026-10-23T21:05:00Z", "docs: after hours"),
-            )
+    def api(path, params):
+        seen["path"], seen["params"] = path, params
+        return _rows(
+            ("a" * 40, "2026-10-23T20:12:00Z", "feat(notifier): order-book telegram (#621)\n\nbody"),
+            ("b" * 40, "2026-10-23T21:05:00Z", "docs: after hours"),
         )
 
-    merges = twm.list_merges("nousergon/crucible-executor", _ts("2026-10-23 19:00:00"), "tok", opener=opener)
-    assert "sha=main" in seen["url"] and "since=2026-10-23T19:00:00Z" in seen["url"]
-    assert seen["auth"] == "Bearer tok"
+    merges = twm.list_merges("nousergon/crucible-executor", _ts("2026-10-23 19:00:00"), api=api)
+    assert seen["path"] == "repos/nousergon/crucible-executor/commits"
+    assert seen["params"]["sha"] == "main" and seen["params"]["since"] == "2026-10-23T19:00:00Z"
     hits = twm.in_window_merges(merges, is_trading_day=lambda d: d == date(2026, 10, 23))
     assert [m.sha for m in hits] == ["a" * 40]
     assert hits[0].title == "feat(notifier): order-book telegram (#621)"
+
+
+def test_gh_api_builds_a_get_with_fields(monkeypatch):
+    calls = []
+
+    class _Out:
+        stdout = "[]"
+
+    monkeypatch.setattr(twm.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _Out())
+    assert twm._gh_api("repos/x/y/commits", {"sha": "main"}) == []
+    assert calls[0] == ["gh", "api", "-X", "GET", "repos/x/y/commits", "-f", "sha=main"]
 
 
 def test_alert_carries_auto_fix_and_resolution_naming_the_issue():

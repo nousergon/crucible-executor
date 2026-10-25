@@ -32,9 +32,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import subprocess
 import sys
-import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 
@@ -69,19 +68,22 @@ def _parse_ts(raw: str) -> datetime:
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
-def list_merges(repo: str, since: datetime, token: str | None, *, opener=urllib.request.urlopen) -> list[Merge]:
+def _gh_api(path: str, params: dict[str, str]) -> list:
+    """GET ``path`` through the ``gh`` CLI, which reads its own token
+    (``GH_TOKEN`` in the workflow) — this module never handles one."""
+    cmd = ["gh", "api", "-X", "GET", path]
+    for key, value in params.items():
+        cmd += ["-f", f"{key}={value}"]
+    out = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)  # noqa: S603
+    return json.loads(out.stdout)
+
+
+def list_merges(repo: str, since: datetime, *, api=_gh_api) -> list[Merge]:
     """Commits on ``main`` of ``repo`` committed at or after ``since``."""
-    url = (
-        f"https://api.github.com/repos/{repo}/commits?sha=main&per_page=100"
-        f"&since={since.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+    rows = api(
+        f"repos/{repo}/commits",
+        {"sha": "main", "per_page": "100", "since": since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")},
     )
-    req = urllib.request.Request(  # noqa: S310 — fixed https://api.github.com URL
-        url, headers={"Accept": "application/vnd.github+json"}
-    )
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    with opener(req, timeout=30) as resp:
-        rows = json.load(resp)
     merges = []
     for row in rows:
         commit = row["commit"]
@@ -126,13 +128,12 @@ def main(argv: list[str] | None = None) -> int:
 
     now = datetime.now(UTC)
     since = now - timedelta(minutes=args.lookback_minutes)
-    token = os.environ.get("GITHUB_TOKEN")
 
     found: list[Merge] = []
     unreadable = []
     for repo in args.repo:
         try:
-            found.extend(in_window_merges(list_merges(repo, since, token)))
+            found.extend(in_window_merges(list_merges(repo, since)))
         except Exception as exc:  # noqa: BLE001 — reported and turns the job red
             unreadable.append(f"{repo}: {type(exc).__name__}: {exc}")
 
