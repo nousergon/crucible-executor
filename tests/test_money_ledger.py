@@ -221,3 +221,163 @@ class TestStore:
 
     def test_none_entry_posts_nothing(self, conn):
         assert ml.post(conn, None) is None
+
+
+class TestStoreEnforcedBalance:
+    """Policy Rule 2 (alpha-engine-config-I12558): the STORE refuses an
+    unbalanced or partial entry, whatever path writes it. Every write here is
+    a raw ``sqlite3`` statement that never goes through ``record_entry``."""
+
+    @pytest.fixture
+    def conn(self, tmp_path):
+        c = sqlite3.connect(tmp_path / "t.db")
+        ml.ensure_schema(c)
+        yield c
+        c.close()
+
+    @staticmethod
+    def _lines(conn, entry_id, *lines):
+        conn.executemany(
+            "INSERT INTO ledger_postings VALUES (?, ?, ?, ?, ?)",
+            [(entry_id, i, acct, amt, cur) for i, (acct, amt, cur) in enumerate(lines)],
+        )
+
+    @staticmethod
+    def _header(conn, entry_id):
+        conn.execute(
+            "INSERT INTO ledger_journal_entries VALUES (?, '2026-10-20', 'now', "
+            "'daily_auto_correct', 'settled_restrike', 'bypass', NULL, '{}')",
+            (entry_id,),
+        )
+
+    def test_the_guard_triggers_are_installed(self, conn):
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+        assert set(ml.STORE_GUARD_TRIGGERS) <= names
+
+    def test_a_header_with_no_postings_cannot_be_posted(self, conn):
+        with pytest.raises(sqlite3.IntegrityError, match="does not balance"):
+            self._header(conn, "je_partial")
+
+    def test_a_single_posting_cannot_be_posted(self, conn):
+        self._lines(conn, "je_one", ("assets:cash:USD", "1.00", "USD"))
+        with pytest.raises(sqlite3.IntegrityError, match="does not balance"):
+            self._header(conn, "je_one")
+
+    def test_an_unbalanced_entry_cannot_be_posted_by_a_raw_write(self, conn):
+        self._lines(conn, "je_bad",
+                    ("assets:securities:UAL", "2404.64", "USD"),
+                    (ml.ACCOUNT_VALUATION_CORRECTION, "-2404.63", "USD"))
+        with pytest.raises(sqlite3.IntegrityError, match="does not balance"):
+            self._header(conn, "je_bad")
+        assert conn.execute("SELECT COUNT(*) FROM ledger_journal_entries").fetchone()[0] == 0
+
+    def test_balance_is_enforced_per_currency_by_the_store(self, conn):
+        self._lines(conn, "je_fx",
+                    ("assets:cash:USD", "1.00", "USD"),
+                    ("assets:cash:EUR", "-1.00", "EUR"))
+        with pytest.raises(sqlite3.IntegrityError, match="does not balance"):
+            self._header(conn, "je_fx")
+
+    def test_the_store_balance_is_exact_cents_at_large_magnitudes(self, conn):
+        self._lines(conn, "je_big",
+                    ("assets:cash:USD", "98765432109.87", "USD"),
+                    ("assets:securities:A", "-98765432109.86", "USD"))
+        with pytest.raises(sqlite3.IntegrityError, match="does not balance"):
+            self._header(conn, "je_big")
+        conn.rollback()  # the refused header leaves its lines orphaned until rolled back
+        self._lines(conn, "je_big_ok",
+                    ("assets:cash:USD", "98765432109.87", "USD"),
+                    ("assets:securities:A", "-98765432109.80", "USD"),
+                    ("assets:securities:B", "-0.07", "USD"))
+        self._header(conn, "je_big_ok")
+        assert ml.verify_entries(conn) == 1
+
+    def test_a_posted_entry_is_sealed(self, conn):
+        doc, _ = ml.record_entry(conn, _entry())
+        with pytest.raises(sqlite3.IntegrityError, match="sealed"):
+            self._lines(conn, doc["entry_id"], ("assets:cash:USD", "5.00", "USD"))
+        assert conn.execute(
+            "SELECT COUNT(*) FROM ledger_postings WHERE entry_id = ?", (doc["entry_id"],)
+        ).fetchone()[0] == 2
+
+    def test_a_failed_append_leaves_neither_header_nor_postings(self, conn, monkeypatch):
+        def broken(_conn):
+            raise ml.LedgerIntegrityError("planted")
+
+        monkeypatch.setattr(ml, "verify_entries", broken)
+        with pytest.raises(ml.LedgerIntegrityError, match="planted"):
+            ml.record_entry(conn, _entry())
+        assert conn.execute("SELECT COUNT(*) FROM ledger_postings").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM ledger_journal_entries").fetchone()[0] == 0
+
+
+class TestVerifyEntries:
+    """A ledger written before the store guards existed (the trades.db on the
+    box was created by executor-PR616's schema) is checked entry by entry."""
+
+    LEGACY_SCHEMA = """
+    CREATE TABLE ledger_journal_entries (
+        entry_id TEXT PRIMARY KEY, effective_date TEXT NOT NULL, posted_at TEXT NOT NULL,
+        source TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL,
+        reverses_entry_id TEXT, evidence_json TEXT NOT NULL);
+    CREATE TABLE ledger_postings (
+        entry_id TEXT NOT NULL, line_no INTEGER NOT NULL, account TEXT NOT NULL,
+        amount TEXT NOT NULL, currency TEXT NOT NULL, PRIMARY KEY (entry_id, line_no));
+    """
+
+    @pytest.fixture
+    def legacy(self, tmp_path):
+        c = sqlite3.connect(tmp_path / "legacy.db")
+        c.executescript(self.LEGACY_SCHEMA)
+        yield c
+        c.close()
+
+    @staticmethod
+    def _write(conn, entry_id, *amounts, header=True):
+        if header:
+            conn.execute(
+                "INSERT INTO ledger_journal_entries VALUES (?, '2026-10-20', 'now', "
+                "'daily_auto_correct', 'settled_restrike', 'legacy', NULL, '{}')",
+                (entry_id,),
+            )
+        conn.executemany(
+            "INSERT INTO ledger_postings VALUES (?, ?, 'assets:cash:USD', ?, 'USD')",
+            [(entry_id, i, a) for i, a in enumerate(amounts)],
+        )
+
+    def test_a_clean_legacy_ledger_verifies_and_gains_the_guards(self, legacy):
+        self._write(legacy, "je_a", "2404.64", "-2404.64")
+        ml.ensure_schema(legacy)
+        assert ml.verify_entries(legacy) == 1
+        names = {r[0] for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+        assert set(ml.STORE_GUARD_TRIGGERS) <= names
+        ml.record_entry(legacy, _entry())  # appends still work over the old rows
+        assert ml.verify_entries(legacy) == 2
+
+    def test_offsetting_broken_entries_pass_the_trial_balance_but_not_verify(self, legacy):
+        self._write(legacy, "je_up", "1.00", "-0.99")
+        self._write(legacy, "je_down", "-1.00", "0.99", "0.00")
+        assert ml.trial_balance(legacy) == {"USD": D("0.00")}
+        with pytest.raises(ml.LedgerIntegrityError, match="je_down.*je_up|je_up"):
+            ml.verify_entries(legacy)
+
+    def test_a_partial_entry_and_an_orphan_line_are_breaks(self, legacy):
+        self._write(legacy, "je_partial", "1.00")
+        self._write(legacy, "je_orphan", "-1.00", header=False)
+        with pytest.raises(ml.LedgerIntegrityError) as exc:
+            ml.verify_entries(legacy)
+        assert "je_partial: 1 posting(s)" in str(exc.value)
+        assert "je_orphan: 1 posting(s) with no entry header" in str(exc.value)
+
+    def test_a_broken_legacy_ledger_refuses_new_entries(self, legacy):
+        self._write(legacy, "je_up", "1.00", "-0.99")
+        self._write(legacy, "je_down", "-1.00", "0.99")
+        with pytest.raises(ml.LedgerIntegrityError, match="broken entr"):
+            ml.record_entry(legacy, _entry())
+        assert legacy.execute(
+            "SELECT COUNT(*) FROM ledger_journal_entries").fetchone()[0] == 2
+
+    def test_an_empty_store_verifies_to_zero_entries(self, tmp_path):
+        c = sqlite3.connect(tmp_path / "empty.db")
+        assert ml.verify_entries(c) == 0
+        c.close()

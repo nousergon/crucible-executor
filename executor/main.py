@@ -28,7 +28,7 @@ import sys
 import time as _time
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 import yaml
 
@@ -219,20 +219,129 @@ def _alert_regime_leg_blind(leg: str, exc: BaseException, run_date: str) -> None
         )
 
 
-def _check_executor_params_staleness(last_modified: datetime | None) -> None:
-    """Best-effort WARN when ``last_modified`` is older than
-    ``_EXECUTOR_PARAMS_STALE_HOURS``. Never raises, never blocks trading."""
+# alpha-engine-config-I12697: the pointer can go stale with NO producer fault.
+# The live key is written only when an auto-apply loop promotes, and since
+# crucible-backtester#811 (2026-10-15, aec-I12231) the trigger optimizer -- the
+# one writer that had been re-stamping it every Saturday -- is observe-only,
+# while executor_optimizer has been refused by alpha_floor for 18+ weeks
+# (aec-I10064). The Evaluator says so, unconditionally and per loop, in
+# config/apply_audit/latest.json (the anchor the freshness registry already
+# uses for the other event-driven config rows). So "stale" splits in two:
+#   - the audit is fresh and records a declared no-write outcome -> the
+#     Evaluator ran and correctly declined: WARNING, naming the blocker;
+#   - anything else (audit missing, unreadable, itself stale, outcome
+#     `error`, or `promoted` while the pointer did not move) -> the ERROR
+#     this check exists for, now carrying what the audit said.
+_APPLY_AUDIT_KEY = "config/apply_audit/latest.json"
+_DECLARED_NO_WRITE_OUTCOMES = frozenset({"blocked", "insufficient", "disabled"})
+
+
+class _Readable(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _S3ObjectReader(Protocol):
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, object]: ...  # noqa: N803 -- boto3 kwarg names
+
+
+def _read_apply_audit(
+    s3: _S3ObjectReader, bucket: str,
+) -> tuple[dict[str, object] | None, datetime | None, str]:
+    """Best-effort read of the Evaluator's apply audit. Never raises.
+
+    Returns ``(audit, last_modified, problem)`` -- ``problem`` is "" on a
+    clean read, else a short reason the audit could not be used. ``s3`` is a
+    boto3 S3 client (untyped: boto3 ships no stubs here).
+    """
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=_APPLY_AUDIT_KEY)
+        audit: object = json.loads(cast("_Readable", resp["Body"]).read())
+        if not isinstance(audit, dict):
+            return None, None, "apply_audit body is not an object"
+        modified = resp.get("LastModified")
+        return (
+            cast("dict[str, object]", audit),
+            modified if isinstance(modified, datetime) else None,
+            "",
+        )
+    except Exception as e:  # noqa: BLE001 -- advisory read, never blocks
+        return None, None, f"apply_audit unreadable ({type(e).__name__})"
+
+
+def _executor_params_loop(audit: dict[str, object]) -> dict[str, object]:
+    loops = audit.get("loops")
+    if not isinstance(loops, dict):
+        return {}
+    loop = cast("dict[str, object]", loops).get("executor_params")
+    return cast("dict[str, object]", loop) if isinstance(loop, dict) else {}
+
+
+def _check_executor_params_staleness(
+    last_modified: datetime | None,
+    s3: _S3ObjectReader | None = None,
+    bucket: str | None = None,
+) -> None:
+    """Best-effort staleness signal for ``config/executor_params.json``.
+
+    ERROR when ``last_modified`` is older than ``_EXECUTOR_PARAMS_STALE_HOURS``
+    and the Evaluator's apply audit does not explain it; WARNING when the
+    audit is fresh and declares the executor_params loop did not write
+    (alpha-engine-config-I12697). Never raises, never blocks trading.
+    """
     if last_modified is None:
         return
     age_hours = (datetime.now(UTC) - last_modified).total_seconds() / 3600.0
-    if age_hours > _EXECUTOR_PARAMS_STALE_HOURS:
-        logger.error(
-            "STALE config/executor_params.json: last modified %.1fh ago "
-            "(> %dh / 2 weekly cycles) — the Saturday Evaluator may have "
-            "silently failed or stalled; executor may be trading on stale "
-            "tuned params (config#2891)",
-            age_hours, _EXECUTOR_PARAMS_STALE_HOURS,
+    if age_hours <= _EXECUTOR_PARAMS_STALE_HOURS:
+        return
+
+    explained = ""
+    audit_note = "apply_audit not consulted"
+    if s3 is not None and bucket:
+        audit, audit_modified, problem = _read_apply_audit(s3, bucket)
+        if problem or audit is None:
+            audit_note = problem or "apply_audit empty"
+        else:
+            loop = _executor_params_loop(audit)
+            outcome = loop.get("outcome")
+            as_of = audit.get("as_of")
+            audit_age = (
+                (datetime.now(UTC) - audit_modified).total_seconds() / 3600.0
+                if audit_modified is not None else None
+            )
+            age_text = "unknown" if audit_age is None else f"{audit_age:.1f}h"
+            audit_note = (
+                f"apply_audit as_of={as_of} age={age_text} "
+                f"executor_params outcome={outcome}"
+            )
+            if (
+                audit_age is not None
+                and audit_age <= _EXECUTOR_PARAMS_STALE_HOURS
+                and outcome in _DECLARED_NO_WRITE_OUTCOMES
+            ):
+                explained = (
+                    f"outcome={outcome} blocked_by={loop.get('blocked_by')} "
+                    f"for {loop.get('consecutive_blocked_weeks')} consecutive "
+                    f"week(s), apply_audit as_of={as_of}"
+                )
+
+    if explained:
+        logger.warning(
+            "config/executor_params.json last modified %.1fh ago (> %dh) -- "
+            "EXPECTED, not a producer fault: the Saturday Evaluator ran and "
+            "declined to write (%s). Executor trades the last promoted params; "
+            "the blocked loop is tracked on alpha-engine-config-I10064 "
+            "(alpha-engine-config-I12697)",
+            age_hours, _EXECUTOR_PARAMS_STALE_HOURS, explained,
         )
+        return
+
+    logger.error(
+        "STALE config/executor_params.json: last modified %.1fh ago "
+        "(> %dh / 2 weekly cycles) — the Saturday Evaluator may have "
+        "silently failed or stalled; executor may be trading on stale "
+        "tuned params (config#2891) [%s]",
+        age_hours, _EXECUTOR_PARAMS_STALE_HOURS, audit_note,
+    )
 
 
 def _load_executor_params_from_s3(bucket: str) -> dict | None:
@@ -253,8 +362,8 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
         import boto3
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
-        _check_executor_params_staleness(obj.get("LastModified"))
         data = json.loads(obj["Body"].read())
+        _check_executor_params_staleness(obj.get("LastModified"), s3=s3, bucket=bucket)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportArgumentType] -- boto3 client and response are untyped
         # Advisory schema validation (log warnings, never block)
         _unknown_keys = [
             k for k in data
@@ -373,7 +482,7 @@ def load_config() -> dict:
     return copy.deepcopy(_LOAD_CONFIG_CACHE)
 
 
-def _next_earnings_date_from_dates_df(df, ref: date) -> date | None:
+def _next_earnings_date_from_dates_df(df: Any, ref: date) -> date | None:  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
     """Extract the next (earliest upcoming, on/after ``ref``) earnings date
     from a ``yfinance.Ticker.get_earnings_dates()`` DataFrame.
 
@@ -407,7 +516,7 @@ def _next_earnings_date_from_dates_df(df, ref: date) -> date | None:
     return future[0].date() if future else None
 
 
-def _compute_support_level(price_history, strategy_config: dict) -> float | None:
+def _compute_support_level(price_history: Any, strategy_config: dict[str, Any]) -> float | None:  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
     """Compute N-day low from price history for support-bounce entry trigger.
 
     Accepts a pandas DataFrame indexed by date with a ``low`` column.
@@ -429,7 +538,7 @@ def _read_signals(
     run_date: str,
     simulate: bool,
     signals_override: dict | None,
-    conn,
+    conn: Any,  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
 ) -> tuple[dict, dict, str, dict, str | None]:
     """Read and validate signals from S3 or override.
 
@@ -689,7 +798,7 @@ def _plan_entries(
     strategy_config: dict,
     market_regime: str,
     sector_ratings: dict,
-    ibkr,
+    ibkr: Any,  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
     portfolio_nav: float,
     peak_nav: float,
     current_positions: dict,
@@ -785,7 +894,7 @@ def _plan_exits_and_reduces(
     strategy_exits: list[dict],
     predictions_by_ticker: dict,
     current_positions: dict,
-    ibkr,
+    ibkr: Any,  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
     portfolio_nav: float,
     config: dict,
     market_regime: str,
@@ -857,7 +966,7 @@ def _plan_exits_and_reduces(
     return plan.orders
 
 
-def _reentry_lockouts(conn, run_date: str, config: dict) -> dict[str, dict]:
+def _reentry_lockouts(conn: Any, run_date: str, config: dict[str, Any]) -> dict[str, dict[str, Any]]:  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
     """Names locked out of re-entry after a recent hard-risk EXIT.
 
     Precedence (highest first): hard-risk overrides (loss floor, catastrophic
@@ -1046,7 +1155,7 @@ class StopRecordWriteError(RuntimeError):
     book with no per-name exit authority.
     """
 
-    def __init__(self, run_date: str, cause: BaseException):
+    def __init__(self, run_date: str, cause: BaseException) -> None:
         self.run_date = run_date
         super().__init__(
             f"Stop records were NOT written for {run_date}: {cause!r}. The "
@@ -1123,7 +1232,7 @@ def _record_stop_write_failure(
         logger.warning("stop-write failure artifact write failed: %s", exc)
 
 
-def write_stops_and_finalize_guarded(*args, **kwargs):
+def write_stops_and_finalize_guarded(*args: Any, **kwargs: Any) -> None:  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
     """``_write_stops_and_finalize``, made LOUD. alpha-engine-config-I10190.
 
     Until 2026-09-08 the §6 call site was::
@@ -1530,7 +1639,7 @@ def _write_hold_book_flag(
         )
 
 
-def _write_derisk_gate_artifact(gate, bucket: str, run_date: str) -> None:
+def _write_derisk_gate_artifact(gate: Any, bucket: str, run_date: str) -> None:  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
     """Persist the expectancy-gated de-risk stance decision for this
     planning cycle to S3 (config-I2820 deliverable 4: "Log visibility").
 
@@ -1564,12 +1673,12 @@ def _write_derisk_gate_artifact(gate, bucket: str, run_date: str) -> None:
 
 
 def _write_stops_and_finalize(
-    ibkr,
+    ibkr: Any,  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
     ob: OrderBook,
     price_histories: dict | None,
     atr_map: dict,
     strategy_config: dict,
-    conn,
+    conn: Any,  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
     run_date: str,
     blocked_entries: list[dict] | None = None,
     signals_bucket: str | None = None,
@@ -1742,7 +1851,7 @@ def _write_stops_and_finalize(
 def run(
     dry_run: bool = False,
     simulate: bool = False,
-    ibkr_client=None,           # injected by backtester when simulate=True
+    ibkr_client: Any = None,  # pyright: ignore[reportExplicitAny] -- injected by backtester when simulate=True; annotated on touch (alpha-engine-config-I12607)
     signals_override: dict = None,  # injected signals dict (skips S3 read)
     price_histories: dict = None,   # injected by backtester for exit manager
     config_override: dict = None,   # injected by backtester param sweep
@@ -2541,7 +2650,7 @@ def run(
                     s["ticker"] for s in strategy_exits if s["action"] == "EXIT"
                 }
 
-                def _conviction_rank(ticker_pos):
+                def _conviction_rank(ticker_pos: Any) -> Any:  # pyright: ignore[reportExplicitAny] -- legacy untyped parameter, annotated on touch (alpha-engine-config-I12607 ANN gate)
                     t, pos = ticker_pos
                     sig_data = signals_by_ticker.get(t, {})
                     score = sig_data.get("score") or 50
@@ -2720,7 +2829,7 @@ def run(
             )
         )
         if run_optimizer_now:
-            _lockouts = _reentry_lockouts(conn, run_date, config)
+            _lockouts = _reentry_lockouts(conn, run_date, config)  # pyright: ignore[reportUnknownArgumentType] -- run()'s config is an untyped dict
             if _lockouts:
                 logger.info(
                     "Re-entry lockout after hard-risk exit (pinned to zero "
