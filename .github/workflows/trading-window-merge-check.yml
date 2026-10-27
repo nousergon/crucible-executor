@@ -64,9 +64,23 @@ jobs:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
           aws-region: us-east-1
 
+      # TELEGRAM IS A LIVE GHA TRANSPORT AND MUST BE WIRED EXPLICITLY
+      # (alpha-engine-config-I9209, same mapping as nousergon-data
+      # pause-check-alert.yml and the notify-ci-failure jobs this repo already
+      # calls with `secrets: inherit`). krepis resolves both values through
+      # get_secret: SSM /alpha-engine/<NAME> first, then the environment. This
+      # role holds no ssm:GetParameter on /alpha-engine/TELEGRAM_* and has ~26
+      # bytes of inline-policy headroom, so the SSM leg is denied and the env
+      # leg is the transport. Both are org-wide Actions secrets.
+      # Without these two lines, crucible-executor#627 (merged 15:04Z on
+      # 2026-10-26) was detected, logged TELEGRAM_BOT_TOKEN=MISSING
+      # TELEGRAM_CHAT_ID=MISSING, and the job stayed green (I12640). The
+      # script now exits 1 on every --publish run whose channel is missing.
       - name: Page on any in-window trading-path merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python scripts/trading_window_merge_check.py \
             --repo nousergon/crucible-executor \
