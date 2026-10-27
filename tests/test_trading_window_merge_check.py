@@ -149,7 +149,7 @@ def _clean_env_secrets(monkeypatch):
 
     monkeypatch.setenv("ALPHA_ENGINE_SECRETS_SOURCE", "env")
     monkeypatch.setattr(krepis.secrets, "_cache", {})
-    for name in twm.TELEGRAM_SECRETS:
+    for name in twm.TELEGRAM_VALUE_NAMES:
         monkeypatch.delenv(name, raising=False)
 
 
@@ -167,7 +167,7 @@ def test_missing_channel_is_red_even_on_a_quiet_day(monkeypatch, capsys):
     monkeypatch.setattr(twm, "list_merges", lambda *a, **k: [])
     assert twm.main(["--repo", "nousergon/crucible-executor", "--publish"]) == 1
     out = capsys.readouterr().out
-    assert "TELEGRAM_BOT_TOKEN=MISSING TELEGRAM_CHAT_ID=MISSING" in out
+    assert "::error::Telegram channel missing" in out
     assert "Auto-fix:" in out and "Resolution: alpha-engine-config-I12640" in out
 
 

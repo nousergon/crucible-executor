@@ -65,11 +65,11 @@ class Merge:
 
 #: The two values krepis.telegram sends with. Names only — a value is never
 #: printed, returned or logged by this module.
-TELEGRAM_SECRETS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+TELEGRAM_VALUE_NAMES = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
 
 
 def missing_telegram_values(*, get_secret=None) -> list[str]:
-    """Names of the Telegram values that do not resolve, in TELEGRAM_SECRETS order.
+    """Names of the Telegram values that do not resolve, in TELEGRAM_VALUE_NAMES order.
 
     Resolved through ``krepis.secrets.get_secret`` (SSM first, then the
     environment), which is exactly what ``krepis.telegram`` does when it
@@ -77,7 +77,7 @@ def missing_telegram_values(*, get_secret=None) -> list[str]:
     """
     if get_secret is None:
         from krepis.secrets import get_secret
-    return [name for name in TELEGRAM_SECRETS if not get_secret(name, required=False)]
+    return [name for name in TELEGRAM_VALUE_NAMES if not get_secret(name, required=False)]
 
 
 def page_reached_telegram(result) -> bool:
@@ -175,9 +175,10 @@ def main(argv: list[str] | None = None) -> int:
     channel_missing = missing_telegram_values() if args.publish else []
     if channel_missing:
         print(
-            "::error::Telegram channel missing for the trading-window page: "
-            + " ".join(f"{name}=MISSING" for name in channel_missing)
-            + " (resolved via SSM /alpha-engine/<NAME>, then the environment). "
+            # A fixed literal: nothing derived from the secret lookup is
+            # printed, not even which name missed (CodeQL py/clear-text-logging).
+            "::error::Telegram channel missing for the trading-window page: TELEGRAM_BOT_TOKEN "
+            "and/or TELEGRAM_CHAT_ID did not resolve (SSM /alpha-engine/<NAME>, then the environment). "
             "Auto-fix: none — the workflow must map the org-wide TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID "
             f"secrets or the role must read them from SSM. Resolution: {ISSUE}"
         )
@@ -222,8 +223,9 @@ def main(argv: list[str] | None = None) -> int:
             failed += 1
             continue
         if not page_reached_telegram(result):
-            detail = getattr(getattr(result, "telegram", None), "detail", "no telegram result")
-            print(f"::error::page for {m.repo}@{m.sha[:9]} did not reach Telegram ({detail}); SNS alone is not a page")
+            # The channel's detail string is not printed: a transport error's
+            # repr can carry the Bot API URL, which embeds the token.
+            print(f"::error::page for {m.repo}@{m.sha[:9]} did not reach Telegram; SNS alone is not a page")
             failed += 1
     return 1 if (failed or unreadable or channel_missing) else 0
 
