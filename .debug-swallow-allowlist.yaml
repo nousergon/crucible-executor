@@ -114,7 +114,7 @@ entries:
 
   # ── flow-doctor transport fallback (notifier.py) ─────────────────────────
   - path: executor/notifier.py
-    line: 239
+    line: 328
     reason: >-
       flow-doctor's own notify_event transport failed. No recording
       surface -- transport carve-out with an explicit fallback path
