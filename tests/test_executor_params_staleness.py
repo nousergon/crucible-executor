@@ -67,3 +67,119 @@ def test_load_executor_params_from_s3_warns_on_stale_write(monkeypatch, caplog, 
     assert any("STALE config/executor_params.json" in r.message for r in caplog.records)
     main._executor_params_loaded = False
     main._executor_params_cache = None
+
+
+# ── alpha-engine-config-I12697: ground the signal in the Evaluator's apply audit ──
+
+
+def _audit(outcome: str, *, blocked_by=("alpha_floor",), weeks: int = 18) -> dict:
+    return {
+        "schema_version": 1,
+        "as_of": "2026-10-23",
+        "loops": {
+            "executor_params": {
+                "outcome": outcome,
+                "blocked_by": list(blocked_by) if blocked_by else None,
+                "consecutive_blocked_weeks": weeks,
+            }
+        },
+    }
+
+
+def _s3_with_audit(audit, audit_modified):
+    s3 = MagicMock()
+
+    def _get(Bucket, Key):  # noqa: N803 -- boto3 kwarg names
+        assert Key == main._APPLY_AUDIT_KEY
+        if isinstance(audit, Exception):
+            raise audit
+        return _make_s3_response(audit, audit_modified)
+
+    s3.get_object.side_effect = _get
+    return s3
+
+
+def _stale():
+    return datetime.now(UTC) - timedelta(hours=main._EXECUTOR_PARAMS_STALE_HOURS + 43)
+
+
+def test_declared_block_in_fresh_audit_is_warning_not_error(caplog):
+    s3 = _s3_with_audit(_audit("blocked"), datetime.now(UTC) - timedelta(days=2))
+    with caplog.at_level(logging.WARNING):
+        main._check_executor_params_staleness(_stale(), s3=s3, bucket="b")
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("EXPECTED" in m and "alpha_floor" in m and "I10064" in m for m in warns)
+
+
+def test_disabled_and_insufficient_are_declared_no_write(caplog):
+    for outcome in ("disabled", "insufficient"):
+        caplog.clear()
+        s3 = _s3_with_audit(_audit(outcome, blocked_by=None), datetime.now(UTC))
+        with caplog.at_level(logging.WARNING):
+            main._check_executor_params_staleness(_stale(), s3=s3, bucket="b")
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], outcome
+
+
+def test_promoted_but_pointer_did_not_move_stays_error(caplog):
+    """The audit claims a write the pointer does not show: a silent no-op."""
+    s3 = _s3_with_audit(_audit("promoted", blocked_by=None), datetime.now(UTC))
+    with caplog.at_level(logging.ERROR):
+        main._check_executor_params_staleness(_stale(), s3=s3, bucket="b")
+    errs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("STALE config/executor_params.json" in m and "outcome=promoted" in m for m in errs)
+
+
+def test_error_outcome_stays_error(caplog):
+    s3 = _s3_with_audit(_audit("error", blocked_by=None), datetime.now(UTC))
+    with caplog.at_level(logging.ERROR):
+        main._check_executor_params_staleness(_stale(), s3=s3, bucket="b")
+    assert any("STALE" in r.getMessage() for r in caplog.records)
+
+
+def test_stale_audit_does_not_explain_a_stale_pointer(caplog):
+    """A blocked verdict from an Evaluator that has itself stopped running proves nothing."""
+    old_audit = datetime.now(UTC) - timedelta(hours=main._EXECUTOR_PARAMS_STALE_HOURS + 1)
+    s3 = _s3_with_audit(_audit("blocked"), old_audit)
+    with caplog.at_level(logging.ERROR):
+        main._check_executor_params_staleness(_stale(), s3=s3, bucket="b")
+    assert any("STALE" in r.getMessage() for r in caplog.records)
+
+
+def test_unreadable_audit_stays_error(caplog):
+    s3 = _s3_with_audit(RuntimeError("NoSuchKey"), None)
+    with caplog.at_level(logging.ERROR):
+        main._check_executor_params_staleness(_stale(), s3=s3, bucket="b")
+    errs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("apply_audit unreadable" in m for m in errs)
+
+
+def test_fresh_pointer_never_reads_the_audit():
+    s3 = MagicMock()
+    main._check_executor_params_staleness(datetime.now(UTC), s3=s3, bucket="b")
+    s3.get_object.assert_not_called()
+
+
+def test_load_path_consults_the_audit(monkeypatch, caplog, tmp_path):
+    """End-to-end on the real read path: a stale pointer + fresh blocked audit does not page."""
+    main._executor_params_loaded = False
+    main._executor_params_cache = None
+    monkeypatch.setattr(main, "_EXECUTOR_PARAMS_CACHE_PATH", tmp_path / "executor_params_cache.json")
+    mock_s3 = MagicMock()
+
+    def _get(Bucket, Key):  # noqa: N803
+        if Key == "config/executor_params.json":
+            return _make_s3_response({"min_score": 75}, _stale())
+        return _make_s3_response(_audit("blocked"), datetime.now(UTC) - timedelta(days=2))
+
+    mock_s3.get_object.side_effect = _get
+    mock_boto3 = MagicMock()
+    mock_boto3.client.return_value = mock_s3
+    monkeypatch.setitem(sys.modules, "boto3", mock_boto3)
+    with caplog.at_level(logging.WARNING):
+        params = main._load_executor_params_from_s3("alpha-engine-research")
+    assert params is not None and params.get("min_score") == 75
+    assert not any("STALE" in r.getMessage() for r in caplog.records)
+    assert any("EXPECTED" in r.getMessage() for r in caplog.records)
+    main._executor_params_loaded = False
+    main._executor_params_cache = None
