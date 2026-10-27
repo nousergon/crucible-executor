@@ -196,3 +196,87 @@ def test_trade_alert_sent_past_daily_cap(monkeypatch):
             patch("executor.notifier.send_message", return_value=True) as mock_send:
         assert send_trade_alert("BUY", "DUOL", 10, 300.0, "pullback", "daemon") is True
     assert mock_send.call_args.kwargs["message_thread_id"] == 5
+
+
+# ── alpha-engine-config-I12702: essential delivery survives a refusing topic ──
+
+
+def _failed_fd(reason="delivery_failed"):
+    fd = _rate_limited_fd()
+    fd.last_dispatch_reason.return_value = reason
+    return fd
+
+
+def _topics(monkeypatch, trades="4", ops="3"):
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_TRADES", trades)
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH", ops)
+    import executor.notifier as notifier
+    notifier._REROUTE_REPORTED.clear()
+
+
+def test_trade_alert_resent_on_delivery_failed(monkeypatch):
+    """2026-10-26: `delivery_failed` essential messages were dropped at WARNING."""
+    _topics(monkeypatch)
+    with patch("executor.notifier.get_flow_doctor", return_value=_failed_fd()), \
+            patch("executor.notifier.send_message", return_value=True) as mock_send:
+        assert send_trade_alert("BUY", "PLTR", 5, 180.0, "pullback", "daemon") is True
+    mock_send.assert_called_once()
+    assert mock_send.call_args.kwargs["message_thread_id"] == 4
+
+
+def test_refusing_topic_reroutes_to_ops_health_and_pages_once(monkeypatch, caplog):
+    _topics(monkeypatch)
+
+    def _send(text, message_thread_id=None):
+        logging.getLogger("krepis.telegram").warning(
+            "Telegram API returned 400: Bad Request: message thread not found")
+        return message_thread_id != 4
+
+    with patch("executor.notifier.get_flow_doctor", return_value=_rate_limited_fd()), \
+            patch("executor.notifier.send_message", side_effect=_send) as mock_send, \
+            caplog.at_level(logging.WARNING):
+        assert send_trade_alert("BUY", "PLTR", 5, 180.0, "pullback", "daemon") is True
+        assert send_trade_alert("SELL", "DUOL", 5, 140.0, "stop", "daemon") is True
+    threads = [c.kwargs["message_thread_id"] for c in mock_send.call_args_list]
+    assert threads == [4, 3, 4, 3]
+    assert mock_send.call_args_list[1].args[0].startswith("[re-routed: Telegram topic 4")
+    errors = [r.getMessage() for r in caplog.records
+              if r.levelno >= logging.ERROR and r.name == "executor.notifier"]
+    assert len(errors) == 1, errors
+    assert "message thread not found" in errors[0]
+
+
+def test_all_routes_failing_pages_with_transport_reason(monkeypatch, caplog):
+    _topics(monkeypatch)
+
+    def _send(text, message_thread_id=None):
+        logging.getLogger("krepis.telegram").warning("Telegram API returned 403: Forbidden")
+        return False
+
+    with patch("executor.notifier.get_flow_doctor", return_value=_failed_fd()), \
+            patch("executor.notifier.send_message", side_effect=_send) as mock_send, \
+            caplog.at_level(logging.ERROR):
+        assert send_trade_alert("BUY", "PLTR", 5, 180.0, "pullback", "daemon") is False
+    assert [c.kwargs["message_thread_id"] for c in mock_send.call_args_list] == [4, 3, None]
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("NOT delivered on any route" in m and "403: Forbidden" in m for m in errors)
+    # The capture handler is removed after the send.
+    assert not any(
+        type(h).__name__ == "_TransportErrorCapture"
+        for h in logging.getLogger("krepis.telegram").handlers
+    )
+
+
+def test_essential_status_resent_on_delivery_failed(monkeypatch):
+    _topics(monkeypatch)
+    with patch("executor.notifier.get_flow_doctor", return_value=_failed_fd()), \
+            patch("executor.notifier.send_message", return_value=True) as mock_send:
+        assert send_daemon_status("*Order book written*", essential=True) is True
+    assert mock_send.call_args.kwargs["message_thread_id"] == 3
+
+
+def test_non_essential_status_not_resent_on_delivery_failed():
+    with patch("executor.notifier.get_flow_doctor", return_value=_failed_fd()), \
+            patch("executor.notifier.send_message", return_value=True) as mock_send:
+        assert send_daemon_status("*IB Gateway reconnected*") is False
+    mock_send.assert_not_called()

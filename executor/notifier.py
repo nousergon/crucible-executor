@@ -41,12 +41,34 @@ _ET = pytz.timezone("US/Eastern")
 # forum topic instead. Repeats are still bounded by flow-doctor's dedup, which
 # runs before the cap.
 _RATE_LIMITED = "rate_limited"
+# alpha-engine-config-I12702 (2026-10-26): seven executor notifications came
+# back `delivery_failed` (flow-doctor's heartbeat: delivery_failed=7, fired=4,
+# rate_limited=3) -- flow-doctor attempted the send and the transport failed --
+# and an essential one in that state was logged at WARNING and dropped,
+# because only `rate_limited` was re-sent.
+# Those failed attempts then counted against the same 10/day budget (the
+# store counts every telegram_alert action, sent or not), so by 13:53Z the
+# cap held BUY PLTR as well, and the past-cap send went to the very topic
+# that had just failed seven times, and failed the same way. An essential
+# message is now re-sent on either reason, and the direct path no longer
+# depends on the one topic being healthy: it tries the message's own topic,
+# then the ops-health topic, then the chat with no topic, and says which
+# route worked. `severity_filtered` etc. are configuration verdicts, not
+# delivery failures, and are still not re-sent.
+_DELIVERY_FAILED = "delivery_failed"
+_RESEND_REASONS = frozenset({_RATE_LIMITED, _DELIVERY_FAILED})
 _TOPIC_ENV_BY_SEVERITY = {
     "critical": "FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL",
     "error": "FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH",
     "warning": "FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH",
     "info": "FLOW_DOCTOR_TELEGRAM_THREAD_TRADES",
 }
+# The transport logs Telegram's own error description (never the token) on
+# this logger; capturing it is what lets the failure page name its cause.
+_TRANSPORT_LOGGER = "krepis.telegram"
+# One ERROR per process per refusing topic; later re-routes stay WARNING so a
+# broken topic is reported once a day, not once per trade.
+_REROUTE_REPORTED: set[int | None] = set()
 
 
 def _topic_thread_id(severity: str) -> int | None:
@@ -57,21 +79,86 @@ def _topic_thread_id(severity: str) -> int | None:
         return None
 
 
-def _send_past_cap(message: str, severity: str, label: str) -> bool:
-    """Deliver an essential message that flow-doctor's daily cap held back."""
-    ok = send_message(message, message_thread_id=_topic_thread_id(severity))
-    if ok:
-        logger.warning(
-            "Essential Telegram message sent past the flow-doctor daily cap: %s",
-            label,
-        )
-    else:
-        logger.error(
-            "Essential Telegram message held by the daily cap AND the direct "
-            "send failed: %s",
-            label,
-        )
-    return ok
+class _TransportErrorCapture(logging.Handler):
+    """Collect the transport's WARNING+ lines for the duration of one send."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = record.getMessage()
+        except Exception:  # noqa: BLE001 -- diagnostic capture only
+            return
+        if line not in self.lines:
+            self.lines.append(line)
+
+    def summary(self) -> str:
+        return ("; ".join(self.lines) or "no transport detail logged")[:400]
+
+
+def _send_past_cap(
+    message: str, severity: str, label: str, reason: str = _RATE_LIMITED,
+) -> bool:
+    """Deliver an essential message that flow-doctor did not deliver.
+
+    ``reason`` is flow-doctor's dispatch verdict (``rate_limited`` or
+    ``delivery_failed``). Routes, in order: the message's own topic, the
+    ops-health topic, then the chat with no topic.
+    """
+    primary = _topic_thread_id(severity)
+    routes: list[int | None] = [primary]
+    ops_health = _topic_thread_id("warning")
+    if ops_health is not None and ops_health not in routes:
+        routes.append(ops_health)
+    if None not in routes:
+        routes.append(None)
+
+    capture = _TransportErrorCapture()
+    transport_logger = logging.getLogger(_TRANSPORT_LOGGER)
+    prior_level = transport_logger.level
+    if transport_logger.getEffectiveLevel() > logging.WARNING:
+        # The cause must be captured even where the process logs at ERROR.
+        transport_logger.setLevel(logging.WARNING)
+    transport_logger.addHandler(capture)
+    try:
+        for i, thread in enumerate(routes):
+            text = message if i == 0 else (
+                f"[re-routed: Telegram topic {primary} refused this message]\n"
+                f"{message}"
+            )
+            if not send_message(text, message_thread_id=thread):
+                continue
+            if i == 0:
+                logger.warning(
+                    "Essential Telegram message sent directly (flow-doctor %s): %s",
+                    reason, label,
+                )
+            elif primary not in _REROUTE_REPORTED:
+                _REROUTE_REPORTED.add(primary)
+                logger.error(
+                    "Telegram topic %s refused an essential message; delivered via "
+                    "topic %s instead (flow-doctor %s). Telegram said: %s "
+                    "(alpha-engine-config-I12702)",
+                    primary, thread, reason, capture.summary(),
+                )
+            else:
+                logger.warning(
+                    "Essential Telegram message re-routed from topic %s to %s: %s",
+                    primary, thread, label,
+                )
+            return True
+    finally:
+        transport_logger.removeHandler(capture)
+        transport_logger.setLevel(prior_level)
+
+    logger.error(
+        "Essential Telegram message NOT delivered on any route (flow-doctor %s; "
+        "tried topics %s): %s. Telegram said: %s (alpha-engine-config-I12702)",
+        reason, routes, label, capture.summary(),
+    )
+    return False
 
 
 def _format_fill_time(fill_time: str | None) -> str:
@@ -190,8 +277,9 @@ def send_trade_alert(
                 )
                 return False
             if not fd.last_dispatched():
-                if fd.last_dispatch_reason() == _RATE_LIMITED:
-                    return _send_past_cap(msg, "info", f"{action} {ticker}")
+                reason = str(fd.last_dispatch_reason())  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType] -- FlowDoctor is untyped here
+                if reason in _RESEND_REASONS:
+                    return _send_past_cap(msg, "info", f"{action} {ticker}", reason)
                 logger.warning(
                     "Telegram trade alert NOT delivered by flow-doctor (reason=%s): %s %s",
                     fd.last_dispatch_reason(),
@@ -232,9 +320,10 @@ def send_daemon_status(message: str, *, essential: bool = False) -> bool:
                 return False
             if fd.last_dispatched():
                 return True
-            if essential and fd.last_dispatch_reason() == _RATE_LIMITED:
+            reason = str(fd.last_dispatch_reason())  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType] -- FlowDoctor is untyped here
+            if essential and reason in _RESEND_REASONS:
                 label = message.split("\n", 1)[0].replace("*", "").strip()
-                return _send_past_cap(message, "warning", label)
+                return _send_past_cap(message, "warning", label, reason)
             return False
         except Exception as e:
             # (a) flow-doctor's own notify_event transport failed.
