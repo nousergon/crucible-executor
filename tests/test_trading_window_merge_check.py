@@ -215,13 +215,34 @@ def test_dedup_skip_counts_as_already_paged(monkeypatch):
     assert twm.main(["--repo", "nousergon/crucible-trader", "--publish"]) == 0
 
 
-def test_workflow_maps_the_telegram_secrets_into_the_publish_step():
+def _workflow_steps():
     import yaml
 
     wf = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "trading-window-merge-check.yml"
-    steps = yaml.safe_load(wf.read_text())["jobs"]["check"]["steps"]
-    publish = [s for s in steps if "--publish" in s.get("run", "")]
-    assert len(publish) == 1
-    env = publish[0]["env"]
-    assert env["TELEGRAM_BOT_TOKEN"] == "${{ secrets.TELEGRAM_BOT_TOKEN }}"
-    assert env["TELEGRAM_CHAT_ID"] == "${{ secrets.TELEGRAM_CHAT_ID }}"
+    return wf.read_text(), yaml.safe_load(wf.read_text())["jobs"]["check"]["steps"]
+
+
+def test_workflow_never_reads_telegram_from_github_secrets():
+    # Brian's standing rule: secrets come from SSM through OIDC only.
+    text, steps = _workflow_steps()
+    assert "secrets.TELEGRAM" not in text
+    for step in steps:
+        for value in (step.get("env") or {}).values():
+            assert "secrets." not in str(value) or value == "${{ secrets.GITHUB_TOKEN }}"
+
+
+def test_workflow_reads_telegram_from_ssm_under_the_reader_role_before_publishing():
+    _, steps = _workflow_steps()
+    roles = [s.get("with", {}).get("role-to-assume", "") for s in steps]
+    reader = next(i for i, r in enumerate(roles) if r.endswith("role/github-actions-trading-window-page"))
+    publisher = next(i for i, r in enumerate(roles) if r.endswith("role/github-actions-lambda-deploy"))
+    load = next(i for i, s in enumerate(steps) if "aws ssm get-parameter" in s.get("run", ""))
+    publish = next(i for i, s in enumerate(steps) if "--publish" in s.get("run", ""))
+    assert reader < load < publisher < publish
+    # A failed read must not skip the detector: the script turns it red instead.
+    assert steps[reader].get("continue-on-error") is True
+    assert steps[load].get("continue-on-error") is True
+    run = steps[load]["run"]
+    assert "TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID" in run
+    assert run.index("::add-mask::") < run.index("GITHUB_ENV"), "mask before the value is exported"
+    assert "--with-decryption" in run

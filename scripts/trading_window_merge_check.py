@@ -179,8 +179,9 @@ def main(argv: list[str] | None = None) -> int:
             # printed, not even which name missed (CodeQL py/clear-text-logging).
             "::error::Telegram channel missing for the trading-window page: TELEGRAM_BOT_TOKEN "
             "and/or TELEGRAM_CHAT_ID did not resolve (SSM /alpha-engine/<NAME>, then the environment). "
-            "Auto-fix: none — the workflow must map the org-wide TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID "
-            f"secrets or the role must read them from SSM. Resolution: {ISSUE}"
+            "Auto-fix: none — the workflow reads both values from SSM under the read-only role "
+            "github-actions-trading-window-page; check that role exists and its two reader steps "
+            f"succeeded. Resolution: {ISSUE}"
         )
 
     found: list[Merge] = []
