@@ -22,10 +22,18 @@ def _ts(s):
     "ts, expected",
     [
         ("2026-10-23 20:12:00", True),  # crucible-executor#621, Fri — the incident
-        ("2026-10-23 13:30:00", True),  # window start is inclusive
+        ("2026-10-23 13:00:00", True),  # 09:00 EDT: window start is inclusive
         ("2026-10-23 20:29:59", True),
-        ("2026-10-23 20:30:00", False),  # window end is exclusive
-        ("2026-10-23 13:29:59", False),
+        ("2026-10-23 20:30:00", False),  # 16:30 EDT: window end is exclusive
+        ("2026-10-23 12:59:59", False),
+        # alpha-engine-config-I12769: under EST (from 2026-11-02) the window is
+        # 14:00-21:30Z. The fixed 13:30-20:30Z missed 20:30-21:00Z, in session.
+        ("2026-11-02 20:45:00", True),  # 15:45 EST
+        ("2026-11-02 21:29:59", True),
+        ("2026-11-02 21:30:00", False),  # 16:30 EST
+        ("2026-11-02 14:00:00", True),  # 09:00 EST
+        ("2026-11-02 13:59:59", False),
+        ("2026-03-09 13:00:00", True),  # Mon after DST starts 2026-03-08: 09:00 EDT
         ("2026-10-24 15:00:00", False),  # Saturday
         ("2026-11-26 15:00:00", False),  # Thanksgiving — NYSE closed
         ("2026-11-27 15:00:00", True),  # day after: early close, still a trading day
@@ -40,9 +48,9 @@ def test_naive_timestamp_is_refused():
         twm.in_trading_window(datetime(2026, 10, 23, 20, 12))
 
 
-def test_window_is_utc_not_eastern():
+def test_window_includes_the_post_close_margin():
     # 2026-10-23 20:12Z is 16:12 ET — after the close, which is how "after
-    # market hours" read as fine. The run rule's window is UTC.
+    # market hours" read as fine. The window runs to 16:30 ET.
     assert twm.in_trading_window(datetime.fromisoformat("2026-10-23T16:12:00-04:00"))
 
 
@@ -82,7 +90,7 @@ def test_gh_api_builds_a_get_with_fields(monkeypatch):
 def test_alert_carries_auto_fix_and_resolution_naming_the_issue():
     m = twm.Merge("nousergon/crucible-executor", "a" * 40, _ts("2026-10-23 20:12:00"), "x")
     message, auto_fix, resolution = twm.alert_text(m)
-    assert "13:30-20:30Z" in message and "2026-10-23 20:12Z" in message
+    assert "09:00-16:30 ET" in message and "2026-10-23 20:12Z" in message
     assert auto_fix and resolution
     assert "alpha-engine-config-I12640" in resolution
 
