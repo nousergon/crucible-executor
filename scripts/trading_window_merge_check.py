@@ -1,9 +1,10 @@
-"""Page when a trading-path merge lands inside the 13:30-20:30Z window.
+"""Page when a trading-path merge lands inside the 09:00-16:30 ET window.
 
 alpha-engine-config-I12640, option 2 (the post-merge detector). The rule
 (change-control-policy § Merge permission; Brian 2026-10-16) is that a
-trading-path merge never lands between 13:30 and 20:30 UTC on an NYSE
-trading day. Until this existed it was enforced only by the session doing
+trading-path merge never lands between 09:00 and 16:30 America/New_York on
+an NYSE trading day (the regular session plus 30 minutes each side;
+restated on the exchange clock by alpha-engine-config-I12769). Until this existed it was enforced only by the session doing
 the merge, and nothing flagged crucible-executor#621 merging at 20:12Z on
 Fri 2026-10-23.
 
@@ -11,8 +12,10 @@ This DETECTS; it does not prevent. Prevention at merge time is option 1
 (a required check under a merge queue), a repo-admin change tracked on the
 same issue.
 
-The window is the run rule's fixed UTC window, not the exchange session:
-13:30-20:30Z is wider than 09:30-16:00 ET in both DST regimes on purpose.
+The window is read on the exchange clock, never as a fixed UTC range: it
+is 13:00-20:30Z under EDT and 14:00-21:30Z under EST. The fixed 13:30-20:30Z
+it replaced was NOT wider than the session in both regimes — under EST it
+missed 20:30-21:00Z, market time (alpha-engine-config-I12769).
 Whether a day counts is krepis.trading_calendar.is_trading_day, the same
 holiday table the executor trades on.
 
@@ -47,9 +50,11 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
-WINDOW_START_UTC = time(13, 30)
-WINDOW_END_UTC = time(20, 30)
+WINDOW_TZ = ZoneInfo("America/New_York")
+WINDOW_START_ET = time(9, 0)
+WINDOW_END_ET = time(16, 30)
 
 ALERT_SOURCE = "crucible-executor/scripts/trading_window_merge_check.py"
 ISSUE = "alpha-engine-config-I12640"
@@ -93,15 +98,15 @@ def page_reached_telegram(result) -> bool:
 
 
 def in_trading_window(ts: datetime, *, is_trading_day=None) -> bool:
-    """True iff ``ts`` (tz-aware) is in [13:30, 20:30) UTC on a trading day."""
+    """True iff ``ts`` (tz-aware) is in [09:00, 16:30) America/New_York on a trading day."""
     if ts.tzinfo is None:
         raise ValueError("timestamp must be tz-aware")
     if is_trading_day is None:
         from krepis.trading_calendar import is_trading_day
-    utc = ts.astimezone(UTC)
-    if not (WINDOW_START_UTC <= utc.time() < WINDOW_END_UTC):
+    et = ts.astimezone(WINDOW_TZ)
+    if not (WINDOW_START_ET <= et.time() < WINDOW_END_ET):
         return False
-    return bool(is_trading_day(utc.date()))
+    return bool(is_trading_day(et.date()))
 
 
 def _parse_ts(raw: str) -> datetime:
@@ -145,7 +150,7 @@ def in_window_merges(merges: list[Merge], *, is_trading_day=None) -> list[Merge]
 def alert_text(m: Merge) -> tuple[str, str, str]:
     """(message, auto_fix, resolution) for one in-window merge."""
     message = (
-        f"Trading-path merge inside the 13:30-20:30Z window: {m.repo}@{m.sha[:9]} landed "
+        f"Trading-path merge inside the 09:00-16:30 ET window: {m.repo}@{m.sha[:9]} landed "
         f"{m.landed_at.astimezone(UTC):%Y-%m-%d %H:%MZ} ({m.title}). The run rule forbids "
         "trading-path merges in this window on NYSE trading days. Check whether the trading box "
         "can pick it up before the close (deploy-on-merge or a mid-day boot-pull) and decide "

@@ -3,8 +3,8 @@ name: Trading-window merge check
 # alpha-engine-config-I12640, option 2: the post-merge DETECTOR.
 #
 # The run rule (change-control-policy § Merge permission; Brian 2026-10-16):
-# no trading-path merge lands between 13:30 and 20:30 UTC on an NYSE trading
-# day. Until this existed only the merging session enforced it, and nothing
+# no trading-path merge lands 09:00-16:30 America/New_York on an NYSE trading
+# day (13:00-20:30Z EDT, 14:00-21:30Z EST; alpha-engine-config-I12769). Until this existed only the merging session enforced it, and nothing
 # flagged crucible-executor#621 merging at 20:12Z on Fri 2026-10-23.
 #
 # What it watches: this repo's main (on push, so a merge here pages within a
@@ -20,13 +20,14 @@ name: Trading-window merge check
 #
 # Not a required check and no pull_request trigger, so the merge queue is not
 # involved (merge-group-required-check-guard has nothing to require here).
-# Cost: one ~1-minute run per weekday hour 13-21Z, plus one per push.
+# Cost: one ~1-minute run per weekday hour 13-22Z, plus one per push. The
+# 22:05Z run (70-minute lookback) covers the EST window's 21:05-21:30Z tail.
 
 on:
   push:
     branches: [main]
   schedule:
-    - cron: "5 13-21 * * 1-5"
+    - cron: "5 13-22 * * 1-5"
   workflow_dispatch:
 
 concurrency:
