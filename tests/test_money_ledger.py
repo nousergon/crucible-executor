@@ -381,3 +381,145 @@ class TestVerifyEntries:
         c = sqlite3.connect(tmp_path / "empty.db")
         assert ml.verify_entries(c) == 0
         c.close()
+
+
+def _statement(**overrides):
+    doc = {
+        "schema_version": "broker_statement.v2",
+        "account": "DU1234567",
+        "trading_day": "2026-10-27",
+        "source": "ib_paper",
+        "positions": {"UAL": 40, "AAPL": 10},
+        "cash_usd": 95123.456,
+        "accrued_cash_usd": 12.34,
+    }
+    doc.update(overrides)
+    return doc
+
+
+_CLOSES = {"UAL": 60.116, "AAPL": 231.5, "MSFT": 400.0}
+
+
+def _opening(statement=None, **kw):
+    kwargs = {"settled_closes": _CLOSES, "closes_date": "2026-10-27",
+              "close_source": "polygon_settled"}
+    kwargs.update(kw)
+    return ml.opening_balance_entry(statement or _statement(), **kwargs)
+
+
+class TestOpeningBalance:
+    """alpha-engine-config-I12557 deliverable 1: one entry anchors the ledger on
+    one broker statement. Shares and cash from IB; prices from Polygon settled."""
+
+    def test_postings_value_ib_shares_at_settled_closes(self):
+        e = _opening()
+        assert e.source == ml.SOURCE_OPENING_BALANCE
+        assert e.kind == ml.KIND_STATEMENT_ANCHOR
+        assert e.effective_date == "2026-10-27"
+        lines = {p.account: p.amount for p in e.postings}
+        assert lines == {
+            "assets:securities:AAPL": D("2315.00"),
+            "assets:securities:UAL": D("2404.64"),  # 40 × 60.116 = 2404.64
+            ml.ACCOUNT_CASH: D("95123.46"),
+            ml.ACCOUNT_ACCRUED: D("12.34"),
+            ml.ACCOUNT_OPENING_BALANCE: D("-99855.44"),
+        }
+        assert e.evidence["nav_after_usd"] == "99855.44"
+        assert e.evidence["shares"] == {"AAPL": 10, "UAL": 40}
+        assert "MSFT" not in e.evidence["settled_closes"]  # only held names
+
+    def test_short_position_and_debit_accrual_are_signed(self):
+        e = _opening(_statement(positions={"UAL": -40}, accrued_cash_usd=-3.21))
+        lines = {p.account: p.amount for p in e.postings}
+        assert lines["assets:securities:UAL"] == D("-2404.64")
+        assert lines[ml.ACCOUNT_ACCRUED] == D("-3.21")
+        assert sum(lines.values()) == 0
+
+    def test_zero_accrual_carries_no_empty_line(self):
+        e = _opening(_statement(accrued_cash_usd=0.0))
+        assert ml.ACCOUNT_ACCRUED not in {p.account for p in e.postings}
+
+    @pytest.mark.parametrize("overrides, match", [
+        ({"accrued_cash_usd": None}, "no recorded accrual"),
+        ({"schema_version": "broker_statement.v9"}, "schema_version"),
+        ({"source": "ledger_replay"}, "not a broker read"),
+        ({"positions": {"UAL": 0}}, "whole non-zero shares"),
+        ({"positions": {"UAL": 1.5}}, "whole non-zero shares"),
+        ({"positions": {"ZZZ": 5}}, "no settled close"),
+        ({"positions": {}, "cash_usd": 0.0, "accrued_cash_usd": 0.0}, "nets to zero"),
+    ])
+    def test_refuses_rather_than_plugs(self, overrides, match):
+        with pytest.raises(ValueError, match=match):
+            _opening(_statement(**overrides))
+
+    def test_closes_must_be_the_statements_day(self):
+        with pytest.raises(ValueError, match="statement's own day"):
+            _opening(closes_date="2026-10-24")
+
+    @pytest.mark.parametrize("bad", [0, -1.0, float("nan")])
+    def test_close_must_be_a_positive_price(self, bad):
+        with pytest.raises(ValueError, match="not a positive price"):
+            _opening(settled_closes={**_CLOSES, "UAL": bad})
+
+    def test_an_opening_kind_cannot_ride_another_source(self):
+        with pytest.raises(ValueError, match="for source"):
+            _entry(kind=ml.KIND_STATEMENT_ANCHOR)
+
+    def test_entry_id_names_the_anchor(self):
+        a = _opening()
+        b = _opening(_statement(account="DU7654321"))
+        assert a.entry_id == _opening().entry_id
+        assert a.entry_id != b.entry_id
+
+    def test_existing_correction_ids_are_unchanged(self):
+        # Computed on main before the opening balance existed: stored entries
+        # must keep the ids they were written under.
+        e = _entry(evidence={"nav_before_usd": "100.00", "nav_after_usd": "2504.64"})
+        assert e.entry_id == "je_a2c6275cb38f81420c680b4145cb5aa1"
+
+
+class TestOneAnchor:
+    @pytest.fixture
+    def conn(self, tmp_path):
+        c = sqlite3.connect(tmp_path / "t.db")
+        yield c
+        c.close()
+
+    def test_guard_trigger_is_installed(self, conn):
+        ml.ensure_schema(conn)
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'")}
+        assert ml.OPENING_BALANCE_GUARD_TRIGGER in names
+
+    def test_same_anchor_twice_is_one_entry(self, conn):
+        _, new1 = ml.record_entry(conn, _opening())
+        _, new2 = ml.record_entry(conn, _opening())
+        assert new1 and not new2
+        assert ml.trial_balance(conn) == {"USD": D("0.00")}
+        assert ml.verify_entries(conn) == 1
+
+    def test_a_second_anchor_is_refused_and_leaves_no_lines(self, conn):
+        ml.record_entry(conn, _opening())
+        moved = _opening(_statement(trading_day="2026-10-28"), closes_date="2026-10-28")
+        with pytest.raises(sqlite3.IntegrityError, match="one anchor"):
+            ml.record_entry(conn, moved)
+        assert conn.execute(
+            "SELECT COUNT(DISTINCT entry_id) FROM ledger_postings").fetchone()[0] == 1
+        ml.verify_entries(conn)
+
+    def test_corrections_post_beside_the_anchor(self, conn):
+        ml.record_entry(conn, _opening())
+        ml.record_entry(conn, _entry())
+        assert ml.verify_entries(conn) == 2
+        assert ml.trial_balance(conn) == {"USD": D("0.00")}
+
+    def test_store_refuses_a_raw_second_anchor(self, conn):
+        ml.record_entry(conn, _opening())
+        conn.executemany(
+            "INSERT INTO ledger_postings VALUES ('je_x', ?, ?, ?, 'USD')",
+            [(0, "assets:cash:USD", "1.00"), (1, "equity:opening_balance", "-1.00")],
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="one anchor"):
+            conn.execute(
+                "INSERT INTO ledger_journal_entries VALUES ('je_x', '2026-10-28', 't', "
+                "'opening_balance', 'statement_anchor', 'r', NULL, '{}')")
