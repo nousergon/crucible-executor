@@ -56,9 +56,50 @@ jobs:
       - name: Install krepis
         run: python -m pip install --quiet "krepis==0.59.81"
 
+      # TELEGRAM COMES FROM SSM THROUGH OIDC, NEVER FROM GITHUB SECRETS
+      # (Brian's standing rule; alpha-engine-config-I12640). krepis resolves
+      # both values through get_secret: SSM /alpha-engine/<NAME> first, then
+      # the environment. The publishing role below holds no read on those
+      # parameters (and has ~26 bytes of inline headroom), so this job first
+      # assumes github-actions-trading-window-page, a read-only role whose
+      # trust admits only this workflow file on main and whose one grant is
+      # ssm:GetParameter on the two values (nous-ergon-ops
+      # infrastructure/iam/github-actions-trading-window-page/). On 10-26,
+      # without a channel, crucible-executor#627 (merged 15:04Z) was detected,
+      # logged TELEGRAM_BOT_TOKEN=MISSING TELEGRAM_CHAT_ID=MISSING, and the job
+      # stayed green.
+      #
+      # Both reader steps are continue-on-error so the detector still runs
+      # and SNS still gets the page; the script then exits 1 on the missing
+      # channel, so a broken read is a red run, never a silent one. This repo
+      # is public: the values are masked before they reach GITHUB_ENV and are
+      # never echoed.
+      - name: Configure AWS credentials via OIDC (Telegram reader)
+        id: telegram_role
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-trading-window-page
+          aws-region: us-east-1
+
+      - name: Load the Telegram values from SSM (masked)
+        if: steps.telegram_role.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
+            value=$(aws ssm get-parameter --name "/alpha-engine/${name}" --with-decryption \
+              --query Parameter.Value --output text) || { echo "::error::SSM read of /alpha-engine/${name} failed"; continue; }
+            case "$value" in *$'\n'*|*$'\r'*) echo "::error::/alpha-engine/${name} holds a line break; not loaded"; continue ;; esac
+            if [ -n "$value" ] && [ "$value" != "None" ]; then
+              echo "::add-mask::${value}"
+              echo "${name}=${value}" >> "$GITHUB_ENV"
+            fi
+          done
+
       # Same identity this repo's changelog.yml already assumes; it holds
-      # sns:Publish on alpha-engine-alerts. No new grant.
-      - name: Configure AWS credentials via OIDC
+      # sns:Publish on alpha-engine-alerts. No new grant on it.
+      - name: Configure AWS credentials via OIDC (publisher)
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6
         with:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy

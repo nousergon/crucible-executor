@@ -26,6 +26,17 @@ Without ``--publish`` it only prints what it would page (the default, so a
 local run sends nothing). Exit 0 when nothing is in-window or every page
 was delivered; 1 when a page could not be delivered or the commit listing
 could not be read, so the job goes red rather than going quiet.
+
+With ``--publish`` the Telegram channel is part of the contract, checked on
+EVERY run rather than only on the day a merge lands in the window. On
+2026-10-26 crucible-executor#627 merged at 15:04Z, this detector saw it
+(run 40345778242), and the page reached SNS only: Telegram logged
+``TELEGRAM_BOT_TOKEN=MISSING TELEGRAM_CHAT_ID=MISSING``, ``publish()`` still
+counted SNS as delivered, and the job finished green. So a run exits 1 when
+either Telegram value does not resolve (``krepis.secrets.get_secret``: SSM
+``/alpha-engine/<NAME>`` first, then the environment — the same resolution
+``krepis.telegram`` sends with), and a page counts as delivered only when
+its Telegram leg is ``ok``.
 """
 
 from __future__ import annotations
@@ -50,6 +61,35 @@ class Merge:
     sha: str
     landed_at: datetime  # committer date: the merge time for a squash or merge commit
     title: str
+
+
+#: The two values krepis.telegram sends with. Names only — a value is never
+#: printed, returned or logged by this module.
+TELEGRAM_VALUE_NAMES = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+
+
+def missing_telegram_values(*, get_secret=None) -> list[str]:
+    """Names of the Telegram values that do not resolve, in TELEGRAM_VALUE_NAMES order.
+
+    Resolved through ``krepis.secrets.get_secret`` (SSM first, then the
+    environment), which is exactly what ``krepis.telegram`` does when it
+    sends, so an empty list here means the page has a channel.
+    """
+    if get_secret is None:
+        from krepis.secrets import get_secret
+    return [name for name in TELEGRAM_VALUE_NAMES if not get_secret(name, required=False)]
+
+
+def page_reached_telegram(result) -> bool:
+    """True iff ``publish()``'s result shows the page on Telegram.
+
+    A dedup skip means an earlier run already paged this sha, so it counts.
+    SNS alone does not: that is the 2026-10-26 green-but-dropped run.
+    """
+    if getattr(result, "dedup_skipped", False):
+        return True
+    telegram = getattr(result, "telegram", None)
+    return bool(getattr(telegram, "ok", False))
 
 
 def in_trading_window(ts: datetime, *, is_trading_day=None) -> bool:
@@ -129,6 +169,21 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(UTC)
     since = now - timedelta(minutes=args.lookback_minutes)
 
+    # Checked before any listing and on every --publish run, so a missing
+    # channel turns the hourly run red on a quiet day too, not only on the
+    # day an in-window merge needs the page.
+    channel_missing = missing_telegram_values() if args.publish else []
+    if channel_missing:
+        print(
+            # A fixed literal: nothing derived from the secret lookup is
+            # printed, not even which name missed (CodeQL py/clear-text-logging).
+            "::error::Telegram channel missing for the trading-window page: TELEGRAM_BOT_TOKEN "
+            "and/or TELEGRAM_CHAT_ID did not resolve (SSM /alpha-engine/<NAME>, then the environment). "
+            "Auto-fix: none — the workflow reads both values from SSM under the read-only role "
+            "github-actions-trading-window-page; check that role exists and its two reader steps "
+            f"succeeded. Resolution: {ISSUE}"
+        )
+
     found: list[Merge] = []
     unreadable = []
     for repo in args.repo:
@@ -141,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"::error::could not list merges for {line}")
     if not found:
         print(f"no trading-path merge inside the window since {since:%Y-%m-%dT%H:%MZ} ({', '.join(args.repo)})")
-        return 1 if unreadable else 0
+        return 1 if (unreadable or channel_missing) else 0
 
     failed = 0
     for m in found:
@@ -152,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         from krepis import alerts
 
         try:
-            alerts.publish(
+            result = alerts.publish(
                 message,
                 severity="error",
                 # A literal, not ALERT_SOURCE: the fleet alert-class guard
@@ -167,7 +222,13 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 — every channel failed; the job must go red
             print(f"::error::page for {m.repo}@{m.sha[:9]} was not delivered: {exc}")
             failed += 1
-    return 1 if (failed or unreadable) else 0
+            continue
+        if not page_reached_telegram(result):
+            # The channel's detail string is not printed: a transport error's
+            # repr can carry the Bot API URL, which embeds the token.
+            print(f"::error::page for {m.repo}@{m.sha[:9]} did not reach Telegram; SNS alone is not a page")
+            failed += 1
+    return 1 if (failed or unreadable or channel_missing) else 0
 
 
 if __name__ == "__main__":
