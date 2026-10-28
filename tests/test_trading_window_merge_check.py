@@ -22,10 +22,18 @@ def _ts(s):
     "ts, expected",
     [
         ("2026-10-23 20:12:00", True),  # crucible-executor#621, Fri — the incident
-        ("2026-10-23 13:30:00", True),  # window start is inclusive
+        ("2026-10-23 13:00:00", True),  # 09:00 EDT: window start is inclusive
         ("2026-10-23 20:29:59", True),
-        ("2026-10-23 20:30:00", False),  # window end is exclusive
-        ("2026-10-23 13:29:59", False),
+        ("2026-10-23 20:30:00", False),  # 16:30 EDT: window end is exclusive
+        ("2026-10-23 12:59:59", False),
+        # alpha-engine-config-I12769: under EST (from 2026-11-02) the window is
+        # 14:00-21:30Z. The fixed 13:30-20:30Z missed 20:30-21:00Z, in session.
+        ("2026-11-02 20:45:00", True),  # 15:45 EST
+        ("2026-11-02 21:29:59", True),
+        ("2026-11-02 21:30:00", False),  # 16:30 EST
+        ("2026-11-02 14:00:00", True),  # 09:00 EST
+        ("2026-11-02 13:59:59", False),
+        ("2026-03-09 13:00:00", True),  # Mon after DST starts 2026-03-08: 09:00 EDT
         ("2026-10-24 15:00:00", False),  # Saturday
         ("2026-11-26 15:00:00", False),  # Thanksgiving — NYSE closed
         ("2026-11-27 15:00:00", True),  # day after: early close, still a trading day
@@ -40,9 +48,9 @@ def test_naive_timestamp_is_refused():
         twm.in_trading_window(datetime(2026, 10, 23, 20, 12))
 
 
-def test_window_is_utc_not_eastern():
+def test_window_includes_the_post_close_margin():
     # 2026-10-23 20:12Z is 16:12 ET — after the close, which is how "after
-    # market hours" read as fine. The run rule's window is UTC.
+    # market hours" read as fine. The window runs to 16:30 ET.
     assert twm.in_trading_window(datetime.fromisoformat("2026-10-23T16:12:00-04:00"))
 
 
@@ -82,7 +90,7 @@ def test_gh_api_builds_a_get_with_fields(monkeypatch):
 def test_alert_carries_auto_fix_and_resolution_naming_the_issue():
     m = twm.Merge("nousergon/crucible-executor", "a" * 40, _ts("2026-10-23 20:12:00"), "x")
     message, auto_fix, resolution = twm.alert_text(m)
-    assert "13:30-20:30Z" in message and "2026-10-23 20:12Z" in message
+    assert "09:00-16:30 ET" in message and "2026-10-23 20:12Z" in message
     assert auto_fix and resolution
     assert "alpha-engine-config-I12640" in resolution
 
@@ -108,6 +116,16 @@ def test_print_only_by_default(monkeypatch):
     assert twm.main(["--repo", "nousergon/crucible-trader"]) == 0
 
 
+def _result(*, telegram_ok, sns_ok=True, dedup_skipped=False):
+    from krepis.alerts import ChannelResult, PublishResult
+
+    return PublishResult(
+        sns=ChannelResult(ok=sns_ok, detail="sns"),
+        telegram=ChannelResult(ok=telegram_ok, detail="telegram" if telegram_ok else "telegram not configured"),
+        dedup_skipped=dedup_skipped,
+    )
+
+
 def test_publish_passes_lines_and_per_sha_dedup(monkeypatch):
     m = twm.Merge("nousergon/crucible-trader", "c" * 40, _ts("2026-10-23 15:00:00"), "x")
     monkeypatch.setattr(twm, "list_merges", lambda *a, **k: [m])
@@ -115,8 +133,124 @@ def test_publish_passes_lines_and_per_sha_dedup(monkeypatch):
     import krepis.alerts
 
     calls = []
-    monkeypatch.setattr(krepis.alerts, "publish", lambda msg, **kw: calls.append(kw))
+    monkeypatch.setattr(twm, "missing_telegram_values", lambda **k: [])
+    monkeypatch.setattr(krepis.alerts, "publish", lambda msg, **kw: calls.append(kw) or _result(telegram_ok=True))
     assert twm.main(["--repo", "nousergon/crucible-trader", "--publish"]) == 0
     assert calls[0]["source"] == twm.ALERT_SOURCE
     assert calls[0]["dedup_key"] == f"trading-window-merge-nousergon/crucible-trader-{'c' * 40}"
     assert calls[0]["auto_fix"] and calls[0]["resolution"]
+
+
+# --- The 2026-10-26 miss: crucible-executor#627 merged 15:04Z, the detector
+# saw it (run 40345778242), Telegram logged MISSING/MISSING, SNS carried the
+# page alone, and the job stayed green. A missing channel must be red.
+
+
+def _clean_env_secrets(monkeypatch):
+    """Resolve secrets from the environment only, with the Telegram values unset.
+
+    ALPHA_ENGINE_SECRETS_SOURCE=env keeps the test off SSM (no AWS call from
+    CI), so this is the runner's state on 10-26: nothing in the env, nothing
+    readable in SSM.
+    """
+    import krepis.secrets
+
+    monkeypatch.setenv("ALPHA_ENGINE_SECRETS_SOURCE", "env")
+    monkeypatch.setattr(krepis.secrets, "_cache", {})
+    for name in twm.TELEGRAM_VALUE_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_missing_telegram_values_reads_through_get_secret(monkeypatch):
+    _clean_env_secrets(monkeypatch)
+    assert twm.missing_telegram_values() == ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    assert twm.missing_telegram_values() == ["TELEGRAM_CHAT_ID"]
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "y")
+    assert twm.missing_telegram_values() == []
+
+
+def test_missing_channel_is_red_even_on_a_quiet_day(monkeypatch, capsys):
+    _clean_env_secrets(monkeypatch)
+    monkeypatch.setattr(twm, "list_merges", lambda *a, **k: [])
+    assert twm.main(["--repo", "nousergon/crucible-executor", "--publish"]) == 1
+    out = capsys.readouterr().out
+    assert "::error::Telegram channel missing" in out
+    assert "Auto-fix:" in out and "Resolution: alpha-engine-config-I12640" in out
+
+
+def test_missing_channel_does_not_gate_a_print_only_run(monkeypatch):
+    _clean_env_secrets(monkeypatch)
+    monkeypatch.setattr(twm, "list_merges", lambda *a, **k: [])
+    assert twm.main(["--repo", "nousergon/crucible-executor"]) == 0
+
+
+def test_in_window_merge_with_missing_channel_still_publishes_and_is_red(monkeypatch):
+    # The 10-26 run exactly: SNS took the page, Telegram did not.
+    _clean_env_secrets(monkeypatch)
+    m = twm.Merge("nousergon/crucible-executor", "7ca2f7971" + "0" * 31, _ts("2026-10-26 15:04:51"), "deps (#627)")
+    monkeypatch.setattr(twm, "list_merges", lambda *a, **k: [m])
+    monkeypatch.setattr(twm, "in_window_merges", lambda ms, **k: ms)
+    import krepis.alerts
+
+    calls = []
+    monkeypatch.setattr(krepis.alerts, "publish", lambda msg, **kw: calls.append(kw) or _result(telegram_ok=False))
+    assert twm.main(["--repo", "nousergon/crucible-executor", "--publish"]) == 1
+    assert len(calls) == 1  # SNS still gets the page; the run is red as well
+
+
+def test_sns_only_delivery_is_red(monkeypatch):
+    m = twm.Merge("nousergon/crucible-trader", "c" * 40, _ts("2026-10-23 15:00:00"), "x")
+    monkeypatch.setattr(twm, "missing_telegram_values", lambda **k: [])
+    monkeypatch.setattr(twm, "list_merges", lambda *a, **k: [m])
+    monkeypatch.setattr(twm, "in_window_merges", lambda ms, **k: ms)
+    import krepis.alerts
+
+    monkeypatch.setattr(krepis.alerts, "publish", lambda msg, **kw: _result(telegram_ok=False))
+    assert twm.main(["--repo", "nousergon/crucible-trader", "--publish"]) == 1
+
+
+def test_dedup_skip_counts_as_already_paged(monkeypatch):
+    m = twm.Merge("nousergon/crucible-trader", "c" * 40, _ts("2026-10-23 15:00:00"), "x")
+    monkeypatch.setattr(twm, "missing_telegram_values", lambda **k: [])
+    monkeypatch.setattr(twm, "list_merges", lambda *a, **k: [m])
+    monkeypatch.setattr(twm, "in_window_merges", lambda ms, **k: ms)
+    import krepis.alerts
+
+    monkeypatch.setattr(
+        krepis.alerts, "publish", lambda msg, **kw: _result(telegram_ok=False, sns_ok=False, dedup_skipped=True)
+    )
+    assert twm.main(["--repo", "nousergon/crucible-trader", "--publish"]) == 0
+
+
+def _workflow_steps():
+    import yaml
+
+    wf = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "trading-window-merge-check.yml"
+    return wf.read_text(), yaml.safe_load(wf.read_text())["jobs"]["check"]["steps"]
+
+
+def test_workflow_never_reads_telegram_from_github_secrets():
+    # Brian's standing rule: secrets come from SSM through OIDC only.
+    text, steps = _workflow_steps()
+    assert "secrets.TELEGRAM" not in text
+    for step in steps:
+        for value in (step.get("env") or {}).values():
+            assert "secrets." not in str(value) or value == "${{ secrets.GITHUB_TOKEN }}"
+
+
+def test_workflow_reads_telegram_from_ssm_under_the_reader_role_before_publishing():
+    _, steps = _workflow_steps()
+    roles = [s.get("with", {}).get("role-to-assume", "") for s in steps]
+    reader = next(i for i, r in enumerate(roles) if r.endswith("role/github-actions-trading-window-page"))
+    publisher = next(i for i, r in enumerate(roles) if r.endswith("role/github-actions-lambda-deploy"))
+    load = next(i for i, s in enumerate(steps) if "aws ssm get-parameter" in s.get("run", ""))
+    publish = next(i for i, s in enumerate(steps) if "--publish" in s.get("run", ""))
+    assert reader < load < publisher < publish
+    # A failed read must not skip the detector: the script turns it red instead.
+    assert steps[reader].get("continue-on-error") is True
+    assert steps[load].get("continue-on-error") is True
+    run = steps[load]["run"]
+    assert "TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID" in run
+    assert run.index("::add-mask::") < run.index("GITHUB_ENV"), "mask before the value is exported"
+    assert "--with-decryption" in run

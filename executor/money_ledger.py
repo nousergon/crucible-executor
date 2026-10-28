@@ -34,6 +34,16 @@ offset is a named income or equity account:
   the same account. ``reverses_entry_id`` is never set here: the correction is
   a new entry, and the original row's view is carried in ``evidence``.
 
+One entry is not a correction: the OPENING BALANCE (``opening_balance`` /
+``statement_anchor``, alpha-engine-config-I12557 deliverable 1) anchors the
+ledger on one broker statement. Shares and cash come from IB (the statement);
+each position is valued at its Polygon settled close. Its postings are cash,
+accrued interest and one line per security, offset to
+``equity:opening_balance``. A ledger holds at most ONE opening balance; the
+store refuses a second (invariant 7), so the anchor cannot be silently moved.
+It is built by :func:`opening_balance_entry` and posted only by an explicit
+caller; no scheduled run posts it.
+
 Invariants, enforced here and NOT by the caller
 ------------------------------------------------
 1. **Balanced.** Every entry's postings sum to exactly zero per currency, in
@@ -59,6 +69,10 @@ Invariants, enforced here and NOT by the caller
    currency, two or more lines) and that no posting lacks a header and no
    header lacks postings. It runs inside every append, next to the trial
    balance; a zero total over two offsetting broken entries is still a break.
+7. **One anchor.** A ``BEFORE INSERT`` trigger refuses an
+   ``opening_balance`` header when the ledger already holds one. Re-posting the
+   SAME anchor is a no-op (its ``entry_id`` names the account and statement
+   date, invariant 3); a different one is an error, never a second anchor.
 """
 
 from __future__ import annotations
@@ -72,7 +86,7 @@ import sqlite3
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
@@ -85,14 +99,34 @@ ACCOUNT_ACCRUED = "assets:accrued_interest:USD"
 ACCOUNT_SECURITIES_PREFIX = "assets:securities:"
 ACCOUNT_BROKER_MARK = "assets:broker_mark_adjustment"
 ACCOUNT_VALUATION_CORRECTION = "income:unrealized_gain:valuation_correction"
+ACCOUNT_OPENING_BALANCE = "equity:opening_balance"
 
-#: The closed set of journal sources. A new source is a code change on purpose.
-SOURCES: tuple[str, ...] = ("daily_auto_correct",)
+SOURCE_DAILY_AUTO_CORRECT = "daily_auto_correct"
+SOURCE_OPENING_BALANCE = "opening_balance"
 
 #: The closed set of correction kinds a ``daily_auto_correct`` entry carries.
 KIND_IB_MARK_TO_SETTLED = "ib_mark_to_settled_close"
 KIND_SETTLED_RESTRIKE = "settled_restrike"
-KINDS: tuple[str, ...] = (KIND_IB_MARK_TO_SETTLED, KIND_SETTLED_RESTRIKE)
+#: The one kind an ``opening_balance`` entry carries.
+KIND_STATEMENT_ANCHOR = "statement_anchor"
+
+#: Every source and the kinds it may carry. A closed vocabulary on purpose: a
+#: new event class (alpha-engine-config-I12557's catalogue) is a code change
+#: that adds its row here.
+KINDS_BY_SOURCE: Mapping[str, tuple[str, ...]] = {
+    SOURCE_DAILY_AUTO_CORRECT: (KIND_IB_MARK_TO_SETTLED, KIND_SETTLED_RESTRIKE),
+    SOURCE_OPENING_BALANCE: (KIND_STATEMENT_ANCHOR,),
+}
+
+#: The closed set of journal sources. A new source is a code change on purpose.
+SOURCES: tuple[str, ...] = tuple(KINDS_BY_SOURCE)
+KINDS: tuple[str, ...] = tuple(k for kinds in KINDS_BY_SOURCE.values() for k in kinds)
+
+#: Broker statements the opening balance may anchor on, and the one broker read
+#: that files them (crucible-trader ``broker_statement``). A book rebuilt from
+#: fills or from this ledger is not a statement and cannot be an anchor.
+ANCHOR_STATEMENT_SCHEMAS: tuple[str, ...] = ("broker_statement.v1", "broker_statement.v2")
+ANCHOR_STATEMENT_SOURCES: tuple[str, ...] = ("ib_paper",)
 
 _ACCOUNT_RE = re.compile(
     r"^(assets|liabilities|equity|income|expenses)(:[A-Za-z0-9_.\-/ ]+)+$"
@@ -154,8 +188,11 @@ class JournalEntry:
     def __post_init__(self) -> None:
         if self.source not in SOURCES:
             raise ValueError(f"journal source {self.source!r} not in {SOURCES}")
-        if self.kind not in KINDS:
-            raise ValueError(f"journal kind {self.kind!r} not in {KINDS}")
+        if self.kind not in KINDS_BY_SOURCE[self.source]:
+            raise ValueError(
+                f"journal kind {self.kind!r} not in {KINDS_BY_SOURCE[self.source]} "
+                f"for source {self.source!r}"
+            )
         if not self.reason or not self.reason.strip():
             raise ValueError("a journal entry must carry a reason")
         datetime.strptime(self.effective_date, "%Y-%m-%d")
@@ -176,25 +213,32 @@ class JournalEntry:
 
     @property
     def entry_id(self) -> str:
-        """Content hash: the same correction is the same entry."""
-        canonical = json.dumps(
-            {
-                "effective_date": self.effective_date,
-                "source": self.source,
-                "kind": self.kind,
-                "reverses_entry_id": self.reverses_entry_id,
-                "postings": sorted(
-                    (p.account, str(p.amount), p.currency) for p in self.postings
-                ),
-                # The before/after NAVs make two identical-delta corrections on
-                # different bases two different entries.
-                "basis": {
-                    k: self.evidence.get(k)
-                    for k in ("nav_before_usd", "nav_after_usd")
-                },
+        """Content hash: the same correction is the same entry.
+
+        An opening balance also hashes its anchor (account and statement
+        date). The key is added for that source only, so every existing
+        correction keeps the id it was stored under.
+        """
+        content: dict[str, object] = {
+            "effective_date": self.effective_date,
+            "source": self.source,
+            "kind": self.kind,
+            "reverses_entry_id": self.reverses_entry_id,
+            "postings": sorted(
+                (p.account, str(p.amount), p.currency) for p in self.postings
+            ),
+            # The before/after NAVs make two identical-delta corrections on
+            # different bases two different entries.
+            "basis": {
+                k: self.evidence.get(k)
+                for k in ("nav_before_usd", "nav_after_usd")
             },
-            sort_keys=True,
-        )
+        }
+        if self.source == SOURCE_OPENING_BALANCE:
+            content["anchor"] = {
+                k: self.evidence.get(k) for k in ("account", "statement_date")
+            }
+        canonical = json.dumps(content, sort_keys=True)
         return "je_" + hashlib.sha256(canonical.encode()).hexdigest()[:32]
 
     def total(self, account_prefix: str) -> Decimal:
@@ -319,11 +363,148 @@ def correction_entry(
     }
     return JournalEntry(
         effective_date=effective_date,
-        source="daily_auto_correct",
+        source=SOURCE_DAILY_AUTO_CORRECT,
         kind=kind,
         reason=reason,
         postings=tuple(postings),
         evidence=ev,
+    )
+
+
+def opening_balance_entry(
+    statement: Mapping[str, object],
+    *,
+    settled_closes: Mapping[str, float | int | str | Decimal | None],
+    closes_date: str,
+    close_source: str,
+    reason: str | None = None,
+) -> JournalEntry:
+    """The ledger's opening balance, anchored on ONE broker statement.
+
+    ``statement`` is a stored crucible-trader broker statement document
+    (``broker_statement.v1``/``v2``: ``account``, ``trading_day``, ``source``,
+    ``positions`` as whole non-zero shares, ``cash_usd``, ``accrued_cash_usd``).
+    Ground truth (alpha-engine-config-I9638 / I10052): IB for shares and cash,
+    Polygon settled data for prices. So each position is valued at
+    ``shares × settled_closes[ticker]``, and ``closes_date`` must be the
+    statement's own trading day.
+
+    Refused rather than guessed (no balancing plugs, policy Rule 8):
+
+    * a document that is not a broker read (``source`` outside
+      :data:`ANCHOR_STATEMENT_SOURCES`) or not a known statement schema;
+    * a statement without a recorded accrual (v1, or v2 with ``None``): an
+      opening book that silently sets accrued interest to zero misstates NAV;
+    * a held position with no finite, positive settled close;
+    * closes from another day than the statement's.
+
+    The share counts and closes go in ``evidence`` (a posting carries no
+    quantity in the aec#12510 shape). The entry balances by construction: the
+    offset to ``equity:opening_balance`` is the negated sum of the asset lines.
+    """
+    version = statement.get("schema_version")
+    if version not in ANCHOR_STATEMENT_SCHEMAS:
+        raise ValueError(
+            f"opening balance needs a broker statement {ANCHOR_STATEMENT_SCHEMAS}, "
+            f"got schema_version {version!r}"
+        )
+    source = statement.get("source")
+    if source not in ANCHOR_STATEMENT_SOURCES:
+        raise ValueError(
+            f"statement source {source!r} is not a broker read {ANCHOR_STATEMENT_SOURCES}; "
+            "a book rebuilt from fills or from the ledger cannot anchor the ledger"
+        )
+    account = statement.get("account")
+    statement_date = statement.get("trading_day")
+    if not isinstance(account, str) or not account:
+        raise ValueError("statement carries no account")
+    if not isinstance(statement_date, str):
+        raise ValueError("statement carries no trading_day")
+    datetime.strptime(statement_date, "%Y-%m-%d")
+    if closes_date != statement_date:
+        raise ValueError(
+            f"settled closes are for {closes_date}, the statement is for {statement_date}; "
+            "the anchor values the statement's own day"
+        )
+    if not close_source or not close_source.strip():
+        raise ValueError("close_source must name where the settled closes came from")
+    accrued = statement.get("accrued_cash_usd")
+    if not isinstance(accrued, (int, float, str, Decimal)):
+        raise ValueError(
+            f"{version} statement for {account} {statement_date} has no recorded accrual "
+            "(accrued_cash_usd); anchor on a broker_statement.v2 that records one"
+        )
+    cash = statement.get("cash_usd")
+    if not isinstance(cash, (int, float, str, Decimal)):
+        raise ValueError("statement carries no cash_usd")
+
+    raw_positions: object = statement.get("positions")
+    if raw_positions is None:
+        raw_positions = {}
+    if not isinstance(raw_positions, Mapping):
+        raise ValueError("statement positions are not a ticker -> shares mapping")
+    positions = cast("Mapping[object, object]", raw_positions)
+    shares_by_ticker: dict[str, int] = {}
+    for ticker, shares in positions.items():
+        if (
+            not isinstance(ticker, str)
+            or not ticker
+            or not isinstance(shares, int)
+            or isinstance(shares, bool)
+            or shares == 0
+        ):
+            raise ValueError(f"position {ticker!r}={shares!r} is not whole non-zero shares")
+        shares_by_ticker[ticker] = shares
+    missing = sorted(t for t in shares_by_ticker if settled_closes.get(t) is None)
+    if missing:
+        raise ValueError(
+            f"no settled close on {closes_date} for held position(s): {', '.join(missing)}"
+        )
+
+    closes: dict[str, str] = {}
+    postings: list[Posting] = []
+    for ticker in sorted(shares_by_ticker):
+        raw = settled_closes[ticker]
+        if raw is None:  # pragma: no cover - refused above as missing
+            raise ValueError(f"no settled close for {ticker}")
+        close = Decimal(repr(raw)) if isinstance(raw, float) else Decimal(str(raw))
+        if not close.is_finite() or close <= 0:
+            raise ValueError(f"settled close for {ticker} is {raw!r}, not a positive price")
+        closes[ticker] = str(close)
+        mv = to_cents(close * shares_by_ticker[ticker])
+        if mv != 0:
+            postings.append(Posting(ACCOUNT_SECURITIES_PREFIX + ticker, mv))
+    for account_name, value in ((ACCOUNT_CASH, cash), (ACCOUNT_ACCRUED, accrued)):
+        amount = to_cents(value)
+        if amount != 0:
+            postings.append(Posting(account_name, amount))
+    net = sum((p.amount for p in postings), Decimal("0"))
+    if net == 0:
+        raise ValueError(
+            f"statement for {account} {statement_date} nets to zero; "
+            "there is nothing to anchor"
+        )
+    postings.append(Posting(ACCOUNT_OPENING_BALANCE, -net))
+    return JournalEntry(
+        effective_date=statement_date,
+        source=SOURCE_OPENING_BALANCE,
+        kind=KIND_STATEMENT_ANCHOR,
+        reason=reason
+        or f"opening balance anchored on the {statement_date} {source} statement for {account}",
+        postings=tuple(postings),
+        evidence={
+            "account": account,
+            "statement_date": statement_date,
+            "statement_schema_version": version,
+            "statement_source": source,
+            "shares": dict(sorted(shares_by_ticker.items())),
+            "settled_closes": closes,
+            "closes_date": closes_date,
+            "close_source": close_source,
+            "nav_before_usd": "0.00",
+            "nav_after_usd": str(net),
+            "nav_change_usd": str(net),
+        },
     )
 
 
@@ -375,6 +556,11 @@ CREATE TRIGGER IF NOT EXISTS ledger_entries_balanced_at_post
         HAVING SUM(CAST(ROUND(CAST(amount AS REAL) * 100) AS INTEGER)) != 0
       )
     BEGIN SELECT RAISE(ABORT, 'ledger entry does not balance: postings must sum to zero per currency'); END;
+CREATE TRIGGER IF NOT EXISTS ledger_single_opening_balance
+    BEFORE INSERT ON ledger_journal_entries
+    WHEN NEW.source = 'opening_balance'
+     AND EXISTS (SELECT 1 FROM ledger_journal_entries WHERE source = 'opening_balance')
+    BEGIN SELECT RAISE(ABORT, 'ledger already has an opening balance; a ledger has one anchor'); END;
 """
 
 #: The triggers that make the store, not the caller, refuse an unbalanced or
@@ -383,6 +569,9 @@ STORE_GUARD_TRIGGERS: tuple[str, ...] = (
     "ledger_postings_sealed_once_posted",
     "ledger_entries_balanced_at_post",
 )
+
+#: The trigger that keeps the ledger on ONE anchor (invariant 7).
+OPENING_BALANCE_GUARD_TRIGGER = "ledger_single_opening_balance"
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
