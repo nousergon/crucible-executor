@@ -183,3 +183,71 @@ def test_load_path_consults_the_audit(monkeypatch, caplog, tmp_path):
     assert any("EXPECTED" in r.getMessage() for r in caplog.records)
     main._executor_params_loaded = False
     main._executor_params_cache = None
+
+
+# ── alpha-engine-config-I12779: the 2026-10-10 values are FIXED BY RULING ──
+
+
+def test_ruled_object_is_declared_warning_not_error(caplog):
+    """The one object the ruling names reads as declared, even with no audit."""
+    etag = '"' + main._EXECUTOR_PARAMS_FIXED_BY_RULING["etag"] + '"'
+    with caplog.at_level(logging.WARNING):
+        main._check_executor_params_staleness(_stale(), etag=etag)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("DECLARED FIXED BY RULING" in m and "I12779" in m for m in warns)
+
+
+def test_ruled_object_does_not_need_the_audit():
+    """The declaration stands on the object identity; the retired audit is not read."""
+    s3 = MagicMock()
+    main._check_executor_params_staleness(
+        _stale(), s3=s3, bucket="b", etag=main._EXECUTOR_PARAMS_FIXED_BY_RULING["etag"],
+    )
+    s3.get_object.assert_not_called()
+
+
+def test_any_other_object_is_not_covered_by_the_ruling(caplog):
+    """A different write is not the ruled object: the normal ERROR path stands."""
+    old_audit = datetime.now(UTC) - timedelta(hours=main._EXECUTOR_PARAMS_STALE_HOURS + 1)
+    s3 = _s3_with_audit(_audit("blocked"), old_audit)
+    with caplog.at_level(logging.ERROR):
+        main._check_executor_params_staleness(
+            _stale(), s3=s3, bucket="b", etag='"0123456789abcdef0123456789abcdef"',
+        )
+    errs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("STALE config/executor_params.json" in m for m in errs)
+    assert not any("DECLARED FIXED" in r.getMessage() for r in caplog.records)
+
+
+def test_missing_etag_is_not_covered_by_the_ruling(caplog):
+    with caplog.at_level(logging.ERROR):
+        main._check_executor_params_staleness(_stale(), etag=None)
+    assert any("STALE" in r.getMessage() for r in caplog.records)
+
+
+def test_load_path_passes_the_etag_and_applies_the_same_values(monkeypatch, caplog, tmp_path):
+    """End-to-end: the ruled object loads unchanged and does not page."""
+    main._executor_params_loaded = False
+    main._executor_params_cache = None
+    monkeypatch.setattr(main, "_EXECUTOR_PARAMS_CACHE_PATH", tmp_path / "executor_params_cache.json")
+    resp = _make_s3_response({"min_score": 75, "max_position_pct": 0.10}, _stale())
+    resp["ETag"] = '"' + main._EXECUTOR_PARAMS_FIXED_BY_RULING["etag"] + '"'
+    mock_s3 = MagicMock()
+
+    def _get(Bucket, Key):  # noqa: N803
+        assert Key == "config/executor_params.json", "the ruled object must not need the audit"
+        return resp
+
+    mock_s3.get_object.side_effect = _get
+    mock_boto3 = MagicMock()
+    mock_boto3.client.return_value = mock_s3
+    monkeypatch.setitem(sys.modules, "boto3", mock_boto3)
+    with caplog.at_level(logging.WARNING):
+        params = main._load_executor_params_from_s3("alpha-engine-research")
+    assert params is not None
+    assert params.get("min_score") == 75 and params.get("max_position_pct") == 0.10
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("DECLARED FIXED BY RULING" in r.getMessage() for r in caplog.records)
+    main._executor_params_loaded = False
+    main._executor_params_cache = None

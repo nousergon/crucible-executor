@@ -178,6 +178,10 @@ _EXECUTOR_PARAMS_KNOWN_METADATA_KEYS = (
 # grace_period_cycles=2 for the central config_executor_params freshness-
 # monitor row this assertion complements as an independent consumer-side
 # signal (config#1724 doctrine), not a replacement for it.
+# Since 2026-10-28 the weekly writer is retired and the live values are FIXED
+# BY RULING (alpha-engine-config-I12779): the threshold is unchanged, and the
+# one object the ruling names is reported as a declared state, not a fault --
+# see _EXECUTOR_PARAMS_FIXED_BY_RULING below.
 _EXECUTOR_PARAMS_STALE_HOURS = 24 * 7 * 2
 
 
@@ -235,6 +239,35 @@ def _alert_regime_leg_blind(leg: str, exc: BaseException, run_date: str) -> None
 _APPLY_AUDIT_KEY = "config/apply_audit/latest.json"
 _DECLARED_NO_WRITE_OUTCOMES = frozenset({"blocked", "insufficient", "disabled"})
 
+# alpha-engine-config-I12779: the values are FIXED BY RULING (Brian,
+# 2026-10-28). The v1 weekly optimizer that re-tuned this file is retired
+# (`alpha-engine-saturday` disabled 2026-10-28, aec-I12758), so the pointer is
+# frozen at its 2026-10-10 17:17:54Z write by decision, not by fault, and the
+# Evaluator's apply audit -- the I12697 explanation above -- stops being
+# refreshed too. Executor parameters become strategy arms graded in the arena
+# in crucible v2 phase 5 (from 2026-11-16); any change that reaches the live
+# book stays Brian's.
+#
+# This is a DECLARED state bound to ONE object, never a mute. It matches only
+# while the live key carries exactly this ETag (the content hash of the ruled
+# values); any other write -- a phase-5 arm promotion, an operator rollback, a
+# corrupted overwrite -- falls straight back to the checks above. It changes
+# nothing the executor applies: the same object is loaded through the same
+# _PARAM_MAP validation either way. The values and their provenance are
+# recorded in the private config repo against I12779, and the matching
+# ARTIFACT_REGISTRY `config_executor_params` row carries a `declared_off`
+# block that clears on the phase-5 milestone.
+_EXECUTOR_PARAMS_FIXED_BY_RULING: dict[str, str] = {
+    "etag": "7c507292c216497fac4298ce05b4551e",
+    "last_modified": "2026-10-10T17:17:54Z",
+    "ruling": "alpha-engine-config-I12779",
+    "ruled": "2026-10-28",
+}
+
+
+def _normalise_etag(etag: object) -> str:
+    return etag.strip().strip('"') if isinstance(etag, str) else ""
+
 
 class _Readable(Protocol):
     def read(self) -> bytes: ...
@@ -280,18 +313,35 @@ def _check_executor_params_staleness(
     last_modified: datetime | None,
     s3: _S3ObjectReader | None = None,
     bucket: str | None = None,
+    etag: object = None,
 ) -> None:
     """Best-effort staleness signal for ``config/executor_params.json``.
 
     ERROR when ``last_modified`` is older than ``_EXECUTOR_PARAMS_STALE_HOURS``
     and the Evaluator's apply audit does not explain it; WARNING when the
     audit is fresh and declares the executor_params loop did not write
-    (alpha-engine-config-I12697). Never raises, never blocks trading.
+    (alpha-engine-config-I12697), or when ``etag`` is exactly the object
+    declared fixed by ruling (alpha-engine-config-I12779). Never raises,
+    never blocks trading.
     """
     if last_modified is None:
         return
     age_hours = (datetime.now(UTC) - last_modified).total_seconds() / 3600.0
     if age_hours <= _EXECUTOR_PARAMS_STALE_HOURS:
+        return
+
+    fixed = _EXECUTOR_PARAMS_FIXED_BY_RULING
+    if _normalise_etag(etag) == fixed["etag"]:
+        logger.warning(
+            "config/executor_params.json last modified %.1fh ago (> %dh) -- "
+            "DECLARED FIXED BY RULING, not a producer fault: the live object "
+            "is the %s write (etag %s), whose values were fixed by ruling %s "
+            "on %s; the v1 optimizer that re-tuned it is retired and executor "
+            "parameters become arena-graded arms in crucible v2 phase 5. Any "
+            "other write ends this declaration.",
+            age_hours, _EXECUTOR_PARAMS_STALE_HOURS, fixed["last_modified"],
+            fixed["etag"], fixed["ruling"], fixed["ruled"],
+        )
         return
 
     explained = ""
@@ -363,7 +413,7 @@ def _load_executor_params_from_s3(bucket: str) -> dict | None:
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
         data = json.loads(obj["Body"].read())
-        _check_executor_params_staleness(obj.get("LastModified"), s3=s3, bucket=bucket)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportArgumentType] -- boto3 client and response are untyped
+        _check_executor_params_staleness(obj.get("LastModified"), s3=s3, bucket=bucket, etag=obj.get("ETag"))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportArgumentType] -- boto3 client and response are untyped
         # Advisory schema validation (log warnings, never block)
         _unknown_keys = [
             k for k in data
