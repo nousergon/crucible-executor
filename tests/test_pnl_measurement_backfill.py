@@ -201,6 +201,61 @@ def test_vendor_anchor_excuses_only_a_ruled_non_session_declaration():
     assert coverage[0]["missing_sessions"] == ["2026-04-03", "2026-04-06"]
 
 
+def test_drift_is_not_evaluated_when_the_vendor_lacks_the_last_session():
+    """alpha-engine-config-I12583, the 2026-10-23 aec#9613 dry run: the vendor
+    had no bar for the book's last session, so its index stopped a session
+    early and the drift arm compared two different windows (+36.6bp read, true
+    gap -0.03bp). The drift must not be a number, and must not be a pass."""
+    rows = [_row("2026-10-20", 100.0, None), _row("2026-10-21", 101.0, 1.0),
+            _row("2026-10-22", 99.0, -1.9802)]
+    vendor = {"2026-10-20": 100.0, "2026-10-21": 101.0}      # no 10-22 bar yet
+    out = check_benchmark_vendor_anchor(rows, vendor_closes=vendor)
+    kinds = [b["kind"] for b in out]
+    assert "benchmark_anchor_drift" not in kinds
+    unevaluated = [b for b in out if b["kind"] == "benchmark_anchor_unevaluated"]
+    assert len(unevaluated) == 1
+    assert unevaluated[0]["run_date"] == "2026-10-22"
+    assert unevaluated[0]["vendor_last_session"] == "2026-10-21"
+    assert "NOT EVALUATED" in unevaluated[0]["message"]
+    # The missing close is still its own coverage finding.
+    assert "benchmark_vendor_coverage" in kinds
+
+
+def test_drift_is_still_measured_once_the_vendor_publishes_the_last_session():
+    rows = [_row("2026-10-20", 100.0, None), _row("2026-10-21", 101.0, 1.0),
+            _row("2026-10-22", 99.0, 5.0)]               # stored 5.0 is wrong
+    vendor = {"2026-10-20": 100.0, "2026-10-21": 101.0, "2026-10-22": 99.0}
+    kinds = [b["kind"] for b in check_benchmark_vendor_anchor(rows, vendor_closes=vendor)]
+    assert "benchmark_anchor_drift" in kinds
+    assert "benchmark_anchor_unevaluated" not in kinds
+
+
+def test_a_declared_last_session_is_not_unevaluated():
+    rows = [_row("2026-04-01", 100.0, None), _row("2026-04-02", 100.0, 0.0),
+            _row("2026-04-03", 100.0, 0.0)]
+    out = check_benchmark_vendor_anchor(
+        rows, vendor_closes={"2026-04-01": 100.0, "2026-04-02": 100.0},
+        declared_non_sessions=[{"date": "2026-04-03",
+                                "ruling": "alpha-engine-config-I9613"}],
+    )
+    assert "benchmark_anchor_unevaluated" not in [b["kind"] for b in out]
+
+
+def test_audit_history_keeps_an_unevaluated_drift_out_of_the_breach_count():
+    rows = [_row("2026-10-20", 100.0, None), _row("2026-10-21", 101.0, 1.0),
+            _row("2026-10-22", 99.0, -1.9802)]
+    vendor = {"2026-10-20": 100.0, "2026-10-21": 101.0}
+    audit = B.audit_history(rows, vendor_closes=vendor)
+    assert [b["kind"] for b in audit["benchmark_vendor_anchor_breaches"]] == [
+        "benchmark_vendor_coverage"
+    ]
+    assert len(audit["benchmark_vendor_anchor_unevaluated"]) == 1
+    assert "NOT EVALUATED" in audit["benchmark_vendor_anchor_status"]
+    measured = B.audit_history(rows, vendor_closes={**vendor, "2026-10-22": 99.0})
+    assert measured["benchmark_vendor_anchor_unevaluated"] == []
+    assert measured["benchmark_vendor_anchor_status"] == "evaluated"
+
+
 def test_vendor_anchor_not_evaluated_is_not_a_pass():
     audit = B.audit_history(
         [_row("2026-03-09", 100.0, None), _row("2026-03-10", 101.0, 1.0)],

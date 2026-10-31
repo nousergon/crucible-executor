@@ -178,6 +178,12 @@ def _run(fake, *argv, now=OK_NOW):
     (datetime(2026, 10, 22, 11, 0, tzinfo=UTC), True),    # 07:00 ET preopen buffer: the 11:00Z close
     (datetime(2026, 10, 22, 15, 0, tzinfo=UTC), True),    # market hours
     (datetime(2026, 10, 24, 15, 0, tzinfo=UTC), False),   # Saturday
+    # EST from Sun 2026-11-01: the same wall-clock windows sit an hour later in UTC.
+    (datetime(2026, 11, 2, 11, 30, tzinfo=UTC), False),   # Mon 06:30 EST (07:30 under EDT)
+    (datetime(2026, 11, 2, 12, 0, tzinfo=UTC), True),     # Mon 07:00 EST preopen buffer
+    (datetime(2026, 11, 2, 20, 45, tzinfo=UTC), True),    # Mon 15:45 EST, in session
+    (datetime(2026, 11, 3, 2, 29, tzinfo=UTC), True),     # Mon 21:29 EST: postclose / EOD timer
+    (datetime(2026, 11, 3, 2, 30, tzinfo=UTC), False),    # the 02:30Z opening under EST
 ])
 def test_refusal_window_is_the_0130_1100z_run_window(utc, refused):
     assert (s.refusal_reason(utc) is not None) is refused

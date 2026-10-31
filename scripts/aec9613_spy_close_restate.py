@@ -139,7 +139,7 @@ def refusal_reason(now: datetime) -> str | None:
     if 45 <= hm < 75:
         return "00:45-01:15 ET: alpha-engine-stop-trading backstop window"
     if weekday and 7 * 60 <= hm < 16 * 60 + 30:
-        return "weekday 07:00-16:30 ET (market hours 13:30-20:30Z plus the preopen buffer)"
+        return "weekday 07:00-16:30 ET (market hours 09:30-16:00 ET plus the preopen buffer)"
     if weekday and 16 * 60 + 30 <= hm < 21 * 60 + 30:
         return "weekday 16:30-21:30 ET: postclose pipelines and the 17:05 EOD timer"
     return None
