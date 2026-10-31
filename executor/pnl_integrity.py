@@ -1792,7 +1792,32 @@ def check_benchmark_vendor_anchor(
 
     first, last = str(dated[0]["date"]), str(dated[-1]["date"])
     sessions = sorted(d for d in vendor_closes if first <= d <= last)
-    if len(sessions) >= 2:
+    if len(sessions) >= 2 and last not in vendor_closes and last not in declared:
+        # alpha-engine-config-I12583. The vendor has no bar yet for the book's
+        # LAST session (Polygon's free tier publishes after the postclose), so
+        # the vendor index stops a session early while the stored chain does
+        # not. A drift over two different windows is not a measurement: on the
+        # 2026-10-23 aec#9613 dry run it read +36.6bp where the true end-to-end
+        # gap was -0.03bp, and the same mismatch can hide a real drift. So the
+        # drift arm reports NOT EVALUATED — neither a breach nor a pass — and
+        # says when it can be measured. The missing close itself is still the
+        # coverage breach above; only the drift NUMBER is withheld.
+        breaches.append({
+            "kind": "benchmark_anchor_unevaluated",
+            "severity": "unevaluated",
+            "run_date": last,
+            "window": [first, last],
+            "vendor_last_session": sessions[-1],
+            "reason": f"vendor has no close for the last persisted session {last}",
+            "message": (
+                f"Benchmark anchor drift NOT EVALUATED over {first} → {last}: "
+                f"the vendor's series ends at {sessions[-1]}, so its total "
+                f"return and the stored chain cover different windows. Re-run "
+                f"once the vendor publishes {last}; this is an ABSENT "
+                "measurement, not a clean one."
+            ),
+        })
+    elif len(sessions) >= 2:
         index = 1.0
         for a, b in zip(sessions, sessions[1:], strict=False):
             c0, c1 = _f(vendor_closes[a]), _f(vendor_closes[b])
