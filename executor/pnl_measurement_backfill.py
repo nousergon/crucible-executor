@@ -715,6 +715,20 @@ def audit_history(
     else:
         anchor_breaches = []
         anchor_status = "NOT EVALUATED — no vendor close series supplied"
+    # A drift arm the vendor's window could not measure (alpha-engine-config-
+    # I12583) is NOT a breach and NOT a pass: it leaves the breach list and the
+    # breach count, and the status says so.
+    anchor_unevaluated = [
+        b for b in anchor_breaches if b.get("kind") == "benchmark_anchor_unevaluated"
+    ]
+    anchor_breaches = [
+        b for b in anchor_breaches if b.get("kind") != "benchmark_anchor_unevaluated"
+    ]
+    if anchor_unevaluated:
+        anchor_status = (
+            "evaluated; anchor drift NOT EVALUATED — "
+            + anchor_unevaluated[0]["reason"]
+        )
 
     residual_breaches: list[dict[str, Any]] = []
     mark_breaches: list[dict[str, Any]] = []
@@ -806,6 +820,7 @@ def audit_history(
         "benchmark_closure": bench,
         "benchmark_vendor_anchor_status": anchor_status,
         "benchmark_vendor_anchor_breaches": anchor_breaches,
+        "benchmark_vendor_anchor_unevaluated": anchor_unevaluated,
         "session_axis_coverage_status": coverage_status,
         "session_axis_coverage": coverage,
         "residual_breaches": residual_breaches,
