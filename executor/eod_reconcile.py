@@ -3287,14 +3287,7 @@ def run(
         })
     else:
         for breach in anchor_breaches:
-            # A drift the vendor's window could not measure (alpha-engine-
-            # config-I12583) is a named absence: recorded with its own
-            # `unevaluated` severity, never paged, never read as clean.
-            unevaluated = breach.get("kind") == "benchmark_anchor_unevaluated"
-            if unevaluated:
-                logger.warning("Benchmark vendor anchor: %s", breach["message"])
-            else:
-                _log_paged("BENCHMARK ANCHOR (observe): %s", breach["message"])
+            _log_paged("BENCHMARK ANCHOR (observe): %s", breach["message"])
             data_warnings.append(breach["message"])
             observe_records.append({"severity": "observe", **breach})
         if not anchor_breaches:
