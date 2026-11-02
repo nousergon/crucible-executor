@@ -27,7 +27,6 @@ from nousergon_lib.trading_calendar import previous_trading_day
 
 from executor import reference_rate
 from executor.dividends import (
-    QQQ_TICKER,
     SPY_TICKER,
     accrue_position_dividends,
     fetch_ex_dividends,
@@ -826,45 +825,6 @@ def _spy_close(run_date: str, config: dict | None = None) -> float:
         )
     close = float(matches["Close"].iloc[-1])
     logger.info("[data_source=arcticdb] SPY close for %s: $%.2f", run_date, close)
-    return close
-
-
-def _benchmark_close_or_none(
-    symbol: str, run_date: str | None, config: dict[str, object] | None = None,
-) -> float | None:
-    """Settled ArcticDB ``macro`` close of a RECORD-ONLY benchmark, or None.
-
-    Same source and same read as :func:`_spy_close` (alpha-engine-config-
-    I13096), but it never raises: QQQ feeds no return, alpha, NAV or risk
-    figure in this reconcile, only the persisted ``qqq_close`` the perf
-    tracker reads, so its absence is a NULL column and a warning — never a
-    failed EOD.
-    """
-    try:
-        from executor.price_cache import (
-            _open_macro_library,  # pyright: ignore[reportPrivateUsage] -- same reader _spy_close uses
-        )
-        bucket = str((config or {}).get("trades_bucket", "alpha-engine-research"))
-        df = pd.DataFrame(_open_macro_library(bucket).read(symbol).data)  # pyright: ignore[reportUnknownMemberType] -- arcticdb read is untyped
-        if df.empty or "Close" not in df.columns:
-            raise ValueError(f"ArcticDB {symbol} frame empty or missing Close column")
-        # Date-string match on the index, the same day-level comparison
-        # _spy_close makes with .normalize(), kept in plain Python types.
-        target = str(run_date)[:10]
-        index_days: list[str] = [str(ts)[:10] for ts in df.index.astype(str).tolist()]  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType] -- pandas Index is untyped
-        close_values: list[float] = [float(v) for v in df["Close"].tolist()]  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType] -- pandas Series is untyped
-        matches = [v for day, v in zip(index_days, close_values, strict=True) if day == target]
-        if not matches:
-            raise ValueError(f"no {symbol} close for {run_date}")
-        close = matches[-1]
-    except Exception as e:  # noqa: BLE001 — record-only column; recorded as NULL + warning
-        logger.warning(
-            "[data_source=arcticdb] %s close for %s unavailable (%s) — "
-            "%s_close persisted NULL (record-only benchmark).",
-            symbol, run_date, e, symbol.lower(),
-        )
-        return None
-    logger.info("[data_source=arcticdb] %s close for %s: $%.2f", symbol, run_date, close)
     return close
 
 
@@ -1729,11 +1689,6 @@ def run(
     if dividend_warning:
         data_warnings.append(dividend_warning)
     spy_dividend_per_share = ex_dividends.get(SPY_TICKER, 0.0)
-    # Record-only second benchmark (alpha-engine-config-I13096): sourced the
-    # same way as SPY's close and distribution, persisted beside them, read by
-    # nothing in this reconcile.
-    qqq_dividend_per_share = ex_dividends.get(QQQ_TICKER, 0.0)
-    qqq_price = _benchmark_close_or_none(QQQ_TICKER, run_date, config)  # pyright: ignore[reportUnknownArgumentType] -- the same untyped run_date/config _spy_close receives
 
     # SPY TOTAL return, not price return (alpha-engine-config-I8188, defect 3).
     # The portfolio leg is NAV-based and therefore already total return, so
@@ -3092,8 +3047,6 @@ def run(
         "daily_return_gross_pct": nav_reconciliation.get("daily_return_gross_pct"),
         "dividend_accrual_available": dividend_accrual_available,
         "spy_dividend_per_share": spy_dividend_per_share,
-        "qqq_close": qqq_price,
-        "qqq_dividend_per_share": qqq_dividend_per_share,
         "dividend_timing_usd": dividend_timing_usd,
         "dividend_receivable_usd": dividend_receivable,
         "integrity_breach_json": (
