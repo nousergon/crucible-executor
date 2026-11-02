@@ -1,0 +1,22 @@
+[Unit]
+Description=Page that v2 trader unit %i failed (alpha-engine-config-I12353)
+# Started by systemd through OnFailure= on every alpha-engine-trader-*.service.
+# It never starts, retries or touches the trader: it reads the failed unit's
+# state and last 50 journal lines and publishes one ops alert through the
+# executor's existing path (SNS via nousergon_lib.alerts, then flow-doctor's
+# Telegram topic). It runs from the EXECUTOR's venv, not the trader's, so the
+# venv build that broke the trader on 2026-10-14/15 cannot break this page too.
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine
+ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.trader_unit_failed %i
+TimeoutStartSec=5min
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+Environment=AWS_REGION=us-east-1
+Environment=ALPHA_ENGINE_JSON_LOGS=1
+Environment=FLOW_DOCTOR_ENABLED=1
+Environment=ALPHA_ENGINE_DEPLOYED=1

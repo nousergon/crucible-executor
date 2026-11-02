@@ -79,8 +79,14 @@ def _trader_files() -> list[Path]:
     return sorted(SYSTEMD.glob("alpha-engine-trader-*")) + [PROVISION]
 
 
+#: The failure notifier (alpha-engine-config-I12353): a systemd template the
+#: four trader units name in ``OnFailure=``. Not a trader unit and has no timer.
+FAILURE_NOTIFIER = "alpha-engine-trader-failed@"
+EXECUTOR_PYTHON = "/home/ec2-user/alpha-engine/.venv/bin/python"
+
+
 def test_every_trader_unit_ships_as_a_service_and_timer_pair() -> None:
-    shipped = {p.stem for p in SYSTEMD.glob("alpha-engine-trader-*")}
+    shipped = {p.stem for p in SYSTEMD.glob("alpha-engine-trader-*")} - {FAILURE_NOTIFIER}
     assert shipped == set(TRADER_UNITS)
     for stem in TRADER_UNITS:
         assert (SYSTEMD / f"{stem}.service").is_file()
@@ -161,6 +167,32 @@ def test_the_pin_smoke_runs_after_the_session_and_before_the_close() -> None:
     )
     smoke = _start_minutes("alpha-engine-trader-pin-smoke")
     assert session_end < smoke < 16 * 60
+
+
+@pytest.mark.parametrize("stem", sorted(TRADER_UNITS))
+def test_every_trader_unit_pages_through_the_notifier_when_it_fails(stem: str) -> None:
+    """alpha-engine-config-I12353: four runs ended `failed` on 2026-10-14/15
+    and nothing paged, because each died before writing the record the sweep
+    reads. `%n` hands the notifier the failed unit's own full name."""
+    unit = _unit(SYSTEMD / f"{stem}.service")
+    assert unit["Unit"]["OnFailure"] == f"{FAILURE_NOTIFIER}%n.service"
+
+
+def test_the_notifier_only_reports_from_the_executor_venv() -> None:
+    """It runs from the executor's venv, never the trader's (the venv build
+    that broke the trader must not break the page), and it changes nothing
+    about the trader: no ExecStartPre, no provisioning, no trader env file."""
+    path = SYSTEMD / f"{FAILURE_NOTIFIER}.service"
+    unit = _unit(path)
+    service = unit["Service"]
+    assert service["Type"] == "oneshot"
+    assert service["User"] == "ec2-user"
+    assert service["ExecStart"] == f"{EXECUTOR_PYTHON} -m executor.trader_unit_failed %i"
+    assert "ExecStartPre" not in service
+    assert "EnvironmentFile" not in service
+    assert "OnFailure" not in unit["Unit"]  # a failed notifier must not recurse
+    assert TRADER_CHECKOUT not in path.read_text()
+    assert not list(SYSTEMD.glob(f"{FAILURE_NOTIFIER}*.timer"))
 
 
 def test_the_calendar_specs_parse(tmp_path: Path) -> None:
