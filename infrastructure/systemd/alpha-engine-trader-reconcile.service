@@ -2,6 +2,10 @@
 Description=v2 trader broker reconciliation (alpha-engine-config-I11071) — trader.reconcile, a separate system from the v1 units in this directory
 After=ibgateway.service network-online.target
 Wants=ibgateway.service network-online.target
+# alpha-engine-config-I12353: a run that ends failed, wherever it died (provisioning,
+# the pinned venv build, the trader), pages through alpha-engine-trader-failed@.
+# The notifier only reports; it never retries or touches this unit.
+OnFailure=alpha-engine-trader-failed@%n.service
 
 [Service]
 Type=oneshot

@@ -2,6 +2,10 @@
 Description=v2 trader shadow books for every active S arm (alpha-engine-config-I11545) — crucible_trader.shadow_books_daily, never connects to the broker
 After=network-online.target alpha-engine-trader-session.service
 Wants=network-online.target
+# alpha-engine-config-I12353: a run that ends failed, wherever it died (provisioning,
+# the pinned venv build, the trader), pages through alpha-engine-trader-failed@.
+# The notifier only reports; it never retries or touches this unit.
+OnFailure=alpha-engine-trader-failed@%n.service
 
 [Service]
 Type=oneshot
