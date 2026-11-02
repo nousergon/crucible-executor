@@ -113,7 +113,10 @@ nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergo
 # matched) and telegram.send_message redacts its text before sending. The lock
 # also takes flow-doctor 0.19.5 (flow-doctor-PR132), which scrubs error_message
 # and captured logs, not only the traceback, before any notifier sees them.
-krepis>=0.59.88
+# >=0.59.89 (alpha-engine-config-I13042, krepis-PR282): redact_secrets also runs
+# on the SNS leg of alerts.publish and in email_sender.send_email, with an
+# inventory test that fails when a new outbound alert path is uncovered.
+krepis>=0.59.89
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
