@@ -31,18 +31,24 @@
 # back to UNREPORTED only if the executor genuinely stops writing
 # `intraday/nav.json` — which is the finding, not a defect in the row.
 #
-# ── Why the binding cadence is 1440 and the row cadence is a SYMBOL ────────
+# ── Why the binding cadence is the SAME symbol as the row's ────────────────
 #
-# §9.6 (`staleness_honesty`) audits a row's DECLARED cadence against the
-# `as_of` an observation supplied, and counts a violation only when the
-# rendered state has NOT already disclosed its own age. `weekday_sf`
-# translates to `minutes_since(most recent trading day) + 1440`, so its
-# smallest possible value is 1440 (`console/calendar_cadence.py`). Setting
-# the binding cadence to that floor guarantees the DRIVER flips to `MISSED`
-# — a disclosed state — strictly before §9.6 could ever count this row, since
-# §9.6's own threshold adds the observing source's poll cadence on top of the
-# same product. A weekday producer idle on Sunday stays HEALTHY, which is
-# what the calendar symbol exists for.
+# The binding used to carry a literal `cadence_minutes: 1440`, the floor of
+# `weekday_sf`'s translation (`minutes_since(most recent trading day) +
+# 1440`, `console/calendar_cadence.py`), chosen so the DRIVER would disclose
+# `MISSED` before §9.6 (`staleness_honesty`) could count the row. A literal
+# cannot see a weekend: the book is written last on Friday ~20:00Z, so with
+# the 1.5x staleness factor the driver read `MISSED` from Saturday ~08:00Z to
+# Monday's pre-open, every week. Measured on the 2026-11-02 00:59Z console
+# snapshot: `crucible-executor-book` MISSED on a correctly idle Sunday
+# (alpha-engine-config-I12991's console lane). The console's `document-fields`
+# driver has accepted a calendar symbol on a binding since nousergon-console
+# #211 (2026-10-30), through the same translator the row uses, so the binding
+# now declares `cadence: weekday_sf`. A missed trading day still renders
+# `MISSED`: the ceiling is measured from the most recent trading day, not from
+# the last write. And since the driver and §9.6 now evaluate the same ceiling,
+# and §9.6 adds the observing source's poll cadence on top, the driver still
+# discloses its own age first.
 
 component_id: crucible-executor-book
 owning_repo: crucible-executor
@@ -236,10 +242,10 @@ metrics:
           book_as_of:
             path: timestamp
             render: text
-    # The floor of `weekday_sf`'s own translation — see the header. Declared
-    # because without a cadence staleness is not computable and the console
-    # says so rather than assuming fresh (§5.2).
-    cadence_minutes: 1440
+    # The row's own calendar symbol — see the header. Declared because
+    # without a cadence staleness is not computable and the console says so
+    # rather than assuming fresh (§5.2).
+    cadence: weekday_sf
 
 # ── Artifacts: the session series ──────────────────────────────────────────
 #

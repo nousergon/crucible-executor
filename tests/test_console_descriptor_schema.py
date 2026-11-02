@@ -163,9 +163,16 @@ def test_metrics_carries_a_document_fields_observation():
     assert len(doc_bindings) == 1, "expected exactly one document-fields metrics binding"
     binding = doc_bindings[0]
     assert len(binding["documents"]) == 3
-    assert binding["cadence_minutes"] > 0, (
-        "without a cadence staleness is not computable (console-policy §5.2)"
-    )
+    # Without a cadence staleness is not computable (console-policy §5.2).
+    # It must be the row's own calendar SYMBOL, never a literal: the book is
+    # idle from Friday's close to Monday's pre-open, and a literal minute
+    # count read that correctly idle weekend as MISSED every week (measured
+    # 2026-11-02, alpha-engine-config-I12991). A literal would also SHADOW the
+    # symbol, because the console's `document-fields` driver lets a literal
+    # win (`console/drivers/document_fields.py::_cadence_seconds`).
+    assert binding.get("cadence") == d["cadence"] == "weekday_sf"
+    for literal in ("cadence_seconds", "cadence_minutes", "cadence_hours"):
+        assert literal not in binding, f"{literal} would shadow cadence: weekday_sf"
 
 
 def test_every_bound_key_is_a_fixed_pointer():
