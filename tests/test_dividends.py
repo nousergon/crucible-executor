@@ -186,7 +186,7 @@ class TestFetch:
         assert available is False
         assert "2026-09-04" in warning
         assert "NO held ticker" in warning
-        assert "4 name(s)" in warning  # the book plus SPY
+        assert "5 name(s)" in warning  # the book plus the SPY and QQQ benchmarks
         assert "unattributed residual" in warning
 
     def test_malformed_rows_are_skipped(self):
