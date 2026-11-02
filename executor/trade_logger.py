@@ -220,6 +220,13 @@ _EOD_MIGRATIONS = [
     "ALTER TABLE eod_pnl ADD COLUMN nav_settled_usd REAL",
     "ALTER TABLE eod_pnl ADD COLUMN nav_basis_diff_usd REAL",
     "ALTER TABLE eod_pnl ADD COLUMN nav_basis_diff_bps REAL",
+    # Second benchmark, record-only (alpha-engine-config-I13096): QQQ's settled
+    # ArcticDB macro close and the per-share distribution going ex in the
+    # row's interval, sourced exactly as spy_close / spy_dividend_per_share
+    # are. NULL when the close was not available; nothing in eod_pnl's own
+    # return, alpha or attribution columns is computed from them.
+    "ALTER TABLE eod_pnl ADD COLUMN qqq_close REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN qqq_dividend_per_share REAL",
 ]
 
 CREATE_SHADOW_BOOK_TABLE = """
@@ -611,7 +618,7 @@ def log_risk_event(conn: sqlite3.Connection, event: dict) -> str:
     return event_id
 
 
-def _as_int_flag(value) -> int | None:
+def _as_int_flag(value: object) -> int | None:
     """SQLite has no BOOLEAN: persist a tri-state flag as 1/0/NULL.
 
     NULL means "not evaluated this run" and is deliberately distinct from 0
@@ -652,8 +659,9 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
              nav_ib_raw_usd, nav_mark_correction_usd, nav_mark_correction_json,
              nav_basis, nav_ib_usd, nav_settled_usd, nav_basis_diff_usd,
              nav_basis_diff_bps,
+             qqq_close, qqq_dividend_per_share,
              created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             eod["date"],
@@ -679,10 +687,10 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             eod.get("commission_usd"),
             eod.get("slippage_usd"),
             eod.get("traded_notional_usd"),
-            _as_int_flag(eod.get("commission_available")),
+            _as_int_flag(eod.get("commission_available")),  # pyright: ignore[reportUnknownArgumentType] -- eod is untyped; param annotated on touch (I12607)
             eod.get("daily_return_net_pct"),
             eod.get("daily_return_gross_pct"),
-            _as_int_flag(eod.get("dividend_accrual_available")),
+            _as_int_flag(eod.get("dividend_accrual_available")),  # pyright: ignore[reportUnknownArgumentType] -- eod is untyped; param annotated on touch (I12607)
             eod.get("spy_dividend_per_share"),
             eod.get("integrity_breach_json"),
             eod.get("dividend_timing_usd"),
@@ -695,6 +703,8 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             eod.get("nav_settled_usd"),
             eod.get("nav_basis_diff_usd"),
             eod.get("nav_basis_diff_bps"),
+            eod.get("qqq_close"),  # pyright: ignore[reportUnknownMemberType] -- eod is the untyped dict every column above reads
+            eod.get("qqq_dividend_per_share"),  # pyright: ignore[reportUnknownMemberType] -- eod is the untyped dict every column above reads
             datetime.now(UTC).isoformat(),
         ),
     )
