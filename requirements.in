@@ -116,7 +116,10 @@ nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergo
 # >=0.59.89 (alpha-engine-config-I13042, krepis-PR282): redact_secrets also runs
 # on the SNS leg of alerts.publish and in email_sender.send_email, with an
 # inventory test that fails when a new outbound alert path is uncovered.
-krepis>=0.59.89
+# >=0.59.90 (alpha-engine-config-I13152, krepis-PR283): redaction also covers an
+# HTML-escaped `&amp;` separator, a percent-encoded value and the alert footer;
+# the lock takes flow-doctor 0.19.6 (flow-doctor-PR133) with it.
+krepis>=0.59.90
 # portfolio_optimizer (PR 1 of portfolio-optimizer-260511 arc): cvxpy solves the
 # constrained mean-variance program (MVO + L1 turnover + SOC vol-target);
 # scikit-learn provides Ledoit-Wolf covariance shrinkage. Both are optional at
