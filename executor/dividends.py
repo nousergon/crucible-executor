@@ -64,12 +64,6 @@ logger = logging.getLogger(__name__)
 # SPY is the benchmark leg; it is fetched alongside the holdings so both legs of
 # the comparison come from one source on one call path.
 SPY_TICKER = "SPY"
-# QQQ is the second, record-only benchmark (alpha-engine-config-I13096): its
-# settled close and ex-dividend are persisted beside SPY's so the perf tracker
-# can compute a QQQ total return from the same EOD source. Nothing in the
-# reconcile's alpha, NAV or accrual math reads it.
-QQQ_TICKER = "QQQ"
-BENCHMARK_TICKERS = (SPY_TICKER, QQQ_TICKER)
 
 
 def _in_interval(ex_date: str, after: str | None, through: str) -> bool:
@@ -157,7 +151,7 @@ def fetch_ex_dividends(
     ``pnl_integrity`` — with the accrual absent, the dividend sits back in the
     residual, which is now bounded and raises.
     """
-    tickers = sorted({t for t in (tickers or []) if t} | set(BENCHMARK_TICKERS))
+    tickers = sorted({t for t in (tickers or []) if t} | {SPY_TICKER})
     if not tickers:
         return {}, {}, True, None
 
