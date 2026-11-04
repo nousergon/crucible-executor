@@ -83,6 +83,8 @@ def _trader_files() -> list[Path]:
 #: four trader units name in ``OnFailure=``. Not a trader unit and has no timer.
 FAILURE_NOTIFIER = "alpha-engine-trader-failed@"
 EXECUTOR_PYTHON = "/home/ec2-user/alpha-engine/.venv/bin/python"
+#: The v2 session's Telegram alert (alpha-engine-config-I13005).
+TRADE_ALERT = "alpha-engine-v2-trade-alert"
 
 
 def test_every_trader_unit_ships_as_a_service_and_timer_pair() -> None:
@@ -175,7 +177,29 @@ def test_every_trader_unit_pages_through_the_notifier_when_it_fails(stem: str) -
     and nothing paged, because each died before writing the record the sweep
     reads. `%n` hands the notifier the failed unit's own full name."""
     unit = _unit(SYSTEMD / f"{stem}.service")
-    assert unit["Unit"]["OnFailure"] == f"{FAILURE_NOTIFIER}%n.service"
+    expected = f"{FAILURE_NOTIFIER}%n.service"
+    if stem == "alpha-engine-trader-session":
+        expected += f" {TRADE_ALERT}.service"
+    assert unit["Unit"]["OnFailure"] == expected
+
+
+def test_every_session_ending_sends_its_trade_alerts() -> None:
+    """alpha-engine-config-I13005: the first v2 orders (2026-11-04) sent no
+    Telegram. The session starts the alert on success and on failure; the
+    alert reads the store, never the trader's env as its own environment."""
+    session = _unit(SYSTEMD / "alpha-engine-trader-session.service")["Unit"]
+    assert session["OnSuccess"] == f"{TRADE_ALERT}.service"
+    assert f"{TRADE_ALERT}.service" in session["OnFailure"].split()
+    path = SYSTEMD / f"{TRADE_ALERT}.service"
+    unit = _unit(path)
+    service = unit["Service"]
+    assert service["Type"] == "oneshot"
+    assert service["User"] == "ec2-user"
+    assert service["ExecStart"] == f"{EXECUTOR_PYTHON} -m executor.v2_trade_alert"
+    assert "EnvironmentFile" not in service
+    assert "ExecStartPre" not in service
+    assert "OnFailure" not in unit["Unit"] and "OnSuccess" not in unit["Unit"]
+    assert not (SYSTEMD / f"{TRADE_ALERT}.timer").exists()
 
 
 def test_the_notifier_only_reports_from_the_executor_venv() -> None:

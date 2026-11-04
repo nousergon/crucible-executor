@@ -170,7 +170,18 @@ def test_metrics_carries_a_document_fields_observation():
     # 2026-11-02, alpha-engine-config-I12991). A literal would also SHADOW the
     # symbol, because the console's `document-fields` driver lets a literal
     # win (`console/drivers/document_fields.py::_cadence_seconds`).
-    assert binding.get("cadence") == d["cadence"] == "weekday_sf"
+    assert binding.get("cadence") == "weekday_sf"
+    # The row carries the same symbol while in service. A declared-off row
+    # (`disabled`, alpha-engine-config-I13109) carries none — the registry
+    # refuses a cadence on one — and its declared lifecycle, not the binding,
+    # decides its console state (`console/index/merge.py::_state_rank`, 0).
+    if d["lifecycle"] == "in-service":
+        assert d["cadence"] == "weekday_sf"
+    else:
+        assert d["lifecycle"] in ("disabled", "deprecated", "retired")
+        assert "cadence" not in d, "a declared-off row carries no cadence"
+        for f in ("lifecycle_reason", "lifecycle_owner", "lifecycle_reexam"):
+            assert d.get(f), f"a declared-off row needs {f}"
     for literal in ("cadence_seconds", "cadence_minutes", "cadence_hours"):
         assert literal not in binding, f"{literal} would shadow cadence: weekday_sf"
 

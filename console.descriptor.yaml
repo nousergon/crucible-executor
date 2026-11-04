@@ -63,16 +63,24 @@ parent_component_reason: >-
   bindings below read, not a schedulable substrate of its own. Same shape as
   `crucible-backtester-attestation` and `ae-preflight-stage-Backtester`.
 owner: brian
-lifecycle: in-service
-cadence: weekday_sf
-cadence_source: >-
-  `intraday/nav.json` and `trades/eod_pnl.csv` are written once per NYSE
-  trading day by the executor daemon on the trading box, whose window is
-  opened and closed by the `ae-executor-start` / `ae-executor-stop`
-  EventBridge rules (`governance/observability.d/ae-executor-{start,stop}.yaml`).
-  Declared as the calendar SYMBOL rather than a literal minute count because a
-  literal cadence on a trading-day producer renders a correctly-idle weekend
-  as a miss (alpha-engine-config-I7060/I7847).
+lifecycle: disabled
+lifecycle_reason: >-
+  Disabled 2026-11-03 by Brian's "Switch to v2" ruling (2026-11-01,
+  alpha-engine-config-I13005): the weekday preopen input carries
+  `skip_morning_planner` and `skip_run_daemon` (nousergon-data#2384), so the v1
+  daemon receives no order book and holds no live book; crucible-trader owns
+  the paper account from 2026-11-03. `intraday/nav.json` stays at
+  2026-10-30T20:00Z by decision, not by defect, and the console read that as
+  MISSED (alpha-engine-config-I13109). The unit's own retirement is
+  alpha-engine-config-I13007; its deletion and tombstone ride the Crucible v2
+  phase-4 cutover (alpha-engine-config-I9760). Restore `cadence: weekday_sf`
+  and its `cadence_source` from git if v1 trading resumes.
+lifecycle_owner: brian
+lifecycle_reexam: 2026-12-02
+promotes_when: >-
+  The weekday preopen schedule input drops `skip_run_daemon` (v1 trading
+  resumes): flip back to `lifecycle: in-service` with `cadence: weekday_sf` in
+  the same change.
 
 authority_tier: act-unattended
 authority_tier_reason: >-
