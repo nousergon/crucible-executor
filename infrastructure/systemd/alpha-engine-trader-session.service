@@ -5,7 +5,10 @@ Wants=ibgateway.service network-online.target
 # alpha-engine-config-I12353: a run that ends failed, wherever it died (provisioning,
 # the pinned venv build, the trader), pages through alpha-engine-trader-failed@.
 # The notifier only reports; it never retries or touches this unit.
-OnFailure=alpha-engine-trader-failed@%n.service
+OnFailure=alpha-engine-trader-failed@%n.service alpha-engine-v2-trade-alert.service
+# alpha-engine-config-I13005: every session ending, ok or not, sends its trades
+# and a summary to Telegram (the v2 trader itself has no Telegram path).
+OnSuccess=alpha-engine-v2-trade-alert.service
 
 [Service]
 Type=oneshot
