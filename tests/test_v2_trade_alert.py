@@ -20,17 +20,28 @@ class _NoSuchKey(Exception):
     pass
 
 
+class _ClientError(Exception):
+    """botocore's ClientError shape: the code lives in ``response``."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
 class _S3:
     """A fake S3 client over ``{key: (LastModified, body)}``."""
 
     class exceptions:  # noqa: N801 -- mirrors boto3's client.exceptions
         NoSuchKey = _NoSuchKey
 
-    def __init__(self, objects: dict[str, tuple[dt.datetime, Any]]) -> None:
+    def __init__(self, objects: dict[str, tuple[dt.datetime, Any]], *, can_list: bool = True) -> None:
         self.objects = objects
+        self.can_list = can_list
 
     def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
         if Key not in self.objects:
+            if not self.can_list:
+                raise _ClientError("AccessDenied")
             raise _NoSuchKey(Key)
         return {"Body": io.BytesIO(json.dumps(self.objects[Key][1]).encode())}
 
@@ -170,3 +181,39 @@ def test_main_takes_no_arguments_and_reads_the_traders_env(monkeypatch, tmp_path
     monkeypatch.setattr(alert, "run_alerts", lambda store, now: seen.append((store, now)) or 0)
     assert alert.main([], now=NOW) == 0
     assert seen == [({"CRUCIBLE_TRADER_STORE_URI": "s3://bkt/crucible"}, NOW)]
+
+
+HELD_RUN = {
+    "status": "ok",
+    "metrics": [
+        {"name": "trader_session_served", "value": 0.0, "status_reason": "held: no predictions feed for trading day"}
+    ],
+}
+
+
+def test_a_held_session_without_list_access_is_reported_as_held() -> None:
+    """2026-11-05: no ListBucket turned the absent shortfall file into a 403 crash."""
+    objects = {f"crucible/runs/trader.session/{DAY}/run.json": (NOW, HELD_RUN)}
+    store = alert.Store(_S3(objects, can_list=False), "bucket", "crucible")
+    rec = _Recorder()
+    assert alert.run_alerts(store, now=NOW, trade=rec.trade, status=rec.status) == 1
+    assert rec.trades == []
+    (summary,) = rec.statuses
+    assert summary.startswith(f"*v2 session {DAY}: HELD, NO ORDERS PLACED*")
+    assert "no predictions feed" in summary
+
+
+def test_other_s3_errors_still_raise() -> None:
+    class _Broken(_S3):
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
+            raise _ClientError("SlowDown")
+
+    with pytest.raises(_ClientError):
+        alert.Store(_Broken({}), "bucket", "crucible").read_json("x.json")
+
+
+def test_an_error_without_a_botocore_response_has_no_code() -> None:
+    assert alert._error_code(RuntimeError()) == ""
+    err = RuntimeError()
+    err.response = {"Error": "x"}  # type: ignore[attr-defined]
+    assert alert._error_code(err) == ""

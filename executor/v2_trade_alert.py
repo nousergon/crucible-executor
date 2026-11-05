@@ -70,6 +70,22 @@ def _num(doc: Mapping[str, object], key: str) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
+#: What S3 returns for a GET of an absent key: NoSuchKey with ListBucket on
+#: the bucket, AccessDenied (403) without it.
+_ABSENT_CODES = frozenset({"NoSuchKey", "404", "AccessDenied", "403"})
+
+
+def _error_code(exc: Exception) -> str:
+    """The botocore ``Error.Code`` of ``exc``, or ``""`` for any other error."""
+    response: object = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return ""
+    error: object = cast(dict[str, object], response).get("Error")
+    if not isinstance(error, dict):
+        return ""
+    return str(cast(dict[str, object], error).get("Code", ""))
+
+
 class _Exceptions(Protocol):
     NoSuchKey: type[Exception]
 
@@ -106,6 +122,14 @@ class Store:
             response = self.client.get_object(Bucket=self.bucket, Key=self.key(relative))
         except missing:
             return None
+        except Exception as exc:
+            # The trader role has no bucket-level ListBucket, so S3 answers a
+            # GET for an absent key with 403 AccessDenied, not NoSuchKey. A
+            # held session writes no execution_shortfall file, and that 403
+            # crashed the alert on 2026-11-05 (alpha-engine-config-I13279).
+            if _error_code(exc) in _ABSENT_CODES:
+                return None
+            raise
         body = cast(BinaryIO, response["Body"])
         loaded: object = json.loads(body.read())
         return cast(Doc, loaded) if isinstance(loaded, dict) else None
@@ -160,6 +184,19 @@ def _money(value: float) -> str:
     return f"${value:,.0f}"
 
 
+def _held_reason(run: Mapping[str, object]) -> str | None:
+    """Why an ``ok`` session served nothing, or ``None`` when it served.
+
+    A held session (no predictions feed, say) ends ``ok`` with the
+    ``trader_session_served`` flag at 0 and writes no execution_shortfall
+    file; without this it read as "the book needed no orders".
+    """
+    for metric in _docs(run, "metrics"):
+        if metric.get("name") == "trader_session_served" and metric.get("value") == 0:
+            return str(metric.get("status_reason") or "none recorded")
+    return None
+
+
 def summarize(day: str, run: Mapping[str, object], shortfall: Mapping[str, object] | None) -> str:
     """The essential one-message summary of a session."""
     if run.get("status") != "ok":
@@ -169,6 +206,13 @@ def summarize(day: str, run: Mapping[str, object], shortfall: Mapping[str, objec
             f"Reason: {run.get('reason') or 'none recorded'}\n"
             "Auto-fix: none; the session timer does not catch up. "
             "Resolution: fix the cause before the next 10:45 ET session, or rerun today."
+        )
+    held = _held_reason(run)
+    if held is not None:
+        return (
+            f"*v2 session {day}: HELD, NO ORDERS PLACED*\n"
+            f"Reason: {held}\n"
+            "Resolution: once the missing input is published, rerun the session today."
         )
     orders = _docs(shortfall, "orders")
     if not orders:
