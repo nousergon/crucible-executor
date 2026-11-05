@@ -99,8 +99,8 @@ import json
 import logging
 import math
 import sqlite3
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Mapping, Sequence, Set
+from typing import Any, cast
 
 import boto3
 
@@ -247,7 +247,7 @@ def _trade_attribution_price(t: Mapping[str, Any] | dict) -> tuple[float | None,
     return None, False
 
 
-def _weighted_prices(trades_today: list[dict] | None, actions, side_word: str) -> dict[str, float]:
+def _weighted_prices(trades_today: list[dict] | None, actions: Set[str], side_word: str) -> dict[str, float]:
     agg: dict[str, list[float]] = {}
     for t in trades_today or []:
         action = str(t.get("action", "")).upper()
@@ -378,10 +378,10 @@ def compute_rotation_realized(
     return realized
 
 
-def _is_finite(value) -> bool:
+def _is_finite(value: object) -> bool:
     """True only for a real, finite number — None/str/NaN/inf are all False."""
     try:
-        return math.isfinite(float(value))
+        return math.isfinite(float(cast("float", value)))
     except (TypeError, ValueError):
         return False
 
@@ -626,8 +626,15 @@ def build_eod_report(
     data_warnings: list[str] | None = None,
     generated_at: str | None = None,
     spy_close_provisional: bool = False,
+    extra_trades_today: Sequence[Mapping[str, object]] | None = None,
 ) -> dict:
     """Assemble the structured EOD report payload (the ``eod_report.json`` artifact).
+
+    ``extra_trades_today`` are fills this executor's ``trades`` table does not
+    hold -- the v2 trader's, read from its ledger journal by
+    :mod:`executor.v2_fills` (alpha-engine-config-I13227) -- appended to the
+    table's rows so the report's rotation sleeve prices the same fills the
+    reconcile's residual was measured against.
 
     ``spy_close_provisional`` marks the day's SPY close (and therefore the
     headline ``spy_return_pct``/``daily_alpha_pct``) as not-yet-settled. The
@@ -640,7 +647,17 @@ def build_eod_report(
     recon = nav_reconciliation or {}
     narratives = position_narratives or {}
 
-    trades_today = _trades_today(conn, run_date)
+    trades_today = _trades_today(conn, run_date) + [
+        {
+            "action": t.get("action"),
+            "ticker": t.get("ticker"),
+            "shares": t.get("shares"),
+            "price": t.get("fill_price"),
+            "fill_price": t.get("fill_price"),
+            "source": t.get("source"),
+        }
+        for t in (extra_trades_today or [])
+    ]
     attribution = compute_alpha_attribution(
         prior_nav=prior_nav,
         spy_return=spy_return,
