@@ -2109,6 +2109,12 @@ def run(
     from executor.trade_logger import get_todays_trades
 
     trades_today_rows = get_todays_trades(conn, run_date)
+    # The v2 trader places this account's orders since 2026-11-03 and logs its
+    # fills in its own store; without them every rotation lands in the
+    # unattributed residual (alpha-engine-config-I13228, executor.v2_fills).
+    from executor.v2_fills import v2_trade_rows
+
+    trades_today_rows = [*trades_today_rows, *v2_trade_rows(run_date, trades_today_rows)]
     buy_entry_px = _buy_entry_prices(trades_today_rows)
 
     # ── Fill provenance (alpha-engine-config-I10800) ─────────────────────────
