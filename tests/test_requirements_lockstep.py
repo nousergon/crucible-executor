@@ -79,7 +79,7 @@ def _parse_pyproject_deps() -> dict[str, str]:
             if match:
                 dep_spec = match.group(1)
                 # Extract package name and version spec
-                pkg_name = re.split(r"[><=!@\[]", dep_spec)[0]
+                pkg_name = re.split(r"[><=!~@\[]", dep_spec)[0]
                 deps[_normalize_pkg_name(pkg_name)] = dep_spec
     return deps
 
