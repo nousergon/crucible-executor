@@ -184,27 +184,44 @@ IB Gateway requires a display (even on a headless server). Xvfb provides a virtu
 
 ### Download IB Gateway
 
-Download the **standalone** Linux installer from the IBKR website — search for "IB Gateway standalone download". At time of writing, version 10.44 is tested and working.
+Download the **standalone** Linux installer from IBKR's installer host. Resolve the target build on the box (the build number is never guessed from this document):
 
 ```bash
-chmod +x ibgateway-standalone-linux-x64.sh
-./ibgateway-standalone-linux-x64.sh -q -dir ~/ibgateway
+CHANNEL=stable-standalone   # use latest-standalone if stable is not newer than the running build
+curl -s https://download2.interactivebrokers.com/installers/ibgateway/$CHANNEL/version.json   # buildVersion, e.g. 10.45.1j
+curl -fLo ~/ibgw.sh https://download2.interactivebrokers.com/installers/ibgateway/$CHANNEL/ibgateway-$CHANNEL-linux-x64.sh
+sha256sum ~/ibgw.sh   # record it in the Pinned versions table below
 ```
 
-This installs into `~/ibgateway/` and places a bundled JRE under `~/.local/share/i4j_jres/`. **Always use this bundled JRE** — IB Gateway requires Azul Zulu 17 and will fail with system Java.
+**Pinned versions** (the single place the fleet records them; the pin lives on the box's root volume, not in any boot path):
 
-Find the bundled JRE path:
+| Component | Running today | Target for the 2026-11-10 window |
+|---|---|---|
+| IB Gateway | 10.44.1 (`TWS_MAJOR_VRSN=1044`); IBKR desupports it on 2026-12-15 | Resolved on the day from `version.json` (stable if newer than 10.44.1, else latest). `buildVersion` and installer sha256: **fill in at the window** |
+| IBC | 3.23.0 | **3.24.2** (final release; `IbcAlpha/IBC` was archived 2026-09-01). Zip sha256: **fill in at the window** |
+
+Install each gateway build **side by side** in its own root, never over the running one, so rollback is a symlink swap:
+
+```bash
+chmod +x ~/ibgw.sh
+~/ibgw.sh -q -dir ~/ibgw-$NEW_MAJOR      # NEW_MAJOR = buildVersion without the dot in its first two parts (10.45 -> 1045)
+```
+
+The installer places a bundled JRE under `~/.local/share/i4j_jres/`. **Always use this bundled JRE** — never system Java. The bundled JRE is Azul Zulu 17 for builds up to 10.47 and Java 25 for 10.48 and later (IBC 3.24.2 is the first IBC that runs the latter).
+
+Find the bundled JRE path and confirm `pref_jre.cfg` names a directory that contains `bin/java`:
 ```bash
 find ~/.local/share/i4j_jres -name java -type f
+cat ~/ibgw-$NEW_MAJOR/.install4j/pref_jre.cfg
 ```
 
-Create the version symlink directory IBC expects:
+Create the version directory IBC expects (`$TWS_PATH/ibgateway/$TWS_MAJOR_VRSN/{jars,.install4j}`):
 ```bash
-mkdir -p ~/ibgateway/1044
-ln -s ~/ibgateway/jars ~/ibgateway/1044/jars
-ln -s ~/ibgateway/.install4j ~/ibgateway/1044/.install4j
-ln -s ~/ibgateway/ibgateway.vmoptions ~/ibgateway/1044/ibgateway.vmoptions
+mkdir -p ~/ibgateway
+ln -sfn ~/ibgw-$NEW_MAJOR ~/ibgateway/$NEW_MAJOR
 ```
+
+The original 10.44.1 layout (`~/ibgateway/1044/{jars,.install4j,ibgateway.vmoptions}` symlinks into `~/ibgateway/`) stays untouched until one clean week after the upgrade.
 
 ---
 
@@ -213,11 +230,15 @@ ln -s ~/ibgateway/ibgateway.vmoptions ~/ibgateway/1044/ibgateway.vmoptions
 IBC automates the IB Gateway login so it can run headlessly via systemd.
 
 ```bash
-# Download IBC v3.23.0
-curl -L https://github.com/IbcAlpha/IBC/releases/download/3.23.0/IBCLinux-3.23.0.zip -o ibc.zip
-unzip ibc.zip -d ~/ibc
-chmod +x ~/ibc/*.sh ~/ibc/scripts/*.sh
+# Download IBC 3.24.2 (the final release; the project is archived and will not ship another)
+curl -fLo ~/ibc-3.24.2.zip https://github.com/IbcAlpha/IBC/releases/download/3.24.2/IBCLinux-3.24.2.zip
+sha256sum ~/ibc-3.24.2.zip   # record it in the Pinned versions table above
+unzip -q ~/ibc-3.24.2.zip -d ~/ibc-3.24.2
+chmod +x ~/ibc-3.24.2/*.sh ~/ibc-3.24.2/scripts/*.sh
+ln -sfn ~/ibc-3.24.2 ~/ibc
 ```
+
+**Upgrading an existing box:** `mv ~/ibc ~/ibc-3.23.0` first, then **copy the old `config.ini` over the shipped one** (`cp -p ~/ibc-3.23.0/config.ini ~/ibc-3.24.2/config.ini`). IBC's shipped `config.ini` has `TradingMode=live`, `AcceptNonBrokerageAccountWarning=no` and a blank `ReadOnlyApi`; starting on it would attempt a live login. 3.24.2 adds no `config.ini` settings. Carry the non-default `gatewaystart.sh` variables across with a `diff`, not from memory. Rollback is `ln -sfn ~/ibc-3.23.0 ~/ibc`.
 
 ### Configure IBC
 
@@ -229,6 +250,7 @@ IbPassword=YOUR_IBKR_PASSWORD
 TradingMode=paper
 AcceptNonBrokerageAccountWarning=yes
 ReadOnlyApi=no
+OverrideTwsMasterClientID=42   # asserted on every start by ibc-master-client-id.sh (ibgateway.service ExecStartPre)
 ```
 
 ### Configure gatewaystart.sh
@@ -236,7 +258,7 @@ ReadOnlyApi=no
 Edit `~/ibc/gatewaystart.sh` — set these variables at the top:
 
 ```bash
-TWS_MAJOR_VRSN=1044
+TWS_MAJOR_VRSN=1044   # the running build; set to $NEW_MAJOR (e.g. 1045) at the upgrade
 IBC_INI=~/ibc/config.ini
 IBC_PATH=/home/ec2-user/ibc
 TWS_PATH=/home/ec2-user
