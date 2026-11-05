@@ -2114,7 +2114,7 @@ def run(
     # unattributed residual (alpha-engine-config-I13228, executor.v2_fills).
     from executor.v2_fills import v2_trade_rows
 
-    trades_today_rows = [*trades_today_rows, *v2_trade_rows(run_date, trades_today_rows)]
+    trades_today_rows.extend(v2_trade_rows(run_date or "", trades_today_rows))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
     buy_entry_px = _buy_entry_prices(trades_today_rows)
 
     # ── Fill provenance (alpha-engine-config-I10800) ─────────────────────────

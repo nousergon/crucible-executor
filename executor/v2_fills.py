@@ -26,8 +26,9 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
-from executor.v2_trade_alert import TRADER_ENV, Store, _docs, _num, open_store, read_env_file
+from executor.v2_trade_alert import TRADER_ENV, Store, open_store, read_env_file
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,19 @@ SHORTFALL_PREFIX = "trader/execution_shortfall/"
 LOOKBACK_FILES = 5
 
 Row = dict[str, object]
+
+
+def _docs(doc: Mapping[str, object] | None, key: str) -> list[dict[str, object]]:
+    """A list of JSON objects under ``key``; anything else reads as empty."""
+    value = None if doc is None else doc.get(key)
+    if not isinstance(value, list):
+        return []
+    return [cast(dict[str, object], item) for item in cast(list[object], value) if isinstance(item, dict)]
+
+
+def _num(doc: Mapping[str, object], key: str) -> float:
+    value = doc.get(key)
+    return float(value) if isinstance(value, (int, float)) else 0.0
 
 
 def _shortfall_keys(store: Store) -> list[str]:
