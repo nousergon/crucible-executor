@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import time as _time
 from datetime import date, timedelta
+from typing import cast
 
 import boto3
 import pandas as pd
@@ -63,6 +64,7 @@ from executor.trade_logger import (
     record_dividend_accrual,
     settle_due_dividend_accruals,
 )
+from executor.v2_fills import load_v2_fills, merge_for_attribution
 
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
 _FLOW_DOCTOR_EXCLUDE_PATTERNS = [r"Error 10197", r"Error 10349"]
@@ -2109,6 +2111,37 @@ def run(
     from executor.trade_logger import get_todays_trades
 
     trades_today_rows = get_todays_trades(conn, run_date)
+
+    # ── v2 trader fills (alpha-engine-config-I13227) ─────────────────────────
+    # Orders moved to the v2 trader on 2026-11-03; its fills live in the v2
+    # ledger journal, not in this executor's `trades` table. Without them the
+    # rotation sleeve reads $0 on a day eleven names were sold, an add to a
+    # held name is valued from the prior close instead of its fill, and the
+    # day's trading P&L lands in `unattributed_true_usd` (+$70,995 on
+    # 2026-11-04). They join the rows the attribution prices; nothing about
+    # the residual bound or how it is judged changes.
+    session_day = cast("str", run_date)
+    v2_rows, v2_warning = load_v2_fills(session_day)
+    if v2_warning:
+        data_warnings.append(v2_warning)
+    v1_rows = cast("list[dict[str, object]]", trades_today_rows)
+    trades_today_rows, v2_rows_attributed, v2_overlap = merge_for_attribution(
+        v1_rows, v2_rows,
+    )
+    if v2_overlap:
+        data_warnings.append(
+            f"v2 fills for {run_date} in {', '.join(v2_overlap)} were NOT added to the "
+            "attribution: v1 also recorded trades in those names today, and the v2 "
+            "journal reads the whole account, so the same execution could be counted "
+            "twice. Those names are attributed from v1's rows alone."
+        )
+    if v2_rows_attributed:
+        logger.info(
+            "v2 fills %s: %d fill(s) across %d name(s) added to the attribution "
+            "from the v2 ledger journal",
+            session_day, len(v2_rows_attributed),
+            len({r["ticker"] for r in v2_rows_attributed}),
+        )
     buy_entry_px = _buy_entry_prices(trades_today_rows)
 
     # ── Fill provenance (alpha-engine-config-I10800) ─────────────────────────
@@ -3509,6 +3542,7 @@ def run(
             data_warnings=data_warnings,
             generated_at=snapshot.get("captured_at"),
             spy_close_provisional=spy_close_provisional,
+            extra_trades_today=v2_rows_attributed,
         )
         attribution = report.get("alpha_attribution")
         # The old check here tested `ties_to_headline`, which is TRUE BY
