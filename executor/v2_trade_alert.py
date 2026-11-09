@@ -303,7 +303,7 @@ def summarize(
                 f"Run status: {run.get('status')}",
                 f"Reason: {run.get('reason') or 'none recorded'}",
                 "Auto-fix: none; the session timer does not catch up. "
-                "Resolution: fix the cause before the next 10:45 ET session, or rerun today.",
+                "Resolution: fix the cause before the next 14:00 ET session, or rerun today.",
             ],
         )
     held = _held_reason(run)
