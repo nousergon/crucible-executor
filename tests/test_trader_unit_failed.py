@@ -103,6 +103,12 @@ def test_a_long_tail_keeps_the_lines_nearest_the_failure(published: list[dict[st
     assert len(message) < 4096
 
 
+def test_the_v2_trade_alert_unit_is_accepted() -> None:
+    """alpha-engine-config-I13284: the alert names this notifier in OnFailure=."""
+    assert tuf.UNIT_RE.fullmatch("alpha-engine-v2-trade-alert.service")
+    assert not tuf.UNIT_RE.fullmatch("alpha-engine-v2-trade-alert.service; rm")
+
+
 @pytest.mark.parametrize(
     "argv",
     [[], ["alpha-engine-daemon.service"], [UNIT, UNIT], ["alpha-engine-trader-x.service; rm"]],

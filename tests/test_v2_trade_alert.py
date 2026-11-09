@@ -104,8 +104,8 @@ class _Recorder:
 
 def test_every_fill_is_alerted_and_the_session_summarised() -> None:
     rec = _Recorder()
-    sent = alert.run_alerts(_store({"status": "ok"}), now=NOW, trade=rec.trade, status=rec.status)
-    assert sent == 3
+    outcome = alert.run_alerts(_store({"status": "ok"}), now=NOW, trade=rec.trade, status=rec.status)
+    assert outcome.delivered == 3 and not outcome.failed
     assert [t[:4] for t in rec.trades] == [("SELL", "AAA", 10, 100.5), ("BUY", "BBB", 20, 100.5)]
     assert rec.trades[0][4]["trigger"] == f"v2 book {DAY} (decision $100.00)"
     (summary,) = rec.statuses
@@ -117,8 +117,8 @@ def test_every_fill_is_alerted_and_the_session_summarised() -> None:
 def test_an_unfilled_order_is_named_and_not_alerted_as_a_trade() -> None:
     shortfall = {**SHORTFALL, "orders": [_order("AAA", "sell", 10), _order("BBB", "buy", 20, 0)]}
     rec = _Recorder(result=False)
-    sent = alert.run_alerts(_store({"status": "ok"}, shortfall), now=NOW, trade=rec.trade, status=rec.status)
-    assert sent == 0 and len(rec.trades) == 1
+    outcome = alert.run_alerts(_store({"status": "ok"}, shortfall), now=NOW, trade=rec.trade, status=rec.status)
+    assert outcome.delivered == 0 and outcome.failed and len(rec.trades) == 1
     assert "1/2 orders filled" in rec.statuses[0] and "UNFILLED: BBB" in rec.statuses[0]
 
 
@@ -145,7 +145,7 @@ def test_a_session_with_no_orders_says_so() -> None:
 def test_a_stale_or_absent_run_record_is_reported() -> None:
     rec = _Recorder()
     stale = _store({"status": "ok"}, at=NOW - dt.timedelta(hours=4))
-    assert alert.run_alerts(stale, now=NOW, trade=rec.trade, status=rec.status) == 1
+    assert alert.run_alerts(stale, now=NOW, trade=rec.trade, status=rec.status) == alert.Outcome(1, True)
     assert "2026-11-04: NO RUN RECORD" in rec.statuses[0]
     empty = alert.Store(_S3({}), "bucket", "")
     alert.run_alerts(empty, now=NOW, trade=rec.trade, status=rec.status)
@@ -178,9 +178,13 @@ def test_main_takes_no_arguments_and_reads_the_traders_env(monkeypatch, tmp_path
     monkeypatch.setattr(alert, "TRADER_ENV", env)
     seen: list[Any] = []
     monkeypatch.setattr(alert, "open_store", lambda values: values)
-    monkeypatch.setattr(alert, "run_alerts", lambda store, now: seen.append((store, now)) or 0)
+    outcomes = [alert.Outcome(2, True), alert.Outcome(1, False), alert.Outcome(1, True, run_unreadable=True)]
+    monkeypatch.setattr(alert, "run_alerts", lambda store, now: seen.append((store, now)) or outcomes.pop(0))
     assert alert.main([], now=NOW) == 0
     assert seen == [({"CRUCIBLE_TRADER_STORE_URI": "s3://bkt/crucible"}, NOW)]
+    # Undelivered summary, or an unreadable run record: non-zero, so OnFailure= pages.
+    assert alert.main([], now=NOW) == 1
+    assert alert.main([], now=NOW) == 1
 
 
 HELD_RUN = {
@@ -196,20 +200,42 @@ def test_a_held_session_without_list_access_is_reported_as_held() -> None:
     objects = {f"crucible/runs/trader.session/{DAY}/run.json": (NOW, HELD_RUN)}
     store = alert.Store(_S3(objects, can_list=False), "bucket", "crucible")
     rec = _Recorder()
-    assert alert.run_alerts(store, now=NOW, trade=rec.trade, status=rec.status) == 1
+    assert alert.run_alerts(store, now=NOW, trade=rec.trade, status=rec.status).delivered == 1
     assert rec.trades == []
     (summary,) = rec.statuses
     assert summary.startswith(f"*v2 session {DAY}: HELD, NO ORDERS PLACED*")
     assert "no predictions feed" in summary
 
 
-def test_other_s3_errors_still_raise() -> None:
+def test_read_json_still_raises_other_s3_errors() -> None:
     class _Broken(_S3):
         def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
             raise _ClientError("SlowDown")
 
     with pytest.raises(_ClientError):
         alert.Store(_Broken({}), "bucket", "crucible").read_json("x.json")
+    assert alert.Store(_S3({}, can_list=False), "b", "").read_json("x.json") is None
+
+
+def test_other_s3_errors_are_returned_as_a_reason_not_raised() -> None:
+    class _Broken(_S3):
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
+            raise _ClientError("SlowDown")
+
+    assert alert.Store(_Broken({}), "bucket", "crucible").read("x.json") == (None, "SlowDown")
+
+
+def test_the_store_read_classifies_absent_denied_and_non_object() -> None:
+    store = alert.Store(_S3({"crucible/list.json": (NOW, [1])}), "bucket", "crucible")
+    assert store.read("absent.json") == (None, None)
+    assert store.read("list.json") == (None, "not a JSON object")
+    assert alert.Store(_S3({}, can_list=False), "b", "").read("x.json") == (None, "AccessDenied")
+
+    class _NotFound(_S3):
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
+            raise _ClientError("404")
+
+    assert alert.Store(_NotFound({}), "b", "").read("x.json") == (None, None)
 
 
 def test_an_error_without_a_botocore_response_has_no_code() -> None:
@@ -217,3 +243,121 @@ def test_an_error_without_a_botocore_response_has_no_code() -> None:
     err = RuntimeError()
     err.response = {"Error": "x"}  # type: ignore[attr-defined]
     assert alert._error_code(err) == ""
+
+
+# alpha-engine-config-I13284: on 2026-11-04 the session placed 13 orders, the
+# trader role could not read the shortfall file it wrote, and the alert said
+# "no orders -- the book needed no orders" with zero per-fill alerts.
+
+BOOK_FAIL = {
+    "name": "trader_order_book_written",
+    "value": 0.0,
+    "status": "FAIL",
+    "status_reason": (
+        "order book not written: AccessDenied: An error occurred (AccessDenied) when calling the "
+        "PutObject operation: User: arn:aws:sts::ACCOUNT:assumed-role/r/s is not authorized"
+    ),
+}
+BOOK_OK = {"name": "trader_order_book_written", "value": 1.0, "status": "OK", "status_reason": "written"}
+SERVED = {"name": "trader_session_served", "value": 1.0, "status": "OK"}
+
+
+def _denied_store(run: dict[str, Any]) -> alert.Store:
+    """The trader role as measured: run.json readable, the shortfall denied."""
+
+    class _Denied(_S3):
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
+            if "execution_shortfall" in Key:
+                raise _ClientError("AccessDenied")
+            return super().get_object(Bucket=Bucket, Key=Key)
+
+    objects: dict[str, tuple[dt.datetime, Any]] = {
+        f"crucible/runs/trader.session/{DAY}/run.json": (NOW, run),
+        f"crucible/trader/execution_shortfall/{DAY}.json": (NOW, SHORTFALL),
+    }
+    return alert.Store(_Denied(objects), "bucket", "crucible")
+
+
+def test_fills_the_run_wrote_but_cannot_be_read_are_never_no_orders() -> None:
+    run = {
+        "status": "ok",
+        "metrics": [SERVED, BOOK_FAIL],
+        "outputs": [{"key": "trader/evidence.json"}, {"key": f"trader/execution_shortfall/{DAY}.json"}],
+    }
+    rec = _Recorder()
+    outcome = alert.run_alerts(_denied_store(run), now=NOW, trade=rec.trade, status=rec.status)
+    assert rec.trades == [] and outcome == alert.Outcome(1, True)
+    (summary,) = rec.statuses
+    assert summary.startswith(f"*v2 session {DAY}: ORDERS PLACED — fill details unreadable (AccessDenied)*")
+    assert "no orders" not in summary
+    assert "no per-fill alert was sent" in summary
+
+
+def test_the_money_path_link_also_counts_as_the_run_writing_the_shortfall() -> None:
+    run = {"status": "ok", "money_path_link": {"money_path_writes": [f"trader/execution_shortfall/{DAY}.json"]}}
+    rec = _Recorder()
+    alert.run_alerts(_denied_store(run), now=NOW, trade=rec.trade, status=rec.status)
+    assert "fill details unreadable" in rec.statuses[0]
+
+
+def test_a_listed_shortfall_that_is_missing_is_unreadable_not_no_orders() -> None:
+    run = {"status": "ok", "outputs": [{"key": f"trader/execution_shortfall/{DAY}.json"}]}
+    rec = _Recorder()
+    alert.run_alerts(_store(run, None), now=NOW, trade=rec.trade, status=rec.status)
+    assert "fill details unreadable (listed in the run's outputs but not found)" in rec.statuses[0]
+
+
+def test_another_store_error_on_the_shortfall_is_unreadable_not_a_crash() -> None:
+    class _Slow(_S3):
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
+            if "execution_shortfall" in Key:
+                raise _ClientError("SlowDown")
+            return super().get_object(Bucket=Bucket, Key=Key)
+
+    objects = {f"crucible/runs/trader.session/{DAY}/run.json": (NOW, {"status": "ok"})}
+    rec = _Recorder()
+    alert.run_alerts(alert.Store(_Slow(objects), "b", "crucible"), now=NOW, trade=rec.trade, status=rec.status)
+    assert "fill details unreadable (SlowDown)" in rec.statuses[0]
+
+
+def test_zero_orders_only_when_the_run_lists_no_shortfall() -> None:
+    run = {"status": "ok", "metrics": [SERVED, BOOK_OK], "outputs": [{"key": "trader/evidence.json"}]}
+    rec = _Recorder()
+    alert.run_alerts(_denied_store(run), now=NOW, trade=rec.trade, status=rec.status)
+    assert rec.statuses == [f"*v2 session {DAY}: no orders*\nthe book needed no orders\nOrder book: written"]
+
+
+def test_the_order_book_is_reported_and_a_failure_is_loud_without_the_arn() -> None:
+    rec = _Recorder()
+    alert.run_alerts(_store({"status": "ok", "metrics": [BOOK_OK]}), now=NOW, trade=rec.trade, status=rec.status)
+    assert rec.statuses[0].endswith("\nOrder book: written")
+    alert.run_alerts(_store({"status": "ok", "metrics": [BOOK_FAIL]}), now=NOW, trade=rec.trade, status=rec.status)
+    last = rec.statuses[1].splitlines()[-1]
+    assert last.startswith("*ORDER BOOK FAILED*: order book not written: AccessDenied")
+    assert "arn:" not in last and "ACCOUNT" not in last
+    refused = {"status": "failed", "reason": "x", "metrics": [BOOK_FAIL]}
+    alert.run_alerts(_store(refused), now=NOW, trade=rec.trade, status=rec.status)
+    assert "*ORDER BOOK FAILED*" in rec.statuses[2]
+    held = {**HELD_RUN, "metrics": [*HELD_RUN["metrics"], BOOK_FAIL]}
+    alert.run_alerts(_store(held, None), now=NOW, trade=rec.trade, status=rec.status)
+    assert "*ORDER BOOK FAILED*" in rec.statuses[3]
+
+
+def test_a_long_reason_is_cut() -> None:
+    assert alert._short("x" * 500).endswith("…") and len(alert._short("x" * 500)) == 160
+    assert alert._short(None) == "none recorded"
+
+
+def test_an_unreadable_run_record_is_reported_and_fails() -> None:
+    class _Denied(_S3):
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
+            raise _ClientError("AccessDenied")
+
+    objects = {f"crucible/runs/trader.session/{DAY}/run.json": (NOW, {"status": "ok"})}
+    rec = _Recorder()
+    outcome = alert.run_alerts(
+        alert.Store(_Denied(objects), "b", "crucible"), now=NOW, trade=rec.trade, status=rec.status
+    )
+    assert outcome == alert.Outcome(1, True, run_unreadable=True) and outcome.failed
+    assert rec.statuses[0].startswith(f"*v2 session {DAY}: RUN RECORD UNREADABLE (AccessDenied)*")
+    assert rec.trades == []

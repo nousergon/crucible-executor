@@ -43,10 +43,12 @@ TAIL_LINES = 50
 #: front so the lines nearest the failure survive.
 MAX_TAIL_CHARS = 3000
 
-#: Only the trader's own units. The instance name comes from systemd's
-#: ``%i``, but it is still checked: this process runs ``journalctl`` and
-#: ``systemctl`` on it.
-UNIT_RE = re.compile(r"alpha-engine-trader-[a-z0-9-]+\.service")
+#: Only the trader's own units, plus the v2 session's Telegram alert
+#: (alpha-engine-config-I13284), which pages here when it could not deliver
+#: its summary or read the run record. The instance name comes from
+#: systemd's ``%i``, but it is still checked: this process runs
+#: ``journalctl`` and ``systemctl`` on it.
+UNIT_RE = re.compile(r"alpha-engine-(?:trader-[a-z0-9-]+|v2-trade-alert)\.service")
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _STATE_PROPERTIES = ("ActiveState", "Result", "ExecMainStatus", "ExecMainExitTimestamp")
@@ -117,7 +119,8 @@ def main(
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) != 1 or not UNIT_RE.fullmatch(args[0]):
         print(
-            f"usage: trader_unit_failed <alpha-engine-trader-*.service>; got {args!r}",
+            "usage: trader_unit_failed "
+            f"<alpha-engine-trader-*.service | alpha-engine-v2-trade-alert.service>; got {args!r}",
             file=sys.stderr,
         )
         return 2
