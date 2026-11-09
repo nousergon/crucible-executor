@@ -24,8 +24,9 @@ without ListBucket with AccessDenied whether the key is absent or merely
 unreadable, so the run record decides: a shortfall file the run lists among
 its ``outputs`` exists, and failing to read it is reported loudly as fills
 that could not be read, never as "no orders". The process exits non-zero when
-the summary was not delivered or the run record could not be read, which
-pages through ``alpha-engine-trader-failed@``.
+the summary was not delivered, the run record could not be read, or the
+fills the run wrote could not be read, which pages through
+``alpha-engine-trader-failed@``.
 
 **Credentials.** The v2 store is read as the trader's own role, through the
 profile named in the trader's env file. Everything else (the Telegram
@@ -356,10 +357,12 @@ class Outcome:
     delivered: int
     summary_delivered: bool
     run_unreadable: bool = False
+    #: The run wrote fills this alert could not read: no per-fill alert went out.
+    fills_unreadable: bool = False
 
     @property
     def failed(self) -> bool:
-        return not self.summary_delivered or self.run_unreadable
+        return not self.summary_delivered or self.run_unreadable or self.fills_unreadable
 
 
 def _read_shortfall(store: Store, day: str, run: Mapping[str, object]) -> tuple[Doc | None, str | None]:
@@ -429,7 +432,7 @@ def run_alerts(
         )
         sent += int(bool(ok))
     delivered = bool(status(summarize(day, run, shortfall, unreadable=unreadable), essential=True))
-    return Outcome(sent + int(delivered), delivered)
+    return Outcome(sent + int(delivered), delivered, fills_unreadable=unreadable is not None)
 
 
 def main(argv: list[str] | None = None, *, now: dt.datetime | None = None) -> int:
@@ -442,6 +445,8 @@ def main(argv: list[str] | None = None, *, now: dt.datetime | None = None) -> in
     logger.info("v2 trade alerts delivered: %d", outcome.delivered)
     if outcome.run_unreadable:
         logger.error("v2 trade alert: the session's run record could not be read")
+    if outcome.fills_unreadable:
+        logger.error("v2 trade alert: the session's fills could not be read; no per-fill alert was sent")
     if not outcome.summary_delivered:
         logger.error("v2 trade alert: the session summary was not delivered")
     return 1 if outcome.failed else 0

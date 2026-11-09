@@ -178,11 +178,17 @@ def test_main_takes_no_arguments_and_reads_the_traders_env(monkeypatch, tmp_path
     monkeypatch.setattr(alert, "TRADER_ENV", env)
     seen: list[Any] = []
     monkeypatch.setattr(alert, "open_store", lambda values: values)
-    outcomes = [alert.Outcome(2, True), alert.Outcome(1, False), alert.Outcome(1, True, run_unreadable=True)]
+    outcomes = [
+        alert.Outcome(2, True),
+        alert.Outcome(1, False),
+        alert.Outcome(1, True, run_unreadable=True),
+        alert.Outcome(1, True, fills_unreadable=True),
+    ]
     monkeypatch.setattr(alert, "run_alerts", lambda store, now: seen.append((store, now)) or outcomes.pop(0))
     assert alert.main([], now=NOW) == 0
     assert seen == [({"CRUCIBLE_TRADER_STORE_URI": "s3://bkt/crucible"}, NOW)]
-    # Undelivered summary, or an unreadable run record: non-zero, so OnFailure= pages.
+    # Undelivered summary, unreadable run record, unreadable fills: non-zero, so OnFailure= pages.
+    assert alert.main([], now=NOW) == 1
     assert alert.main([], now=NOW) == 1
     assert alert.main([], now=NOW) == 1
 
@@ -286,7 +292,8 @@ def test_fills_the_run_wrote_but_cannot_be_read_are_never_no_orders() -> None:
     }
     rec = _Recorder()
     outcome = alert.run_alerts(_denied_store(run), now=NOW, trade=rec.trade, status=rec.status)
-    assert rec.trades == [] and outcome == alert.Outcome(1, True)
+    # Loud in Telegram AND non-zero, so OnFailure= pages too.
+    assert rec.trades == [] and outcome == alert.Outcome(1, True, fills_unreadable=True) and outcome.failed
     (summary,) = rec.statuses
     assert summary.startswith(f"*v2 session {DAY}: ORDERS PLACED — fill details unreadable (AccessDenied)*")
     assert "no orders" not in summary
@@ -323,7 +330,7 @@ def test_another_store_error_on_the_shortfall_is_unreadable_not_a_crash() -> Non
 def test_zero_orders_only_when_the_run_lists_no_shortfall() -> None:
     run = {"status": "ok", "metrics": [SERVED, BOOK_OK], "outputs": [{"key": "trader/evidence.json"}]}
     rec = _Recorder()
-    alert.run_alerts(_denied_store(run), now=NOW, trade=rec.trade, status=rec.status)
+    assert not alert.run_alerts(_denied_store(run), now=NOW, trade=rec.trade, status=rec.status).failed
     assert rec.statuses == [f"*v2 session {DAY}: no orders*\nthe book needed no orders\nOrder book: written"]
 
 

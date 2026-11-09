@@ -205,7 +205,7 @@ def test_every_session_ending_sends_its_trade_alerts() -> None:
 
 def test_an_undelivered_trade_alert_pages_through_the_notifier() -> None:
     """alpha-engine-config-I13284: the alert exits non-zero when its summary
-    was not delivered or the run record was unreadable, and that must page.
+    was not delivered or the run record or fills were unreadable; that must page.
     Only the notifier: never itself, so a failing alert cannot loop."""
     unit = _unit(SYSTEMD / f"{TRADE_ALERT}.service")["Unit"]
     assert unit["OnFailure"] == f"{FAILURE_NOTIFIER}%n.service"
