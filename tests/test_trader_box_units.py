@@ -36,7 +36,7 @@ TRADER_CHECKOUT = "/home/ec2-user/crucible-trader"
 TRADER_UNITS = {
     "alpha-engine-trader-session": (
         "scripts/trader_pinned.sh daily_session",
-        "Mon..Fri *-*-* 10:45:00 America/New_York",
+        "Mon..Fri *-*-* 09:35:00 America/New_York",
         "false",
     ),
     "alpha-engine-trader-shadow-books": (
