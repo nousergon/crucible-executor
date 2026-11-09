@@ -2,20 +2,22 @@
 Description=Daily v2 trader session, shadow (alpha-engine-config-I11545)
 
 [Timer]
-# 10:45 New York time, weekdays: after the open in both EDT and EST (the
-# timezone suffix keeps it there across DST), and hours inside the box's
-# measured up-window (started ~08:15, stopped 17:10-17:50 by the v1 postclose
-# pipeline; CloudTrail 2026-09-11 to -24). The entry point skips NYSE
-# holidays itself.
+# 09:35 New York time, weekdays: five minutes after the open, once the
+# opening auction has printed and live quotes exist, in both EDT and EST (the
+# timezone suffix keeps it there across DST). Brian 2026-11-09: the book must
+# be ready and trading at the open, not 75 minutes into the day (it was 10:45
+# until then). Inside the box's measured up-window (started 08:15 ET per
+# CloudTrail 2026-11-06 and -09; stopped 17:10-17:50). The entry point skips
+# NYSE holidays itself.
 #
 # The session binds to the LAST CLOSED session (crucible.runner), so its
 # served day is the previous session, whose predictions the harness
 # published after that close.
 #
 # Persistent=false on purpose. A catch-up run on the next boot would bind to
-# that morning's last closed session -- the same day the scheduled 10:45 run
+# that morning's last closed session -- the same day the scheduled 09:35 run
 # then binds to -- so a missed session is a missed day, never a double one.
-OnCalendar=Mon..Fri *-*-* 10:45:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 09:35:00 America/New_York
 Persistent=false
 Unit=alpha-engine-trader-session.service
 
