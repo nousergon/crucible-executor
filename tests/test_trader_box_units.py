@@ -198,8 +198,17 @@ def test_every_session_ending_sends_its_trade_alerts() -> None:
     assert service["ExecStart"] == f"{EXECUTOR_PYTHON} -m executor.v2_trade_alert"
     assert "EnvironmentFile" not in service
     assert "ExecStartPre" not in service
-    assert "OnFailure" not in unit["Unit"] and "OnSuccess" not in unit["Unit"]
+    # It chains nothing on success, and fails only into the notifier (below).
+    assert "OnSuccess" not in unit["Unit"]
     assert not (SYSTEMD / f"{TRADE_ALERT}.timer").exists()
+
+
+def test_an_undelivered_trade_alert_pages_through_the_notifier() -> None:
+    """alpha-engine-config-I13284: the alert exits non-zero when its summary
+    was not delivered or the run record or fills were unreadable; that must page.
+    Only the notifier: never itself, so a failing alert cannot loop."""
+    unit = _unit(SYSTEMD / f"{TRADE_ALERT}.service")["Unit"]
+    assert unit["OnFailure"] == f"{FAILURE_NOTIFIER}%n.service"
 
 
 def test_the_notifier_only_reports_from_the_executor_venv() -> None:

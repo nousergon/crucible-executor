@@ -6,6 +6,10 @@ Description=Telegram alerts for the v2 trader's daily session (alpha-engine-conf
 # trader's env file, which it reads itself) and sends one alert per filled
 # order to the #trades topic plus one session summary, through the executor's
 # existing Telegram path. It runs from the EXECUTOR's venv, not the trader's.
+# alpha-engine-config-I13284: it exits non-zero when the session summary was
+# not delivered, the run record could not be read, or the fills the run wrote
+# could not be read, and that pages through the notifier the trader units use.
+OnFailure=alpha-engine-trader-failed@%n.service
 
 [Service]
 Type=oneshot
