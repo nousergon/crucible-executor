@@ -335,6 +335,34 @@ def send_daemon_status(message: str, *, essential: bool = False) -> bool:
     return send_message(message)
 
 
+def send_trading_notice(message: str, *, auto_fix: str) -> bool:
+    """Send a daily trading notice straight to the ``#trades`` topic, never via flow-doctor.
+
+    For the v2 market-open and market-close notices (alpha-engine-config-I12024),
+    which Brian asked for by name: they must arrive every trading day, so
+    flow-doctor's daily cap is not in their path at all, and they carry exactly
+    the footer their sender declares (``auto_fix``; ``INFORMATIONAL`` carries
+    none), not flow-doctor's default one. Routes, in order: the ``#trades``
+    topic, the ops-health topic, then the chat with no topic -- the same
+    fallback :func:`_send_past_cap` uses for an essential message.
+    """
+    primary = _topic_thread_id("info")
+    routes: list[int | None] = [primary]
+    ops_health = _topic_thread_id("warning")
+    if ops_health is not None and ops_health not in routes:
+        routes.append(ops_health)
+    if None not in routes:
+        routes.append(None)
+    label = message.split("\n", 1)[0].replace("*", "").strip()
+    for i, thread in enumerate(routes):
+        if send_message(message, message_thread_id=thread, auto_fix=auto_fix):
+            if i:
+                logger.warning("Trading notice re-routed from topic %s to %s: %s", primary, thread, label)
+            return True
+    logger.error("Trading notice NOT delivered on any route (tried topics %s): %s", routes, label)
+    return False
+
+
 def _normalize_flow_doctor_severity(severity: str) -> str:
     """Map alerts.publish severity strings to flow-doctor notify_on tiers."""
     normalized = severity.lower()

@@ -309,3 +309,99 @@ def test_a_changed_timer_is_stopped_before_its_new_file_lands() -> None:
     # A NEW timer has no last trigger to clear; only the changed branch stops.
     new = body[body.index('if [ ! -f "$target" ]; then') : body.index('elif ! diff -q')]
     assert "systemctl stop" not in new
+
+
+# --- The market-open and market-close notices (alpha-engine-config-I12024) -----
+
+MARKET_ALERTS = {
+    # stem -> (argument, OnCalendar)
+    "alpha-engine-v2-market-open-alert": ("open", "Mon..Fri *-*-* 09:40:00 America/New_York"),
+    "alpha-engine-v2-market-close-alert": ("close", "Mon..Fri *-*-* 16:07:00 America/New_York"),
+}
+MARKET_OPEN_MINUTES = 9 * 60 + 30
+SMOKE = "alpha-engine-trader-pin-smoke"
+SESSION = "alpha-engine-trader-session"
+
+
+def _alert_window(stem: str) -> tuple[int, int]:
+    hour, minute = map(int, re.search(r"(\d\d):(\d\d):00", MARKET_ALERTS[stem][1]).groups())
+    timeout = _unit(SYSTEMD / f"{stem}.service")["Service"]["TimeoutStartSec"]
+    start = hour * 60 + minute
+    return start, start + int(re.fullmatch(r"(\d+)min", timeout).group(1))
+
+
+@pytest.mark.parametrize("stem", sorted(MARKET_ALERTS))
+def test_each_market_notice_is_its_own_timer_and_never_the_sessions(stem: str) -> None:
+    """Brian 2026-11-10: a Telegram at the open and at the close. Each runs on
+    its own timer from the executor venv; the session's unit is not touched, so
+    the trading path is exactly what it was."""
+    arg, on_calendar = MARKET_ALERTS[stem]
+    unit = _unit(SYSTEMD / f"{stem}.service")
+    service = unit["Service"]
+    assert service["Type"] == "oneshot" and service["User"] == "ec2-user"
+    assert service["ExecStart"] == f"{EXECUTOR_PYTHON} -m executor.v2_market_alert {arg}"
+    assert "EnvironmentFile" not in service and "ExecStartPre" not in service
+    assert unit["Unit"]["OnFailure"] == f"{FAILURE_NOTIFIER}%n.service"
+    assert "OnSuccess" not in unit["Unit"]
+    timer = _unit(SYSTEMD / f"{stem}.timer")["Timer"]
+    assert timer["OnCalendar"] == on_calendar
+    assert timer["Persistent"] == "false"
+    assert timer["Unit"] == f"{stem}.service"
+    session = _unit(SYSTEMD / f"{SESSION}.service")["Unit"]
+    assert stem not in session["OnSuccess"] + session["OnFailure"]
+
+
+def test_the_open_notice_runs_while_the_session_trades() -> None:
+    """After the 09:30 open and session start, and done long before the
+    session's hard stop."""
+    start, end = _alert_window("alpha-engine-v2-market-open-alert")
+    session_start = _start_minutes(SESSION)
+    session_end = session_start + _timeout_minutes(SESSION)
+    assert MARKET_OPEN_MINUTES <= session_start < start
+    assert end < session_end
+
+
+def test_the_close_notice_fits_between_the_session_stop_and_the_pin_smoke() -> None:
+    """It reports a session that has ended: it starts after the session's hard
+    stop (start + TimeoutStartSec) and ends before the 16:10 pin smoke starts."""
+    start, end = _alert_window("alpha-engine-v2-market-close-alert")
+    session_end = _start_minutes(SESSION) + _timeout_minutes(SESSION)
+    assert 16 * 60 <= session_end < start
+    assert end < _start_minutes(SMOKE)
+
+
+def test_the_market_notices_hold_their_own_read_only_client_id() -> None:
+    """IB refuses a second connection on an id in use. The notices share one id
+    (they run six hours apart), set in their own units and in no other unit
+    here, and never v1's 1-3. The module also refuses the trader's ids from its
+    private env file at run time."""
+    ids: set[str] = set()
+    for stem in MARKET_ALERTS:
+        text = (SYSTEMD / f"{stem}.service").read_text()
+        ids |= set(re.findall(r"^Environment=CRUCIBLE_V2_ALERT_IB_CLIENT_ID=(\d+)$", text, re.M))
+    assert len(ids) == 1
+    (alert_id,) = ids
+    assert int(alert_id) not in {1, 2, 3}
+    others = [p for p in SYSTEMD.glob("*.service") if p.stem not in MARKET_ALERTS]
+    for path in others:
+        for found in re.findall(r"CLIENT_ID=(\d+)\s*$", path.read_text(), re.M):
+            assert found != alert_id, f"{path.name} uses the notices' client id"
+
+
+def test_every_unit_that_pages_through_the_notifier_is_one_it_accepts() -> None:
+    """The notifier refuses a unit name outside its allowlist and exits 2 without
+    paging, so a unit naming it in OnFailure= must be on that list."""
+    from executor.trader_unit_failed import UNIT_RE
+
+    for path in SYSTEMD.glob("*.service"):
+        on_failure = _unit(path)["Unit"].get("OnFailure", "") if _unit(path).has_section("Unit") else ""
+        if f"{FAILURE_NOTIFIER}%n.service" in on_failure.split():
+            assert UNIT_RE.fullmatch(path.name), f"{path.name} would not page"
+
+
+@pytest.mark.parametrize("stem", sorted(MARKET_ALERTS))
+def test_each_market_notice_attributes_its_sends_to_its_registry_row(stem: str) -> None:
+    """The alert-tier registry row (nousergon-data playbooks.yaml,
+    crucible_v2_market_open_close) is keyed on this source."""
+    text = (SYSTEMD / f"{stem}.service").read_text()
+    assert re.search(r"^Environment=KREPIS_EVENT_SOURCE=crucible-executor/v2-market-alert$", text, re.M)

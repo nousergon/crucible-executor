@@ -1,0 +1,21 @@
+[Unit]
+Description=Daily v2 market-open Telegram notice (alpha-engine-config-I12024)
+
+[Timer]
+# 09:40 New York time, weekdays (the timezone suffix keeps it there across
+# DST). Brian 2026-11-10: a Telegram when the market opens, with the order book
+# and the infrastructure that came up. The session starts at 09:30; ten minutes
+# lets it provision, build its book and start its entry/exit watch (on
+# 2026-11-10 the book was written 3 min 16 s after the run started), so what
+# is not up by then is a problem line, not a race. TimeoutStartSec=2min ends it
+# by 09:42. It holds its own read-only client id, so it never contends with
+# the session for the session's.
+#
+# Persistent=false: a catch-up at a late boot would report an open that has
+# long passed. The module skips NYSE holidays itself.
+OnCalendar=Mon..Fri *-*-* 09:40:00 America/New_York
+Persistent=false
+Unit=alpha-engine-v2-market-open-alert.service
+
+[Install]
+WantedBy=timers.target
