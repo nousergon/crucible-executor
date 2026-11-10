@@ -854,6 +854,19 @@ sync_systemd_units_from() {
             log "OK   systemd: installed $name (new, src=$SYSTEMD_SRC)"
             CHANGED=true
         elif ! diff -q "$unit" "$target" >/dev/null 2>&1; then
+            # A CHANGED timer is stopped before its new file lands
+            # (alpha-engine-config-I13447). systemd schedules a calendar timer
+            # from its in-memory last trigger, which survives daemon-reload and
+            # is kept whether or not the timer is Persistent=. So on a box up
+            # since the morning, moving OnCalendar to a time between that
+            # trigger and now made the reload fire the timer AT ONCE: the v2
+            # trader session started at 20:36 ET on 2026-11-09 this way.
+            # Stopping clears the last trigger, and the `enable --now` pass
+            # below starts the timer fresh, scheduled from now. Stopping a
+            # timer never stops a service it already started.
+            case "$name" in
+                *.timer) sudo systemctl stop "$name" >> "$LOG" 2>&1 || true ;;
+            esac
             sudo cp "$unit" /etc/systemd/system/
             log "OK   systemd: updated $name (src=$SYSTEMD_SRC)"
             CHANGED=true
