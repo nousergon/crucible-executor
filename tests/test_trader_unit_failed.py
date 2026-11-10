@@ -119,3 +119,10 @@ def test_anything_but_one_trader_unit_is_refused_without_paging(
     box = _Box()
     assert tuf.main(argv, run=box, now=NOW) == 2
     assert published == [] and box.calls == []
+
+
+def test_the_market_notice_units_are_accepted() -> None:
+    """alpha-engine-config-I12024: the open and close notices name this notifier in OnFailure=."""
+    for unit in ("alpha-engine-v2-market-open-alert.service", "alpha-engine-v2-market-close-alert.service"):
+        assert tuf.UNIT_RE.fullmatch(unit)
+    assert not tuf.UNIT_RE.fullmatch("alpha-engine-v2-market-open-alert.service; rm")

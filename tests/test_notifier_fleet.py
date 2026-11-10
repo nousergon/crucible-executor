@@ -280,3 +280,32 @@ def test_non_essential_status_not_resent_on_delivery_failed():
             patch("executor.notifier.send_message", return_value=True) as mock_send:
         assert send_daemon_status("*IB Gateway reconnected*") is False
     mock_send.assert_not_called()
+
+
+def test_trading_notice_goes_to_trades_without_flow_doctor(monkeypatch):
+    """alpha-engine-config-I12024: the market open/close notices never pass
+    flow-doctor (its daily cap cannot hold them) and carry only the footer
+    their sender declares."""
+    from krepis.telegram import INFORMATIONAL
+
+    from executor.notifier import send_trading_notice
+
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_TRADES", "5")
+    with patch("executor.notifier.get_flow_doctor") as mock_fd, \
+            patch("executor.notifier.send_message", return_value=True) as mock_send:
+        assert send_trading_notice("*Market open*", auto_fix=INFORMATIONAL) is True
+    mock_fd.assert_not_called()
+    mock_send.assert_called_once()
+    assert mock_send.call_args.kwargs == {"message_thread_id": 5, "auto_fix": INFORMATIONAL}
+
+
+def test_trading_notice_falls_back_to_ops_health_then_no_topic(monkeypatch):
+    from executor.notifier import send_trading_notice
+
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_TRADES", "5")
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH", "3")
+    with patch("executor.notifier.send_message", side_effect=[False, False, True]) as mock_send:
+        assert send_trading_notice("*Market close*", auto_fix="none.") is True
+    assert [c.kwargs["message_thread_id"] for c in mock_send.call_args_list] == [5, 3, None]
+    with patch("executor.notifier.send_message", return_value=False):
+        assert send_trading_notice("*Market close*", auto_fix="none.") is False

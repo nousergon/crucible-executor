@@ -1,0 +1,20 @@
+[Unit]
+Description=Daily v2 market-close Telegram notice (alpha-engine-config-I12024)
+
+[Timer]
+# 16:07 New York time, weekdays. Brian 2026-11-10: a Telegram when the market
+# closes, with the orders and the infrastructure that comes down. After the
+# session's 16:05 hard stop (09:30 + TimeoutStartSec=395min), so the session
+# has ended and written its record, and with TimeoutStartSec=2min it ends by
+# 16:09, before the 16:10 pin smoke. Its read-only client id is its own, so it
+# never holds the one the smoke and the 16:45 reconcile share. On an NYSE half
+# day the market closed at 13:00 and this still reports the day at 16:07.
+#
+# Persistent=false: a catch-up at a later boot would report a close that has
+# long passed. The module skips NYSE holidays itself.
+OnCalendar=Mon..Fri *-*-* 16:07:00 America/New_York
+Persistent=false
+Unit=alpha-engine-v2-market-close-alert.service
+
+[Install]
+WantedBy=timers.target
