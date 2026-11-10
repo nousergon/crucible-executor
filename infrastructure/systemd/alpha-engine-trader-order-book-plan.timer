@@ -8,7 +8,7 @@ Description=Daily v2 trader pre-open order book (alpha-engine-config-I12024)
 # (predictions/{day}.json at ~20:45 ET). The box starts at ~08:15 and
 # boot-pull syncs these units then, so 08:40 leaves the gateway its login time.
 # TimeoutStartSec=30min ends the run by 09:10 at the latest: before the open,
-# before the 09:35 session, and hours before the pin smoke and the reconcile.
+# before the 09:30 session, and hours before the pin smoke and the reconcile.
 # The entry point skips NYSE holidays and refuses to start at or after 09:30.
 #
 # Persistent=false, as for the session: a catch-up at a late boot would plan a
