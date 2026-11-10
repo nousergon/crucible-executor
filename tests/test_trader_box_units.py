@@ -36,7 +36,7 @@ TRADER_CHECKOUT = "/home/ec2-user/crucible-trader"
 TRADER_UNITS = {
     "alpha-engine-trader-session": (
         "scripts/trader_pinned.sh daily_session",
-        "Mon..Fri *-*-* 09:35:00 America/New_York",
+        "Mon..Fri *-*-* 09:30:00 America/New_York",
         "false",
     ),
     "alpha-engine-trader-shadow-books": (
@@ -174,11 +174,11 @@ def test_the_pin_smoke_runs_after_the_session_and_before_the_reconcile() -> None
 
 def test_the_session_outlives_its_last_entry_trigger() -> None:
     """Brian 2026-11-09: the session holds its buys for v1's entry triggers, the
-    last at 15:55 ET (crucible-trader `entry_timing`). It starts after the open
-    and its hard stop must leave room for that last buy's fill wait."""
+    last at 15:55 ET (crucible-trader `entry_timing`). It starts at the open
+    (Brian 2026-11-10; systemd never fires a calendar timer early) and its hard stop must leave room for that last buy's fill wait."""
     start = _start_minutes("alpha-engine-trader-session")
     session_end = start + _timeout_minutes("alpha-engine-trader-session")
-    assert 9 * 60 + 30 < start
+    assert 9 * 60 + 30 <= start
     assert session_end >= 15 * 60 + 55 + 10
 
 

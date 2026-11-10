@@ -2,8 +2,9 @@
 Description=Daily v2 trader session, shadow (alpha-engine-config-I11545)
 
 [Timer]
-# 09:35 New York time, weekdays (EDT and EST alike; the timezone suffix keeps
-# it there across DST): five minutes after the open, once live quotes exist.
+# 09:30 New York time, weekdays (EDT and EST alike; the timezone suffix keeps
+# it there across DST): the open (Brian 2026-11-10). systemd never fires a
+# calendar timer early, and the trader refuses a routed start before 09:30.
 # Brian 2026-11-09: no burst of buying and selling at the open. The trader
 # now holds its buys for v1's intraday entry triggers (crucible-trader
 # `crucible_trader.entry_timing`: a 2% pullback from the day's high, from
@@ -18,9 +19,9 @@ Description=Daily v2 trader session, shadow (alpha-engine-config-I11545)
 # published after that close.
 #
 # Persistent=false on purpose. A catch-up run on the next boot would bind to
-# that morning's last closed session -- the same day the scheduled 09:35 run
+# that morning's last closed session -- the same day the scheduled 09:30 run
 # then binds to -- so a missed session is a missed day, never a double one.
-OnCalendar=Mon..Fri *-*-* 09:35:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 09:30:00 America/New_York
 Persistent=false
 Unit=alpha-engine-trader-session.service
 

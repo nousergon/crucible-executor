@@ -374,7 +374,7 @@ FILED = [{"key": f"trader/execution_shortfall/{DAY}.json"}]
 
 
 def test_a_run_that_failed_mid_day_after_orders_is_never_no_orders() -> None:
-    """The all-day session: sells at 09:35, then a dropped gateway at 13:00."""
+    """The all-day session: sells at 09:30, then a dropped gateway at 13:00."""
     shortfall = {**SHORTFALL, "orders": [_order("AAA", "sell", 10), _order("BBB", "buy", 20, 0)]}
     run = {"status": "failed", "reason": "RoutingRefusedError: the gateway dropped", "outputs": FILED}
     rec = _Recorder()

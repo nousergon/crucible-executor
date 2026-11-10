@@ -10,11 +10,11 @@ Description=Daily paper smoke of the queued v2 trader pin request (alpha-engine-
 # trader-pin apply at 23:15 UTC.
 #
 # Why 16:10. The smoke connects to IB Gateway paper with the
-# trader's OWN client id from trader.env -- the same id the 09:35 session and
+# trader's OWN client id from trader.env -- the same id the 09:30 session and
 # the 16:45 reconcile use (v1 holds 1, 2 and 3). IB refuses a second
 # connection on an id already in use, so the smoke must not overlap either.
 # The session holds that id all day, waiting on its buys' entry triggers, and
-# its hard stop is 16:05 (09:35 + TimeoutStartSec=390min). 16:10 is the first
+# its hard stop is 16:05 (09:30 + TimeoutStartSec=395min). 16:10 is the first
 # slot after it, and the smoke's own 30-minute hard stop (16:40) still ends
 # before the 16:45 reconcile. The smoke is read-only, places no order and
 # needs no open market, and it still runs the same day, well before
