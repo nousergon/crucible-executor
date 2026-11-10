@@ -304,7 +304,7 @@ def summarize(
     unknown, never "no orders".
 
     **A failed run is "no orders" only when it filed none.** The session runs
-    all day (sells at 09:35, buys on their triggers until 15:55 ET), so a run
+    all day (sells at 09:30, buys on their triggers until 15:55 ET), so a run
     that fails at 13:00 may have sent its sells and some buys; the trader files
     those orders before the run fails (``trader.session``'s run lists the
     execution_shortfall file among its outputs). Such a run is summarised with
@@ -351,7 +351,7 @@ def summarize(
                 f"Run status: {run.get('status')}",
                 f"Reason: {run.get('reason') or 'none recorded'}",
                 "Auto-fix: none; the session timer does not catch up. "
-                "Resolution: fix the cause before the next 09:35 ET session, or rerun today.",
+                "Resolution: fix the cause before the next 09:30 ET session, or rerun today.",
             ],
         )
     held = _held_reason(run)
