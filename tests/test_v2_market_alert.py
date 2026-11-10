@@ -37,16 +37,22 @@ class _S3:
     class exceptions:  # noqa: N801 -- mirrors boto3's client.exceptions
         NoSuchKey = _NoSuchKey
 
-    def __init__(self, objects: dict[str, Any], *, denied: Sequence[str] = ()) -> None:
+    def __init__(
+        self, objects: dict[str, Any], *, denied: Sequence[str] = (), modified: dict[str, dt.datetime] | None = None
+    ) -> None:
         self.objects = objects
         self.denied = set(denied)
+        self.modified = modified or {}
 
     def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
         if Key in self.denied:
             raise _ClientError("InternalError")
         if Key not in self.objects:
             raise _ClientError("AccessDenied")  # the trader role has no ListBucket
-        return {"Body": io.BytesIO(json.dumps(self.objects[Key]).encode())}
+        response: dict[str, Any] = {"Body": io.BytesIO(json.dumps(self.objects[Key]).encode())}
+        if Key in self.modified:
+            response["LastModified"] = self.modified[Key]
+        return response
 
     def get_paginator(self, _name: str) -> Any:  # pragma: no cover -- not used here
         raise AssertionError
@@ -85,6 +91,7 @@ SHORTFALL = {
     ]
 }
 RUN_OK = {"status": "ok", "metrics": [{"name": "trader_session_served", "value": 1.0}]}
+PUBLISHED = dt.datetime(2026, 11, 11, 11, 10, tzinfo=dt.UTC)  # 06:10 ET
 
 
 def _store(objects: dict[str, Any], **kw: Any) -> Store:
@@ -98,32 +105,49 @@ class _Systemd:
         self.units = units
 
     def __call__(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "git":
+            assert list(argv[-3:]) == ["rev-parse", "--short=7", "HEAD"]
+            return subprocess.CompletedProcess(list(argv), 0, stdout="93564d6\n", stderr="")
         assert "--timestamp=unix" in argv
+        if argv[2] == "--timestamp=unix":  # the manager itself: when the box booted
+            return subprocess.CompletedProcess(list(argv), 0, stdout=f"KernelTimestamp={BOOTED}", stderr="")
         props = self.units.get(argv[2], {})
         out = "\n".join(f"{k}={v}" for k, v in props.items())
         return subprocess.CompletedProcess(list(argv), 0, stdout=out, stderr="")
 
 
+BOOTED = "@1794402000"  # 08:00 ET
+PULLED = {"ActiveState": "inactive", "Result": "success", "ExecMainExitTimestamp": "@1794402960"}  # 08:16 ET
 RUNNING = {"ActiveState": "activating", "Result": "success", "ExecMainStartTimestamp": "@1794407401"}
-STOPPED = {"ActiveState": "inactive", "Result": "success", "ExecMainExitTimestamp": "@1794430600"}
+STOPPED = {
+    "ActiveState": "inactive",
+    "Result": "success",
+    "ExecMainStartTimestamp": "@1794407701",  # 09:35 ET
+    "ExecMainExitTimestamp": "@1794430600",  # 15:56 ET
+}
 ACTIVE = {"ActiveState": "active"}
 
 
-def _systemd(session: dict[str, str]) -> _Systemd:
+def _systemd(session: dict[str, str], pull: dict[str, str] = PULLED) -> _Systemd:
     return _Systemd(
         {
             m.SESSION_UNIT: session,
             m.GATEWAY_UNIT: ACTIVE,
+            m.BOOT_PULL_UNIT: pull,
             "alpha-engine-trader-pin-smoke.timer": ACTIVE,
             "alpha-engine-trader-reconcile.timer": ACTIVE,
         }
     )
 
 
+STOP = m.OpenOrder("SPY", "SELL", "TRAIL", "GTC", 10, 0)
+
+
 def _broker(**kw: Any) -> Any:
     def read(_env: Any, _client_id: int, *, want_orders: bool) -> m.Broker:
-        orders = kw.get("orders", (m.OpenOrder("SPY", "SELL", "TRAIL", "GTC"),)) if want_orders else None
-        return m.Broker(error=kw.get("error"), account_kind=kw.get("account", "paper"), open_orders=orders)
+        orders = kw.get("orders", (STOP,)) if want_orders else None
+        done = kw.get("done", ()) if want_orders else None
+        return m.Broker(error=kw.get("error"), account_kind=kw.get("account", "paper"), open_orders=orders, done=done)
 
     return read
 
@@ -140,13 +164,14 @@ class _Sent:
 
 def _notify(kind: m.Kind, store: Store, tmp_path: Path, *, now: dt.datetime, session: dict[str, str], **kw: Any):
     sent = _Sent(kw.pop("ok", True))
+    pull = kw.pop("pull", PULLED)
     outcome = m.notify(
         kind,
         store,
         ENV,
         now=now,
         client_id=44,
-        run=_systemd(session),
+        run=_systemd(session, pull),
         broker=_broker(**kw),
         send=sent,
         sent_dir=tmp_path,
@@ -156,48 +181,91 @@ def _notify(kind: m.Kind, store: Store, tmp_path: Path, *, now: dt.datetime, ses
 
 # --- the open -----------------------------------------------------------------
 
+PREDICTIONS = {"predicted_alpha": {f"S{i}": 0.01 for i in range(812)}}
+OPEN_DOCS: dict[str, Any] = {
+    f"trader/order_books/{DAY}.json": BOOK,
+    f"trader/entry_watch/{DAY}.json": WATCH,
+    f"predictions/{DAY}.json": PREDICTIONS,
+}
+#: CVLT's sell went out at the start and filled in full.
+DONE = (m.OpenOrder("CVLT", "SELL", "MKT", "DAY", 657, 657),)
 
-def test_an_all_clear_open_is_a_short_pointer_with_no_footer(tmp_path: Path) -> None:
-    store = _store({f"trader/order_books/{DAY}.json": BOOK, f"trader/entry_watch/{DAY}.json": WATCH})
-    outcome, sent = _notify("open", store, tmp_path, now=OPEN_AT, session=RUNNING)
+OPEN_ALL_OK = """\
+*Market OPEN — v2 trading day 2026-11-11 (Wed)*
+✅ Box up — booted 08:00 ET
+✅ Code pulled 08:16 ET — executor 93564d6, trader 811eb9b
+✅ Predictions for 2026-11-10 present published 06:10 ET — 812 names
+✅ Order book built 08:41 ET — 4 target changes (2 enter, 1 exit, 1 increase), 4 orders planned (2 sell, 2 buy)
+✅ IB Gateway connected — paper account
+✅ Trading session running since 09:30 ET
+✅ Entry/exit watch live — last write 09:35 ET
+✅ Orders so far today: 1 sent, 1 filled, 3 waiting on their triggers
+Details on console: https://console.nousergon.ai/page/crucible-trading"""
+
+
+def _lines(text: str) -> list[str]:
+    return text.splitlines()
+
+
+def test_an_all_clear_open_is_a_checklist_with_no_footer(tmp_path: Path) -> None:
+    store = _store(OPEN_DOCS, modified={f"crucible/predictions/{DAY}.json": PUBLISHED})
+    outcome, sent = _notify("open", store, tmp_path, now=OPEN_AT, session=RUNNING, done=DONE)
     assert outcome.outcome == "sent"
     ((text, auto_fix),) = sent.calls
     assert auto_fix == INFORMATIONAL
-    assert text.splitlines()[0] == "*Market open, v2 trading day 2026-11-11*"
-    assert "pre-open order book for 2026-11-10 was written at 08:41 ET: 4 target changes" in text
-    assert "(2 enter, 1 exit, 1 increase), 4 orders planned (2 sell, 2 buy), 3 waiting on their triggers" in text
-    assert "IB Gateway (paper)" in text and "the session (since 09:30 ET)" in text
-    assert "its entry/exit watch" in text and "trader release 811eb9b" in text
-    assert text.rstrip().endswith(m.CONSOLE_URL)
-    for footer in ("Impact:", "Auto-fix:", "You:", "Problem:"):
+    assert text == OPEN_ALL_OK
+    for footer in ("Impact:", "Auto-fix:", "You:", "❌"):
         assert footer not in text
-    assert len(text.splitlines()) == 4
 
 
-def test_what_is_not_up_at_the_open_is_a_problem_with_a_footer(tmp_path: Path) -> None:
+def test_a_failure_at_the_open_is_a_cross_with_the_footer(tmp_path: Path) -> None:
     stale = {**WATCH, "updated_at_utc": "2026-11-11T14:00:00Z"}
-    store = _store({f"trader/order_books/{DAY}.json": BOOK, f"trader/entry_watch/{DAY}.json": stale})
+    store = _store({**OPEN_DOCS, f"trader/entry_watch/{DAY}.json": stale})
     _, sent = _notify("open", store, tmp_path, now=OPEN_AT, session=RUNNING, error="ConnectionRefusedError: x")
     ((text, auto_fix),) = sent.calls
     assert auto_fix != INFORMATIONAL
-    assert ": 2 problems*" in text.splitlines()[0]
-    assert "Problem: IB Gateway did not answer an API session (ConnectionRefusedError: x)." in text
-    assert "Problem: the entry/exit watch has not written since 09:00 ET." in text
-    assert "IB Gateway (" not in text  # not listed as up
+    lines = _lines(text)
+    assert lines[0] == "*Market OPEN — v2 trading day 2026-11-11 (Wed)*"
+    assert "❌ IB Gateway did not answer an API session (ConnectionRefusedError: x)" in lines
+    assert "❌ Entry/exit watch has not written since 09:00 ET" in lines
+    assert "✅ Orders so far today: 1 sent, fills not read from the broker, 3 waiting on their triggers" in lines
+    assert "✅ Trading session running since 09:30 ET" in lines  # what is fine still says so
     for footer in ("*Impact:*", "*Auto-fix:*", "*You:*"):
         assert footer in text
     assert text.rstrip().endswith(m.CONSOLE_URL)
 
 
-def test_a_session_that_already_ended_at_the_open_is_a_problem(tmp_path: Path) -> None:
+def test_a_failed_code_pull_is_a_cross(tmp_path: Path) -> None:
+    failed = {"ActiveState": "failed", "Result": "exit-code", "ExecMainExitTimestamp": "@1794402960"}
+    _, sent = _notify("open", _store(OPEN_DOCS), tmp_path, now=OPEN_AT, session=RUNNING, pull=failed)
+    ((text, _),) = sent.calls
+    assert (
+        "❌ Code pull did not succeed (boot-pull failed, result exit-code) — executor 93564d6, trader 811eb9b"
+        in _lines(text)
+    )
+    assert "*You:* Read /var/log/boot-pull.log on the trading box." in text
+
+
+def test_partial_fills_at_the_open_are_never_counted_as_filled(tmp_path: Path) -> None:
+    done = (m.OpenOrder("CVLT", "SELL", "MKT", "DAY", 657, 220), m.OpenOrder("ANF", "SELL", "MKT", "DAY", 6, 6))
+    working = (STOP, m.OpenOrder("NTNX", "BUY", "LMT", "DAY", 1334, 817))
+    _, sent = _notify("open", _store(OPEN_DOCS), tmp_path, now=OPEN_AT, session=RUNNING, done=done, orders=working)
+    ((text, _),) = sent.calls
+    assert "✅ Orders so far today: 1 sent, 1 filled, 2 partly filled, 3 waiting on their triggers" in _lines(text)
+
+
+def test_a_session_that_already_ended_at_the_open_is_a_cross(tmp_path: Path) -> None:
     """A release without the entry timing sends everything at the start and
     ends in minutes: that is exactly what the open must flag."""
     store = _store({f"trader/order_books/{DAY}.json": BOOK, f"runs/trader.session/{DAY}/run.json": RUN_OK})
     ended = {"ActiveState": "inactive", "Result": "success", "ExecMainExitTimestamp": "@1794407770"}
     _, sent = _notify("open", store, tmp_path, now=OPEN_AT, session=ended)
     ((text, _),) = sent.calls
-    assert "Problem: the session is not running (inactive, result success, ended 09:36 ET)." in text
-    assert "trader release not recorded" in text
+    lines = _lines(text)
+    assert "❌ Trading session not running (inactive, result success, ended 09:36 ET)" in lines
+    assert "✅ Code pulled 08:16 ET — executor 93564d6, trader not recorded yet" in lines
+    assert "❌ Entry/exit watch has written nothing yet" in lines
+    assert "⏳ Orders so far today: none recorded yet" in lines
 
 
 def test_a_held_session_is_named_at_the_open(tmp_path: Path) -> None:
@@ -205,81 +273,143 @@ def test_a_held_session_is_named_at_the_open(tmp_path: Path) -> None:
     store = _store({f"runs/trader.session/{DAY}/run.json": held})
     _, sent = _notify("open", store, tmp_path, now=OPEN_AT, session={"ActiveState": "inactive"})
     ((text, _),) = sent.calls
-    assert "No order book for 2026-11-10 yet." in text
-    assert "Problem: the session HELD and placed no order: no feed." in text
+    lines = _lines(text)
+    assert "❌ No predictions for 2026-11-10" in lines
+    assert "❌ No order book for 2026-11-10" in lines
+    assert "❌ Trading session HELD and placed no order: no feed" in lines
 
 
-def test_a_live_account_on_the_gateway_is_a_problem_and_no_account_id_is_printed(tmp_path: Path) -> None:
-    store = _store({f"trader/order_books/{DAY}.json": BOOK, f"trader/entry_watch/{DAY}.json": WATCH})
-    _, sent = _notify("open", store, tmp_path, now=OPEN_AT, session=RUNNING, account="live")
+def test_a_live_account_on_the_gateway_is_a_cross_and_no_account_id_is_printed(tmp_path: Path) -> None:
+    _, sent = _notify("open", _store(OPEN_DOCS), tmp_path, now=OPEN_AT, session=RUNNING, account="live")
     ((text, _),) = sent.calls
-    assert "Problem: the gateway's account type is live, not paper." in text
+    assert "❌ IB Gateway connected to a live account, not paper" in _lines(text)
     assert "DU" not in text
 
 
-def test_an_unreadable_document_is_a_problem_not_an_absence(tmp_path: Path) -> None:
+def test_an_unreadable_document_is_a_cross_not_an_absence(tmp_path: Path) -> None:
     store = _store({}, denied=[f"crucible/trader/order_books/{DAY}.json"])
     _, sent = _notify("open", store, tmp_path, now=OPEN_AT, session=RUNNING)
     ((text, _),) = sent.calls
-    assert f"Problem: trader/order_books/{DAY}.json is unreadable (InternalError)." in text
+    assert f"❌ Could not read trader/order_books/{DAY}.json (InternalError)" in _lines(text)
 
 
 # --- the close ----------------------------------------------------------------
 
 
-def _close_store(watch: dict[str, Any] | None = None) -> Store:
+def _close_store(watch: dict[str, Any] | None = None, *, shortfall: dict[str, Any] = SHORTFALL) -> Store:
     objects: dict[str, Any] = {
         f"runs/trader.session/{DAY}/run.json": RUN_OK,
-        f"trader/execution_shortfall/{DAY}.json": SHORTFALL,
+        f"trader/execution_shortfall/{DAY}.json": shortfall,
     }
     if watch is not None:
         objects[f"trader/entry_watch/{DAY}.json"] = watch
     return _store(objects)
 
 
-def test_an_all_clear_close_counts_fills_and_says_what_still_runs(tmp_path: Path) -> None:
-    done = {**WATCH, "state": "complete", "entries": [_entry("ANF", "sell", "sent"), _entry("PLTR", "buy", "not_sent")]}
-    outcome, sent = _notify("close", _close_store(done), tmp_path, now=CLOSE_AT, session=STOPPED)
+DONE_WATCH = {
+    **WATCH,
+    "state": "complete",
+    "entries": [_entry("ANF", "sell", "sent"), _entry("PLTR", "buy", "not_sent")],
+}
+ALL_FILLED = {
+    "orders": [
+        _order("ANF", "sell", 6, 6, 922.56),
+        _order("CVLT", "sell", 657, 657, 109823.55),
+        _order("FSLR", "buy", 178, 178, 31974.14),
+    ]
+}
+
+CLOSE_ALL_OK = """\
+*Market CLOSED — v2 trading day 2026-11-11 (Wed)*
+✅ Trading session ran 09:35–15:56 ET and stopped cleanly
+✅ Trades executed today: 3 orders — 3 filled, 0 partly filled, 0 not filled; sold $110,746, bought $31,974
+✅ Timed orders left unsent and cancelled at the close: 1 (PLTR)
+✅ Broker holds only GTC stops (1)
+⏳ Still to run: pin smoke 16:10 ET
+⏳ Still to run: reconcile 16:45 ET
+⏳ Box stops at the 01:00 ET backstop
+Details on console: https://console.nousergon.ai/page/crucible-trading"""
+
+
+def test_an_all_clear_close_is_a_checklist_with_no_footer(tmp_path: Path) -> None:
+    store = _close_store(DONE_WATCH, shortfall=ALL_FILLED)
+    outcome, sent = _notify("close", store, tmp_path, now=CLOSE_AT, session=STOPPED)
     assert outcome.outcome == "sent"
     ((text, auto_fix),) = sent.calls
     assert auto_fix == INFORMATIONAL
-    assert text.splitlines()[0] == "*Market close, v2 trading day 2026-11-11*"
+    assert text == CLOSE_ALL_OK
+
+
+def test_partial_fills_at_the_close_are_counted_and_named(tmp_path: Path) -> None:
+    _, sent = _notify("close", _close_store(DONE_WATCH), tmp_path, now=CLOSE_AT, session=STOPPED)
+    ((text, auto_fix),) = sent.calls
+    assert auto_fix == INFORMATIONAL
     assert (
-        "5 orders: 2 filled, 2 partly filled, 1 not filled; sold $37,698, bought $80,312 "
-        "(partial or unfilled: CVLT, NTNX, MU)." in text
-    )
-    assert "The session stopped cleanly at 15:56 ET (1 timed order not sent)" in text
-    assert "the broker holds only GTC stops (1)" in text
-    assert "pin smoke 16:10 and broker reconcile 16:45 ET" in text and "01:00 ET" in text
-    assert "Auto-fix:" not in text and "Problem:" not in text
-    assert text.rstrip().endswith(m.CONSOLE_URL)
+        "✅ Trades executed today: 5 orders — 2 filled, 2 partly filled, 1 not filled; sold $37,698, "
+        "bought $80,312; partly filled: CVLT 220/657, NTNX 817/1,334; not filled: MU 0/13"
+    ) in _lines(text)
 
 
-def test_a_working_order_left_at_the_broker_is_a_problem(tmp_path: Path) -> None:
-    orders = (m.OpenOrder("SPY", "SELL", "TRAIL", "GTC"), m.OpenOrder("CVLT", "SELL", "MKT", "DAY"))
+def test_a_working_order_left_at_the_broker_is_a_cross(tmp_path: Path) -> None:
+    orders = (STOP, m.OpenOrder("CVLT", "SELL", "MKT", "DAY", 657, 220))
     _, sent = _notify("close", _close_store(), tmp_path, now=CLOSE_AT, session=STOPPED, orders=orders)
     ((text, auto_fix),) = sent.calls
     assert auto_fix != INFORMATIONAL
-    assert "Problem: 1 non-stop order still open at the broker: SELL CVLT MKT DAY." in text
+    assert "❌ Broker still has 1 non-stop order open: SELL CVLT MKT DAY" in _lines(text)
     assert "holds only GTC stops" not in text
     assert "*Impact:*" in text and "*You:*" in text
 
 
-def test_a_session_that_hit_its_hard_stop_is_a_problem(tmp_path: Path) -> None:
-    timeout = {"ActiveState": "failed", "Result": "timeout"}
+def test_a_session_that_hit_its_hard_stop_is_a_cross(tmp_path: Path) -> None:
+    timeout = {
+        "ActiveState": "failed",
+        "Result": "timeout",
+        "ExecMainStartTimestamp": "@1794407701",
+        "ExecMainExitTimestamp": "@1794431100",
+    }
     waiting = {**WATCH, "state": "stopped", "entries": [_entry("MU", "buy")]}
     _, sent = _notify("close", _close_store(waiting), tmp_path, now=CLOSE_AT, session=timeout)
     ((text, _),) = sent.calls
-    assert "Problem: the session ended timeout (it hit the 16:05 hard stop)." in text
-    assert "Problem: timed orders still waiting at the stop: MU." in text
+    lines = _lines(text)
+    assert "❌ Trading session ran 09:35–16:05 ET and ended timeout (it hit the 16:05 hard stop)" in lines
+    assert "❌ Timed orders still waiting at the stop: MU" in lines
     assert "stopped cleanly" not in text
+
+
+def test_a_stopped_after_close_timer_is_a_cross(tmp_path: Path) -> None:
+    run = _systemd(STOPPED)
+    run.units["alpha-engine-trader-reconcile.timer"] = {"ActiveState": "inactive"}
+    sent = _Sent()
+    m.notify(
+        "close",
+        _close_store(),
+        ENV,
+        now=CLOSE_AT,
+        client_id=44,
+        run=run,
+        broker=_broker(),
+        send=sent,
+        sent_dir=tmp_path,
+    )
+    ((text, _),) = sent.calls
+    assert "❌ Still to run: reconcile 16:45 ET — but its timer is inactive" in _lines(text)
+    assert "⏳ Still to run: pin smoke 16:10 ET" in _lines(text)
 
 
 def test_a_close_with_no_run_record_says_so(tmp_path: Path) -> None:
     _, sent = _notify("close", _store({}), tmp_path, now=CLOSE_AT, session=STOPPED)
     ((text, _),) = sent.calls
-    assert "No orders today." in text
-    assert f"Problem: the session wrote no run record for {DAY}." in text
+    lines = _lines(text)
+    assert "✅ Trades executed today: none" in lines
+    assert f"❌ Trading session ran 09:35–15:56 ET but wrote no run record for {DAY}" in lines
+
+
+def test_fills_the_run_filed_but_this_notice_cannot_read_are_a_cross(tmp_path: Path) -> None:
+    run = {**RUN_OK, "outputs": [{"key": f"trader/execution_shortfall/{DAY}.json"}]}
+    store = _store({f"runs/trader.session/{DAY}/run.json": run})
+    _, sent = _notify("close", store, tmp_path, now=CLOSE_AT, session=STOPPED)
+    ((text, _),) = sent.calls
+    assert "❌ Trades executed today: the session filed its fills but they could not be read" in _lines(text)
 
 
 # --- once a day, trading days only, delivery ---------------------------------

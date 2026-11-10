@@ -15,17 +15,27 @@ message, the session summary (:mod:`executor.v2_trade_alert`), and only when the
 session unit ended, whenever that was. Nothing said the session had started,
 and nothing ran at the close.
 
-**What each one says.** One message each, a pointer and not a copy: two or
-three sentences and the console's trading page. The open names the order book
-(its day, when it was written, what it changes, how many orders are waiting on
-their triggers) and what came up (the box, IB Gateway and the account type, the
-session, its entry/exit watch, the trader release). The close names what the
-orders did (filled, partly filled, not filled, and the notional each way),
-whether the session stopped cleanly with no timed order left waiting, what the
-broker still holds open (only GTC stops are expected), and what still runs
-before the box stops. Anything that is not as expected becomes a problem line
-with ``Impact:``, ``Auto-fix:`` and ``You:``; an all-clear message carries no
-footer (Brian 2026-11-04).
+**What each one says: a proof-of-life checklist** (Brian 2026-11-10: "I'm going
+to need confirmation that the system is actually doing what it should be during
+market hours"). A headline (``Market OPEN — v2 trading day 2026-11-11 (Wed)``),
+then one line per process, each ✅ done, ❌ failed or ⏳ still to come, with its
+time and its key number, then the console's trading page. Every line is read
+from evidence, never assumed: the session's own documents in the v2 store,
+systemd, the executor checkout, and the read-only broker session.
+
+* The open: the box up (boot time), the code pulled (boot-pull, the executor
+  and trader shas), the day's predictions, the order book (when, what it
+  changes, how many orders it plans), IB Gateway (paper or live, never an
+  account number), the session (running since), its entry/exit watch (last
+  write), and the orders so far: sent, filled, waiting on their triggers.
+* The close: the session's run (from, to, stopped cleanly), the trades executed
+  (filled, partly filled, not filled, the notional each way, which names fell
+  short), the timed orders left unsent, what the broker still holds (only GTC
+  stops are expected), and what still runs tonight (⏳).
+
+An order counts as filled only when every share it asked for filled; fewer is
+partly filled, never "filled". Any ❌ line adds the ``Impact:``, ``Auto-fix:``
+and ``You:`` footer; an all-clear message carries none (Brian 2026-11-04).
 
 **Read-only, and off the trading path.** It reads the session's own documents
 in the v2 store (as the trader's role, through the trader's env file), asks
@@ -65,7 +75,9 @@ from executor.v2_trade_alert import (
     Store,
     open_store,
     read_env_file,
+    run_lists_output,
     shortfall_key,
+    split_fills,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,13 +90,16 @@ CONSOLE_URL = "https://console.nousergon.ai/page/crucible-trading"
 
 SESSION_UNIT = "alpha-engine-trader-session.service"
 GATEWAY_UNIT = "ibgateway.service"
+BOOT_PULL_UNIT = "boot-pull.service"
+#: The executor checkout this module runs from; boot-pull resets it at boot.
+EXECUTOR_DIR = Path(__file__).resolve().parents[1]
 #: The units still to run after the close, and when (their timers' OnCalendar).
 AFTER_CLOSE = (
     ("alpha-engine-trader-pin-smoke.timer", "pin smoke 16:10"),
-    ("alpha-engine-trader-reconcile.timer", "broker reconcile 16:45"),
+    ("alpha-engine-trader-reconcile.timer", "reconcile 16:45"),
 )
 #: When the box stops: the 01:00 ET backstop stop (the session timer's own note).
-BOX_STOP = "the box stops at the 01:00 ET backstop"
+BOX_STOP = "the 01:00 ET backstop"
 
 #: This alert's own IB API client id, set in its units. Never one the trader
 #: uses (:func:`_refused_client_ids`) and never v1's 1-3.
@@ -96,6 +111,8 @@ PAPER_PORT = 4002
 
 ORDER_BOOK_PREFIX = "trader/order_books/"
 ENTRY_WATCH_PREFIX = "trader/entry_watch/"
+#: The champion's serving feed the session trades from (``crucible.keys.predictions_key``).
+PREDICTIONS_PREFIX = "predictions/"
 #: The watch rewrites its document at least every 600 s while it waits
 #: (crucible-trader ``entry_timing.HEARTBEAT_S``); older than this, it has stopped.
 WATCH_STALE_AFTER = dt.timedelta(minutes=15)
@@ -118,24 +135,46 @@ def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
 
 # --- what is observed ---------------------------------------------------------
 
+Mark = Literal["ok", "fail", "wait"]
+#: How each checklist line starts: done, failed, still to come.
+ICONS: Mapping[Mark, str] = {"ok": "✅", "fail": "❌", "wait": "⏳"}
+
 
 @dataclass(frozen=True)
-class Problem:
-    """One thing that is not as expected, and what it means."""
+class Check:
+    """One line of the checklist. A ``fail`` line says what it means and what to do."""
 
-    line: str
-    impact: str
-    action: str
+    mark: Mark
+    text: str
+    impact: str = ""
+    action: str = ""
+
+    def render(self) -> str:
+        return f"{ICONS[self.mark]} {self.text}"
+
+
+def _ok(text: str) -> Check:
+    return Check("ok", text)
+
+
+def _wait(text: str) -> Check:
+    return Check("wait", text)
+
+
+def _fail(text: str, impact: str, action: str) -> Check:
+    return Check("fail", text, impact, action)
 
 
 @dataclass(frozen=True)
 class OpenOrder:
-    """One order the broker still has working: no account, no order id."""
+    """One order the broker reports for today: no account, no order id."""
 
     symbol: str
     action: str
     order_type: str
     tif: str
+    quantity: float = 0.0
+    filled: float = 0.0
 
     @property
     def is_stop(self) -> bool:
@@ -144,11 +183,17 @@ class OpenOrder:
 
 @dataclass(frozen=True)
 class Broker:
-    """What a read-only API session saw. ``error`` set means it could not connect."""
+    """What a read-only API session saw. ``error`` set means it could not connect.
+
+    ``open_orders`` are the orders still working; ``done`` the orders the API
+    sent today that are finished (filled or cancelled). Both ``None`` when the
+    orders were not asked for.
+    """
 
     error: str | None = None
     account_kind: str = "unknown"
     open_orders: tuple[OpenOrder, ...] | None = None
+    done: tuple[OpenOrder, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +209,10 @@ class Unit:
     @property
     def result(self) -> str:
         return self.props.get("Result", "unknown")
+
+    @property
+    def running(self) -> bool:
+        return self.active in ("active", "activating")
 
     def stamp(self, name: str) -> dt.datetime | None:
         """A timestamp property as ``systemctl show --timestamp=unix`` gives it (``@1762875001``)."""
@@ -195,6 +244,23 @@ def unit_state(unit: str, run: Runner = _run) -> Unit:
     return Unit(props)
 
 
+def booted_at(run: Runner = _run) -> dt.datetime | None:
+    """When this box booted: systemd's own ``KernelTimestamp``."""
+    proc = run(["systemctl", "show", "--timestamp=unix", "--property=KernelTimestamp"])
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition("=")
+        if key == "KernelTimestamp":
+            return Unit({key: value}).stamp(key)
+    return None
+
+
+def executor_sha(run: Runner = _run) -> str | None:
+    """The short sha the executor checkout (this module's own) is at."""
+    proc = run(["git", "-C", str(EXECUTOR_DIR), "rev-parse", "--short=7", "HEAD"])
+    sha = proc.stdout.strip()
+    return sha if proc.returncode == 0 and sha else None
+
+
 def _refused_client_ids(env: Mapping[str, str]) -> set[int]:
     refused = set(_V1_CLIENT_IDS)
     for var in _TRADER_CLIENT_ID_VARS:
@@ -204,11 +270,33 @@ def _refused_client_ids(env: Mapping[str, str]) -> set[int]:
     return refused
 
 
+def _quantity(value: object) -> float:
+    """A share count from the SDK; IB's "unset" (a float near max) and garbage read as 0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    number = float(value)
+    return number if 0 <= number < 1e12 else 0.0
+
+
+def _broker_order(trade: object, *, filled: float | None = None) -> OpenOrder:
+    contract: object = getattr(trade, "contract", None)
+    order: object = getattr(trade, "order", None)
+    status: object = getattr(trade, "orderStatus", None)
+    return OpenOrder(
+        symbol=str(getattr(contract, "symbol", "?")),
+        action=str(getattr(order, "action", "?")),
+        order_type=str(getattr(order, "orderType", "?")),
+        tif=str(getattr(order, "tif", "?")),
+        quantity=_quantity(getattr(order, "totalQuantity", 0)),
+        filled=_quantity(getattr(status, "filled", 0)) if filled is None else filled,
+    )
+
+
 def read_broker(env: Mapping[str, str], client_id: int, *, want_orders: bool) -> Broker:
-    """A READ-ONLY IB API session on ``client_id``: the account type and, if asked, the open orders.
+    """A READ-ONLY IB API session on ``client_id``: the account type and, if asked, today's orders.
 
     Never raises: anything that stops the read is returned as ``error``, which
-    the notice reports as a problem line.
+    the notice reports as a failed line.
     """
     if client_id in _refused_client_ids(env):
         return Broker(error=f"client id {client_id} is one the trader or v1 uses; not connecting")
@@ -222,7 +310,7 @@ def read_broker(env: Mapping[str, str], client_id: int, *, want_orders: bool) ->
         ib = ib_insync.IB()
         # readonly=True: the session can read but never place or cancel an order.
         ib.connect(host, port, clientId=client_id, timeout=15, readonly=True)
-    except Exception as exc:  # noqa: BLE001 -- reported as a problem line, never raised
+    except Exception as exc:  # noqa: BLE001 -- reported as a failed line, never raised
         return Broker(error=f"{type(exc).__name__}: {str(exc)[:120]}")
     try:
         accounts = [str(a) for a in cast(list[object], ib.managedAccounts() or [])]
@@ -232,24 +320,19 @@ def read_broker(env: Mapping[str, str], client_id: int, *, want_orders: bool) ->
             kind = "paper"
         else:
             kind = "live"
-        orders: tuple[OpenOrder, ...] | None = None
-        if want_orders:
-            ib.reqAllOpenOrders()
-            found: list[OpenOrder] = []
-            for trade in cast(list[object], ib.openTrades()):
-                contract: object = getattr(trade, "contract", None)
-                order: object = getattr(trade, "order", None)
-                found.append(
-                    OpenOrder(
-                        symbol=str(getattr(contract, "symbol", "?")),
-                        action=str(getattr(order, "action", "?")),
-                        order_type=str(getattr(order, "orderType", "?")),
-                        tif=str(getattr(order, "tif", "?")),
-                    )
-                )
-            orders = tuple(found)
-        return Broker(account_kind=kind, open_orders=orders)
-    except Exception as exc:  # noqa: BLE001 -- reported as a problem line, never raised
+        if not want_orders:
+            return Broker(account_kind=kind)
+        ib.reqAllOpenOrders()
+        working = tuple(_broker_order(t) for t in cast(list[object], ib.openTrades()))
+        # Finished orders the API sent this gateway session (the gateway restarts
+        # every trading day with the box). A completed order's fill is on the
+        # order itself (``filledQuantity``), not on its status.
+        done = tuple(
+            _broker_order(t, filled=_quantity(getattr(getattr(t, "order", None), "filledQuantity", 0)))
+            for t in cast(list[object], ib.reqCompletedOrders(True))
+        )
+        return Broker(account_kind=kind, open_orders=working, done=done)
+    except Exception as exc:  # noqa: BLE001 -- reported as a failed line, never raised
         return Broker(error=f"{type(exc).__name__}: {str(exc)[:120]}")
     finally:
         ib.disconnect()
@@ -284,12 +367,33 @@ def _when(value: object) -> dt.datetime | None:
         return None
 
 
+def _hm(moment: dt.datetime | None) -> str:
+    return "?" if moment is None else moment.astimezone(_NEW_YORK).strftime("%H:%M")
+
+
 def _et(moment: dt.datetime | None) -> str:
-    return "?" if moment is None else moment.astimezone(_NEW_YORK).strftime("%H:%M ET")
+    return f"{_hm(moment)} ET"
 
 
 def _money(value: float) -> str:
     return f"${value:,.0f}"
+
+
+def _shares(value: float) -> str:
+    return f"{value:,.0f}"
+
+
+def _plain(text: object) -> str:
+    """Free text with no ``*``: an odd one would open a bold entity in the message.
+
+    Only ``*``. ``krepis.telegram.send_message`` escapes ``_``, backticks and
+    brackets itself, so an identifier (a key, a unit) arrives as it is.
+    """
+    return str(text).replace("*", "")
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
 def _read(store: Store, relative: str) -> tuple[Doc | None, str | None]:
@@ -299,10 +403,16 @@ def _read(store: Store, relative: str) -> tuple[Doc | None, str | None]:
     reads as absent here: every document this notice reads is one the session
     may legitimately not have written yet.
     """
-    doc, reason = store.read(relative)
-    if reason in ("AccessDenied", "403"):
-        return None, None
+    doc, reason, _ = _read_stamped(store, relative)
     return doc, reason
+
+
+def _read_stamped(store: Store, relative: str) -> tuple[Doc | None, str | None, dt.datetime | None]:
+    """:func:`_read`, plus when the document was written (S3 ``LastModified``)."""
+    doc, reason, modified = store.read_stamped(relative)
+    if reason in ("AccessDenied", "403"):
+        return None, None, None
+    return doc, reason, modified
 
 
 def _held_reason(run: Mapping[str, object] | None) -> str | None:
@@ -312,29 +422,19 @@ def _held_reason(run: Mapping[str, object] | None) -> str | None:
     return None
 
 
+def _unreadable_checks(unreadable: Sequence[str]) -> list[Check]:
+    return [
+        _fail(f"Could not read {_plain(r)}", "this notice could not check it", "check the trader role's read grants.")
+        for r in unreadable
+    ]
+
+
+def _headline(state: str, today: str) -> str:
+    weekday = dt.date.fromisoformat(today).strftime("%a")
+    return f"*Market {state} — v2 trading day {today} ({weekday})*"
+
+
 # --- the open -----------------------------------------------------------------
-
-
-def book_sentence(day: str, book: Mapping[str, object] | None, watch: Mapping[str, object] | None) -> str:
-    """What the order book is and what the session will do with it."""
-    if book is None:
-        return f"No order book for {day} yet."
-    actions = _sub(_sub(book, "summary"), "actions")
-    counts = [(a, int(_num(actions, a))) for a in _ACTIONS]
-    changes = sum(n for _, n in counts)
-    detail = ", ".join(f"{n} {a}" for a, n in counts if n)
-    stage = " pre-open" if book.get("stage") == "pre_open" else ""
-    text = f"The{stage} order book for {day} was written at {_et(_when(book.get('written_at_utc')))}: "
-    text += f"{changes} target change{'s' if changes != 1 else ''}" + (f" ({detail})" if detail else "")
-    entries = _docs(watch, "entries")
-    if entries:
-        sells = sum(1 for e in entries if e.get("side") == "sell")
-        waiting = sum(1 for e in entries if e.get("status") == "waiting")
-        text += (
-            f", {len(entries)} order{'s' if len(entries) != 1 else ''} planned "
-            f"({sells} sell, {len(entries) - sells} buy), {waiting} waiting on their triggers"
-        )
-    return text + "."
 
 
 @dataclass(frozen=True)
@@ -348,119 +448,167 @@ class OpenFacts:
     watch: Doc | None
     run: Doc | None
     now: dt.datetime
+    boot: dt.datetime | None = None
+    boot_pull: Unit = field(default_factory=Unit)
+    executor_sha: str | None = None
+    predictions: Doc | None = None
+    predictions_at: dt.datetime | None = None
     unreadable: tuple[str, ...] = ()
 
 
-def open_problems(f: OpenFacts) -> list[Problem]:
-    """Everything that should be up at the open and is not."""
-    out: list[Problem] = []
-    trades_lost = "orders the book needs may not go out today"
-    for reason in f.unreadable:
-        out.append(Problem(f"{reason}.", "this notice could not check it", "check the trader role's read grants."))
+_TRADES_LOST = "orders the book needs may not go out today"
+_READ_JOURNAL = "read the session's journal on the trading box."
+
+
+def _box_check(f: OpenFacts) -> Check:
+    return _ok(f"Box up — booted {_et(f.boot)}" if f.boot is not None else "Box up — boot time not read")
+
+
+def _code_check(f: OpenFacts) -> Check:
+    sha = None if f.watch is None else f.watch.get("code_sha")
+    trader = str(sha)[:7] if isinstance(sha, str) and sha else "not recorded yet"
+    shas = f"executor {f.executor_sha or 'unknown'}, trader {_plain(trader)}"
+    pull = f.boot_pull
+    if pull.active == "activating":
+        return _wait(f"Code pull still running — {shas}")
+    if pull.result != "success":
+        return _fail(
+            f"Code pull did not succeed (boot-pull {pull.active}, result {pull.result}) — {shas}",
+            "today's session may be running stale code",
+            "read /var/log/boot-pull.log on the trading box.",
+        )
+    return _ok(f"Code pulled {_et(pull.stamp('ExecMainExitTimestamp'))} — {shas}")
+
+
+def _predictions_check(f: OpenFacts) -> Check:
+    if f.predictions is None:
+        return _fail(
+            f"No predictions for {f.day}",
+            "the session holds and places no order",
+            "check that the predictor published the day's feed.",
+        )
+    alpha = _sub(f.predictions, "predicted_alpha")
+    when = f" published {_et(f.predictions_at)}" if f.predictions_at is not None else ""
+    return _ok(f"Predictions for {f.day} present{when} — {_plural(len(alpha), 'name')}")
+
+
+def _book_check(f: OpenFacts) -> Check:
+    if f.book is None:
+        return _fail(f"No order book for {f.day}", _TRADES_LOST, _READ_JOURNAL)
+    actions = _sub(_sub(f.book, "summary"), "actions")
+    counts = [(a, int(_num(actions, a))) for a in _ACTIONS]
+    changes = sum(n for _, n in counts)
+    detail = ", ".join(f"{n} {a}" for a, n in counts if n)
+    text = f"Order book built {_et(_when(f.book.get('written_at_utc')))} — {_plural(changes, 'target change')}"
+    text += f" ({detail})" if detail else ""
+    entries = _docs(f.watch, "entries")
+    if entries:
+        sells = sum(1 for e in entries if e.get("side") == "sell")
+        text += f", {_plural(len(entries), 'order')} planned ({sells} sell, {len(entries) - sells} buy)"
+    return _ok(text)
+
+
+def _gateway_check(f: OpenFacts) -> Check:
     if f.gateway.active != "active":
-        out.append(
-            Problem(
-                f"IB Gateway service is {f.gateway.active}.",
-                "the session cannot quote or send orders",
-                "check ibgateway.service on the trading box.",
-            )
+        return _fail(
+            f"IB Gateway service is {f.gateway.active}",
+            "the session cannot quote or send orders",
+            "check ibgateway.service on the trading box.",
         )
     if f.broker.error is not None:
-        out.append(
-            Problem(
-                f"IB Gateway did not answer an API session ({f.broker.error}).",
-                trades_lost,
-                "check the gateway login on the trading box.",
-            )
+        return _fail(
+            f"IB Gateway did not answer an API session ({_plain(f.broker.error)})",
+            _TRADES_LOST,
+            "check the gateway login on the trading box.",
         )
-    elif f.broker.account_kind != "paper":
-        out.append(
-            Problem(
-                f"the gateway's account type is {f.broker.account_kind}, not paper.",
-                "the trader refuses any account that is not paper, so it will place no order",
-                "check which account the gateway logged in to.",
-            )
+    if f.broker.account_kind != "paper":
+        return _fail(
+            f"IB Gateway connected to a {f.broker.account_kind} account, not paper",
+            "the trader refuses any account that is not paper, so it will place no order",
+            "check which account the gateway logged in to.",
         )
+    return _ok("IB Gateway connected — paper account")
+
+
+def _session_check(f: OpenFacts) -> Check:
+    if f.session.running:
+        return _ok(f"Trading session running since {_et(f.session.stamp('ExecMainStartTimestamp'))}")
     held = _held_reason(f.run)
-    if f.session.active not in ("active", "activating"):
-        if held is not None:
-            out.append(
-                Problem(
-                    f"the session HELD and placed no order: {held}.",
-                    "no trades today",
-                    "once the missing input is published, rerun the session today.",
-                )
-            )
-        else:
-            ended = _et(f.session.stamp("ExecMainExitTimestamp"))
-            out.append(
-                Problem(
-                    f"the session is not running ({f.session.active}, result {f.session.result}, ended {ended}).",
-                    "orders still waiting on their triggers will not go out",
-                    "read the session's journal; its failure page carries the tail if it failed.",
-                )
-            )
-        return out
-    if f.book is None:
-        out.append(
-            Problem(
-                f"no order book for {f.day} yet.",
-                trades_lost,
-                "read the session's journal on the trading box.",
-            )
+    if held is not None:
+        return _fail(
+            f"Trading session HELD and placed no order: {_plain(held)}",
+            "no trades today",
+            "once the missing input is published, rerun the session today.",
         )
+    return _fail(
+        f"Trading session not running ({f.session.active}, result {f.session.result}, "
+        f"ended {_et(f.session.stamp('ExecMainExitTimestamp'))})",
+        "orders still waiting on their triggers will not go out",
+        "read the session's journal; its failure page carries the tail if it failed.",
+    )
+
+
+def _watch_check(f: OpenFacts) -> Check:
     if f.watch is None:
-        out.append(
-            Problem(
-                "the entry/exit watch has written nothing yet.",
-                trades_lost,
-                "read the session's journal on the trading box.",
-            )
-        )
+        return _fail("Entry/exit watch has written nothing yet", _TRADES_LOST, _READ_JOURNAL)
+    updated = _when(f.watch.get("updated_at_utc"))
+    state = f.watch.get("state")
+    if state == "complete":
+        return _ok(f"Entry/exit watch complete — last write {_et(updated)}")
+    if state != "watching":
+        return _fail(f"Entry/exit watch is {_plain(state)} — last write {_et(updated)}", _TRADES_LOST, _READ_JOURNAL)
+    if updated is None or f.now - updated > WATCH_STALE_AFTER:
+        return _fail(f"Entry/exit watch has not written since {_et(updated)}", _TRADES_LOST, _READ_JOURNAL)
+    return _ok(f"Entry/exit watch live — last write {_et(updated)}")
+
+
+def broker_fills(broker: Broker) -> tuple[int, int] | None:
+    """``(filled, partly filled)`` among today's non-stop orders at the broker; ``None`` if not read.
+
+    Filled means every share ordered; an order with some shares and not all is
+    partly filled, whether it is still working or was cancelled with the rest.
+    """
+    if broker.error is not None or broker.done is None:
+        return None
+    done = [o for o in broker.done if not o.is_stop]
+    working = [o for o in broker.open_orders or () if not o.is_stop]
+    filled = sum(1 for o in done if 0 < o.quantity <= o.filled)
+    partly = sum(1 for o in (*done, *working) if 0 < o.filled < o.quantity)
+    return filled, partly
+
+
+def _orders_check(f: OpenFacts) -> Check:
+    entries = _docs(f.watch, "entries")
+    if not entries:
+        return _wait("Orders so far today: none recorded yet")
+    sent = sum(1 for e in entries if e.get("status") in ("sent", "triggered"))
+    waiting = sum(1 for e in entries if e.get("status") == "waiting")
+    fills = broker_fills(f.broker)
+    if fills is None:
+        filled = "fills not read from the broker"
     else:
-        updated = _when(f.watch.get("updated_at_utc"))
-        state = f.watch.get("state")
-        if state not in ("watching", "complete"):
-            out.append(
-                Problem(
-                    f"the entry/exit watch is {state}.",
-                    trades_lost,
-                    "read the session's journal on the trading box.",
-                )
-            )
-        elif state == "watching" and (updated is None or f.now - updated > WATCH_STALE_AFTER):
-            out.append(
-                Problem(
-                    f"the entry/exit watch has not written since {_et(updated)}.",
-                    trades_lost,
-                    "read the session's journal on the trading box.",
-                )
-            )
-    return out
+        filled = f"{fills[0]} filled" + (f", {fills[1]} partly filled" if fills[1] else "")
+    return _ok(f"Orders so far today: {sent} sent, {filled}, {waiting} waiting on their triggers")
+
+
+def open_checks(f: OpenFacts) -> list[Check]:
+    """One line per process that should be up and done by the open."""
+    return [
+        _box_check(f),
+        _code_check(f),
+        _predictions_check(f),
+        _book_check(f),
+        _gateway_check(f),
+        _session_check(f),
+        _watch_check(f),
+        _orders_check(f),
+        *_unreadable_checks(f.unreadable),
+    ]
 
 
 def render_open(f: OpenFacts) -> tuple[str, str]:
-    """``(text, auto_fix)`` of the market-open notice."""
-    problems = open_problems(f)
-    head = f"*Market open, v2 trading day {f.today}*"
-    if problems:
-        head = f"*Market open, v2 trading day {f.today}: {len(problems)} problem{'s' if len(problems) > 1 else ''}*"
-    up: list[str] = ["the box"]
-    if f.gateway.active == "active" and f.broker.error is None:
-        up.append(f"IB Gateway ({f.broker.account_kind})")
-    if f.session.active in ("active", "activating"):
-        up.append(f"the session (since {_et(f.session.stamp('ExecMainStartTimestamp'))})")
-        watch_state = None if f.watch is None else f.watch.get("state")
-        if watch_state == "watching":
-            up.append("its entry/exit watch")
-    sha = None if f.watch is None else f.watch.get("code_sha")
-    release = f"trader release {str(sha)[:7]}" if isinstance(sha, str) and sha else "trader release not recorded"
-    body = [
-        head,
-        book_sentence(f.day, f.book, f.watch),
-        f"Up: {_join(up)}; {release}.",
-    ]
-    return _finish(body, problems)
+    """``(text, auto_fix)`` of the market-open checklist."""
+    return _finish(_headline("OPEN", f.today), open_checks(f))
 
 
 # --- the close ----------------------------------------------------------------
@@ -479,148 +627,155 @@ class CloseFacts:
     unreadable: tuple[str, ...] = ()
 
 
-def orders_sentence(shortfall: Mapping[str, object] | None, held: str | None) -> str:
+def _close_session_check(f: CloseFacts) -> Check:
+    if f.session.running:
+        return _fail(
+            f"Trading session still running after its 16:05 hard stop (since {_et(f.session.stamp('ExecMainStartTimestamp'))})",
+            "it holds the client id the 16:10 pin smoke and the 16:45 reconcile need",
+            _READ_JOURNAL,
+        )
+    ran = f"{_hm(f.session.stamp('ExecMainStartTimestamp'))}–{_et(f.session.stamp('ExecMainExitTimestamp'))}"
+    if f.session.result != "success":
+        hard_stop = " (it hit the 16:05 hard stop)" if f.session.result == "timeout" else ""
+        return _fail(
+            f"Trading session ran {ran} and ended {f.session.result}{hard_stop}",
+            "orders it had not sent did not go out; those it sent are on the record",
+            "its failure page carries the journal tail; fix the cause before the next session.",
+        )
+    if f.run is None:
+        return _fail(
+            f"Trading session ran {ran} but wrote no run record for {f.day}",
+            "today's orders are not on the record here; check the broker",
+            _READ_JOURNAL,
+        )
+    if f.run.get("status") != "ok":
+        reason = _plain(str(f.run.get("reason") or "no reason recorded")[:160])
+        return _fail(
+            f"Trading session ran {ran}; its run ended {_plain(f.run.get('status'))}: {reason}",
+            "the remaining orders were not sent",
+            "fix the cause; a rerun adopts the orders already sent and never resends them.",
+        )
+    return _ok(f"Trading session ran {ran} and stopped cleanly")
+
+
+def _filled_of(o: Mapping[str, object]) -> str:
+    return f"{_plain(o.get('symbol'))} {_shares(_num(o, 'filled_quantity'))}/{_shares(_num(o, 'quantity'))}"
+
+
+def _trades_check(f: CloseFacts) -> Check:
+    held = _held_reason(f.run)
     if held is not None:
-        return f"The session held and placed no order ({held})."
-    orders = _docs(shortfall, "orders")
+        return _fail(
+            f"Trades executed today: none — the session held ({_plain(held)})",
+            "no trades today",
+            "find why the input was missing before the next session.",
+        )
+    if f.shortfall is None and f.run is not None and run_lists_output(f.run, shortfall_key(f.day)):
+        return _fail(
+            "Trades executed today: the session filed its fills but they could not be read",
+            "today's fills are unconfirmed here; check the broker",
+            "check the trader role's read grant on the execution shortfall file.",
+        )
+    orders = _docs(f.shortfall, "orders")
     if not orders:
-        reason = None if shortfall is None else shortfall.get("reason")
-        return f"No orders today{f' ({reason})' if reason else ''}."
-    full = [o for o in orders if 0 < _num(o, "quantity") <= _num(o, "filled_quantity")]
-    partial = [o for o in orders if 0 < _num(o, "filled_quantity") < _num(o, "quantity")]
-    unfilled = [o for o in orders if _num(o, "filled_quantity") <= 0]
+        reason = None if f.shortfall is None else f.shortfall.get("reason")
+        return _ok(f"Trades executed today: none{f' ({_plain(reason)})' if reason else ''}")
+    full, partial, unfilled = split_fills(orders)
     sold = sum(_num(o, "notional_usd") for o in orders if o.get("side") == "sell")
     bought = sum(_num(o, "notional_usd") for o in orders if o.get("side") == "buy")
     text = (
-        f"{len(orders)} order{'s' if len(orders) != 1 else ''}: {len(full)} filled, "
+        f"Trades executed today: {_plural(len(orders), 'order')} — {len(full)} filled, "
         f"{len(partial)} partly filled, {len(unfilled)} not filled; sold {_money(sold)}, bought {_money(bought)}"
     )
-    named = [str(o.get("symbol")) for o in (*partial, *unfilled)]
-    return text + (f" (partial or unfilled: {', '.join(named)})." if named else ".")
+    if partial:
+        text += f"; partly filled: {', '.join(_filled_of(o) for o in partial)}"
+    if unfilled:
+        text += f"; not filled: {', '.join(_filled_of(o) for o in unfilled)}"
+    return _ok(text)
 
 
-def close_problems(f: CloseFacts) -> list[Problem]:
-    out: list[Problem] = []
-    for reason in f.unreadable:
-        out.append(Problem(f"{reason}.", "this notice could not check it", "check the trader role's read grants."))
-    if f.session.active in ("active", "activating"):
-        out.append(
-            Problem(
-                "the session is still running after its 16:05 hard stop.",
-                "it holds the client id the 16:10 pin smoke and the 16:45 reconcile need",
-                "read the session's journal on the trading box.",
-            )
-        )
-    elif f.session.result != "success":
-        out.append(
-            Problem(
-                f"the session ended {f.session.result}"
-                f"{' (it hit the 16:05 hard stop)' if f.session.result == 'timeout' else ''}.",
-                "orders it had not sent did not go out; those it sent are on the record",
-                "its failure page carries the journal tail; fix the cause before the next 09:30 session.",
-            )
-        )
-    if f.run is None:
-        out.append(
-            Problem(
-                f"the session wrote no run record for {f.day}.",
-                "today's orders are not on the record here; check the broker",
-                "read the session's journal on the trading box.",
-            )
-        )
-    elif f.run.get("status") != "ok":
-        out.append(
-            Problem(
-                f"the session's run ended {f.run.get('status')}: {str(f.run.get('reason') or 'no reason recorded')[:160]}.",
-                "the remaining orders were not sent",
-                "fix the cause; a rerun adopts the orders already sent and never resends them.",
-            )
-        )
-    waiting = [str(e.get("symbol")) for e in _docs(f.watch, "entries") if e.get("status") == "waiting"]
+def _timed_check(f: CloseFacts) -> Check:
+    entries = _docs(f.watch, "entries")
+    waiting = [_plain(e.get("symbol")) for e in entries if e.get("status") == "waiting"]
     if waiting:
-        out.append(
-            Problem(
-                f"timed orders still waiting at the stop: {', '.join(waiting)}.",
-                "the book did not reach its target today",
-                "nothing tonight; tomorrow's session sizes against what is actually held.",
-            )
+        return _fail(
+            f"Timed orders still waiting at the stop: {', '.join(waiting)}",
+            "the book did not reach its target today",
+            "nothing tonight; tomorrow's session sizes against what is actually held.",
         )
+    not_sent = [_plain(e.get("symbol")) for e in entries if e.get("status") == "not_sent"]
+    if not not_sent:
+        return _ok("Timed orders left unsent: none")
+    return _ok(f"Timed orders left unsent and cancelled at the close: {len(not_sent)} ({', '.join(not_sent)})")
+
+
+def _broker_check(f: CloseFacts) -> Check:
     if f.broker.error is not None:
-        out.append(
-            Problem(
-                f"the broker could not be read ({f.broker.error}).",
-                "open orders at the broker are unchecked",
-                "check the gateway on the trading box before 16:45.",
-            )
+        return _fail(
+            f"Broker not read ({_plain(f.broker.error)})",
+            "open orders at the broker are unchecked",
+            "check the gateway on the trading box before 16:45.",
         )
-    else:
-        stray = [o for o in f.broker.open_orders or () if not o.is_stop]
-        if stray:
-            listed = ", ".join(f"{o.action} {o.symbol} {o.order_type} {o.tif}" for o in stray[:6])
-            out.append(
-                Problem(
-                    f"{len(stray)} non-stop order{'s' if len(stray) != 1 else ''} still open at the broker: {listed}.",
-                    "an order left working can fill after the session, outside the record",
-                    "cancel it in the paper account if it is not meant to be there.",
-                )
-            )
+    orders = f.broker.open_orders or ()
+    stray = [o for o in orders if not o.is_stop]
+    if stray:
+        listed = ", ".join(f"{o.action} {o.symbol} {o.order_type} {o.tif}" for o in stray[:6])
+        return _fail(
+            f"Broker still has {_plural(len(stray), 'non-stop order')} open: {_plain(listed)}",
+            "an order left working can fill after the session, outside the record",
+            "cancel it in the paper account if it is not meant to be there.",
+        )
+    return _ok(f"Broker holds only GTC stops ({len(orders)})")
+
+
+def _after_close_checks(f: CloseFacts) -> list[Check]:
+    out: list[Check] = []
     for timer, label in AFTER_CLOSE:
         state = f.timers.get(timer, Unit()).active
-        if state != "active":
+        if state == "active":
+            out.append(_wait(f"Still to run: {label} ET"))
+        else:
             out.append(
-                Problem(
-                    f"the {label} timer is {state}.",
-                    f"the {label} will not run tonight",
+                _fail(
+                    f"Still to run: {label} ET — but its timer is {state}",
+                    f"the {label.rsplit(' ', 1)[0]} will not run tonight",
                     f"check {timer} on the trading box.",
                 )
             )
+    out.append(_wait(f"Box stops at {BOX_STOP}"))
     return out
 
 
-def render_close(f: CloseFacts) -> tuple[str, str]:
-    """``(text, auto_fix)`` of the market-close notice."""
-    problems = close_problems(f)
-    head = f"*Market close, v2 trading day {f.today}*"
-    if problems:
-        head = f"*Market close, v2 trading day {f.today}: {len(problems)} problem{'s' if len(problems) > 1 else ''}*"
-    held = _held_reason(f.run)
-    stopped = ""
-    if f.session.active not in ("active", "activating") and f.session.result == "success":
-        not_sent = sum(1 for e in _docs(f.watch, "entries") if e.get("status") == "not_sent")
-        stopped = f"The session stopped cleanly at {_et(f.session.stamp('ExecMainExitTimestamp'))}"
-        if not_sent:
-            stopped += f" ({not_sent} timed order{'s' if not_sent != 1 else ''} not sent)"
-        orders = f.broker.open_orders
-        if f.broker.error is None and orders is not None and all(o.is_stop for o in orders):
-            stopped += f"; the broker holds only GTC stops ({len(orders)})"
-        stopped += ". "
-    body = [
-        head,
-        orders_sentence(f.shortfall, held),
-        f"{stopped}Still to run: {_join([label for _, label in AFTER_CLOSE])} ET; {BOX_STOP}.",
+def close_checks(f: CloseFacts) -> list[Check]:
+    """One line per process the trading day ran, then what still runs tonight."""
+    return [
+        _close_session_check(f),
+        _trades_check(f),
+        _timed_check(f),
+        _broker_check(f),
+        *_unreadable_checks(f.unreadable),
+        *_after_close_checks(f),
     ]
-    return _finish(body, problems)
+
+
+def render_close(f: CloseFacts) -> tuple[str, str]:
+    """``(text, auto_fix)`` of the market-close checklist."""
+    return _finish(_headline("CLOSED", f.today), close_checks(f))
 
 
 # --- shared ---------------------------------------------------------------------
 
 
-def _join(items: Sequence[str]) -> str:
-    if len(items) <= 1:
-        return "".join(items)
-    return f"{', '.join(items[:-1])} and {items[-1]}"
-
-
-def _finish(body: list[str], problems: Sequence[Problem]) -> tuple[str, str]:
-    """The notice: body, any problem lines, then (only with problems) the footer, then the link."""
-    if not problems:
-        return brief_alert("\n".join(body), CONSOLE_URL, auto_fix=INFORMATIONAL), INFORMATIONAL
-    lines = [*body, *(f"Problem: {p.line}" for p in problems)]
-    impact = "; ".join(dict.fromkeys(p.impact for p in problems))
-    action = " ".join(dict.fromkeys(p.action[0].upper() + p.action[1:] for p in problems))
+def _finish(headline: str, checks: Sequence[Check]) -> tuple[str, str]:
+    """The headline, one line per check, the footer (only when a check failed), the link."""
+    body = "\n".join([headline, *(c.render() for c in checks)])
+    failed = [c for c in checks if c.mark == "fail"]
+    if not failed:
+        return brief_alert(body, CONSOLE_URL, auto_fix=INFORMATIONAL), INFORMATIONAL
+    impact = "; ".join(dict.fromkeys(c.impact for c in failed))
+    action = " ".join(dict.fromkeys(c.action[0].upper() + c.action[1:] for c in failed))
     auto_fix = "none; nothing on the box retries or restarts the trader."
-    text = brief_alert("\n".join(lines), CONSOLE_URL, impact=impact, auto_fix=auto_fix, action=action)
-    return text, auto_fix
+    return brief_alert(body, CONSOLE_URL, impact=impact, auto_fix=auto_fix, action=action), auto_fix
 
 
 @dataclass(frozen=True)
@@ -648,24 +803,31 @@ def gather_open(
     day = previous_trading_day(today).isoformat()
     unreadable: list[str] = []
     docs: dict[str, Doc | None] = {}
+    stamps: dict[str, dt.datetime | None] = {}
     for name, key in (
         ("book", f"{ORDER_BOOK_PREFIX}{day}.json"),
         ("watch", f"{ENTRY_WATCH_PREFIX}{day}.json"),
         ("run", f"{RUNS_PREFIX}{day}/run.json"),
+        ("predictions", f"{PREDICTIONS_PREFIX}{day}.json"),
     ):
-        docs[name], reason = _read(store, key)
+        docs[name], reason, stamps[name] = _read_stamped(store, key)
         if reason is not None:
-            unreadable.append(f"{key} is unreadable ({reason[:80]})")
+            unreadable.append(f"{key} ({reason[:80]})")
     return OpenFacts(
         today=today.isoformat(),
         day=day,
         session=unit_state(SESSION_UNIT, run),
         gateway=unit_state(GATEWAY_UNIT, run),
-        broker=broker(env, client_id, want_orders=False),
+        broker=broker(env, client_id, want_orders=True),
         book=docs["book"],
         watch=docs["watch"],
         run=docs["run"],
         now=now,
+        boot=booted_at(run),
+        boot_pull=unit_state(BOOT_PULL_UNIT, run),
+        executor_sha=executor_sha(run),
+        predictions=docs["predictions"],
+        predictions_at=stamps["predictions"],
         unreadable=tuple(unreadable),
     )
 
@@ -690,7 +852,7 @@ def gather_close(
     ):
         docs[name], reason = _read(store, key)
         if reason is not None:
-            unreadable.append(f"{key} is unreadable ({reason[:80]})")
+            unreadable.append(f"{key} ({reason[:80]})")
     return CloseFacts(
         today=today.isoformat(),
         day=day,
@@ -755,10 +917,12 @@ def main(argv: list[str] | None = None, *, now: dt.datetime | None = None) -> in
 
 __all__ = [
     "CONSOLE_URL",
+    "Check",
     "CloseFacts",
     "OpenFacts",
     "Outcome",
-    "Problem",
+    "close_checks",
+    "open_checks",
     "main",
     "notify",
     "render_close",
