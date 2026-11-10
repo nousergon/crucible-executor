@@ -277,3 +277,24 @@ def test_provisioning_clones_as_the_box_not_as_the_trader() -> None:
     unset = text.index("unset AWS_PROFILE AWS_CONFIG_FILE")
     assert unset < text.index("git clone")
     assert unset < text.index("fetch --quiet origin main")
+
+
+def test_a_changed_timer_is_stopped_before_its_new_file_lands() -> None:
+    """alpha-engine-config-I13447. systemd schedules a calendar timer from its
+    in-memory last trigger, which survives daemon-reload whatever Persistent=
+    says. Reloading a moved OnCalendar on a box that was up since the morning
+    fired the session at 20:36 ET. Stopping the changed timer first clears that
+    trigger. The later `enable --now` then schedules it from now."""
+    text = BOOT_PULL.read_text()
+    body = text[text.index("sync_systemd_units_from() {") :]
+    body = body[: body.index("\n}\n")]
+    changed = body[body.index('elif ! diff -q "$unit" "$target"') :]
+    changed = changed[: changed.index("CHANGED=true")]
+    stop = changed.index('*.timer) sudo systemctl stop "$name"')
+    assert stop < changed.index('sudo cp "$unit" /etc/systemd/system/')
+    assert body.index("sudo systemctl daemon-reload") < body.index(
+        'sudo systemctl enable --now "$tname"'
+    )
+    # A NEW timer has no last trigger to clear; only the changed branch stops.
+    new = body[body.index('if [ ! -f "$target" ]; then') : body.index('elif ! diff -q')]
+    assert "systemctl stop" not in new
