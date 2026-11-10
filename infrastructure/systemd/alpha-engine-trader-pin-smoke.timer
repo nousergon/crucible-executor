@@ -2,28 +2,29 @@
 Description=Daily paper smoke of the queued v2 trader pin request (alpha-engine-config-I11545)
 
 [Timer]
-# 15:00 New York time, weekdays (12:15 until 2026-11-09, moved after the
-# 14:00 session). Brian's ruling on I11545: anyone may queue a
+# 16:10 New York time, weekdays (12:15 until 2026-11-09, then 15:00 for one
+# day, moved after the all-day session). Brian's ruling on I11545: anyone may queue a
 # sha, and the next clean post-close pins it -- gated on this smoke, so the
 # smoke has to run the same day, while this box is up (started ~08:15,
 # stopped 17:10-17:50 by the v1 postclose pipeline), and before crucible's
 # trader-pin apply at 23:15 UTC.
 #
-# Why 15:00. The smoke connects to IB Gateway paper with the
-# trader's OWN client id from trader.env -- the same id the 14:00 session and
+# Why 16:10. The smoke connects to IB Gateway paper with the
+# trader's OWN client id from trader.env -- the same id the 09:30 session and
 # the 16:45 reconcile use (v1 holds 1, 2 and 3). IB refuses a second
 # connection on an id already in use, so the smoke must not overlap either.
-# The session is a oneshot with TimeoutStartSec=30min and disconnects when it
-# ends, so it is gone by 14:30 at the latest. 15:00 leaves thirty minutes of
-# margin after the session's hard stop, and the smoke's own 30-minute hard
-# stop (15:30) still ends before the close and over an hour before the 16:45
-# reconcile. The smoke itself is read-only and places no order.
+# The session holds that id all day, waiting on its buys' entry triggers, and
+# its hard stop is 16:05 (09:30 + TimeoutStartSec=395min). 16:10 is the first
+# slot after it, and the smoke's own 30-minute hard stop (16:40) still ends
+# before the 16:45 reconcile. The smoke is read-only, places no order and
+# needs no open market, and it still runs the same day, well before
+# crucible's 23:15 UTC trader-pin apply.
 #
 # Persistent=false: a catch-up at boot (~08:15) would smoke before the day's
 # session and could collide with a late session start on the shared client
 # id. A missed smoke is not silent: crucible's apply fails the next evening
 # when a request older than the session still has no smoke.
-OnCalendar=Mon..Fri *-*-* 15:00:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 16:10:00 America/New_York
 Persistent=false
 Unit=alpha-engine-trader-pin-smoke.service
 

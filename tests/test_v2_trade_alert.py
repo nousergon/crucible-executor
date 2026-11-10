@@ -368,3 +368,43 @@ def test_an_unreadable_run_record_is_reported_and_fails() -> None:
     assert outcome == alert.Outcome(1, True, run_unreadable=True) and outcome.failed
     assert rec.statuses[0].startswith(f"*v2 session {DAY}: RUN RECORD UNREADABLE (AccessDenied)*")
     assert rec.trades == []
+
+
+FILED = [{"key": f"trader/execution_shortfall/{DAY}.json"}]
+
+
+def test_a_run_that_failed_mid_day_after_orders_is_never_no_orders() -> None:
+    """The all-day session: sells at 09:30, then a dropped gateway at 13:00."""
+    shortfall = {**SHORTFALL, "orders": [_order("AAA", "sell", 10), _order("BBB", "buy", 20, 0)]}
+    run = {"status": "failed", "reason": "RoutingRefusedError: the gateway dropped", "outputs": FILED}
+    rec = _Recorder()
+    alert.run_alerts(_store(run, shortfall), now=NOW, trade=rec.trade, status=rec.status)
+    assert [t[:3] for t in rec.trades] == [("SELL", "AAA", 10)]  # the fill is still alerted
+    (summary,) = rec.statuses
+    assert summary.startswith(f"*v2 session {DAY}: RUN FAILED after 2 order(s) placed, 1 filled*")
+    assert "NO ORDERS PLACED" not in summary
+    assert "the gateway dropped" in summary and "UNFILLED: BBB" in summary
+    assert "Sells $1,005 · Buys $0" in summary and "Orders already at the broker stand" in summary
+
+
+def test_a_failed_run_whose_filed_orders_cannot_be_read_says_orders_were_placed() -> None:
+    run = {"status": "failed", "reason": "ProtectiveStopError: AAA", "outputs": FILED}
+    rec = _Recorder()
+    outcome = alert.run_alerts(_denied_store(run), now=NOW, trade=rec.trade, status=rec.status)
+    assert outcome.fills_unreadable and outcome.failed
+    (summary,) = rec.statuses
+    assert summary.startswith(f"*v2 session {DAY}: RUN FAILED after ORDERS WERE PLACED")
+    assert "NO ORDERS PLACED" not in summary and "ProtectiveStopError" in summary
+
+
+def test_a_failed_run_that_filed_an_empty_order_list_is_no_orders() -> None:
+    run = {"status": "failed", "reason": "x", "outputs": FILED}
+    rec = _Recorder()
+    alert.run_alerts(_store(run, {"orders": []}), now=NOW, trade=rec.trade, status=rec.status)
+    assert rec.statuses[0].startswith(f"*v2 session {DAY}: NO ORDERS PLACED*")
+
+
+def test_a_missing_run_record_never_claims_no_order_was_placed() -> None:
+    rec = _Recorder()
+    alert.run_alerts(alert.Store(_S3({}), "bucket", ""), now=NOW, trade=rec.trade, status=rec.status)
+    assert "no order was placed" not in rec.statuses[0] and "check the broker" in rec.statuses[0]

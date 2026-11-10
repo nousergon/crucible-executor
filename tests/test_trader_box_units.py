@@ -36,7 +36,7 @@ TRADER_CHECKOUT = "/home/ec2-user/crucible-trader"
 TRADER_UNITS = {
     "alpha-engine-trader-session": (
         "scripts/trader_pinned.sh daily_session",
-        "Mon..Fri *-*-* 14:00:00 America/New_York",
+        "Mon..Fri *-*-* 09:30:00 America/New_York",
         "false",
     ),
     "alpha-engine-trader-shadow-books": (
@@ -52,7 +52,7 @@ TRADER_UNITS = {
     ),
     "alpha-engine-trader-pin-smoke": (
         "scripts/trader_pin_request_smoke.sh",
-        "Mon..Fri *-*-* 15:00:00 America/New_York",
+        "Mon..Fri *-*-* 16:10:00 America/New_York",
         "false",
     ),
 }
@@ -163,12 +163,23 @@ def test_no_two_broker_units_can_hold_the_client_id_at_once() -> None:
         assert end < start, f"{earlier} can still hold the client id when {later} starts"
 
 
-def test_the_pin_smoke_runs_after_the_session_and_before_the_close() -> None:
+def test_the_pin_smoke_runs_after_the_session_and_before_the_reconcile() -> None:
     session_end = _start_minutes("alpha-engine-trader-session") + _timeout_minutes(
         "alpha-engine-trader-session"
     )
     smoke = _start_minutes("alpha-engine-trader-pin-smoke")
-    assert session_end < smoke < 16 * 60
+    smoke_end = smoke + _timeout_minutes("alpha-engine-trader-pin-smoke")
+    assert session_end < smoke and smoke_end < _start_minutes("alpha-engine-trader-reconcile")
+
+
+def test_the_session_outlives_its_last_entry_trigger() -> None:
+    """Brian 2026-11-09: the session holds its buys for v1's entry triggers, the
+    last at 15:55 ET (crucible-trader `entry_timing`). It starts at the open
+    (Brian 2026-11-10; systemd never fires a calendar timer early) and its hard stop must leave room for that last buy's fill wait."""
+    start = _start_minutes("alpha-engine-trader-session")
+    session_end = start + _timeout_minutes("alpha-engine-trader-session")
+    assert 9 * 60 + 30 <= start
+    assert session_end >= 15 * 60 + 55 + 10
 
 
 @pytest.mark.parametrize("stem", sorted(TRADER_UNITS))

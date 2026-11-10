@@ -29,6 +29,12 @@ ExecStartPre=/usr/bin/env bash /home/ec2-user/alpha-engine/infrastructure/trader
 # trader. Its hold-book safeguard reads the paper account through a READ-ONLY
 # gateway session and cannot cancel or close anything.
 ExecStart=/usr/bin/env bash /home/ec2-user/crucible-trader/scripts/trader_pinned.sh daily_session
-TimeoutStartSec=30min
+# 395 minutes: a hard stop at 16:05 ET. The session holds its buys until
+# their entry trigger, at the latest the 15:55 expiry (earlier on a half day),
+# then waits up to 30 s for each fill and files the day. The stop leaves that
+# ten minutes and ends five minutes before the 16:10 pin smoke, which shares
+# this session's IB client id. A stop that fires mid-day is a SIGTERM the
+# harness records as a failed run; the orders already sent are on the record.
+TimeoutStartSec=395min
 StandardOutput=journal
 StandardError=journal

@@ -294,8 +294,48 @@ def summarize(
     ``unreadable`` is why the execution_shortfall file the run wrote could not
     be read; the summary then says orders were placed and their fills are
     unknown, never "no orders".
+
+    **A failed run is "no orders" only when it filed none.** The session runs
+    all day (sells at 09:30, buys on their triggers until 15:55 ET), so a run
+    that fails at 13:00 may have sent its sells and some buys; the trader files
+    those orders before the run fails (``trader.session``'s run lists the
+    execution_shortfall file among its outputs). Such a run is summarised with
+    its orders, and ``NO ORDERS PLACED`` is said only of a failed run that
+    filed no order at all.
     """
     if run.get("status") != "ok":
+        failure = [
+            f"Run status: {run.get('status')}",
+            f"Reason: {run.get('reason') or 'none recorded'}",
+        ]
+        if unreadable is not None:
+            return _with_order_book(
+                run,
+                [
+                    f"*v2 session {day}: RUN FAILED after ORDERS WERE PLACED — fill details "
+                    f"unreadable ({_short(unreadable)})*",
+                    *failure,
+                    f"The run wrote {shortfall_key(day)} before it failed but this alert could not "
+                    "read it; check the broker for what is working and what filled.",
+                    "Auto-fix: none. Orders already at the broker stand; the session's remaining "
+                    "buys were not sent. Resolution: fix the cause, then rerun today (a rerun "
+                    "adopts the orders already sent and never resends them).",
+                ],
+            )
+        orders = _docs(shortfall, "orders")
+        if orders:
+            filled = [o for o in orders if _num(o, "filled_quantity") > 0]
+            return _with_order_book(
+                run,
+                [
+                    f"*v2 session {day}: RUN FAILED after {len(orders)} order(s) placed, {len(filled)} filled*",
+                    *failure,
+                    *_order_lines(shortfall, orders),
+                    "Auto-fix: none. Orders already at the broker stand; the session's remaining "
+                    "buys were not sent. Resolution: fix the cause, then rerun today (a rerun "
+                    "adopts the orders already sent and never resends them).",
+                ],
+            )
         return _with_order_book(
             run,
             [
@@ -303,7 +343,7 @@ def summarize(
                 f"Run status: {run.get('status')}",
                 f"Reason: {run.get('reason') or 'none recorded'}",
                 "Auto-fix: none; the session timer does not catch up. "
-                "Resolution: fix the cause before the next 14:00 ET session, or rerun today.",
+                "Resolution: fix the cause before the next 09:30 ET session, or rerun today.",
             ],
         )
     held = _held_reason(run)
@@ -332,12 +372,16 @@ def summarize(
         reason = _get(shortfall, "reason") or "the book needed no orders"
         return _with_order_book(run, [f"*v2 session {day}: no orders*", str(reason)])
     filled = [o for o in orders if _num(o, "filled_quantity") > 0]
+    lines = [f"*v2 session {day}: {len(filled)}/{len(orders)} orders filled*", *_order_lines(shortfall, orders)]
+    return _with_order_book(run, lines)
+
+
+def _order_lines(shortfall: Mapping[str, object] | None, orders: list[Doc]) -> list[str]:
+    """What the filed orders did: notional filled each way, shortfall, unfilled, champion."""
+    filled = [o for o in orders if _num(o, "filled_quantity") > 0]
     sells = sum(_num(o, "notional_usd") for o in filled if o.get("side") == "sell")
     buys = sum(_num(o, "notional_usd") for o in filled if o.get("side") == "buy")
-    lines = [
-        f"*v2 session {day}: {len(filled)}/{len(orders)} orders filled*",
-        f"Sells {_money(sells)} · Buys {_money(buys)}",
-    ]
+    lines = [f"Sells {_money(sells)} · Buys {_money(buys)}"]
     for metric in _docs(shortfall, "metrics"):
         if metric.get("name") == "execution_shortfall_bps" and metric.get("value") is not None:
             lines.append(f"Shortfall {_num(metric, 'value'):+.1f} bps ({metric.get('status')})")
@@ -347,7 +391,7 @@ def summarize(
     champion = _get(shortfall, "champion")
     if champion:
         lines.append(f"Champion: {champion}")
-    return _with_order_book(run, lines)
+    return lines
 
 
 @dataclass(frozen=True)
@@ -397,8 +441,9 @@ def run_alerts(
     if newest is None or now - newest[1] > FRESH_WITHIN:
         ok = status(
             f"*v2 session {today}: NO RUN RECORD*\n"
-            "The session ended without writing runs/trader.session/{day}/run.json, "
-            "so no order was placed. The unit's own failure page carries its journal.",
+            "The session ended without writing runs/trader.session/{day}/run.json. "
+            "It runs all day, so orders it sent before it died may be at the broker; "
+            "check the broker. The unit's own failure page carries its journal.",
             essential=True,
         )
         return Outcome(int(bool(ok)), bool(ok))
@@ -414,7 +459,13 @@ def run_alerts(
             essential=True,
         )
         return Outcome(int(bool(ok)), bool(ok), run_unreadable=True)
-    shortfall, unreadable = _read_shortfall(store, day, run) if run.get("status") == "ok" else (None, None)
+    # A failed run is read too when it FILED its orders before failing (the
+    # all-day session can fail after its sells and some buys went out).
+    shortfall, unreadable = (
+        _read_shortfall(store, day, run)
+        if run.get("status") == "ok" or run_lists_output(run, shortfall_key(day))
+        else (None, None)
+    )
     sent = 0
     for order in _docs(shortfall, "orders"):
         quantity = _num(order, "filled_quantity")
