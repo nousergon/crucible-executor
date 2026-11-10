@@ -158,21 +158,27 @@ class Store:
         still mean absent; the caller decides from the run record), and so is
         any other error, instead of raising.
         """
+        doc, reason, _ = self.read_stamped(relative)
+        return doc, reason
+
+    def read_stamped(self, relative: str) -> tuple[Doc | None, str | None, dt.datetime | None]:
+        """:meth:`read`, plus when the object was last written (S3 ``LastModified``) if S3 said."""
         missing = self.client.exceptions.NoSuchKey
         try:
             response = self.client.get_object(Bucket=self.bucket, Key=self.key(relative))
             body = cast(BinaryIO, response["Body"])
             loaded: object = json.loads(body.read())
         except missing:
-            return None, None
+            return None, None, None
         except Exception as exc:
             code = _error_code(exc)
             if code in ("NoSuchKey", "404"):
-                return None, None
-            return None, code or type(exc).__name__
+                return None, None, None
+            return None, code or type(exc).__name__, None
         if not isinstance(loaded, dict):
-            return None, "not a JSON object"
-        return cast(Doc, loaded), None
+            return None, "not a JSON object", None
+        modified = response.get("LastModified")
+        return cast(Doc, loaded), None, modified if isinstance(modified, dt.datetime) else None
 
     def newest_run(self) -> tuple[str, dt.datetime] | None:
         """``(served day, LastModified)`` of the newest session run record."""
@@ -251,6 +257,31 @@ def _short(reason: object) -> str:
     return text if len(text) <= _REASON_CHARS else text[: _REASON_CHARS - 1] + "…"
 
 
+def split_fills(orders: Iterable[Mapping[str, object]]) -> tuple[list[Doc], list[Doc], list[Doc]]:
+    """``(filled, partly filled, not filled)`` orders of an execution_shortfall file.
+
+    Filled means every share ordered filled. An order with some shares filled
+    and not all is PARTLY filled and is never counted as filled: on 2026-11-10
+    the summary said "7/7 orders filled" while CVLT had filled 220 of 657 and
+    NTNX 817 of 1334.
+    """
+    full: list[Doc] = []
+    partial: list[Doc] = []
+    unfilled: list[Doc] = []
+    for order in orders:
+        filled, quantity = _num(order, "filled_quantity"), _num(order, "quantity")
+        bucket = unfilled if filled <= 0 else full if filled >= quantity else partial
+        bucket.append(dict(order))
+    return full, partial, unfilled
+
+
+def _fill_count(orders: list[Doc]) -> str:
+    """``5/7 orders filled, 2 partly filled``: the headline count, partials named apart."""
+    full, partial, _ = split_fills(orders)
+    text = f"{len(full)}/{len(orders)} orders filled"
+    return text + (f", {len(partial)} partly filled" if partial else "")
+
+
 def shortfall_key(day: str) -> str:
     return f"trader/execution_shortfall/{day}.json"
 
@@ -324,11 +355,12 @@ def summarize(
             )
         orders = _docs(shortfall, "orders")
         if orders:
-            filled = [o for o in orders if _num(o, "filled_quantity") > 0]
+            full, partial, _ = split_fills(orders)
+            partly = f", {len(partial)} partly filled" if partial else ""
             return _with_order_book(
                 run,
                 [
-                    f"*v2 session {day}: RUN FAILED after {len(orders)} order(s) placed, {len(filled)} filled*",
+                    f"*v2 session {day}: RUN FAILED after {len(orders)} order(s) placed, {len(full)} filled{partly}*",
                     *failure,
                     *_order_lines(shortfall, orders),
                     "Auto-fix: none. Orders already at the broker stand; the session's remaining "
@@ -371,8 +403,7 @@ def summarize(
     if not orders:
         reason = _get(shortfall, "reason") or "the book needed no orders"
         return _with_order_book(run, [f"*v2 session {day}: no orders*", str(reason)])
-    filled = [o for o in orders if _num(o, "filled_quantity") > 0]
-    lines = [f"*v2 session {day}: {len(filled)}/{len(orders)} orders filled*", *_order_lines(shortfall, orders)]
+    lines = [f"*v2 session {day}: {_fill_count(orders)}*", *_order_lines(shortfall, orders)]
     return _with_order_book(run, lines)
 
 
@@ -385,9 +416,12 @@ def _order_lines(shortfall: Mapping[str, object] | None, orders: list[Doc]) -> l
     for metric in _docs(shortfall, "metrics"):
         if metric.get("name") == "execution_shortfall_bps" and metric.get("value") is not None:
             lines.append(f"Shortfall {_num(metric, 'value'):+.1f} bps ({metric.get('status')})")
-    unfilled = [str(o.get("symbol")) for o in orders if _num(o, "filled_quantity") <= 0]
-    if unfilled:
-        lines.append(f"UNFILLED: {', '.join(unfilled)}")
+    _, partial, not_filled = split_fills(orders)
+    if partial:
+        shares = (f"{o.get('symbol')} {_num(o, 'filled_quantity'):,.0f}/{_num(o, 'quantity'):,.0f}" for o in partial)
+        lines.append(f"PARTLY FILLED: {', '.join(shares)}")
+    if not_filled:
+        lines.append(f"UNFILLED: {', '.join(str(o.get('symbol')) for o in not_filled)}")
     champion = _get(shortfall, "champion")
     if champion:
         lines.append(f"Champion: {champion}")
