@@ -272,6 +272,14 @@ def order_book_line(run: Mapping[str, object]) -> str | None:
         if metric.get("name") != "trader_order_book_written":
             continue
         if metric.get("status") == "OK" and _num(metric, "value") > 0:
+            # alpha-engine-config-I12024: the book is announced before the
+            # open (`executor.v2_order_book_alert`); this line only says
+            # whether the session traded that book or its own.
+            reason = str(metric.get("status_reason") or "")
+            if " reused: " in reason:
+                return "Order book: the pre-open book, as announced"
+            if reason.startswith("as-traded book"):
+                return "Order book: the session's book differs from the pre-open book (kept as as-traded)"
             return "Order book: written"
         return f"*ORDER BOOK FAILED*: {_short(metric.get('status_reason'))}"
     return None
