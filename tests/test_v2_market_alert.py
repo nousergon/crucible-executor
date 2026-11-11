@@ -101,11 +101,15 @@ def _store(objects: dict[str, Any], **kw: Any) -> Store:
 class _Systemd:
     """``systemctl show`` answers per unit."""
 
-    def __init__(self, units: dict[str, dict[str, str]]) -> None:
+    def __init__(self, units: dict[str, dict[str, str]], *, origin_main: str = "93564d6aaa") -> None:
         self.units = units
+        self.origin_main = origin_main
 
     def __call__(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if argv[0] == "git":
+            if list(argv[-3:]) == ["rev-parse", "HEAD", "origin/main"]:
+                out = f"93564d6aaa\n{self.origin_main}\n"
+                return subprocess.CompletedProcess(list(argv), 0, stdout=out, stderr="")
             assert list(argv[-3:]) == ["rev-parse", "--short=7", "HEAD"]
             return subprocess.CompletedProcess(list(argv), 0, stdout="93564d6\n", stderr="")
         assert "--timestamp=unix" in argv
@@ -128,7 +132,7 @@ STOPPED = {
 ACTIVE = {"ActiveState": "active"}
 
 
-def _systemd(session: dict[str, str], pull: dict[str, str] = PULLED) -> _Systemd:
+def _systemd(session: dict[str, str], pull: dict[str, str] = PULLED, origin_main: str = "93564d6aaa") -> _Systemd:
     return _Systemd(
         {
             m.SESSION_UNIT: session,
@@ -137,7 +141,8 @@ def _systemd(session: dict[str, str], pull: dict[str, str] = PULLED) -> _Systemd
             "alpha-engine-trader-pin-smoke.timer": ACTIVE,
             "alpha-engine-trader-reconcile.timer": ACTIVE,
             "alpha-engine-v2-day-end.timer": ACTIVE,
-        }
+        },
+        origin_main=origin_main,
     )
 
 
@@ -166,16 +171,19 @@ class _Sent:
 def _notify(kind: m.Kind, store: Store, tmp_path: Path, *, now: dt.datetime, session: dict[str, str], **kw: Any):
     sent = _Sent(kw.pop("ok", True))
     pull = kw.pop("pull", PULLED)
+    origin_main = kw.pop("origin_main", "93564d6aaa")
+    boot_pull_log = kw.pop("boot_pull_log", tmp_path / "no-boot-pull.log")
     outcome = m.notify(
         kind,
         store,
         ENV,
         now=now,
         client_id=44,
-        run=_systemd(session, pull),
+        run=_systemd(session, pull, origin_main),
         broker=_broker(**kw),
         send=sent,
         sent_dir=tmp_path,
+        boot_pull_log=boot_pull_log,
     )
     return outcome, sent
 
@@ -194,7 +202,7 @@ DONE = (m.OpenOrder("CVLT", "SELL", "MKT", "DAY", 657, 657),)
 OPEN_ALL_OK = """\
 *Market OPEN — v2 trading day 2026-11-11 (Wed)*
 ✅ Box up — booted 08:00 ET
-✅ Code pulled 08:16 ET — executor 93564d6, trader 811eb9b
+✅ Code pulled 08:16 ET — executor 93564d6, crucible release 811eb9b
 ✅ Predictions for 2026-11-10 present published 06:10 ET — 812 names
 ✅ Order book built 08:41 ET — 4 target changes (2 enter, 1 exit, 1 increase), 4 orders planned (2 sell, 2 buy)
 ✅ IB Gateway connected — paper account
@@ -241,10 +249,85 @@ def test_a_failed_code_pull_is_a_cross(tmp_path: Path) -> None:
     _, sent = _notify("open", _store(OPEN_DOCS), tmp_path, now=OPEN_AT, session=RUNNING, pull=failed)
     ((text, _),) = sent.calls
     assert (
-        "❌ Code pull did not succeed (boot-pull failed, result exit-code) — executor 93564d6, trader 811eb9b"
+        "❌ Code pull did not succeed (boot-pull failed, result exit-code) — executor 93564d6, crucible release 811eb9b"
         in _lines(text)
     )
     assert "*You:* Read /var/log/boot-pull.log on the trading box." in text
+
+
+FAILED_PULL = {"ActiveState": "failed", "Result": "exit-code", "ExecMainExitTimestamp": "@1794402960"}
+
+
+def _boot_log(tmp_path: Path, *runs: str) -> Path:
+    log = tmp_path / "boot-pull.log"
+    log.write_text("".join(f"2026-11-11 08:00:00 === boot-pull started ===\n{body}" for body in runs))
+    return log
+
+
+def _summary(items: str) -> str:
+    return f"2026-11-11 08:16:00 === boot-pull completed with 1 failure(s): {items} ===\n"
+
+
+def test_a_failed_pull_that_left_the_executor_on_main_is_judged_current(tmp_path: Path) -> None:
+    """THE 2026-11-11 SHAPE: only the credential pre-check failed; every repo synced."""
+    log = _boot_log(tmp_path, _summary("git-credential-helper (check failed)"))
+    _, sent = _notify(
+        "open", _store(OPEN_DOCS), tmp_path, now=OPEN_AT, session=RUNNING, pull=FAILED_PULL, boot_pull_log=log
+    )
+    ((text, _),) = sent.calls
+    assert (
+        "✅ Code current — executor 93564d6 on main, crucible release 811eb9b; boot-pull reported a non-repo "
+        "failure: git-credential-helper (check failed) (see /var/log/boot-pull.log)"
+    ) in _lines(text)
+    assert "stale code" not in text
+
+
+def test_a_failed_pull_names_the_failed_item(tmp_path: Path) -> None:
+    log = _boot_log(tmp_path, _summary("/home/ec2-user/alpha-engine-config (git)"))
+    _, sent = _notify(
+        "open", _store(OPEN_DOCS), tmp_path, now=OPEN_AT, session=RUNNING, pull=FAILED_PULL, boot_pull_log=log
+    )
+    ((text, _),) = sent.calls
+    assert (
+        "❌ Code pull did not succeed: /home/ec2-user/alpha-engine-config (git) — executor 93564d6, crucible release 811eb9b"
+        in _lines(text)
+    ), "a repo failure stays a cross even with the executor on main"
+    assert "stale code" in text
+
+
+def test_a_failed_pull_with_the_executor_off_main_is_a_cross(tmp_path: Path) -> None:
+    log = _boot_log(tmp_path, _summary("git-credential-helper (check failed)"))
+    _, sent = _notify(
+        "open",
+        _store(OPEN_DOCS),
+        tmp_path,
+        now=OPEN_AT,
+        session=RUNNING,
+        pull=FAILED_PULL,
+        boot_pull_log=log,
+        origin_main="ffffffffff",
+    )
+    ((text, _),) = sent.calls
+    assert (
+        "❌ Code pull did not succeed: git-credential-helper (check failed) — executor 93564d6, crucible release 811eb9b"
+        in _lines(text)
+    )
+
+
+def test_an_older_runs_summary_is_never_borrowed(tmp_path: Path) -> None:
+    """Today's run died before its summary: yesterday's must not be read as today's."""
+    log = _boot_log(tmp_path, _summary("git-credential-helper (check failed)"), "2026-11-11 08:01:00 OK something\n")
+    assert m.boot_pull_failures(log) is None
+    assert m.boot_pull_failures(tmp_path / "absent.log") is None
+    unreadable = tmp_path / "unreadable.log"
+    unreadable.mkdir()  # reading a directory raises an OSError, as a mode-0600 file would
+    assert m.boot_pull_failures(unreadable) is None
+
+
+def test_access_denied_reads_as_absent(tmp_path: Path) -> None:
+    """403 is "not written yet" only while the role has GetObject on the key: pinned here."""
+    doc, reason = m._read(_store({}), f"trader/entry_watch/{DAY}.json")
+    assert (doc, reason) == (None, None)
 
 
 def test_partial_fills_at_the_open_are_never_counted_as_filled(tmp_path: Path) -> None:
@@ -264,7 +347,7 @@ def test_a_session_that_already_ended_at_the_open_is_a_cross(tmp_path: Path) -> 
     ((text, _),) = sent.calls
     lines = _lines(text)
     assert "❌ Trading session not running (inactive, result success, ended 09:36 ET)" in lines
-    assert "✅ Code pulled 08:16 ET — executor 93564d6, trader not recorded yet" in lines
+    assert "✅ Code pulled 08:16 ET — executor 93564d6, crucible release not recorded yet" in lines
     assert "❌ Entry/exit watch has written nothing yet" in lines
     assert "⏳ Orders so far today: none recorded yet" in lines
 
