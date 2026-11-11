@@ -46,6 +46,11 @@ leaving the box up (the 01:00 ET backstop schedule still stops it):
   a ``daemon-reload``, alpha-engine-config-I13447; a stray manual start) is not
   the day end, and by then an evening actor may be using the box.
 
+**Its logs leave first.** Just before the poweroff it runs
+:mod:`executor.box_log_ship` once, bounded by :data:`SHIP_TIMEOUT_SECONDS`, in a
+child process so this module stays stdlib-only. A failed or slow copy is a
+warning; it never holds the box up.
+
 Power-off is an OS ``poweroff``; the instance's shutdown behaviour is ``stop``,
 so the box stops, it does not terminate. Stdlib only: a broken executor venv
 package cannot keep the box up.
@@ -80,6 +85,8 @@ DEADLINE = dt.time(18, 10)
 MORNING_BOOT_CUTOFF = dt.time(12, 0)
 POLL_SECONDS = 15
 STOP_TIMEOUT_SECONDS = 120
+#: The final log copy (:func:`ship_logs`) is abandoned after this long.
+SHIP_TIMEOUT_SECONDS = 90
 
 #: The units that may still be working at the day end (``systemctl`` glob
 #: patterns). The box never powers off while one is running or queued.
@@ -103,6 +110,21 @@ Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(list(argv), capture_output=True, text=True, timeout=STOP_TIMEOUT_SECONDS + 30, check=False)
+
+
+def ship_logs() -> None:
+    """Copy the day's logs off the box once more (``executor.box_log_ship``), best-effort.
+
+    Never raises and never waits past :data:`SHIP_TIMEOUT_SECONDS`."""
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "executor.box_log_ship"],
+            capture_output=True,
+            timeout=SHIP_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - a log copy never holds the box up
+        logger.warning("v2 day end: final log copy skipped: %s: %s", type(exc).__name__, exc)
 
 
 def read_uptime(path: Path = PROC_UPTIME) -> float:
@@ -176,6 +198,7 @@ def main(
     clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
     uptime: Callable[[], float] = read_uptime,
     sleep: Callable[[float], None] = time.sleep,
+    ship: Callable[[], None] = ship_logs,
 ) -> int:
     """``python -m executor.v2_day_end [--dry-run]``."""
     args = list(sys.argv[1:] if argv is None else argv)
@@ -214,6 +237,10 @@ def main(
     if dry_run:
         logger.info("v2 day end: --dry-run, not powering off")
         return 0
+    try:
+        ship()
+    except Exception as exc:  # noqa: BLE001 - a log copy never holds the box up
+        logger.warning("v2 day end: final log copy failed: %s", exc)
     result = run([SYSTEMCTL, "--no-block", "poweroff"])
     if result.returncode != 0:
         logger.error("v2 day end: poweroff failed (%s): %s", result.returncode, result.stderr.strip())

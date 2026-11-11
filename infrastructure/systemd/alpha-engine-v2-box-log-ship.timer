@@ -1,0 +1,16 @@
+[Unit]
+Description=Copy the trading box's logs to S3 every ten minutes while it is up (alpha-engine-config-I12024)
+
+[Timer]
+# Every ten minutes, all day: the box is up only for its trading day and any
+# run an operator or the evening pipeline boots it for, and each of those is
+# worth its logs. Each run overwrites the day's objects in place.
+OnCalendar=*-*-* *:00/10:00
+# A first copy soon after boot, so a boot-pull failure is readable at once.
+OnBootSec=3min
+AccuracySec=30s
+Persistent=false
+Unit=alpha-engine-v2-box-log-ship.service
+
+[Install]
+WantedBy=timers.target

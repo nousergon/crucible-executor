@@ -487,7 +487,12 @@ def test_the_day_end_service_timeout_covers_its_own_budget() -> None:
     from executor import v2_day_end as day_end
 
     deadline, fire = day_end.DEADLINE, day_end.FIRE_AT
-    budget = (deadline.hour - fire.hour) * 60 + deadline.minute - fire.minute + day_end.STOP_TIMEOUT_SECONDS // 60
+    budget = (
+        (deadline.hour - fire.hour) * 60
+        + deadline.minute
+        - fire.minute
+        + (day_end.STOP_TIMEOUT_SECONDS + day_end.SHIP_TIMEOUT_SECONDS) / 60
+    )
     assert budget < _timeout_minutes(DAY_END)
 
 
@@ -595,4 +600,61 @@ def test_the_watchdog_unit_carries_no_private_literals(suffix: str) -> None:
     text = (SYSTEMD / f"{WATCHDOG}{suffix}").read_text()
     assert not re.search(r"\b\d{12}\b", text)
     assert "arn:aws:" not in text and "s3://" not in text
+    assert not re.search(r"\bi-[0-9a-f]{8,17}\b", text)
+
+
+# --- The box log copy (alpha-engine-config-I12024) ---------------------------------
+
+LOG_SHIP = "alpha-engine-v2-box-log-ship"
+
+
+def test_the_log_copy_is_an_ec2_user_oneshot_that_never_pages() -> None:
+    """It reads every unit's journal through the journal group, writes with the
+    instance role (no trader env file), and has no failure notifier."""
+    unit = _unit(SYSTEMD / f"{LOG_SHIP}.service")
+    service = unit["Service"]
+    assert service["Type"] == "oneshot" and service["User"] == "ec2-user"
+    assert service["SupplementaryGroups"] == "systemd-journal"
+    assert service["ExecStart"] == f"{EXECUTOR_PYTHON} -m executor.box_log_ship"
+    assert "EnvironmentFile" not in service
+    assert "AWS_PROFILE" not in (SYSTEMD / f"{LOG_SHIP}.service").read_text()
+    assert "OnFailure" not in unit["Unit"]
+    timer = _unit(SYSTEMD / f"{LOG_SHIP}.timer")["Timer"]
+    assert timer["OnCalendar"] == "*-*-* *:00/10:00"
+    assert timer["Persistent"] == "false"
+    assert timer["Unit"] == f"{LOG_SHIP}.service"
+
+
+def test_the_log_copy_covers_every_v2_unit_on_this_box() -> None:
+    import fnmatch
+
+    from executor import box_log_ship as ship
+
+    stems = {p.stem for p in SYSTEMD.glob("alpha-engine-trader-*.service")}
+    stems |= {p.stem for p in SYSTEMD.glob("alpha-engine-v2-*.service")}
+    stems |= {"boot-pull", "ibgateway"}
+    for stem in stems:
+        name = f"{stem}.service".replace("@.service", "@x.service")
+        assert any(fnmatch.fnmatchcase(name, p) for p in ship.UNIT_PATTERNS), name
+
+
+def test_the_log_copy_calendar_parses() -> None:
+    analyze = subprocess.run(["which", "systemd-analyze"], capture_output=True, text=True)
+    if analyze.returncode != 0:
+        pytest.skip("systemd-analyze not installed")
+    on_calendar = _unit(SYSTEMD / f"{LOG_SHIP}.timer")["Timer"]["OnCalendar"]
+    result = subprocess.run(["systemd-analyze", "calendar", on_calendar], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "path",
+    [SYSTEMD / f"{LOG_SHIP}.service", SYSTEMD / f"{LOG_SHIP}.timer", ROOT / "executor" / "box_log_ship.py"],
+    ids=lambda p: p.name,
+)
+def test_the_log_copy_carries_no_private_literals(path: Path) -> None:
+    text = path.read_text()
+    assert not re.search(r"\b\d{12}\b", text)
+    assert "arn:aws:" not in text and "s3://" not in text
+    assert "alpha-engine-research" not in text
     assert not re.search(r"\bi-[0-9a-f]{8,17}\b", text)
