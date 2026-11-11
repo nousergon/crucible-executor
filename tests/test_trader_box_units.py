@@ -76,7 +76,10 @@ def _unit(path: Path) -> configparser.ConfigParser:
 
 
 def _trader_files() -> list[Path]:
-    return sorted(SYSTEMD.glob("alpha-engine-trader-*")) + [PROVISION]
+    return sorted(SYSTEMD.glob("alpha-engine-trader-*")) + [
+        PROVISION,
+        ROOT / "infrastructure" / "session-hours-gate.sh",
+    ]
 
 
 #: The failure notifier (alpha-engine-config-I12353): a systemd template the
@@ -192,6 +195,39 @@ def test_every_trader_unit_pages_through_the_notifier_when_it_fails(stem: str) -
     if stem == "alpha-engine-trader-session":
         expected += f" {TRADE_ALERT}.service"
     assert unit["Unit"]["OnFailure"] == expected
+
+
+GATE_ON_BOX = "/home/ec2-user/alpha-engine/infrastructure/session-hours-gate.sh"
+
+
+def _service_lines(path: Path) -> list[str]:
+    return [line.strip() for line in path.read_text().splitlines() if not line.lstrip().startswith("#")]
+
+
+def test_the_session_refuses_a_start_outside_its_hours_before_anything_runs() -> None:
+    """alpha-engine-config-I13544: a replaced timer fired the session at 20:36
+    and 20:38 ET; the trader held but still wrote a held run manifest. The
+    gate is an ExecCondition=, which systemd runs before ExecStartPre=, and it
+    is written above ExecStartPre= so the file reads in the order it runs."""
+    path = SYSTEMD / "alpha-engine-trader-session.service"
+    service = _unit(path)["Service"]
+    assert service["ExecCondition"] == f"/usr/bin/env bash {GATE_ON_BOX}"
+    lines = _service_lines(path)
+    condition = lines.index(f"ExecCondition=/usr/bin/env bash {GATE_ON_BOX}")
+    assert condition < lines.index(f"ExecStartPre=/usr/bin/env bash {PROVISION_ON_BOX}")
+    assert sum(line.startswith("ExecCondition=") for line in lines) == 1
+    gate = ROOT / "infrastructure" / "session-hours-gate.sh"
+    assert gate.is_file()
+    # Only the session is gated: the other broker units run after the close.
+    for stem in set(TRADER_UNITS) - {"alpha-engine-trader-session"}:
+        assert "ExecCondition" not in _unit(SYSTEMD / f"{stem}.service")["Service"]
+
+
+def test_a_gate_refused_session_sends_no_trade_alert() -> None:
+    """systemd starts OnSuccess= on a skipped ExecCondition= too; the alert
+    skips itself when the session's Result says the gate refused it."""
+    service = _unit(SYSTEMD / f"{TRADE_ALERT}.service")["Service"]
+    assert service["ExecCondition"] == f"/usr/bin/env bash {GATE_ON_BOX} session-ran"
 
 
 def test_every_session_ending_sends_its_trade_alerts() -> None:

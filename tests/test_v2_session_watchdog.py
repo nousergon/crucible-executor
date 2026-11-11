@@ -126,6 +126,26 @@ def test_a_session_that_never_ran_today_is_started() -> None:
     assert w.decide(_facts(session=yesterday, watch=None)).action == "start"
 
 
+def test_a_start_the_hours_gate_refused_is_not_a_run_and_is_started() -> None:
+    """alpha-engine-config-I13544: a start the session's ExecCondition= refused
+    (say a timer fired at 08:20 ET) ends inactive with Result=exec-condition.
+    Nothing ran, so it is neither an operator stop nor a failure: start it."""
+    skipped = _session("inactive", w.SKIPPED_BY_GATE, started=_at(8, 20), ended=None)
+    for stop_requested in (False, None, True):
+        d = w.decide(_facts(session=skipped, watch=None, stop_requested=stop_requested))
+        assert d.action == "start" and "hours gate" in d.reason
+    # Last night's 20:38 ET refusal: today has simply not run yet.
+    evening = _session("inactive", w.SKIPPED_BY_GATE, started=_at(20, 38, dt.date(2026, 11, 10)))
+    assert w.decide(_facts(session=evening, watch=None)).action == "start"
+
+
+def test_a_gate_refused_start_still_obeys_the_cap_and_the_kill_switch() -> None:
+    skipped = _session("inactive", w.SKIPPED_BY_GATE, started=_at(8, 20))
+    assert w.decide(_facts(session=skipped, watch=None, restarts=w.MAX_RESTARTS)).action == "give_up"
+    d = w.decide(_facts(session=skipped, watch=None, kill_switch=("engaged", "freeze")))
+    assert d.action == "hold" and d.report == "kill_switch"
+
+
 # --- the completed-session no-op ----------------------------------------------------
 
 

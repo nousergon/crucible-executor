@@ -105,6 +105,10 @@ HARD_STOP_UNTIL = dt.time(16, 9)
 #: this is not judged stale: it has not had the time to write.
 STALE_AFTER = dt.timedelta(minutes=15)
 MAX_RESTARTS = 2
+#: ``Result`` of a start the session's ExecCondition= (session-hours-gate.sh,
+#: alpha-engine-config-I13544) refused: inactive, nothing ran. The gate admits
+#: 09:25-16:00 ET, which holds this watchdog's whole restart window.
+SKIPPED_BY_GATE = "exec-condition"
 
 #: Other money-path jobs on this box. Never restart beside one.
 MONEY_PATH_UNITS = (
@@ -210,6 +214,11 @@ def _problem(f: Facts, local: dt.datetime) -> tuple[Action, str] | Decision | No
         return Decision("none", f"the session is {f.session.active}; judged on the next tick")
     if not started_today:
         return "start", "the session has not run today"
+    if f.session.result == SKIPPED_BY_GATE:
+        # Its hours gate refused the last start (an ExecCondition= skip): no
+        # step of the session ran, so it has not run today. Never an operator
+        # stop, and inside this window the gate admits the start.
+        return "start", "the session has not run today (its last start was refused by its hours gate)"
     if f.session.result == "success":
         return Decision(
             "hold",

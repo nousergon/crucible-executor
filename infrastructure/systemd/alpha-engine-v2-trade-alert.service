@@ -15,6 +15,11 @@ OnFailure=alpha-engine-trader-failed@%n.service
 Type=oneshot
 User=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine
+# alpha-engine-config-I13544: the session's OnSuccess= fires even when its
+# hours gate skipped it (systemd starts OnSuccess= on any activating->inactive
+# transition). Skip quietly when the session never ran; anything else,
+# including an unreadable Result, sends the alert.
+ExecCondition=/usr/bin/env bash /home/ec2-user/alpha-engine/infrastructure/session-hours-gate.sh session-ran
 ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.v2_trade_alert
 TimeoutStartSec=5min
 StandardOutput=journal
