@@ -132,3 +132,15 @@ def test_the_day_end_box_stop_is_accepted() -> None:
     """alpha-engine-config-I12024: the day-end stop pages here when poweroff is refused."""
     assert tuf.UNIT_RE.fullmatch("alpha-engine-v2-day-end.service")
     assert not tuf.UNIT_RE.fullmatch("alpha-engine-v2-day-end.service; rm")
+
+
+def test_the_session_watchdog_is_accepted() -> None:
+    assert tuf.UNIT_RE.fullmatch("alpha-engine-v2-session-watchdog.service")
+
+
+def test_a_failed_session_page_names_the_watchdog_and_others_do_not() -> None:
+    now = dt.datetime(2026, 11, 11, 16, 0, tzinfo=dt.UTC)
+    session = tuf.build_message("alpha-engine-trader-session.service", {}, "tail", now)
+    assert "Auto-fix: the session watchdog restarts the session" in session
+    reconcile = tuf.build_message("alpha-engine-trader-reconcile.service", {}, "tail", now)
+    assert "Auto-fix: none." in reconcile and "watchdog" not in reconcile

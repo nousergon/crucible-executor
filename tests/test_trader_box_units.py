@@ -481,3 +481,82 @@ def test_the_day_end_unit_carries_no_private_literals(suffix: str) -> None:
     assert not re.search(r"\b\d{12}\b", text)
     assert "arn:aws:" not in text and "s3://" not in text
     assert not re.search(r"\bi-[0-9a-f]{8,17}\b", text)
+
+
+# --- The session watchdog (alpha-engine-config-I12024) ---------------------------
+
+WATCHDOG = "alpha-engine-v2-session-watchdog"
+
+
+def _calendars(stem: str) -> list[str]:
+    text = (SYSTEMD / f"{stem}.timer").read_text()
+    return re.findall(r"^OnCalendar=(.+)$", text, re.M)
+
+
+def test_the_watchdog_is_an_ec2_user_oneshot_on_its_own_timer() -> None:
+    """Brian 2026-11-11: a dead or stalled session is restarted the same day.
+    It runs as ec2-user (state beside the notices'), starts the session through
+    sudo, and is never started by the session itself."""
+    unit = _unit(SYSTEMD / f"{WATCHDOG}.service")
+    service = unit["Service"]
+    assert service["Type"] == "oneshot" and service["User"] == "ec2-user"
+    assert service["ExecStart"] == f"{EXECUTOR_PYTHON} -m executor.v2_session_watchdog"
+    assert "EnvironmentFile" not in service and "ExecStartPre" not in service
+    assert unit["Unit"]["OnFailure"] == f"{FAILURE_NOTIFIER}%n.service"
+    timer = _unit(SYSTEMD / f"{WATCHDOG}.timer")["Timer"]
+    assert timer["Persistent"] == "false"
+    assert timer["Unit"] == f"{WATCHDOG}.service"
+    session = _unit(SYSTEMD / f"{SESSION}.service")["Unit"]
+    assert WATCHDOG not in session["OnSuccess"] + session["OnFailure"]
+
+
+def test_the_watchdog_fires_every_five_minutes_in_market_hours_and_at_the_hard_stop() -> None:
+    from executor import v2_session_watchdog as w
+
+    calendars = _calendars(WATCHDOG)
+    assert calendars == [
+        "Mon..Fri *-*-* 09..15:00/5:00 America/New_York",
+        "Mon..Fri *-*-* 16:05:00 America/New_York",
+    ]
+    assert (w.HARD_STOP_AT.hour, w.HARD_STOP_AT.minute) == (16, 5)
+    # The 16:05 pass ends before the 16:10 pin smoke needs the client id.
+    assert w.HARD_STOP_UNTIL.hour * 60 + w.HARD_STOP_UNTIL.minute < _start_minutes(SMOKE)
+    # Its own run ends well inside the next five-minute firing.
+    assert _timeout_minutes(WATCHDOG) < 5
+
+
+def test_the_watchdog_only_restarts_after_the_open_notice() -> None:
+    from executor import v2_session_watchdog as w
+
+    start, _ = _alert_window("alpha-engine-v2-market-open-alert")
+    assert start < w.WINDOW_OPEN.hour * 60 + w.WINDOW_OPEN.minute
+
+
+def test_the_watchdog_waits_for_the_other_money_path_units() -> None:
+    from executor import v2_session_watchdog as w
+
+    for stem in BROKER_UNITS:
+        if stem != SESSION:
+            assert f"{stem}.service" in w.MONEY_PATH_UNITS
+
+
+def test_the_watchdog_attributes_its_sends_to_its_registry_row() -> None:
+    text = (SYSTEMD / f"{WATCHDOG}.service").read_text()
+    assert re.search(r"^Environment=KREPIS_EVENT_SOURCE=crucible-executor/v2-session-watchdog$", text, re.M)
+
+
+def test_the_watchdog_calendars_parse() -> None:
+    analyze = subprocess.run(["which", "systemd-analyze"], capture_output=True, text=True)
+    if analyze.returncode != 0:
+        pytest.skip("systemd-analyze not installed")
+    for on_calendar in _calendars(WATCHDOG):
+        result = subprocess.run(["systemd-analyze", "calendar", on_calendar], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("suffix", [".service", ".timer"])
+def test_the_watchdog_unit_carries_no_private_literals(suffix: str) -> None:
+    text = (SYSTEMD / f"{WATCHDOG}{suffix}").read_text()
+    assert not re.search(r"\b\d{12}\b", text)
+    assert "arn:aws:" not in text and "s3://" not in text
+    assert not re.search(r"\bi-[0-9a-f]{8,17}\b", text)

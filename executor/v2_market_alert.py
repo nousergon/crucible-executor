@@ -70,6 +70,7 @@ from krepis.trading_calendar import is_trading_day, previous_trading_day
 from executor.notifier import send_trading_notice
 from executor.v2_trade_alert import (
     RUNS_PREFIX,
+    SESSION_WATCHDOG_AUTO_FIX,
     TRADER_ENV,
     Doc,
     Store,
@@ -457,6 +458,12 @@ class OpenFacts:
 
 
 _TRADES_LOST = "orders the book needs may not go out today"
+#: The footer's Auto-fix when a check fails (executor.v2_session_watchdog).
+OPEN_AUTO_FIX = f"{SESSION_WATCHDOG_AUTO_FIX}. Nothing on the box fixes a missing input."
+CLOSE_AUTO_FIX = (
+    "none tonight; the session watchdog restarts the session only in market hours "
+    "(09:45 ET to 10 minutes before the close, at most twice a day)."
+)
 _READ_JOURNAL = "read the session's journal on the trading box."
 
 
@@ -608,7 +615,7 @@ def open_checks(f: OpenFacts) -> list[Check]:
 
 def render_open(f: OpenFacts) -> tuple[str, str]:
     """``(text, auto_fix)`` of the market-open checklist."""
-    return _finish(_headline("OPEN", f.today), open_checks(f))
+    return _finish(_headline("OPEN", f.today), open_checks(f), OPEN_AUTO_FIX)
 
 
 # --- the close ----------------------------------------------------------------
@@ -759,13 +766,13 @@ def close_checks(f: CloseFacts) -> list[Check]:
 
 def render_close(f: CloseFacts) -> tuple[str, str]:
     """``(text, auto_fix)`` of the market-close checklist."""
-    return _finish(_headline("CLOSED", f.today), close_checks(f))
+    return _finish(_headline("CLOSED", f.today), close_checks(f), CLOSE_AUTO_FIX)
 
 
 # --- shared ---------------------------------------------------------------------
 
 
-def _finish(headline: str, checks: Sequence[Check]) -> tuple[str, str]:
+def _finish(headline: str, checks: Sequence[Check], auto_fix: str) -> tuple[str, str]:
     """The headline, one line per check, the footer (only when a check failed), the link."""
     body = "\n".join([headline, *(c.render() for c in checks)])
     failed = [c for c in checks if c.mark == "fail"]
@@ -773,7 +780,6 @@ def _finish(headline: str, checks: Sequence[Check]) -> tuple[str, str]:
         return brief_alert(body, CONSOLE_URL, auto_fix=INFORMATIONAL), INFORMATIONAL
     impact = "; ".join(dict.fromkeys(c.impact for c in failed))
     action = " ".join(dict.fromkeys(c.action[0].upper() + c.action[1:] for c in failed))
-    auto_fix = "none; nothing on the box retries or restarts the trader."
     return brief_alert(body, CONSOLE_URL, impact=impact, auto_fix=auto_fix, action=action), auto_fix
 
 
