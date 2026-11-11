@@ -51,6 +51,12 @@ from executor.notifier import send_daemon_status, send_trade_alert
 
 logger = logging.getLogger(__name__)
 
+#: What heals a failed or stalled session the same day (executor.v2_session_watchdog).
+SESSION_WATCHDOG_AUTO_FIX = (
+    "the session watchdog restarts a failed or stalled session within 5 minutes, from 09:45 ET "
+    "to 10 minutes before the close, at most twice a day (never one an operator stopped, never "
+    "under the kill switch); each restart sends its own notice"
+)
 TRADER_ENV = Path("/home/ec2-user/alpha-engine-config/crucible-trader/trader.env")
 RUNS_PREFIX = "runs/trader.session/"
 #: A run record older than this was not written by the session that just
@@ -348,9 +354,9 @@ def summarize(
                     *failure,
                     f"The run wrote {shortfall_key(day)} before it failed but this alert could not "
                     "read it; check the broker for what is working and what filled.",
-                    "Auto-fix: none. Orders already at the broker stand; the session's remaining "
-                    "buys were not sent. Resolution: fix the cause, then rerun today (a rerun "
-                    "adopts the orders already sent and never resends them).",
+                    f"Auto-fix: {SESSION_WATCHDOG_AUTO_FIX}. Orders already at the broker stand. "
+                    "Resolution: if no restart notice follows, fix the cause, then rerun today (a "
+                    "rerun adopts the orders already sent and never resends them).",
                 ],
             )
         orders = _docs(shortfall, "orders")
@@ -363,9 +369,9 @@ def summarize(
                     f"*v2 session {day}: RUN FAILED after {len(orders)} order(s) placed, {len(full)} filled{partly}*",
                     *failure,
                     *_order_lines(shortfall, orders),
-                    "Auto-fix: none. Orders already at the broker stand; the session's remaining "
-                    "buys were not sent. Resolution: fix the cause, then rerun today (a rerun "
-                    "adopts the orders already sent and never resends them).",
+                    f"Auto-fix: {SESSION_WATCHDOG_AUTO_FIX}. Orders already at the broker stand. "
+                    "Resolution: if no restart notice follows, fix the cause, then rerun today (a "
+                    "rerun adopts the orders already sent and never resends them).",
                 ],
             )
         return _with_order_book(
@@ -374,8 +380,8 @@ def summarize(
                 f"*v2 session {day}: NO ORDERS PLACED*",
                 f"Run status: {run.get('status')}",
                 f"Reason: {run.get('reason') or 'none recorded'}",
-                "Auto-fix: none; the session timer does not catch up. "
-                "Resolution: fix the cause before the next 09:30 ET session, or rerun today.",
+                f"Auto-fix: {SESSION_WATCHDOG_AUTO_FIX}. "
+                "Resolution: if no restart notice follows, fix the cause, or rerun today.",
             ],
         )
     held = _held_reason(run)

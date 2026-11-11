@@ -1,0 +1,38 @@
+[Unit]
+Description=Restart a dead or stalled v2 trading session the same day (alpha-engine-config-I12024)
+# Started by its own timer, never by the session. executor.v2_session_watchdog
+# restarts alpha-engine-trader-session.service when, between 09:45 ET and ten
+# minutes before the close, it has failed (no stop request in its journal) or
+# never started, or it is running but its entry/exit watch has not written for
+# 15 minutes; and today's session has not finished. A rerun adopts every order
+# already at the broker and never resends one (crucible-trader order_router).
+#
+# It never restarts a session an operator stopped (a clean stop, or a stop
+# request in the journal), never under the kill switch, never when a rerun
+# would break the money-path chain, never beside the trader reconcile or pin
+# smoke, and at most twice a day; then it says so once on Telegram with the
+# command to start the session. At 16:05 it stops a session it restarted, the
+# hard stop a 09:30 start has.
+# It exits non-zero only when its message was not delivered, and that pages
+# through the notifier the trader units use.
+OnFailure=alpha-engine-trader-failed@%n.service
+
+[Service]
+Type=oneshot
+# ec2-user, like the notices: it reads the v2 store as the trader's role
+# through the trader's env file, and writes its once-a-day state beside theirs.
+# Starting and stopping the session goes through `sudo -n systemctl --no-block`.
+User=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine
+ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.v2_session_watchdog
+TimeoutStartSec=3min
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+Environment=AWS_REGION=us-east-1
+Environment=ALPHA_ENGINE_JSON_LOGS=1
+Environment=FLOW_DOCTOR_ENABLED=1
+Environment=ALPHA_ENGINE_DEPLOYED=1
+# Attributes every send to its alert-registry row (nousergon-data
+# infrastructure/overseer/playbooks.yaml, class crucible_v2_session_watchdog).
+Environment=KREPIS_EVENT_SOURCE=crucible-executor/v2-session-watchdog

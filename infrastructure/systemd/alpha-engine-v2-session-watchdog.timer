@@ -1,0 +1,17 @@
+[Unit]
+Description=v2 trading session watchdog, every 5 minutes in market hours (alpha-engine-config-I12024)
+
+[Timer]
+# Every five minutes 09:00-15:55 New York time, weekdays, and once at 16:05.
+# The module acts only from 09:45 to ten minutes before the close (15:50 on a
+# full day) on an NYSE trading day, and in the 16:05 pass; every other firing
+# is a no-op. The timezone suffix keeps it there across DST.
+OnCalendar=Mon..Fri *-*-* 09..15:00/5:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 16:05:00 America/New_York
+AccuracySec=10s
+# Persistent=false: a catch-up at a late boot would judge a day that has moved on.
+Persistent=false
+Unit=alpha-engine-v2-session-watchdog.service
+
+[Install]
+WantedBy=timers.target
