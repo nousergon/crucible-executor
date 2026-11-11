@@ -126,3 +126,9 @@ def test_the_market_notice_units_are_accepted() -> None:
     for unit in ("alpha-engine-v2-market-open-alert.service", "alpha-engine-v2-market-close-alert.service"):
         assert tuf.UNIT_RE.fullmatch(unit)
     assert not tuf.UNIT_RE.fullmatch("alpha-engine-v2-market-open-alert.service; rm")
+
+
+def test_the_day_end_box_stop_is_accepted() -> None:
+    """alpha-engine-config-I12024: the day-end stop pages here when poweroff is refused."""
+    assert tuf.UNIT_RE.fullmatch("alpha-engine-v2-day-end.service")
+    assert not tuf.UNIT_RE.fullmatch("alpha-engine-v2-day-end.service; rm")

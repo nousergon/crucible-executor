@@ -97,9 +97,9 @@ EXECUTOR_DIR = Path(__file__).resolve().parents[1]
 AFTER_CLOSE = (
     ("alpha-engine-trader-pin-smoke.timer", "pin smoke 16:10"),
     ("alpha-engine-trader-reconcile.timer", "reconcile 16:45"),
+    # executor.v2_day_end: stops the box once the units above are done.
+    ("alpha-engine-v2-day-end.timer", "box stop 17:30"),
 )
-#: When the box stops: the 01:00 ET backstop stop (the session timer's own note).
-BOX_STOP = "the 01:00 ET backstop"
 
 #: This alert's own IB API client id, set in its units. Never one the trader
 #: uses (:func:`_refused_client_ids`) and never v1's 1-3.
@@ -742,7 +742,6 @@ def _after_close_checks(f: CloseFacts) -> list[Check]:
                     f"check {timer} on the trading box.",
                 )
             )
-    out.append(_wait(f"Box stops at {BOX_STOP}"))
     return out
 
 

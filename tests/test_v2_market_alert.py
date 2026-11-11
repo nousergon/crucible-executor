@@ -136,6 +136,7 @@ def _systemd(session: dict[str, str], pull: dict[str, str] = PULLED) -> _Systemd
             m.BOOT_PULL_UNIT: pull,
             "alpha-engine-trader-pin-smoke.timer": ACTIVE,
             "alpha-engine-trader-reconcile.timer": ACTIVE,
+            "alpha-engine-v2-day-end.timer": ACTIVE,
         }
     )
 
@@ -327,7 +328,7 @@ CLOSE_ALL_OK = """\
 ✅ Broker holds only GTC stops (1)
 ⏳ Still to run: pin smoke 16:10 ET
 ⏳ Still to run: reconcile 16:45 ET
-⏳ Box stops at the 01:00 ET backstop
+⏳ Still to run: box stop 17:30 ET
 Details on console: https://console.nousergon.ai/page/crucible-trading"""
 
 

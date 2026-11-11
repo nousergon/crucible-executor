@@ -405,3 +405,79 @@ def test_each_market_notice_attributes_its_sends_to_its_registry_row(stem: str) 
     crucible_v2_market_open_close) is keyed on this source."""
     text = (SYSTEMD / f"{stem}.service").read_text()
     assert re.search(r"^Environment=KREPIS_EVENT_SOURCE=crucible-executor/v2-market-alert$", text, re.M)
+
+
+# --- The day-end box stop (alpha-engine-config-I12024) --------------------------
+
+DAY_END = "alpha-engine-v2-day-end"
+
+
+def test_the_day_end_stop_is_a_root_oneshot_on_its_own_timer() -> None:
+    """Brian 2026-11-11: the box idled ~10 hours a weekday after the v1 post-close
+    stop stopped running. The box stops itself once the v2 day is done."""
+    unit = _unit(SYSTEMD / f"{DAY_END}.service")
+    service = unit["Service"]
+    assert service["Type"] == "oneshot"
+    # poweroff and `systemctl stop` need root.
+    assert "User" not in service
+    assert service["ExecStart"] == f"{EXECUTOR_PYTHON} -m executor.v2_day_end"
+    assert "EnvironmentFile" not in service and "ExecStartPre" not in service
+    assert unit["Unit"]["OnFailure"] == f"{FAILURE_NOTIFIER}%n.service"
+    timer = _unit(SYSTEMD / f"{DAY_END}.timer")["Timer"]
+    assert timer["OnCalendar"] == "Mon..Fri *-*-* 17:30:00 America/New_York"
+    assert timer["Unit"] == f"{DAY_END}.service"
+
+
+def test_the_day_end_never_catches_up_at_a_later_boot() -> None:
+    """A catch-up would power off a box the evening reconcile pipeline just booted."""
+    assert _unit(SYSTEMD / f"{DAY_END}.timer")["Timer"]["Persistent"] == "false"
+
+
+def test_the_day_end_fires_after_every_v2_unit_has_hit_its_hard_stop() -> None:
+    """Nothing of the v2 day can still be running at 17:30 on a normal day: each
+    unit's start + TimeoutStartSec ends first. The module waits regardless."""
+    from executor import v2_day_end as day_end
+
+    fire = _unit(SYSTEMD / f"{DAY_END}.timer")["Timer"]["OnCalendar"]
+    hour, minute = map(int, re.search(r"(\d\d):(\d\d):00", fire).groups())
+    assert (hour, minute) == (day_end.FIRE_AT.hour, day_end.FIRE_AT.minute)
+    for stem in BROKER_UNITS:
+        assert _start_minutes(stem) + _timeout_minutes(stem) < hour * 60 + minute, stem
+    for stem in MARKET_ALERTS:
+        assert _alert_window(stem)[1] < hour * 60 + minute, stem
+
+
+def test_the_day_end_service_timeout_covers_its_own_budget() -> None:
+    from executor import v2_day_end as day_end
+
+    deadline, fire = day_end.DEADLINE, day_end.FIRE_AT
+    budget = (deadline.hour - fire.hour) * 60 + deadline.minute - fire.minute + day_end.STOP_TIMEOUT_SECONDS // 60
+    assert budget < _timeout_minutes(DAY_END)
+
+
+def test_the_day_end_waits_for_every_v2_unit_after_the_close() -> None:
+    from executor import v2_day_end as day_end
+
+    for stem in (*BROKER_UNITS, *MARKET_ALERTS, TRADE_ALERT):
+        if stem == "alpha-engine-v2-market-open-alert":
+            continue
+        assert f"{stem}.service" in day_end.WAIT_UNITS, stem
+        assert (SYSTEMD / f"{stem}.service").is_file()
+    assert f"{FAILURE_NOTIFIER}*.service" in day_end.WAIT_UNITS
+
+
+def test_the_day_end_calendar_parses() -> None:
+    analyze = subprocess.run(["which", "systemd-analyze"], capture_output=True, text=True)
+    if analyze.returncode != 0:
+        pytest.skip("systemd-analyze not installed")
+    on_calendar = _unit(SYSTEMD / f"{DAY_END}.timer")["Timer"]["OnCalendar"]
+    result = subprocess.run(["systemd-analyze", "calendar", on_calendar], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("suffix", [".service", ".timer"])
+def test_the_day_end_unit_carries_no_private_literals(suffix: str) -> None:
+    text = (SYSTEMD / f"{DAY_END}{suffix}").read_text()
+    assert not re.search(r"\b\d{12}\b", text)
+    assert "arn:aws:" not in text and "s3://" not in text
+    assert not re.search(r"\bi-[0-9a-f]{8,17}\b", text)

@@ -1,0 +1,19 @@
+[Unit]
+Description=Daily v2 day-end box stop (alpha-engine-config-I12024)
+
+[Timer]
+# 17:30 New York time, weekdays: after every unit of the v2 day has passed its
+# own hard stop (session 16:05, close notice 16:09, pin smoke 16:40, trader
+# reconcile 16:45 + 30min = 17:15), and after the v1 component-3 post-close
+# timers (21:05 / 21:15 UTC, i.e. 17:05 / 17:15 ET in EDT) have started. The
+# module still waits for any of them that is running or queued.
+#
+# Persistent=false: a catch-up at a later boot would power off a box that the
+# evening reconcile pipeline (or an operator) just booted for its own work.
+# A missed day end is not silent: the 01:00 ET backstop schedule stops the box.
+OnCalendar=Mon..Fri *-*-* 17:30:00 America/New_York
+Persistent=false
+Unit=alpha-engine-v2-day-end.service
+
+[Install]
+WantedBy=timers.target
