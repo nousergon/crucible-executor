@@ -23,6 +23,14 @@ WorkingDirectory=/home/ec2-user
 # in this public repository. No leading '-': a missing file fails the unit
 # rather than running the trader against defaults it does not have.
 EnvironmentFile=/home/ec2-user/alpha-engine-config/crucible-trader/trader.env
+# alpha-engine-config-I13544: refuse a start outside Mon-Fri 09:25-16:00 ET
+# before anything runs. A changed timer replaced by boot-pull on a box up
+# since the morning fired this unit at 20:36 ET (11-09) and 20:38 ET (11-10);
+# the trader held, but still wrote a held run manifest the sweep paged on.
+# ExecCondition= runs before ExecStartPre=; exit 1 skips quietly (no
+# provisioning, no trader, Result=exec-condition, no OnFailure=). Exit 255,
+# the gate's answer when it cannot read the clock, fails the unit and pages.
+ExecCondition=/usr/bin/env bash /home/ec2-user/alpha-engine/infrastructure/session-hours-gate.sh
 ExecStartPre=/usr/bin/env bash /home/ec2-user/alpha-engine/infrastructure/trader-provision.sh
 # SHADOW: with routing off the session resolves the champion, builds the book,
 # records the served day and files a no_orders shortfall. No order leaves the
