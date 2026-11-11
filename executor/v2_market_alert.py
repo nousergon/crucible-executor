@@ -56,6 +56,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib
 import logging
+import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -93,6 +94,15 @@ GATEWAY_UNIT = "ibgateway.service"
 BOOT_PULL_UNIT = "boot-pull.service"
 #: The executor checkout this module runs from; boot-pull resets it at boot.
 EXECUTOR_DIR = Path(__file__).resolve().parents[1]
+#: boot-pull's own log; it runs as ec2-user, as this notice does.
+BOOT_PULL_LOG = Path("/var/log/boot-pull.log")
+#: How much of the log's tail is read: one boot's run is far smaller.
+_BOOT_PULL_LOG_TAIL = 256 * 1024
+_BOOT_PULL_STARTED = "=== boot-pull started ==="
+_BOOT_PULL_SUMMARY = re.compile(r"=== boot-pull completed with \d+ failure\(s\): (.*) ===")
+#: Failed-item suffixes boot-pull gives a repo it could not bring to main.
+#: Any of these means some checkout may be stale, whatever the executor's is.
+_REPO_FAILURE_MARKS = ("(git)", "(pip)", "(deploy-gate rollback)")
 #: The units still to run after the close, and when (their timers' OnCalendar).
 AFTER_CLOSE = (
     ("alpha-engine-trader-pin-smoke.timer", "pin smoke 16:10"),
@@ -261,6 +271,44 @@ def executor_sha(run: Runner = _run) -> str | None:
     return sha if proc.returncode == 0 and sha else None
 
 
+def executor_on_main(run: Runner = _run) -> bool | None:
+    """Whether the executor checkout's HEAD is its ``origin/main``; ``None`` if git could not say.
+
+    Local refs only, never a fetch: ``origin/main`` is what boot-pull fetched
+    this boot. If that fetch failed, boot-pull names the repo with ``(git)``
+    (:func:`boot_pull_failures`), which keeps the line a failure.
+    """
+    proc = run(["git", "-C", str(EXECUTOR_DIR), "rev-parse", "HEAD", "origin/main"])
+    shas = proc.stdout.split()
+    if proc.returncode != 0 or len(shas) != 2:
+        return None
+    return shas[0] == shas[1]
+
+
+def boot_pull_failures(log: Path = BOOT_PULL_LOG) -> str | None:
+    """What boot-pull's latest run said failed; ``None`` if the log is unreadable or says nothing.
+
+    Only the summary line after the latest ``boot-pull started`` counts, so a
+    run that died before its summary never borrows an older run's.
+    """
+    try:
+        with log.open("rb") as handle:
+            handle.seek(0, 2)
+            handle.seek(max(0, handle.tell() - _BOOT_PULL_LOG_TAIL))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    start = tail.rfind(_BOOT_PULL_STARTED)
+    if start == -1:
+        return None
+    found = None
+    for line in tail[start:].splitlines():
+        match = _BOOT_PULL_SUMMARY.search(line)
+        if match:
+            found = match.group(1).strip()
+    return found or None
+
+
 def _refused_client_ids(env: Mapping[str, str]) -> set[int]:
     refused = set(_V1_CLIENT_IDS)
     for var in _TRADER_CLIENT_ID_VARS:
@@ -410,6 +458,9 @@ def _read(store: Store, relative: str) -> tuple[Doc | None, str | None]:
 def _read_stamped(store: Store, relative: str) -> tuple[Doc | None, str | None, dt.datetime | None]:
     """:func:`_read`, plus when the document was written (S3 ``LastModified``)."""
     doc, reason, modified = store.read_stamped(relative)
+    # AccessDenied reads as absent. That is only true while the role holds
+    # GetObject on every key read here: a missing grant also answers 403, and
+    # would then read as "not written yet" (2026-11-11, the entry watch).
     if reason in ("AccessDenied", "403"):
         return None, None, None
     return doc, reason, modified
@@ -451,6 +502,10 @@ class OpenFacts:
     boot: dt.datetime | None = None
     boot_pull: Unit = field(default_factory=Unit)
     executor_sha: str | None = None
+    #: The executor checkout's HEAD equals its ``origin/main``; ``None`` if unread.
+    executor_on_main: bool | None = None
+    #: boot-pull's own summary of what failed; ``None`` if unread or none.
+    boot_pull_failed: str | None = None
     predictions: Doc | None = None
     predictions_at: dt.datetime | None = None
     unreadable: tuple[str, ...] = ()
@@ -465,17 +520,32 @@ def _box_check(f: OpenFacts) -> Check:
 
 
 def _code_check(f: OpenFacts) -> Check:
+    # The watch's ``code_sha`` is the crucible release the trader runs
+    # (crucible-trader ``entry_timing.CODE_SHA_VAR``, the pinned release sha),
+    # not a crucible-trader commit.
     sha = None if f.watch is None else f.watch.get("code_sha")
-    trader = str(sha)[:7] if isinstance(sha, str) and sha else "not recorded yet"
-    shas = f"executor {f.executor_sha or 'unknown'}, trader {_plain(trader)}"
+    release = str(sha)[:7] if isinstance(sha, str) and sha else "not recorded yet"
+    executor = f"executor {f.executor_sha or 'unknown'}"
+    shas = f"{executor}, crucible release {_plain(release)}"
     pull = f.boot_pull
     if pull.active == "activating":
         return _wait(f"Code pull still running — {shas}")
     if pull.result != "success":
+        failed = f.boot_pull_failed
+        what = f": {_plain(failed)}" if failed else f" (boot-pull {pull.active}, result {pull.result})"
+        # Judged on the post-condition, and only when boot-pull's own summary
+        # was read: an unread log could hide a failed executor fetch, which
+        # leaves origin/main stale and HEAD == origin/main proving nothing.
+        repo_failed = failed is None or any(mark in failed for mark in _REPO_FAILURE_MARKS)
+        if f.executor_on_main and not repo_failed:
+            return _ok(
+                f"Code current — {executor} on main, crucible release {_plain(release)}; "
+                f"boot-pull reported a non-repo failure{what} (see {BOOT_PULL_LOG})"
+            )
         return _fail(
-            f"Code pull did not succeed (boot-pull {pull.active}, result {pull.result}) — {shas}",
+            f"Code pull did not succeed{what} — {shas}",
             "today's session may be running stale code",
-            "read /var/log/boot-pull.log on the trading box.",
+            f"read {BOOT_PULL_LOG} on the trading box.",
         )
     return _ok(f"Code pulled {_et(pull.stamp('ExecMainExitTimestamp'))} — {shas}")
 
@@ -797,6 +867,7 @@ def gather_open(
     client_id: int,
     run: Runner = _run,
     broker: Callable[..., Broker] = read_broker,
+    boot_pull_log: Path = BOOT_PULL_LOG,
 ) -> OpenFacts:
     today = now.astimezone(_NEW_YORK).date()
     day = previous_trading_day(today).isoformat()
@@ -812,6 +883,8 @@ def gather_open(
         docs[name], reason, stamps[name] = _read_stamped(store, key)
         if reason is not None:
             unreadable.append(f"{key} ({reason[:80]})")
+    boot_pull = unit_state(BOOT_PULL_UNIT, run)
+    pulled_badly = boot_pull.active != "activating" and boot_pull.result != "success"
     return OpenFacts(
         today=today.isoformat(),
         day=day,
@@ -823,8 +896,10 @@ def gather_open(
         run=docs["run"],
         now=now,
         boot=booted_at(run),
-        boot_pull=unit_state(BOOT_PULL_UNIT, run),
+        boot_pull=boot_pull,
         executor_sha=executor_sha(run),
+        executor_on_main=executor_on_main(run) if pulled_badly else None,
+        boot_pull_failed=boot_pull_failures(boot_pull_log) if pulled_badly else None,
         predictions=docs["predictions"],
         predictions_at=stamps["predictions"],
         unreadable=tuple(unreadable),
@@ -876,6 +951,7 @@ def notify(
     broker: Callable[..., Broker] = read_broker,
     send: Callable[..., bool] = send_trading_notice,
     sent_dir: Path = SENT_DIR,
+    boot_pull_log: Path = BOOT_PULL_LOG,
 ) -> Outcome:
     """Send today's ``kind`` notice once. Sends at most one message."""
     today = now.astimezone(_NEW_YORK).date()
@@ -885,7 +961,9 @@ def notify(
     if marker.exists():
         return Outcome("already_sent", f"the {kind} notice for {today} was sent already")
     if kind == "open":
-        text, auto_fix = render_open(gather_open(store, env, now=now, client_id=client_id, run=run, broker=broker))
+        text, auto_fix = render_open(
+            gather_open(store, env, now=now, client_id=client_id, run=run, broker=broker, boot_pull_log=boot_pull_log)
+        )
     else:
         text, auto_fix = render_close(gather_close(store, env, now=now, client_id=client_id, run=run, broker=broker))
     if not send(text, auto_fix=auto_fix):

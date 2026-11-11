@@ -17,7 +17,9 @@ script) because there is no way to exercise the real
 """
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 _BOOT_PULL = Path(__file__).parent.parent / "infrastructure" / "boot-pull.sh"
@@ -102,8 +104,9 @@ def test_credential_helper_check_failure_is_fail_loud():
     App installation lost read on this repo, or the instance role lost
     ssm:GetParameter) must also increment the same failure accumulator."""
     src = _src()
-    assert '"$HELPER" --check alpha-engine-config' in src
-    check_branch = src[src.index('"$HELPER" --check alpha-engine-config') :]
+    call = '_boot_pull_check_credential_helper "$HELPER" alpha-engine-config'
+    assert call in src
+    check_branch = src[src.index(call) :]
     check_branch = check_branch[: check_branch.index("else")]
     assert 'log "FAIL' in check_branch
     assert "PULL_FAILURES=$((PULL_FAILURES + 1))" in check_branch
@@ -147,3 +150,76 @@ def test_no_second_failure_reporting_mechanism_was_invented():
         "PULL_FAILURES/FAILED_REPOS — the credential check must not publish "
         "its own alert."
     )
+
+
+# --- the --check retry (alpha-engine-config-I12024) --------------------------
+# Measured 2026-11-11: ONE transient mint failure at --check was counted as a
+# pull failure and boot-pull exited 1, while the repo loop that followed
+# authenticated every repo. These run the real function, sourced with
+# AE_BOOT_PULL_LIB_ONLY=1, against a scripted stand-in helper.
+
+
+def _scripted_helper(tmp_path: Path, outcomes: list[int]) -> Path:
+    """A helper whose Nth --check exits outcomes[N-1] (last repeats)."""
+    counter = tmp_path / "check_count"
+    cases = "\n".join(
+        f'[ "$n" {"-eq" if i < len(outcomes) else "-ge"} {i} ] && exit {rc}'
+        for i, rc in enumerate(outcomes, start=1)
+    )
+    helper = tmp_path / "helper.sh"
+    helper.write_text(
+        "#!/bin/sh\n"
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "{counter}"\n'
+        f"{cases}\n"
+    )
+    helper.chmod(0o755)
+    return helper
+
+
+def _check(tmp_path: Path, outcomes: list[int]) -> tuple[int, str, int]:
+    helper = _scripted_helper(tmp_path, outcomes)
+    log = tmp_path / "boot-pull.log"
+    env = {
+        **os.environ,
+        "AE_BOOT_PULL_LIB_ONLY": "1",
+        "AE_BOOT_PULL_LOG": str(log),
+        "AE_BOOT_PULL_RETRY_BACKOFF_1": "0",
+        "AE_BOOT_PULL_RETRY_BACKOFF_2": "0",
+    }
+    res = subprocess.run(
+        ["bash", "-c", f'. "{_BOOT_PULL}"; _boot_pull_check_credential_helper "{helper}" alpha-engine-config'],
+        env=env, capture_output=True, text=True,
+    )
+    count = int((tmp_path / "check_count").read_text().strip())
+    return res.returncode, (log.read_text() if log.exists() else ""), count
+
+
+def test_check_transient_failure_then_success_is_not_a_failure(tmp_path: Path) -> None:
+    rc, log, count = _check(tmp_path, [1, 0])
+    assert rc == 0, log
+    assert count == 2
+    assert "RETRY git credential helper --check alpha-engine-config — attempt 1/3" in log
+    assert "recovered on attempt 2/3" in log
+    assert "FAIL" not in log
+
+
+def test_check_failing_three_times_still_fails(tmp_path: Path) -> None:
+    rc, log, count = _check(tmp_path, [1])
+    assert rc == 1, log
+    assert count == 3, "exactly 3 attempts, never more"
+    assert "failed on all 3 attempts" in log
+
+
+def test_check_success_first_time_does_not_retry(tmp_path: Path) -> None:
+    rc, log, count = _check(tmp_path, [0])
+    assert rc == 0 and count == 1
+    assert "RETRY" not in log
+
+
+def test_check_failure_still_counts_in_the_main_script() -> None:
+    """The caller still increments PULL_FAILURES when the function returns 1."""
+    src = _src()
+    branch = src[src.index('elif ! _boot_pull_check_credential_helper "$HELPER" alpha-engine-config') :]
+    branch = branch[: branch.index("elif", 5)]
+    assert "PULL_FAILURES=$((PULL_FAILURES + 1))" in branch
+    assert 'FAILED_REPOS+=("git-credential-helper (check failed)")' in branch
