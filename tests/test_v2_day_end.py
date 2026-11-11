@@ -6,7 +6,7 @@ import ast
 import datetime as dt
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -26,7 +26,7 @@ def _uptime(boot: dt.datetime, now: dt.datetime) -> float:
 class _Box:
     """A fake systemctl: ``busy`` is a list of unit sets, one per poll."""
 
-    def __init__(self, polls: Sequence[Sequence[str]] = ((),), *, jobs: Sequence[str] = (), fail: bool = False):
+    def __init__(self, polls: Sequence[Sequence[str]] = ((),), *, jobs: Sequence[str] = (), fail: bool = False) -> None:
         self.polls = list(polls)
         self.jobs = list(jobs)
         self.fail = fail
@@ -57,7 +57,7 @@ class _Box:
 
 
 class _Clock:
-    def __init__(self, start: dt.datetime):
+    def __init__(self, start: dt.datetime) -> None:
         self.now = start
 
     def __call__(self) -> dt.datetime:
@@ -67,7 +67,14 @@ class _Clock:
         self.now += dt.timedelta(seconds=seconds)
 
 
-def _main(box: _Box, *, now: dt.datetime = FIRE, boot: dt.datetime = MORNING_BOOT, argv: list[str] | None = None):
+def _main(
+    box: _Box,
+    *,
+    now: dt.datetime = FIRE,
+    boot: dt.datetime = MORNING_BOOT,
+    argv: list[str] | None = None,
+    ship: Callable[[], None] = lambda: None,
+) -> tuple[int, _Clock, list[str]]:
     clock = _Clock(now)
     status = m.main(
         [] if argv is None else argv,
@@ -75,6 +82,7 @@ def _main(box: _Box, *, now: dt.datetime = FIRE, boot: dt.datetime = MORNING_BOO
         clock=clock,
         uptime=lambda: _uptime(boot, now),
         sleep=clock.sleep,
+        ship=ship,
     )
     return status, clock, []
 
@@ -223,3 +231,42 @@ def test_the_deadline_ends_before_the_evening_reconcile_pipeline_can_start() -> 
     """The EOD collection that starts the evening reconcile pipeline begins at 18:15 ET."""
     assert m.FIRE_AT < m.LATE_LIMIT < m.DEADLINE < dt.time(18, 15)
     assert m.MORNING_BOOT_CUTOFF < m.FIRE_AT
+
+
+def test_the_logs_are_copied_once_just_before_the_poweroff() -> None:
+    box = _Box()
+    order: list[str] = []
+    status, _, _ = _main(box, ship=lambda: order.append(f"ship after {len(box.calls)} calls"))
+    assert status == 0 and box.poweroffs == 1
+    assert order == [f"ship after {len(box.calls) - 1} calls"]
+
+
+def test_a_failed_log_copy_never_holds_the_box_up() -> None:
+    def broken() -> None:
+        raise RuntimeError("s3 down")
+
+    box = _Box()
+    status, _, _ = _main(box, ship=broken)
+    assert status == 0 and box.poweroffs == 1
+
+
+@pytest.mark.parametrize("argv", [["--dry-run"]])
+def test_no_log_copy_when_not_acting(argv: list[str]) -> None:
+    shipped: list[int] = []
+    _main(_Box(), argv=argv, ship=lambda: shipped.append(1))
+    _main(_Box(), now=FIRE - dt.timedelta(hours=1), ship=lambda: shipped.append(1))
+    assert shipped == []
+
+
+def test_the_final_log_copy_is_bounded_and_swallows_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        seen.update(kwargs, argv=argv)
+        raise subprocess.TimeoutExpired(argv, m.SHIP_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    m.ship_logs()
+    assert seen["timeout"] == m.SHIP_TIMEOUT_SECONDS
+    assert seen["argv"] == [sys.executable, "-m", "executor.box_log_ship"]
+    assert m.SHIP_TIMEOUT_SECONDS < 120

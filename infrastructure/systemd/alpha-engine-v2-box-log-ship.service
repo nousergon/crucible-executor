@@ -1,0 +1,27 @@
+[Unit]
+Description=Copy today's trading-box logs to S3 for read-only diagnosis (alpha-engine-config-I12024)
+# Started by its own timer every ten minutes, and run once more by
+# executor.v2_day_end just before the box powers off. executor.box_log_ship
+# copies today's journals of the v2 units, boot-pull and IB Gateway, and the
+# tail of /var/log/boot-pull.log, redacted, to the box-logs prefix of the
+# box's signals bucket, so a session with read-only AWS access can read them
+# without running a command on the box.
+#
+# No OnFailure: a log copy never pages. The module exits 0 on every failure
+# and logs a warning in this unit's journal.
+
+[Service]
+Type=oneshot
+# ec2-user owns /var/log/boot-pull.log; the journal group reads every unit's
+# journal. No EnvironmentFile: it writes with the box's instance role, never
+# the trader's profile.
+User=ec2-user
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/home/ec2-user/alpha-engine
+ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.box_log_ship
+TimeoutStartSec=5min
+Nice=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+Environment=AWS_REGION=us-east-1
