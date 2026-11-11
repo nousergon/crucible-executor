@@ -69,16 +69,14 @@ class _Clock:
 
 def _main(box: _Box, *, now: dt.datetime = FIRE, boot: dt.datetime = MORNING_BOOT, argv: list[str] | None = None):
     clock = _Clock(now)
-    pages: list[str] = []
     status = m.main(
         [] if argv is None else argv,
         run=box,
         clock=clock,
         uptime=lambda: _uptime(boot, now),
         sleep=clock.sleep,
-        page=pages.append,
     )
-    return status, clock, pages
+    return status, clock, []
 
 
 def test_a_quiet_day_end_powers_off_at_once() -> None:
@@ -106,7 +104,7 @@ def test_a_queued_job_counts_as_busy() -> None:
     # The job never leaves the queue: the deadline forces the stop.
     assert status == 0 and box.poweroffs == 1
     assert box.stops == [[m.SYSTEMCTL, "stop", "alpha-engine-trader-pin-smoke.service"]]
-    assert len(pages) == 1
+    assert pages == []
 
 
 def test_a_failure_page_in_flight_is_waited_for() -> None:
@@ -131,7 +129,7 @@ def test_at_the_deadline_it_stops_what_still_runs_then_powers_off_and_pages() ->
     assert box.stops == [[m.SYSTEMCTL, "stop", stuck]]
     stop_at = box.calls.index([m.SYSTEMCTL, "stop", stuck])
     assert box.calls[-1] == [m.SYSTEMCTL, "--no-block", "poweroff"] and stop_at < len(box.calls) - 1
-    assert len(pages) == 1 and stuck in pages[0] and "powering the box off anyway" in pages[0]
+    assert pages == []  # logged, never sent to chat
 
 
 def test_an_unreadable_systemd_is_busy_never_idle() -> None:
@@ -139,7 +137,7 @@ def test_an_unreadable_systemd_is_busy_never_idle() -> None:
     _, clock, pages = _main(box)
     deadline = dt.datetime.combine(FIRE.date(), m.DEADLINE, tzinfo=NY)
     assert clock.now >= deadline and box.poweroffs == 1
-    assert box.stops == [] and len(pages) == 1
+    assert box.stops == [] and pages == []
 
 
 @pytest.mark.parametrize(
@@ -209,8 +207,7 @@ def test_the_uptime_reader(tmp_path: Path) -> None:
 
 
 def test_the_decision_path_is_stdlib_only() -> None:
-    """A broken venv package must not keep the box up: only the best-effort page
-    imports anything outside the standard library, and only inside a try."""
+    """A broken venv package must not keep the box up, and it sends no alert."""
     tree = ast.parse(Path(m.__file__).read_text())
     top_level = {
         alias.name.split(".")[0]
@@ -219,6 +216,7 @@ def test_the_decision_path_is_stdlib_only() -> None:
         for alias in (node.names if isinstance(node, ast.Import) else [ast.alias(node.module or "")])
     }
     assert top_level <= set(sys.stdlib_module_names) | {"__future__"}
+    assert "publish_ops_alert" not in Path(m.__file__).read_text()
 
 
 def test_the_deadline_ends_before_the_evening_reconcile_pipeline_can_start() -> None:

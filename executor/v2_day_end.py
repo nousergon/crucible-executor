@@ -27,7 +27,9 @@ so on a normal day nothing is running and the box goes down at once.
 before the earliest the evening reconcile pipeline can start (the EOD
 collection starts at 18:15 ET). Past it, an idle box is the worse outcome: it
 stops what is still running (``systemctl stop``, so nothing is running when the
-power goes), logs why, pages best-effort, and powers off anyway.
+power goes), logs why in this unit's journal, and powers off anyway. It sends no
+alert of its own: a box stop is not a chat event, and a unit it had to stop
+reports through that unit's own failure path.
 
 **Whose box it stops: the morning's, and only that.** The evening reconcile
 pipeline, an operator replay or a heal replay may boot this box for its own
@@ -45,8 +47,8 @@ leaving the box up (the 01:00 ET backstop schedule still stops it):
   the day end, and by then an evening actor may be using the box.
 
 Power-off is an OS ``poweroff``; the instance's shutdown behaviour is ``stop``,
-so the box stops, it does not terminate. Stdlib only on the decision path: a
-broken executor venv package cannot keep the box up.
+so the box stops, it does not terminate. Stdlib only: a broken executor venv
+package cannot keep the box up.
 """
 
 from __future__ import annotations
@@ -167,16 +169,6 @@ def _deadline(now: dt.datetime) -> dt.datetime:
     return dt.datetime.combine(local.date(), DEADLINE, tzinfo=NEW_YORK)
 
 
-def _page(message: str) -> None:
-    """Best effort: a forced power-off is worth a page, but never worth an idle box."""
-    try:
-        from executor.notifier import publish_ops_alert
-
-        publish_ops_alert(message, severity="warning", source="alpha-engine/executor/v2_day_end.py")
-    except Exception:  # noqa: BLE001 -- the page must never keep the box up
-        logger.exception("v2 day end: could not page about the forced power-off")
-
-
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -184,7 +176,6 @@ def main(
     clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
     uptime: Callable[[], float] = read_uptime,
     sleep: Callable[[float], None] = time.sleep,
-    page: Callable[[str], None] = _page,
 ) -> int:
     """``python -m executor.v2_day_end [--dry-run]``."""
     args = list(sys.argv[1:] if argv is None else argv)
@@ -214,7 +205,6 @@ def main(
         )
         logger.error(reason)
         if not dry_run:
-            page(reason)
             stoppable = [u for u in busy if not u.startswith("<")]
             if stoppable:
                 run([SYSTEMCTL, "stop", *stoppable])
