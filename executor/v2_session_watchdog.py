@@ -59,7 +59,10 @@ start (``TimeoutStartSec``). A session this watchdog restarted later carries a
 later stop, and it shares the trader's IB client id with the 16:10 pin smoke.
 So at 16:05 a session it restarted today that is still running is stopped.
 
-Each restart sends one Telegram (Impact / Auto-fix / You). The process exits
+Each restart sends one Telegram (Impact / Auto-fix / You). After a notice
+that the session is down and staying down (out of restarts, an operator stop,
+the kill switch, the chain), the first tick that sees it running again with a
+fresh watch says so once, so the channel's last word is never a stale "down". The process exits
 non-zero only when a message was not delivered, which pages through
 ``alpha-engine-trader-failed@``. It runs as ``ec2-user`` and starts or stops
 the session through ``sudo -n systemctl --no-block``.
@@ -155,7 +158,15 @@ class Facts:
     reported: frozenset[str] = field(default_factory=lambda: frozenset[str]())
 
 
-Action = Literal["none", "wait", "restart", "start", "give_up", "hold", "hard_stop"]
+Action = Literal["none", "wait", "restart", "start", "give_up", "hold", "hard_stop", "recovered"]
+
+#: The once-a-day reports that tell the channel the session is DOWN and staying
+#: down. After one of them, a session seen running again is announced once
+#: (:data:`RECOVERED`): Brian 2026-11-12, "we never updated the channel that it
+#: is now working again" -- the last word in #trades was "out of restarts" for
+#: a session a manual start had brought back an hour earlier.
+DOWN_REPORTS = ("give_up", "operator_stop", "kill_switch", "chain")
+RECOVERED = "recovered"
 
 
 @dataclass(frozen=True)
@@ -208,7 +219,13 @@ def _problem(f: Facts, local: dt.datetime) -> tuple[Action, str] | Decision | No
         # A watch written before this run began is the previous run's.
         last = max(updated, started) if updated is not None else started
         if f.now - last <= STALE_AFTER:
-            return Decision("none", f"the session is running; its watch wrote at {_hm(last)} ET")
+            healthy = f"the session is running; its watch wrote at {_hm(last)} ET"
+            down = [r for r in DOWN_REPORTS if r in f.reported]
+            if down:
+                return Decision(
+                    "recovered", f"{healthy}, after the {down[0].replace('_', ' ')} notice", report=RECOVERED
+                )
+            return Decision("none", healthy)
         return "restart", f"the session is running but its watch has not written since {_hm(last)} ET"
     if f.session.active not in ("inactive", "failed"):
         return Decision("none", f"the session is {f.session.active}; judged on the next tick")
@@ -470,6 +487,16 @@ def message(d: Decision, *, now: dt.datetime, restarts: int, command: str) -> tu
             auto_fix=auto_fix,
             action=f"after the cause in the session's failure page is fixed, start it: {command}",
         ), auto_fix
+    if d.action == "recovered":
+        auto_fix = "none needed"
+        body = f"*v2 trading session running again*\nWhy: {d.reason}."
+        return brief_alert(
+            body,
+            CONSOLE_URL,
+            impact="orders still waiting on their triggers go out again for the rest of today",
+            auto_fix=auto_fix,
+            action="nothing.",
+        ), auto_fix
     if d.action == "hard_stop":
         auto_fix = f"stopped the restarted session at {at} ET, the hard stop a 09:30 start has"
         body = f"*v2 trading session stopped at its hard stop*\nWhy: {d.reason}."
@@ -519,6 +546,16 @@ def act(
     """Carry out one decision; sends at most one message."""
     if d.action in ("none", "wait"):
         return Outcome(d)
+    if d.action == "recovered":
+        text, auto_fix = message(d, now=now, restarts=len(state.restarts), command=command)
+        delivered = send(text, auto_fix=auto_fix)
+        if delivered:
+            # Clearing the down report is what makes this once: the next tick
+            # sees nothing to announce, and a later death is announced afresh.
+            # The restart cap is untouched; it counts restarts, not notices.
+            state.reported[:] = [r for r in state.reported if r not in DOWN_REPORTS]
+            save_state(state_path, state)
+        return Outcome(d, delivered)
     if d.action in ("hold", "give_up"):
         if d.report in state.reported:
             return Outcome(d)
