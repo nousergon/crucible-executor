@@ -119,3 +119,28 @@ def test_anything_but_one_trader_unit_is_refused_without_paging(
     box = _Box()
     assert tuf.main(argv, run=box, now=NOW) == 2
     assert published == [] and box.calls == []
+
+
+def test_the_market_notice_units_are_accepted() -> None:
+    """alpha-engine-config-I12024: the open and close notices name this notifier in OnFailure=."""
+    for unit in ("alpha-engine-v2-market-open-alert.service", "alpha-engine-v2-market-close-alert.service"):
+        assert tuf.UNIT_RE.fullmatch(unit)
+    assert not tuf.UNIT_RE.fullmatch("alpha-engine-v2-market-open-alert.service; rm")
+
+
+def test_the_day_end_box_stop_is_accepted() -> None:
+    """alpha-engine-config-I12024: the day-end stop pages here when poweroff is refused."""
+    assert tuf.UNIT_RE.fullmatch("alpha-engine-v2-day-end.service")
+    assert not tuf.UNIT_RE.fullmatch("alpha-engine-v2-day-end.service; rm")
+
+
+def test_the_session_watchdog_is_accepted() -> None:
+    assert tuf.UNIT_RE.fullmatch("alpha-engine-v2-session-watchdog.service")
+
+
+def test_a_failed_session_page_names_the_watchdog_and_others_do_not() -> None:
+    now = dt.datetime(2026, 11, 11, 16, 0, tzinfo=dt.UTC)
+    session = tuf.build_message("alpha-engine-trader-session.service", {}, "tail", now)
+    assert "Auto-fix: the session watchdog restarts the session" in session
+    reconcile = tuf.build_message("alpha-engine-trader-reconcile.service", {}, "tail", now)
+    assert "Auto-fix: none." in reconcile and "watchdog" not in reconcile

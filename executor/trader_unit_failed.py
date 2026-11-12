@@ -45,10 +45,17 @@ MAX_TAIL_CHARS = 3000
 
 #: Only the trader's own units, plus the v2 session's Telegram alert
 #: (alpha-engine-config-I13284), which pages here when it could not deliver
-#: its summary or read the run record. The instance name comes from
+#: its summary or read the run record, and the market-open and market-close
+#: notices (alpha-engine-config-I12024), which page here when their message was
+#: not delivered, the day-end box stop (alpha-engine-config-I12024), which
+#: pages here when the poweroff was refused, and the session watchdog, which
+#: pages here when its restart notice was not delivered. The instance name comes from
 #: systemd's ``%i``, but it is still checked: this process runs
 #: ``journalctl`` and ``systemctl`` on it.
-UNIT_RE = re.compile(r"alpha-engine-(?:trader-[a-z0-9-]+|v2-trade-alert)\.service")
+UNIT_RE = re.compile(
+    r"alpha-engine-(?:trader-[a-z0-9-]+|v2-(?:trade|market-open|market-close|order-book)-alert|v2-day-end|v2-session-watchdog)\.service"
+)
+SESSION_UNIT = "alpha-engine-trader-session.service"
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _STATE_PROPERTIES = ("ActiveState", "Result", "ExecMainStatus", "ExecMainExitTimestamp")
@@ -90,6 +97,16 @@ def journal_tail(unit: str, run: Runner = _run) -> str:
     return f"(journal tail unreadable: {problem})"
 
 
+def _auto_fix(unit: str) -> str:
+    if unit == SESSION_UNIT:
+        return (
+            "the session watchdog restarts the session within 5 minutes, from 09:45 ET to "
+            "10 minutes before the close, at most twice a day (never one an operator stopped, "
+            "never under the kill switch); each restart sends its own notice."
+        )
+    return "none. The trader timers do not catch up (Persistent=false), so this run is not retried today."
+
+
 def build_message(unit: str, state: dict[str, str], tail: str, now: dt.datetime) -> str:
     """One ops alert: the unit, how it ended, the tail, Auto-fix and Resolution."""
     local = now.astimezone(_NEW_YORK)
@@ -99,11 +116,10 @@ def build_message(unit: str, state: dict[str, str], tail: str, now: dt.datetime)
         f"ActiveState={state.get('ActiveState', '?')} Result={state.get('Result', '?')} "
         f"ExecMainStatus={state.get('ExecMainStatus', '?')} ended {ended} "
         f"(noticed {local.strftime('%Y-%m-%d %H:%M %Z')})\n"
-        "Auto-fix: none. The trader timers do not catch up (Persistent=false), "
-        "so this run is not retried today.\n"
+        f"Auto-fix: {_auto_fix(unit)}\n"
         "Resolution: read the tail below, fix the cause (provisioning, the "
-        "pinned venv build or the trader), and confirm the unit's next "
-        "scheduled run succeeds.\n"
+        "pinned venv build or the trader); the unit's next "
+        "scheduled run shows whether the fix held.\n"
         f"Last {TAIL_LINES} journal lines:\n"
         f"```\n{tail}\n```"
     )
@@ -120,7 +136,7 @@ def main(
     if len(args) != 1 or not UNIT_RE.fullmatch(args[0]):
         print(
             "usage: trader_unit_failed "
-            f"<alpha-engine-trader-*.service | alpha-engine-v2-trade-alert.service>; got {args!r}",
+            f"<alpha-engine-trader-*.service | alpha-engine-v2-*-alert.service | alpha-engine-v2-day-end.service>; got {args!r}",
             file=sys.stderr,
         )
         return 2

@@ -122,6 +122,44 @@ def test_an_unfilled_order_is_named_and_not_alerted_as_a_trade() -> None:
     assert "1/2 orders filled" in rec.statuses[0] and "UNFILLED: BBB" in rec.statuses[0]
 
 
+def test_a_partial_fill_is_never_counted_as_filled() -> None:
+    """2026-11-10: the summary said 7/7 filled while CVLT filled 220 of 657 and NTNX 817 of 1334."""
+    orders = [
+        _order("AAA", "sell", 10),
+        _order("CVLT", "sell", 657, 220),
+        _order("NTNX", "buy", 1334, 817),
+        _order("BBB", "buy", 20, 0),
+    ]
+    rec = _Recorder()
+    alert.run_alerts(
+        _store({"status": "ok"}, {**SHORTFALL, "orders": orders}), now=NOW, trade=rec.trade, status=rec.status
+    )
+    (summary,) = rec.statuses
+    assert summary.startswith(f"*v2 session {DAY}: 1/4 orders filled, 2 partly filled*")
+    assert "PARTLY FILLED: CVLT 220/657, NTNX 817/1,334" in summary and "UNFILLED: BBB" in summary
+    # Each partial fill is still alerted, for the shares that filled.
+    assert [t[:3] for t in rec.trades] == [("SELL", "AAA", 10), ("SELL", "CVLT", 220), ("BUY", "NTNX", 817)]
+
+
+def test_a_failed_run_counts_its_partial_fills_apart() -> None:
+    orders = [_order("AAA", "sell", 10, 4), _order("BBB", "buy", 20, 20)]
+    run = {"status": "failed", "reason": "RoutingRefusedError: the gateway dropped", "outputs": FILED}
+    rec = _Recorder()
+    alert.run_alerts(_store(run, {**SHORTFALL, "orders": orders}), now=NOW, trade=rec.trade, status=rec.status)
+    (summary,) = rec.statuses
+    assert summary.startswith(f"*v2 session {DAY}: RUN FAILED after 2 order(s) placed, 1 filled, 1 partly filled*")
+    assert "PARTLY FILLED: AAA 4/10" in summary
+
+
+@pytest.mark.parametrize(
+    ("quantity", "filled", "bucket"),
+    [(10, 10, 0), (10, 11, 0), (10, 9, 1), (10, 0.5, 1), (10, 0, 2), (10, -1, 2)],
+)
+def test_split_fills_buckets_each_order_once(quantity: float, filled: float, bucket: int) -> None:
+    buckets = alert.split_fills([{"symbol": "X", "quantity": quantity, "filled_quantity": filled}])
+    assert [len(b) for b in buckets] == [int(i == bucket) for i in range(3)]
+
+
 def test_a_refused_book_says_no_orders_and_why() -> None:
     rec = _Recorder()
     run = {"status": "failed", "reason": "RiskCapExceededError: PLTR over the per-order cap"}

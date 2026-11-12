@@ -289,6 +289,34 @@ sync_repo_to_main() {
     return 0
 }
 
+# _boot_pull_check_credential_helper <helper> <repo> — runs `<helper> --check
+# <repo>` up to 3 attempts with the repo loop's own 5s-then-10s backoff, and
+# returns 0 as soon as one mints. Returns 1 only if all 3 attempts fail, so a
+# helper that genuinely cannot mint still FAILs the run (alpha-engine-config-I12024).
+# Measured 2026-11-11: one transient mint failure here was counted as a pull
+# failure and the run exited 1, while the repo loop right after authenticated
+# every repo. `--check` always mints fresh (it never reads the token cache), so
+# there is no cached credential to erase between attempts; it is just retried.
+_boot_pull_check_credential_helper() {
+    local helper="$1" repo="$2" attempt=1 max_attempts=3 backoff
+    while :; do
+        if "$helper" --check "$repo" >> "$LOG" 2>&1; then
+            [ "$attempt" -gt 1 ] && log "OK   git credential helper --check $repo recovered on attempt $attempt/$max_attempts"
+            return 0
+        fi
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            log "FAIL git credential helper --check $repo failed on all $max_attempts attempts"
+            return 1
+        fi
+        # Same test-only overrides as sync_repo_to_main; production never sets them.
+        backoff="${AE_BOOT_PULL_RETRY_BACKOFF_1:-5}"
+        [ "$attempt" -gt 1 ] && backoff="${AE_BOOT_PULL_RETRY_BACKOFF_2:-10}"
+        log "RETRY git credential helper --check $repo — attempt $attempt/$max_attempts failed; retrying in ${backoff}s"
+        sleep "$backoff"
+        attempt=$((attempt + 1))
+    done
+}
+
 # Tests source this file for sync_repo_to_main() and must not execute the boot
 # sequence (SSM reads, sudo, systemctl). Everything above this line is pure
 # definition; everything below has side effects.
@@ -383,8 +411,8 @@ if [ ! -x "$HELPER" ]; then
     log "FAIL git credential helper missing/not executable at $HELPER — this box cannot authenticate to GitHub for private-repo pulls (netrc file removed above, no fallback by design)"
     PULL_FAILURES=$((PULL_FAILURES + 1))
     FAILED_REPOS+=("git-credential-helper (missing)")
-elif ! "$HELPER" --check alpha-engine-config >> "$LOG" 2>&1; then
-    log "FAIL git credential helper present but --check alpha-engine-config failed — this box cannot authenticate to GitHub for private-repo pulls"
+elif ! _boot_pull_check_credential_helper "$HELPER" alpha-engine-config; then
+    log "FAIL git credential helper present but --check alpha-engine-config failed 3 times — this box cannot authenticate to GitHub for private-repo pulls"
     PULL_FAILURES=$((PULL_FAILURES + 1))
     FAILED_REPOS+=("git-credential-helper (check failed)")
 elif ! sudo -u ec2-user -H git ls-remote --quiet \
@@ -862,8 +890,16 @@ sync_systemd_units_from() {
             # trigger and now made the reload fire the timer AT ONCE: the v2
             # trader session started at 20:36 ET on 2026-11-09 this way.
             # Stopping clears the last trigger, and the `enable --now` pass
-            # below starts the timer fresh, scheduled from now. Stopping a
-            # timer never stops a service it already started.
+            # below starts the timer fresh. Stopping a timer never stops a
+            # service it already started.
+            # The stop alone did NOT prevent it (alpha-engine-config-I13544):
+            # the session still fired at 20:38 ET on 2026-11-10, probably
+            # because a timer with no last trigger is scheduled from its own
+            # last activation (that morning), whose next 09:30 is already
+            # past. The guard is the session unit's ExecCondition=
+            # (session-hours-gate.sh), which refuses any start outside
+            # Mon-Fri 09:25-16:00 ET before anything runs. Kept: stopping is
+            # still the right way to replace a timer.
             case "$name" in
                 *.timer) sudo systemctl stop "$name" >> "$LOG" 2>&1 || true ;;
             esac

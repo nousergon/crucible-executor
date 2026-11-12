@@ -1,0 +1,32 @@
+[Unit]
+Description=Stop the trading box once the v2 trading day is done (alpha-engine-config-I12024)
+# Started by its own timer at 17:30 New York time. The v1 post-close pipeline
+# used to stop this box after the close; it is started only by the v1 daemon's
+# exit, which v2 skips, so since 2026-10-30 nothing stopped the box until the
+# 01:00 ET backstop schedule. executor.v2_day_end waits (until 18:10 ET at the
+# latest) for the session, the close notice, the pin smoke and the trader
+# reconcile to be neither running nor queued, then powers the box off. The
+# instance's shutdown behaviour is stop, so poweroff stops it.
+#
+# It acts only on a box booted this morning (before 12:00 ET, same New York
+# day) and only when it starts between 17:30 and 17:45 ET. A box the evening
+# reconcile pipeline or an operator booted is theirs to stop (see the module).
+# A failure (poweroff refused) pages through the notifier the trader units use.
+OnFailure=alpha-engine-trader-failed@%n.service
+
+[Service]
+Type=oneshot
+# root: poweroff and `systemctl stop` need it. It runs the executor venv's
+# interpreter, but the module is stdlib-only on its decision path.
+WorkingDirectory=/home/ec2-user/alpha-engine
+ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.v2_day_end
+# 17:30 to the 18:10 ET deadline is 40 minutes, plus the stop of anything still
+# running then (bounded at 2 minutes) and the poweroff request.
+TimeoutStartSec=45min
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+Environment=AWS_REGION=us-east-1
+Environment=ALPHA_ENGINE_JSON_LOGS=1
+Environment=FLOW_DOCTOR_ENABLED=1
+Environment=ALPHA_ENGINE_DEPLOYED=1

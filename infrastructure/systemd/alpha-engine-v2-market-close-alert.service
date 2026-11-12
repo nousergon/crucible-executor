@@ -1,0 +1,36 @@
+[Unit]
+Description=Telegram market-close notice for the v2 trading day (alpha-engine-config-I12024)
+# Started by its own timer, never by the session: the trading path is not
+# touched. It reads the session's documents in the v2 store (as the trader's
+# role, via the profile in the trader's env file, which it reads itself), asks
+# systemd for unit state, and opens a READ-ONLY IB API session on its own client
+# id below. It places, changes and cancels nothing, and sends one message to
+# the #trades topic, once a day. It runs from the EXECUTOR's venv.
+# It exits non-zero only when the message was not delivered, and that pages
+# through the notifier the trader units use.
+After=ibgateway.service network-online.target
+OnFailure=alpha-engine-trader-failed@%n.service
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/alpha-engine
+# This notice's OWN IB client id, for a read-only session. IB refuses a second
+# connection on an id in use, so it is none of v1's (1-3), none of the
+# trader's (its env file's session and master ids, which the module refuses
+# at run time) and not the pre-open plan's. The open and close notices share
+# it: they run six hours apart and each ends within its TimeoutStartSec.
+Environment=CRUCIBLE_V2_ALERT_IB_CLIENT_ID=44
+ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.v2_market_alert close
+TimeoutStartSec=2min
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/home/ec2-user/alpha-engine
+Environment=AWS_REGION=us-east-1
+Environment=ALPHA_ENGINE_JSON_LOGS=1
+Environment=FLOW_DOCTOR_ENABLED=1
+Environment=ALPHA_ENGINE_DEPLOYED=1
+# Attributes every send to its alert-registry row (nousergon-data
+# infrastructure/overseer/playbooks.yaml, class crucible_v2_market_open_close):
+# krepis.telegram.send_message files one intake event per send under it.
+Environment=KREPIS_EVENT_SOURCE=crucible-executor/v2-market-alert
