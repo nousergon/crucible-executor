@@ -527,3 +527,65 @@ def test_the_open_and_close_notices_name_the_watchdog_truthfully() -> None:
     assert m.CLOSE_AUTO_FIX.startswith("none tonight") and "watchdog" in m.CLOSE_AUTO_FIX
     assert "nothing on the box retries or restarts" not in m.OPEN_AUTO_FIX + m.CLOSE_AUTO_FIX
     assert w.WINDOW_OPEN == dt.time(9, 45) and w.MAX_RESTARTS == 2  # the numbers those texts state
+
+
+# --- back up after a down notice (Brian 2026-11-12) ----------------------------------
+
+
+def test_a_running_session_after_a_down_notice_is_announced_once() -> None:
+    d = w.decide(_facts(reported=frozenset({"give_up"})))
+    assert d.action == "recovered" and "after the give up notice" in d.reason
+
+
+def test_a_running_session_with_no_down_notice_stays_silent() -> None:
+    assert w.decide(_facts(reported=frozenset())).action == "none"
+
+
+def test_a_young_or_stale_session_is_not_announced_as_back() -> None:
+    young = w.decide(_facts(session=_session(started=_at(11, 55)), reported=frozenset({"give_up"})))
+    assert young.action == "none"
+    stale = w.decide(_facts(watch=_watch(updated=_at(11, 30)), reported=frozenset({"give_up"})))
+    assert stale.action != "recovered"
+
+
+def test_back_up_after_out_of_restarts_end_to_end(tmp_path: Path) -> None:
+    box, sends = _Box(FAILED_PROPS), _Sends()
+    for minute in (0, 5, 10):
+        _tick(box, sends, tmp_path, now=_at(11, minute))
+    assert sends.sent[-1][1] == "none left — 2 restarts used"
+    # A manual start at 11:30; its watch writes.
+    box.session = dict(_session(started=_at(11, 30)).props)
+    watch = {f"trader/entry_watch/{DAY}.json": _watch(updated=_at(11, 58))}
+    outcome = _tick(box, sends, tmp_path, now=_at(12, 0), objects=watch)
+    assert outcome.decision.action == "recovered" and outcome.delivered
+    text, auto_fix = sends.sent[-1]
+    assert "running again" in text and auto_fix == "none needed"
+    assert box.actions == [["sudo", "-n", w.SYSTEMCTL, "start", "--no-block", w.SESSION_UNIT]] * 2
+    # Once: the next tick is silent.
+    count = len(sends.sent)
+    assert _tick(box, sends, tmp_path, now=_at(12, 5), objects=watch).decision.action == "none"
+    assert len(sends.sent) == count
+
+
+def test_a_second_death_after_recovery_is_announced_again(tmp_path: Path) -> None:
+    box, sends = _Box(FAILED_PROPS), _Sends()
+    for minute in (0, 5, 10):
+        _tick(box, sends, tmp_path, now=_at(11, minute))
+    box.session = dict(_session(started=_at(11, 30)).props)
+    watch = {f"trader/entry_watch/{DAY}.json": _watch(updated=_at(11, 58))}
+    _tick(box, sends, tmp_path, now=_at(12, 0), objects=watch)
+    box.session = dict(_session("failed", "exit-code", started=_at(11, 30), ended=_at(12, 30)).props)
+    outcome = _tick(box, sends, tmp_path, now=_at(12, 35))
+    assert outcome.decision.action == "give_up" and outcome.delivered
+    assert sends.sent[-1][1] == "none left — 2 restarts used"
+
+
+def test_an_undelivered_back_up_notice_is_retried(tmp_path: Path) -> None:
+    state = tmp_path / "2026-11-11.json"
+    state.write_text(json.dumps({"restarts": [], "reported": ["operator_stop"]}))
+    box = _Box(dict(RUNNING.props))
+    watch = {f"trader/entry_watch/{DAY}.json": _watch(updated=_at(11, 58))}
+    assert not _tick(box, _Sends(ok=False), tmp_path, objects=watch).delivered
+    sends = _Sends()
+    _tick(box, sends, tmp_path, now=_at(12, 5), objects=watch)
+    assert len(sends.sent) == 1 and json.loads(state.read_text())["reported"] == []
