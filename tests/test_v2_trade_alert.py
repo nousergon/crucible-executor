@@ -74,7 +74,9 @@ SHORTFALL = {
 }
 
 
-def _store(run: dict[str, Any] | None, shortfall: Any = SHORTFALL, *, at: dt.datetime = NOW) -> alert.Store:
+def _store(
+    run: dict[str, Any] | None, shortfall: Any = SHORTFALL, *, at: dt.datetime = NOW, book: Any = None
+) -> alert.Store:
     objects: dict[str, tuple[dt.datetime, Any]] = {
         "crucible/runs/trader.session/2026-10-30/run.json": (at - dt.timedelta(days=3), {"status": "ok"}),
     }
@@ -83,6 +85,8 @@ def _store(run: dict[str, Any] | None, shortfall: Any = SHORTFALL, *, at: dt.dat
         objects[f"crucible/runs/trader.session/{DAY}/other.json"] = (at, {})
     if shortfall is not None:
         objects[f"crucible/trader/execution_shortfall/{DAY}.json"] = (at, shortfall)
+    if book is not None:
+        objects[f"crucible/trader/order_books/{DAY}.json"] = (at, book)
     return alert.Store(_S3(objects), "bucket", "crucible")
 
 
@@ -446,3 +450,48 @@ def test_a_missing_run_record_never_claims_no_order_was_placed() -> None:
     rec = _Recorder()
     alert.run_alerts(alert.Store(_S3({}), "bucket", ""), now=NOW, trade=rec.trade, status=rec.status)
     assert "no order was placed" not in rec.statuses[0] and "check the broker" in rec.statuses[0]
+
+
+# -- the realized gain or loss on a sale (Brian 2026-11-13) ----------------------------
+
+
+def test_a_sale_carries_its_realized_gain_against_the_broker_cost() -> None:
+    book = {
+        "rows": [
+            {"ticker": "AAA", "avg_cost_usd": 80.0},
+            {"ticker": "BBB", "avg_cost_usd": None},
+            {"ticker": "$CASH", "avg_cost_usd": True},
+        ]
+    }
+    rec = _Recorder()
+    alert.run_alerts(_store({"status": "ok"}, book=book), now=NOW, trade=rec.trade, status=rec.status)
+    sell, buy = rec.trades
+    # 10 sold at 100.50 against an 80.00 cost: +$205.00, +25.6%.
+    assert sell[4]["realized_pnl"] == 205.0
+    assert sell[4]["realized_return_pct"] == pytest.approx(25.625)
+    # A buy realizes nothing.
+    assert buy[4]["realized_pnl"] is None and buy[4]["realized_return_pct"] is None
+
+
+def test_without_a_book_cost_the_sale_is_still_alerted_without_a_realized_line() -> None:
+    rec = _Recorder()
+    alert.run_alerts(_store({"status": "ok"}), now=NOW, trade=rec.trade, status=rec.status)
+    assert rec.trades[0][4]["realized_pnl"] is None
+
+
+@pytest.mark.parametrize(
+    ("price", "shares", "cost", "expected"),
+    [
+        (90.0, 10, 100.0, (-100.0, -10.0)),
+        (100.0, 10, None, None),
+        (100.0, 10, 0.0, None),
+        (0.0, 10, 100.0, None),
+        (100.0, 0, 100.0, None),
+    ],
+)
+def test_realized_on_sale(price: float, shares: int, cost: float | None, expected: Any) -> None:
+    got = alert.realized_on_sale(price, shares, cost)
+    if expected is None:
+        assert got is None
+    else:
+        assert got == (expected[0], pytest.approx(expected[1]))
