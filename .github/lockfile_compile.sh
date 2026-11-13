@@ -26,7 +26,15 @@ LOCK_PYVER="$(cat "$LOCK_REPO_ROOT/.python-version")"
 # platform-conditional dependency, so no --python-platform is pinned here —
 # unlike crucible-dashboard, whose streamlit graph drops `watchdog` when
 # resolved on macOS. Add one here the moment a conditional dep appears.
-LOCK_COMPILE_FLAGS=(--python "$LOCK_PYVER")
+# Resolve for the oldest PATCH the lock is allowed to run on, not bare
+# "3.11" (which uv reads as 3.11.0). soupsieve's CVE fixes (3.0.2+) declare
+# Requires-Python >=3.11.5, so a 3.11.0 floor made the fixed version
+# unresolvable and pinned the vulnerable 2.10. Every interpreter that runs
+# this lock is newer: CI's setup-python takes the latest 3.11.x and the
+# trading box installs AL2023's python3.11 package. Raise this when a pin
+# needs a later patch; keep its minor equal to .python-version.
+LOCK_PY_FLOOR="${LOCK_PYVER}.5"
+LOCK_COMPILE_FLAGS=(--python-version "$LOCK_PY_FLOOR")
 
 # The exact command a human should run to regenerate the lock by hand, for
 # the guard's failure message. Pure.
