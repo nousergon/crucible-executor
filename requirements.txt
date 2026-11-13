@@ -66,7 +66,7 @@ jsonschema-specifications==2025.9.1
     # via jsonschema
 korean-lunar-calendar==0.4.0
     # via exchange-calendars
-krepis==0.59.96
+krepis[flow-doctor]==0.59.96
     # via
     #   -r requirements.in
     #   nousergon-lib
@@ -82,7 +82,7 @@ narwhals==2.28.0
     # via scikit-learn
 nest-asyncio==1.6.0
     # via ib-insync
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@5ca3449996fad68988c3d07b1d5a8b98159f8deb
+nousergon-lib[contracts,flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.130
     # via -r requirements.in
 numpy==2.4.6
     # via
@@ -185,13 +185,9 @@ scipy==1.17.1
     #   scs
 scs==3.3.1
     # via cvxpy
-setuptools==84.2.1
-    # via
-    #   -r requirements.in
-    #   osqp
 six==1.17.0
     # via python-dateutil
-soupsieve==2.10
+soupsieve==4.0
     # via beautifulsoup4
 sparsediffpy==0.6.1
     # via cvxpy
