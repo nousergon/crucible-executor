@@ -55,6 +55,12 @@ TRADER_UNITS = {
         "Mon..Fri *-*-* 16:10:00 America/New_York",
         "false",
     ),
+    # alpha-engine-config-I12024: the day's order book, before the open.
+    "alpha-engine-trader-order-book-plan": (
+        "scripts/trader_pinned.sh order_book_plan",
+        "Mon..Fri *-*-* 08:40:00 America/New_York",
+        "false",
+    ),
 }
 
 #: The units that connect to IB Gateway with the trader's ONE client id
@@ -140,6 +146,7 @@ def test_the_two_day_bound_runs_never_catch_up_at_boot() -> None:
         "alpha-engine-trader-shadow-books",
         "alpha-engine-trader-pin-smoke",
         "alpha-engine-trader-reconcile",
+        "alpha-engine-trader-order-book-plan",
     ):
         assert _unit(SYSTEMD / f"{stem}.timer")["Timer"]["Persistent"] == "false"
 
@@ -345,6 +352,58 @@ def test_a_changed_timer_is_stopped_before_its_new_file_lands() -> None:
     # A NEW timer has no last trigger to clear; only the changed branch stops.
     new = body[body.index('if [ ! -f "$target" ]; then') : body.index('elif ! diff -q')]
     assert "systemctl stop" not in new
+
+
+# --- The pre-open order book (alpha-engine-config-I12024) ----------------------
+
+ORDER_BOOK_PLAN = "alpha-engine-trader-order-book-plan"
+ORDER_BOOK_ALERT = "alpha-engine-v2-order-book-alert"
+NYSE_OPEN_MINUTES = 9 * 60 + 30
+BOX_BOOT_MINUTES = 8 * 60 + 15
+
+
+def test_the_order_book_plan_ends_before_the_open_and_overlaps_no_broker_unit() -> None:
+    """Brian 2026-11-09/10: the book is saved BEFORE 09:30 ET. The plan starts
+    after the ~08:15 boot, and its worst case (start + TimeoutStartSec) ends
+    before the open and before the session, the pin smoke and the reconcile
+    can start, so it never holds the gateway while any of them runs."""
+    start = _start_minutes(ORDER_BOOK_PLAN)
+    end = start + _timeout_minutes(ORDER_BOOK_PLAN)
+    assert BOX_BOOT_MINUTES < start and end < NYSE_OPEN_MINUTES
+    for stem in BROKER_UNITS:
+        assert end < _start_minutes(stem), f"the plan can still run when {stem} starts"
+
+
+def test_the_order_book_plan_connects_on_its_own_client_id() -> None:
+    """IB refuses a second connection on an id in use. The plan's id is set in
+    its own unit, and is none of v1's (1-3); crucible-trader refuses the
+    session's and the master's ids at run time, which live in the private env
+    file, not here."""
+    service = (SYSTEMD / f"{ORDER_BOOK_PLAN}.service").read_text()
+    ids = re.findall(r"^Environment=CRUCIBLE_TRADER_PLAN_IB_CLIENT_ID=(\d+)$", service, re.M)
+    assert len(ids) == 1 and int(ids[0]) not in {1, 2, 3}
+    for stem in BROKER_UNITS:
+        assert "CRUCIBLE_TRADER_PLAN_IB_CLIENT_ID" not in (SYSTEMD / f"{stem}.service").read_text()
+
+
+def test_the_pre_open_book_is_announced_by_its_own_alert_once() -> None:
+    """The plan starts the order-book alert on success only: a failed plan
+    pages through the notifier and announces nothing. The alert has no timer,
+    so it runs only when the plan does."""
+    plan = _unit(SYSTEMD / f"{ORDER_BOOK_PLAN}.service")["Unit"]
+    assert plan["OnSuccess"] == f"{ORDER_BOOK_ALERT}.service"
+    assert plan["OnFailure"] == f"{FAILURE_NOTIFIER}%n.service"
+    unit = _unit(SYSTEMD / f"{ORDER_BOOK_ALERT}.service")
+    service = unit["Service"]
+    assert service["Type"] == "oneshot" and service["User"] == "ec2-user"
+    assert service["ExecStart"] == f"{EXECUTOR_PYTHON} -m executor.v2_order_book_alert"
+    assert "EnvironmentFile" not in service and "ExecStartPre" not in service
+    assert unit["Unit"]["OnFailure"] == f"{FAILURE_NOTIFIER}%n.service"
+    assert "OnSuccess" not in unit["Unit"]
+    assert not (SYSTEMD / f"{ORDER_BOOK_ALERT}.timer").exists()
+    # The session's own alert is unchanged: it never announces a book.
+    session = _unit(SYSTEMD / "alpha-engine-trader-session.service")["Unit"]
+    assert ORDER_BOOK_ALERT not in session["OnSuccess"] + session["OnFailure"]
 
 
 # --- The market-open and market-close notices (alpha-engine-config-I12024) -----

@@ -1,0 +1,21 @@
+[Unit]
+Description=Daily v2 trader pre-open order book (alpha-engine-config-I12024)
+
+[Timer]
+# 08:40 New York time, weekdays (EDT and EST alike; the timezone suffix keeps
+# it there across DST). Brian 2026-11-09/10: the day's order book is built and
+# saved BEFORE the 09:30 open. Its inputs are ready the evening before
+# (predictions/{day}.json at ~20:45 ET). The box starts at ~08:15 and
+# boot-pull syncs these units then, so 08:40 leaves the gateway its login time.
+# TimeoutStartSec=30min ends the run by 09:10 at the latest: before the open,
+# before the 09:30 session, and hours before the pin smoke and the reconcile.
+# The entry point skips NYSE holidays and refuses to start at or after 09:30.
+#
+# Persistent=false, as for the session: a catch-up at a late boot would plan a
+# book the session is about to write anyway, and after 09:30 the plan refuses.
+OnCalendar=Mon..Fri *-*-* 08:40:00 America/New_York
+Persistent=false
+Unit=alpha-engine-trader-order-book-plan.service
+
+[Install]
+WantedBy=timers.target

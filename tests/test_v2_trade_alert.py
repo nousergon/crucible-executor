@@ -446,3 +446,12 @@ def test_a_missing_run_record_never_claims_no_order_was_placed() -> None:
     rec = _Recorder()
     alert.run_alerts(alert.Store(_S3({}), "bucket", ""), now=NOW, trade=rec.trade, status=rec.status)
     assert "no order was placed" not in rec.statuses[0] and "check the broker" in rec.statuses[0]
+
+
+def test_the_order_book_line_says_which_book_the_session_traded() -> None:
+    """alpha-engine-config-I12024: the book is announced before the open; the
+    session summary only says whether it traded that book or kept its own."""
+    reused = {**BOOK_OK, "status_reason": "trader/order_books/d.json reused: the session's book matches"}
+    differs = {**BOOK_OK, "status_reason": "as-traded book written to trader/order_books/as_traded/d.json"}
+    assert alert.order_book_line({"metrics": [reused]}) == "Order book: the pre-open book, as announced"
+    assert "differs from the pre-open book" in str(alert.order_book_line({"metrics": [differs]}))
