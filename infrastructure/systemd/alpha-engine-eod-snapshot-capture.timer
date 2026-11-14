@@ -1,0 +1,30 @@
+[Unit]
+Description=Capture the EOD broker snapshot one minute after the close (alpha-engine-config-I13663)
+
+[Timer]
+# 16:01 New York time, weekdays, EST and EDT alike. The snapshot is
+# write-once per trading day (snapshot_capturer.py: the first capture is the
+# day's record), so whichever capturer fires first sets the broker marks the
+# EOD reconcile compares against the settled closes.
+#
+# Until 2026-10-30 that was the v1 postclose pipeline's CaptureSnapshot, at
+# 20:01 UTC (16:01 EDT). Since that pipeline stopped, the first capturer has
+# been alpha-engine-reference-rate-publish.timer at 21:15 UTC: 16:15 EST, a
+# quarter of an hour into extended hours. IB marks a position at its last
+# print, extended hours included, so every broker mark since 2026-11-02 is an
+# after-hours price. Measured from the eod_pnl rows, |IB NetLiquidation -
+# settled rebuild| before any mark correction: 2026-10-01..10-30 (16:01
+# capture) median 1.8bp, under 5bp on 20 of 22 sessions; 2026-11-02..11-13
+# (16:15 capture) median 20.3bp, at least 9.8bp on all 10, and 2026-11-13
+# (56.7bp) crossed the 50bp level gate and failed the post-close reconcile.
+# This timer puts the capture back at the close; it changes no gate.
+#
+# Persistent=false: a catch-up at a later boot would capture an after-hours
+# mark, which is the defect. If the box is down at 16:01 the existing 21:05 /
+# 21:15 UTC capturers still write the day's snapshot, as they do today.
+OnCalendar=Mon..Fri *-*-* 16:01:00 America/New_York
+Persistent=false
+Unit=alpha-engine-eod-snapshot-capture.service
+
+[Install]
+WantedBy=timers.target
