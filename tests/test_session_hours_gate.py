@@ -142,7 +142,15 @@ def test_an_unreadable_clock_fails_the_unit_never_skips_it(now: str) -> None:
 
 
 def test_a_missing_new_york_zoneinfo_fails_rather_than_reading_utc(tmp_path: Path) -> None:
-    proc = _gate(now=_ny(2026, 11, 11, 9, 30), TZDIR=str(tmp_path))
+    # A missing zoneinfo makes `date` silently answer in UTC. Reproduce that
+    # with a `date` shim rather than an empty TZDIR: whether glibc honours an
+    # empty TZDIR depends on the runner image (it did not on GitHub's
+    # runner from 2026-11-18), and the gate's behaviour is what is under test.
+    real_date = shutil.which("date") or "/bin/date"
+    shim = tmp_path / "date"
+    shim.write_text(f'#!{BASH}\nTZ=UTC exec {real_date} "$@"\n')
+    shim.chmod(0o755)
+    proc = _gate(now=_ny(2026, 11, 11, 9, 30), PATH=f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
     assert proc.returncode == FAIL
     assert "zoneinfo" in proc.stdout
 
