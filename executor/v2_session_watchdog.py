@@ -20,6 +20,18 @@ when, today's session has not finished (its entry/exit watch is not
   :data:`STALE_AFTER` (the open/close notices use the same 15 minutes): it is
   stuck, so it is restarted.
 
+**A HELD day is retried.** A session whose harness inputs were not yet
+published (crucible-trader ``daily_session``: a ``ContractUnavailable`` hold)
+exits cleanly and writes an ``ok`` run record whose ``trader_session_served``
+metric reads ``held: ...``. Nothing is routed. That is not a finished day: on
+2026-11-17 the inputs landed 40 minutes after the 09:30 start and the day
+traded only because a human restarted it. So a held day, ended cleanly with no
+stop request in its journal, is started again every :data:`HELD_RETRY_EVERY`
+after its last exit, at most :data:`MAX_HELD_RETRIES` times a day. A retry
+whose inputs are still missing holds again and routes nothing. Held retries
+have their own cap, never spend a restart, and pass the same kill-switch,
+chain and neighbour gates.
+
 **Why a rerun of the same day is safe** (crucible-trader ``order_router`` and
 ``order_intent``). Every order is keyed one per name per trading day, and an
 immutable intent is created (create-if-absent) BEFORE it is submitted. A rerun
@@ -108,6 +120,16 @@ HARD_STOP_UNTIL = dt.time(16, 9)
 #: this is not judged stale: it has not had the time to write.
 STALE_AFTER = dt.timedelta(minutes=15)
 MAX_RESTARTS = 2
+#: A held day is retried this long after its last exit (09:31 hold, first retry
+#: 09:51), up to :data:`MAX_HELD_RETRIES` times (to about 12:30 ET).
+HELD_RETRY_EVERY = dt.timedelta(minutes=20)
+MAX_HELD_RETRIES = 8
+#: The ``kind`` a held retry is recorded under in the day's state file.
+HELD_RETRY = "held_retry"
+#: crucible-trader ``daily_session``: the metric a session records whether or
+#: not it served, and the prefix of its reason when it held.
+SERVED_METRIC = "trader_session_served"
+HELD_PREFIX = "held:"
 #: ``Result`` of a start the session's ExecCondition= (session-hours-gate.sh,
 #: alpha-engine-config-I13544) refused: inactive, nothing ran. The gate admits
 #: 09:25-16:00 ET, which holds this watchdog's whole restart window.
@@ -156,16 +178,17 @@ class Facts:
     chain: Gate = ("clear", "")
     restarts: int = 0
     reported: frozenset[str] = field(default_factory=lambda: frozenset[str]())
+    held_retries: int = 0
 
 
-Action = Literal["none", "wait", "restart", "start", "give_up", "hold", "hard_stop", "recovered"]
+Action = Literal["none", "wait", "restart", "start", "retry_held", "give_up", "hold", "hard_stop", "recovered"]
 
 #: The once-a-day reports that tell the channel the session is DOWN and staying
 #: down. After one of them, a session seen running again is announced once
 #: (:data:`RECOVERED`): Brian 2026-11-12, "we never updated the channel that it
 #: is now working again" -- the last word in #trades was "out of restarts" for
 #: a session a manual start had brought back an hour earlier.
-DOWN_REPORTS = ("give_up", "operator_stop", "kill_switch", "chain")
+DOWN_REPORTS = ("give_up", "operator_stop", "kill_switch", "chain", "held_out")
 RECOVERED = "recovered"
 
 
@@ -191,11 +214,28 @@ def _hm(moment: dt.datetime) -> str:
     return moment.astimezone(NEW_YORK).strftime("%H:%M")
 
 
+def held_reason(run: Doc | None) -> str | None:
+    """Why an ``ok`` run record HELD (served nothing), or ``None`` when it did not."""
+    if run is None or run.get("status") != "ok":
+        return None
+    metrics = run.get("metrics")
+    if not isinstance(metrics, list):
+        return None
+    for raw in cast(list[object], metrics):
+        if not isinstance(raw, dict):
+            continue
+        metric = cast(Mapping[str, object], raw)
+        reason = metric.get("status_reason")
+        if metric.get("name") == SERVED_METRIC and isinstance(reason, str) and reason.startswith(HELD_PREFIX):
+            return reason[len(HELD_PREFIX) :].strip()
+    return None
+
+
 def _finished(f: Facts) -> str | None:
-    """Why today's session counts as done, or ``None``."""
+    """Why today's session counts as done, or ``None``. A held run record is not done."""
     if f.watch is not None and f.watch.get("state") == "complete":
         return "its entry/exit watch is complete"
-    if f.run is not None and f.run.get("status") == "ok":
+    if f.run is not None and f.run.get("status") == "ok" and held_reason(f.run) is None:
         return "its run record is ok"
     return None
 
@@ -236,6 +276,13 @@ def _problem(f: Facts, local: dt.datetime) -> tuple[Action, str] | Decision | No
         # step of the session ran, so it has not run today. Never an operator
         # stop, and inside this window the gate admits the start.
         return "start", "the session has not run today (its last start was refused by its hours gate)"
+    held = held_reason(f.run)
+    if held is not None and f.session.result == "success" and f.stop_requested is False:
+        exited = f.session.stamp("ExecMainExitTimestamp") or started or f.now
+        why = f"the session held at {_hm(exited)} ET and served nothing ({held[:160]})"
+        if f.now - exited < HELD_RETRY_EVERY:
+            return Decision("none", f"{why}; retried from {_hm(exited + HELD_RETRY_EVERY)} ET")
+        return "retry_held", why
     if f.session.result == "success":
         return Decision(
             "hold",
@@ -267,7 +314,7 @@ def decide(f: Facts) -> Decision:
     if not is_trading_day(local.date()):
         return Decision("none", f"{local.date()} is not an NYSE session")
     if HARD_STOP_AT <= local.time() <= HARD_STOP_UNTIL:
-        if f.session.running and f.restarts > 0:
+        if f.session.running and (f.restarts > 0 or f.held_retries > 0):
             return Decision("hard_stop", "a session this watchdog restarted is still running at 16:05 ET")
         return Decision("none", "16:05 pass: nothing this watchdog restarted is running")
     close = dt.datetime.combine(local.date(), session_close_et(local.date()), tzinfo=NEW_YORK)
@@ -288,6 +335,10 @@ def decide(f: Facts) -> Decision:
         return Decision("hold", f"{why}; not restarting: {detail}", report="chain")
     if f.busy:
         return Decision("wait", f"{why}; waiting: {', '.join(f.busy)} is running")
+    if action == "retry_held":
+        if f.held_retries >= MAX_HELD_RETRIES:
+            return Decision("hold", f"{why}; {MAX_HELD_RETRIES} held retries already used today", report="held_out")
+        return Decision(action, why)
     if f.restarts >= MAX_RESTARTS:
         return Decision("give_up", f"{why}; {MAX_RESTARTS} restarts already used today", report="give_up")
     return Decision(action, why)
@@ -403,7 +454,10 @@ def load_state(path: Path) -> State:
         return State()
     except (OSError, ValueError):
         # Unreadable counts as the cap reached: never more restarts than allowed.
-        return State(restarts=[{"at": "?", "why": "state unreadable"}] * MAX_RESTARTS)
+        return State(
+            restarts=[{"at": "?", "why": "state unreadable"}] * MAX_RESTARTS
+            + [{"at": "?", "why": "state unreadable", "kind": HELD_RETRY}] * MAX_HELD_RETRIES
+        )
     doc = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
     restarts = doc.get("restarts")
     reported = doc.get("reported")
@@ -413,6 +467,16 @@ def load_state(path: Path) -> State:
         else [],
         reported=[str(r) for r in cast(list[object], reported)] if isinstance(reported, list) else [],
     )
+
+
+def restarts_used(state: State) -> int:
+    """Restarts counted against :data:`MAX_RESTARTS`: every attempt but a held retry."""
+    return sum(1 for r in state.restarts if r.get("kind") != HELD_RETRY)
+
+
+def held_retries_used(state: State) -> int:
+    """Held retries counted against :data:`MAX_HELD_RETRIES`."""
+    return sum(1 for r in state.restarts if r.get("kind") == HELD_RETRY)
 
 
 def save_state(path: Path, state: State) -> None:
@@ -437,8 +501,9 @@ def gather(store: Store, *, now: dt.datetime, state: State, run: Runner = _run) 
         busy=busy_units(run),
         kill_switch=read_kill_switch(store, day),
         chain=read_chain(store, record),
-        restarts=len(state.restarts),
+        restarts=restarts_used(state),
         reported=frozenset(state.reported),
+        held_retries=held_retries_used(state),
     )
 
 
@@ -461,9 +526,22 @@ def _instance_id(path: Path = INSTANCE_ID_FILE) -> str:
         return "<trading box instance id>"
 
 
-def message(d: Decision, *, now: dt.datetime, restarts: int, command: str) -> tuple[str, str]:
+def message(d: Decision, *, now: dt.datetime, restarts: int, command: str, held_retries: int = 0) -> tuple[str, str]:
     """``(text, auto_fix)`` for a decision that is reported."""
     at = _hm(now)
+    if d.action == "retry_held":
+        auto_fix = (
+            f"started the session again at {at} ET (held retry {held_retries} of {MAX_HELD_RETRIES} today); "
+            "if its inputs are still missing it holds again and routes nothing"
+        )
+        body = f"*v2 trading session held; retried by the watchdog*\nWhy: {d.reason}."
+        return brief_alert(
+            body,
+            CONSOLE_URL,
+            impact="no orders went out while it was held; once its inputs are published, today's book can",
+            auto_fix=auto_fix,
+            action="nothing unless another notice follows; the watchdog retries a held day up to its daily cap.",
+        ), auto_fix
     if d.action in ("restart", "start"):
         auto_fix = (
             f"restarted the session at {at} ET (restart {restarts} of {MAX_RESTARTS} today); "
@@ -513,6 +591,7 @@ def message(d: Decision, *, now: dt.datetime, restarts: int, command: str) -> tu
         "operator_stop": "the session was stopped on purpose; it is left stopped",
         "kill_switch": "the kill switch holds trading; the session is left down",
         "chain": "a rerun now would break the money-path chain the trader verifies",
+        "held_out": "its inputs never arrived within the watchdog's held retries",
     }.get(d.report, "the watchdog will not restart it")
     body = f"*v2 trading session not restarted*\nWhy: {d.reason}."
     return brief_alert(
@@ -547,7 +626,9 @@ def act(
     if d.action in ("none", "wait"):
         return Outcome(d)
     if d.action == "recovered":
-        text, auto_fix = message(d, now=now, restarts=len(state.restarts), command=command)
+        text, auto_fix = message(
+            d, now=now, restarts=restarts_used(state), held_retries=held_retries_used(state), command=command
+        )
         delivered = send(text, auto_fix=auto_fix)
         if delivered:
             # Clearing the down report is what makes this once: the next tick
@@ -559,7 +640,9 @@ def act(
     if d.action in ("hold", "give_up"):
         if d.report in state.reported:
             return Outcome(d)
-        text, auto_fix = message(d, now=now, restarts=len(state.restarts), command=command)
+        text, auto_fix = message(
+            d, now=now, restarts=restarts_used(state), held_retries=held_retries_used(state), command=command
+        )
         delivered = send(text, auto_fix=auto_fix)
         if delivered:
             state.reported.append(d.report)
@@ -569,16 +652,29 @@ def act(
         result = run(["sudo", "-n", SYSTEMCTL, "stop", "--no-block", SESSION_UNIT])
         if result.returncode != 0:
             d = Decision("hard_stop", f"{d.reason}; the stop was refused ({result.stderr.strip()[:120]})")
-        text, auto_fix = message(d, now=now, restarts=len(state.restarts), command=command)
+        text, auto_fix = message(
+            d, now=now, restarts=restarts_used(state), held_retries=held_retries_used(state), command=command
+        )
         return Outcome(d, send(text, auto_fix=auto_fix))
-    # restart / start: the attempt counts against the cap whether or not it took.
+    # restart / start / retry_held: the attempt counts against its cap whether or not it took.
     verb = "restart" if d.action == "restart" else "start"
-    state.restarts.append({"at": now.astimezone(dt.UTC).isoformat(), "why": d.reason})
+    entry = {"at": now.astimezone(dt.UTC).isoformat(), "why": d.reason}
+    if d.action == "retry_held":
+        entry["kind"] = HELD_RETRY
+    state.restarts.append(entry)
     save_state(state_path, state)
     result = run(["sudo", "-n", SYSTEMCTL, verb, "--no-block", SESSION_UNIT])
     if result.returncode != 0:
         d = Decision(d.action, f"{d.reason}; but `systemctl {verb}` failed ({result.stderr.strip()[:120]})")
-    text, auto_fix = message(d, now=now, restarts=len(state.restarts), command=command)
+    elif d.action == "retry_held" and held_retries_used(state) > 1:
+        # One notice per held day: later retries are logged, not sent, so the
+        # channel is not paged every 20 minutes while the inputs are late. A
+        # retry that serves is visible as the day's trades; one that never
+        # does ends in the held_out notice.
+        return Outcome(d)
+    text, auto_fix = message(
+        d, now=now, restarts=restarts_used(state), held_retries=held_retries_used(state), command=command
+    )
     return Outcome(d, send(text, auto_fix=auto_fix))
 
 
@@ -626,7 +722,7 @@ def main(argv: list[str] | None = None, *, now: dt.datetime | None = None) -> in
     return 0
 
 
-__all__ = ["Decision", "Facts", "decide", "gather", "main", "message", "tick"]
+__all__ = ["Decision", "Facts", "decide", "gather", "held_reason", "main", "message", "tick"]
 
 
 if __name__ == "__main__":

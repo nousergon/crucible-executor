@@ -11,12 +11,12 @@ attrs==26.1.0
     #   referencing
 beautifulsoup4==4.15.0
     # via yfinance
-boto3==1.43.126
+boto3==1.44.3
     # via
     #   -r requirements.in
     #   krepis
     #   nousergon-lib
-botocore==1.43.126
+botocore==1.44.3
     # via
     #   boto3
     #   s3transfer
@@ -40,11 +40,11 @@ cvxpy==1.9.3
     # via -r requirements.in
 eventkit==1.0.3
     # via ib-insync
-exchange-calendars==4.13.2
+exchange-calendars==4.13.3
     # via -r requirements.in
-flow-doctor==0.19.9
+flow-doctor==0.19.12
     # via krepis
-highspy==1.15.1
+highspy==1.16.0
     # via cvxpy
 ib-insync==0.9.86
     # via -r requirements.in
@@ -66,7 +66,7 @@ jsonschema-specifications==2025.9.1
     # via jsonschema
 korean-lunar-calendar==0.4.0
     # via exchange-calendars
-krepis==0.59.96
+krepis==0.59.111
     # via
     #   -r requirements.in
     #   nousergon-lib
@@ -131,7 +131,7 @@ pydantic==2.14.3
     #   pydantic-settings
 pydantic-core==2.50.4
     # via pydantic
-pydantic-settings==2.16.2
+pydantic-settings==2.16.3
     # via flow-doctor
 pyluach==2.3.0
     # via exchange-calendars
@@ -183,7 +183,7 @@ scipy==1.17.1
     #   qdldl
     #   scikit-learn
     #   scs
-scs==3.3.1
+scs==3.3.2
     # via cvxpy
 setuptools==84.2.1
     # via
@@ -191,7 +191,7 @@ setuptools==84.2.1
     #   osqp
 six==1.17.0
     # via python-dateutil
-soupsieve==4.1
+soupsieve==4.1.1
     # via beautifulsoup4
 sparsediffpy==0.6.1
     # via cvxpy

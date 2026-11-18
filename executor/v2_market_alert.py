@@ -70,6 +70,7 @@ from krepis.trading_calendar import is_trading_day, previous_trading_day
 
 from executor.notifier import send_trading_notice
 from executor.v2_trade_alert import (
+    ENTRY_WATCH_PREFIX,
     RUNS_PREFIX,
     SESSION_WATCHDOG_AUTO_FIX,
     TRADER_ENV,
@@ -121,7 +122,6 @@ _TRADER_CLIENT_ID_VARS = ("CRUCIBLE_TRADER_IB_CLIENT_ID", "CRUCIBLE_TRADER_IB_MA
 PAPER_PORT = 4002
 
 ORDER_BOOK_PREFIX = "trader/order_books/"
-ENTRY_WATCH_PREFIX = "trader/entry_watch/"
 #: The champion's serving feed the session trades from (``crucible.keys.predictions_key``).
 PREDICTIONS_PREFIX = "predictions/"
 #: The watch rewrites its document at least every 600 s while it waits
