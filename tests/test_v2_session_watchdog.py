@@ -156,7 +156,7 @@ def test_a_completed_watch_is_never_restarted(session: Unit) -> None:
 
 
 def test_an_ok_run_record_is_never_restarted() -> None:
-    """A held session (no input) is also an ok run: nothing to restart."""
+    """An ok run whose served metric names no hold is done: nothing to restart."""
     run = {"status": "ok", "metrics": [{"name": "trader_session_served", "value": 0}]}
     d = w.decide(_facts(session=_session("inactive", "success", ended=_at(9, 40)), watch=None, run=run))
     assert d.action == "none"
@@ -165,6 +165,99 @@ def test_an_ok_run_record_is_never_restarted() -> None:
 def test_a_failed_run_record_is_restarted() -> None:
     d = w.decide(_facts(session=FAILED, run={"status": "failed"}, watch=_watch("stopped")))
     assert d.action == "start"
+
+
+# --- a held day is retried ------------------------------------------------------------
+
+HELD_RUN = {
+    "status": "ok",
+    "metrics": [
+        {
+            "name": "trader_session_served",
+            "status": "OK",
+            "status_reason": "held: the construction inputs for 2026-11-10 are not published: arm 's:x' recorded none",
+        }
+    ],
+}
+SERVED_RUN = {
+    "status": "ok",
+    "metrics": [{"name": "trader_session_served", "status": "OK", "status_reason": "live session on m:x: 3 served"}],
+}
+HELD = _session("inactive", "success", ended=_at(9, 31))
+
+
+def test_held_reason_reads_the_served_metric() -> None:
+    assert w.held_reason(HELD_RUN) is not None and "not published" in (w.held_reason(HELD_RUN) or "")
+    assert w.held_reason(SERVED_RUN) is None
+    assert w.held_reason({"status": "failed", "metrics": HELD_RUN["metrics"]}) is None
+    assert w.held_reason(None) is None
+
+
+def test_a_held_day_is_retried_after_the_spacing() -> None:
+    d = w.decide(_facts(now=_at(9, 51), session=HELD, watch=None, run=HELD_RUN))
+    assert d.action == "retry_held" and "held at 09:31 ET" in d.reason
+
+
+def test_a_held_day_waits_out_the_spacing() -> None:
+    d = w.decide(_facts(now=_at(9, 45), session=HELD, watch=None, run=HELD_RUN))
+    assert d.action == "none" and "retried from 09:51 ET" in d.reason
+
+
+def test_a_served_ok_record_is_still_done() -> None:
+    d = w.decide(_facts(now=_at(10, 0), session=HELD, watch=None, run=SERVED_RUN))
+    assert d.action == "none" and "done" in d.reason
+
+
+@pytest.mark.parametrize("stop", [True, None])
+def test_a_held_day_with_a_stop_request_or_unread_journal_is_an_operator_stop(stop: bool | None) -> None:
+    d = w.decide(_facts(now=_at(10, 0), session=HELD, watch=None, run=HELD_RUN, stop_requested=stop))
+    assert d.action == "hold" and d.report == "operator_stop"
+
+
+def test_held_retries_have_their_own_cap_and_do_not_spend_restarts() -> None:
+    spent = w.decide(_facts(now=_at(10, 0), session=HELD, watch=None, run=HELD_RUN, restarts=w.MAX_RESTARTS))
+    assert spent.action == "retry_held"
+    out = w.decide(_facts(now=_at(10, 0), session=HELD, watch=None, run=HELD_RUN, held_retries=w.MAX_HELD_RETRIES))
+    assert out.action == "hold" and out.report == "held_out"
+
+
+def test_a_held_retry_obeys_the_kill_switch_and_the_neighbours() -> None:
+    held = {"now": _at(10, 0), "session": HELD, "watch": None, "run": HELD_RUN}
+    assert w.decide(_facts(**held, kill_switch=("engaged", "freeze"))).report == "kill_switch"
+    assert w.decide(_facts(**held, busy=("alpha-engine-trader-reconcile.service",))).action == "wait"
+
+
+def test_a_held_day_is_retried_end_to_end_and_recorded_as_a_held_retry(tmp_path: Path) -> None:
+    box, sends = _Box(dict(HELD.props)), _Sends()
+    objects = {f"runs/trader.session/{DAY}/run.json": HELD_RUN}
+    outcome = _tick(box, sends, tmp_path, now=_at(9, 55), objects=objects)
+    assert outcome.decision.action == "retry_held" and outcome.delivered
+    assert box.actions == [["sudo", "-n", w.SYSTEMCTL, "start", "--no-block", w.SESSION_UNIT]]
+    ((text, auto_fix),) = sends.sent
+    assert "held retry 1 of" in auto_fix and "held; retried" in text
+    state = w.load_state(tmp_path / "2026-11-11.json")
+    assert w.held_retries_used(state) == 1 and w.restarts_used(state) == 0
+
+
+def test_only_the_first_held_retry_sends_a_notice(tmp_path: Path) -> None:
+    box, sends = _Box(dict(HELD.props)), _Sends()
+    objects = {f"runs/trader.session/{DAY}/run.json": HELD_RUN}
+    for minute in (55, 56):
+        box.session = dict(_session("inactive", "success", ended=_at(9, minute - 25)).props)
+        assert _tick(box, sends, tmp_path, now=_at(9, minute), objects=objects).decision.action == "retry_held"
+    assert len(box.actions) == 2 and len(sends.sent) == 1
+
+
+def test_the_hard_stop_pass_stops_a_held_retry() -> None:
+    d = w.decide(_facts(now=_at(16, 5), session=RUNNING, held_retries=1))
+    assert d.action == "hard_stop"
+
+
+def test_an_unreadable_state_file_also_spends_the_held_retries(tmp_path: Path) -> None:
+    path = tmp_path / "2026-11-11.json"
+    path.write_text("{not json")
+    state = w.load_state(path)
+    assert w.held_retries_used(state) == w.MAX_HELD_RETRIES and w.restarts_used(state) == w.MAX_RESTARTS
 
 
 # --- an operator stop is never restarted --------------------------------------------
