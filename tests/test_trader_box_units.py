@@ -159,17 +159,14 @@ def test_no_two_broker_units_can_hold_the_client_id_at_once() -> None:
     next one starts: the smoke shares the session's and the reconcile's IB
     client id, and IB refuses a second connection on an id in use."""
     windows = sorted(
-        (_start_minutes(stem), _start_minutes(stem) + _timeout_minutes(stem), stem)
-        for stem in BROKER_UNITS
+        (_start_minutes(stem), _start_minutes(stem) + _timeout_minutes(stem), stem) for stem in BROKER_UNITS
     )
     for (_, end, earlier), (start, _, later) in zip(windows, windows[1:], strict=False):
         assert end < start, f"{earlier} can still hold the client id when {later} starts"
 
 
 def test_the_pin_smoke_runs_after_the_session_and_before_the_reconcile() -> None:
-    session_end = _start_minutes("alpha-engine-trader-session") + _timeout_minutes(
-        "alpha-engine-trader-session"
-    )
+    session_end = _start_minutes("alpha-engine-trader-session") + _timeout_minutes("alpha-engine-trader-session")
     smoke = _start_minutes("alpha-engine-trader-pin-smoke")
     smoke_end = smoke + _timeout_minutes("alpha-engine-trader-pin-smoke")
     assert session_end < smoke and smoke_end < _start_minutes("alpha-engine-trader-reconcile")
@@ -339,11 +336,9 @@ def test_a_changed_timer_is_stopped_before_its_new_file_lands() -> None:
     changed = changed[: changed.index("CHANGED=true")]
     stop = changed.index('*.timer) sudo systemctl stop "$name"')
     assert stop < changed.index('sudo cp "$unit" /etc/systemd/system/')
-    assert body.index("sudo systemctl daemon-reload") < body.index(
-        'sudo systemctl enable --now "$tname"'
-    )
+    assert body.index("sudo systemctl daemon-reload") < body.index('sudo systemctl enable --now "$tname"')
     # A NEW timer has no last trigger to clear; only the changed branch stops.
-    new = body[body.index('if [ ! -f "$target" ]; then') : body.index('elif ! diff -q')]
+    new = body[body.index('if [ ! -f "$target" ]; then') : body.index("elif ! diff -q")]
     assert "systemctl stop" not in new
 
 
@@ -579,6 +574,26 @@ def test_the_watchdog_waits_for_the_other_money_path_units() -> None:
     for stem in BROKER_UNITS:
         if stem != SESSION:
             assert f"{stem}.service" in w.MONEY_PATH_UNITS
+
+
+def test_the_release_alerts_ride_the_watchdog_tick_and_never_stop_it() -> None:
+    """Brian 2026-11-18: each order alerted when its trigger fires, not at the
+    session's end. One more ExecStart= on the watchdog's oneshot (no new timer):
+    first, so a failing watchdog never holds an alert up, and ``-``-prefixed, so
+    a failing alert never stops the watchdog."""
+    text = (SYSTEMD / f"{WATCHDOG}.service").read_text()
+    assert re.search(r"^Type=oneshot$", text, re.M)
+    lines = re.findall(r"^ExecStart=(.+)$", text, re.M)
+    assert lines == [
+        f"-{EXECUTOR_PYTHON} -m executor.v2_release_alert",
+        f"{EXECUTOR_PYTHON} -m executor.v2_session_watchdog",
+    ]
+    from executor import v2_release_alert as r
+    from executor import v2_session_watchdog as w
+
+    # It catches the 15:55 expiry releases in the watchdog's 16:05 pass.
+    assert r.WINDOW_CLOSE >= w.HARD_STOP_UNTIL
+    assert r.STATE_DIR.parent == w.STATE_DIR.parent and r.STATE_DIR != w.STATE_DIR
 
 
 def test_the_watchdog_attributes_its_sends_to_its_registry_row() -> None:
