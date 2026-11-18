@@ -19,6 +19,13 @@ filled order through :func:`executor.notifier.send_trade_alert` (the same
 no record, or a session with no orders is said so in the summary, and so is
 whether the session's order book was written (``trader_order_book_written``).
 
+**Each order is announced when it is sent**, by
+:mod:`executor.v2_release_alert` every five minutes in the session (Brian
+2026-11-18: four orders released 09:45-10:30 ET all alerted at 10:31). So a
+per-fill alert here is the FILL CONFIRMATION of an order already announced: its
+trigger line names when the order was sent and why, joined by symbol from the
+session's entry/exit watch, and reads as before when the watch is unreadable.
+
 **Absent is not unreadable** (alpha-engine-config-I13284). S3 answers a GET
 without ListBucket with AccessDenied whether the key is absent or merely
 unreadable, so the run record decides: a shortfall file the run lists among
@@ -61,6 +68,9 @@ TRADER_ENV = Path("/home/ec2-user/alpha-engine-config/crucible-trader/trader.env
 RUNS_PREFIX = "runs/trader.session/"
 #: The session's order book, read for the broker cost each sale realizes against.
 ORDER_BOOK_PREFIX = "trader/order_books/"
+#: The session's entry/exit watch (crucible-trader ``entry_timing.entry_watch_key``):
+#: when and why each order was released, joined onto its fill alert.
+ENTRY_WATCH_PREFIX = "trader/entry_watch/"
 #: A run record older than this was not written by the session that just
 #: ended: this run wrote nothing (it died before its manifest).
 FRESH_WITHIN = dt.timedelta(hours=3)
@@ -495,6 +505,32 @@ def realized_on_sale(price: float, shares: int, avg_cost: float | None) -> tuple
     return round((price - avg_cost) * shares, 2), (price / avg_cost - 1.0) * 100.0
 
 
+def _releases(store: Store, day: str) -> tuple[Doc | None, dict[str, Doc]]:
+    """``(watch, entry by symbol)`` of the session's entry/exit watch; empty when unreadable.
+
+    One order per name per day (crucible-trader ``order_router``), so the
+    symbol joins a fill to the entry that released it.
+    """
+    watch, _ = store.read(f"{ENTRY_WATCH_PREFIX}{day}.json")
+    return watch, {str(e.get("symbol")): e for e in _docs(watch, "entries") if e.get("symbol")}
+
+
+def fill_trigger(day: str, order: Mapping[str, object], watch: Doc | None, entry: Doc | None) -> str:
+    """The per-fill alert's ``Trigger:`` text.
+
+    With the order's watch entry: when it was sent and why, so the fill reads
+    as the confirmation of the order already announced at its release
+    (:mod:`executor.v2_release_alert`). Without one: the book and decision
+    price, as before.
+    """
+    if entry is None or not entry.get("released_at_utc"):
+        return f"v2 book {day} (decision ${_num(order, 'decision_price'):,.2f})"
+    # Imported here: executor.v2_release_alert imports this module.
+    from executor.v2_release_alert import release_time_et, why
+
+    return f"fill of the order sent {release_time_et(entry)}: {why(entry, watch)}"
+
+
 def run_alerts(
     store: Store,
     *,
@@ -534,6 +570,7 @@ def run_alerts(
         else (None, None)
     )
     costs = _avg_costs(store, day) if _docs(shortfall, "orders") else {}
+    watch, released = _releases(store, day) if _docs(shortfall, "orders") else (None, {})
     sent = 0
     for order in _docs(shortfall, "orders"):
         quantity = _num(order, "filled_quantity")
@@ -550,7 +587,7 @@ def run_alerts(
             str(order.get("symbol")),
             int(quantity),
             price,
-            trigger=f"v2 book {day} (decision ${_num(order, 'decision_price'):,.2f})",
+            trigger=fill_trigger(day, order, watch, released.get(str(order.get("symbol")))),
             source="crucible v2 trader",
             fill_time=order.get("submitted_at_utc"),
             realized_pnl=None if realized is None else realized[0],

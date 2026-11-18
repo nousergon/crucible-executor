@@ -15,15 +15,26 @@ Description=Restart a dead or stalled v2 trading session the same day (alpha-eng
 # hard stop a 09:30 start has.
 # It exits non-zero only when its message was not delivered, and that pages
 # through the notifier the trader units use.
+#
+# The same tick also sends the per-order release alerts (Brian 2026-11-18:
+# each trade alerted when its trigger fires, saying why):
+# executor.v2_release_alert reads the session's entry/exit watch and sends one
+# #trades message per order newly released, never twice (a per-day state file
+# beside the watchdog's). It runs FIRST and `-`-prefixed, so its failure never
+# stops the watchdog and a failing watchdog never holds up an alert; an alert
+# it could not deliver is retried on the next tick. Its sends are attributed
+# to this unit's registry row (same notify-silent trading-day disposition).
 OnFailure=alpha-engine-trader-failed@%n.service
 
 [Service]
+# oneshot: the only type that allows more than one ExecStart=; they run in order.
 Type=oneshot
 # ec2-user, like the notices: it reads the v2 store as the trader's role
 # through the trader's env file, and writes its once-a-day state beside theirs.
 # Starting and stopping the session goes through `sudo -n systemctl --no-block`.
 User=ec2-user
 WorkingDirectory=/home/ec2-user/alpha-engine
+ExecStart=-/home/ec2-user/alpha-engine/.venv/bin/python -m executor.v2_release_alert
 ExecStart=/home/ec2-user/alpha-engine/.venv/bin/python -m executor.v2_session_watchdog
 TimeoutStartSec=3min
 StandardOutput=journal
