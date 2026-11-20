@@ -53,7 +53,7 @@ MAX_TAIL_CHARS = 3000
 #: systemd's ``%i``, but it is still checked: this process runs
 #: ``journalctl`` and ``systemctl`` on it.
 UNIT_RE = re.compile(
-    r"alpha-engine-(?:trader-[a-z0-9-]+|v2-(?:trade|market-open|market-close)-alert|v2-day-end|v2-session-watchdog)\.service"
+    r"alpha-engine-(?:trader-[a-z0-9-]+|v2-(?:trade|market-open|market-close|order-book)-alert|v2-day-end|v2-session-watchdog)\.service"
 )
 SESSION_UNIT = "alpha-engine-trader-session.service"
 
