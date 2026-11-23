@@ -31,6 +31,18 @@ ceiling, so reading what is already granted is the change that can land.
 journal holds no arrival price, so ``price_at_order`` is absent and the
 row's slippage is reported as not measured, never as zero.
 
+**Splits (alpha-engine-config-I14106).** A corporate-action split is a
+``kind: split`` journal entry that restates quantity at unchanged cents (its
+securities posting carries the share DELTA, ``evidence.ratio`` the ratio). The
+v1 attribution values the prior day's position from its own snapshot, which is
+pre-split, so on 2026-11-20 (SNDK 8:1, 262 -> 2,096 shares, all 2,096 then sold
+at about $89) the sale was priced against 262 shares at the pre-split close and
+$159,821 of realized P&L fell into the residual. :func:`v2_splits` reads those
+entries and :func:`apply_splits_to_prior_positions` restates the prior
+positions (shares x ratio, per-share prices / ratio, market value unchanged)
+before the attribution runs. A split with no matching prior position raises
+:class:`V2SplitError` by name; it is never dropped.
+
 **What it never does.** It never invents a row: a missing env file, an
 absent or unreadable journal, or a journal for another day gives no rows,
 and the integrity gate then fails exactly as before. A ticker the executor
@@ -40,7 +52,9 @@ itself logged a trade for today is skipped, so a fill is never counted twice.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+import math
+from collections.abc import Mapping, MutableMapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -90,6 +104,22 @@ def _security_leg(entry: Mapping[str, object]) -> tuple[str, float, int] | None:
     return None
 
 
+def _cash_cents(entry: Mapping[str, object]) -> int | None:
+    """The fill's cash posting: what actually changed hands.
+
+    A sale with IB's realized P&L books the securities posting at COST (the
+    holding relieved at IB's cost, the difference to ``income:realized_gains``),
+    so the securities cents are not the execution price; the cash posting is
+    (alpha-engine-config-I14106: 2026-11-20 SNDK booked at $104.33 cost against
+    $89.30 proceeds, $31k of realized P&L in the residual).
+    """
+    for posting in _docs(entry, "postings"):
+        cents = _cents(posting)
+        if posting.get("account") == "assets:cash:USD" and cents is not None and cents != 0:
+            return cents
+    return None
+
+
 def _commission_cents(entry: Mapping[str, object]) -> int | None:
     for posting in _docs(entry, "postings"):
         cents = _cents(posting)
@@ -125,6 +155,9 @@ def rows_from_journal(doc: Mapping[str, object], run_date: str) -> list[Row]:
         if leg is None:
             continue
         ticker, quantity, cents = leg
+        cash = _cash_cents(entry)
+        if cash is not None:
+            cents = cash
         side = "BUY" if quantity > 0 else "SELL"
         group = groups.setdefault((ticker, side), [0.0, 0.0, 0.0, 1.0])
         group[0] += abs(quantity)
@@ -180,3 +213,98 @@ def v2_trade_rows(
     kept = [r for r in rows if r["ticker"] not in logged]
     logger.info("v2 fills for %s: %d row(s) added to the attribution from %s", run_date, len(kept), key)
     return kept
+
+
+class V2SplitError(RuntimeError):
+    """A journal split that cannot be applied to the v1 prior positions."""
+
+
+@dataclass(frozen=True)
+class Split:
+    """One journal ``split`` entry: ``ticker`` gained ``delta_shares`` (``ratio`` when stated)."""
+
+    ticker: str
+    delta_shares: float
+    ratio: float | None
+
+
+def _ratio(entry: Mapping[str, object]) -> float | None:
+    evidence = entry.get("evidence")
+    value = cast(Mapping[str, object], evidence).get("ratio") if isinstance(evidence, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    ratio = float(value)
+    return ratio if math.isfinite(ratio) and ratio > 0 else None
+
+
+def splits_from_journal(doc: Mapping[str, object], run_date: str) -> list[Split]:
+    """The ``kind: split`` entries of one day's ledger journal (same day/schema guard as the fills)."""
+    if doc.get("schema_version") != JOURNAL_SCHEMA_VERSION or doc.get("trading_day") != run_date:
+        return []
+    splits: list[Split] = []
+    for entry in _docs(doc, "entries"):
+        if entry.get("kind") != "split":
+            continue
+        leg = _security_leg(entry)
+        if leg is None:
+            raise V2SplitError(f"v2 journal for {run_date}: split entry {entry.get('event_ref')!r} has no securities posting")
+        ticker, delta, _ = leg
+        splits.append(Split(ticker, delta, _ratio(entry)))
+    return splits
+
+
+def v2_splits(run_date: str, *, store: Store | None = None, env_file: Path = TRADER_ENV) -> list[Split]:
+    """The v2 journal's splits on ``run_date``; an unreadable or absent journal gives none (as the fills do)."""
+    try:
+        if store is None:
+            if not env_file.exists():
+                return []
+            store = open_store(read_env_file(env_file))
+        doc = store.read_json(journal_key(run_date))
+    except Exception as exc:  # noqa: BLE001 - the fills read logs the same failure
+        logger.warning("v2 splits for %s unreadable: %s: %s", run_date, type(exc).__name__, exc)
+        return []
+    return [] if doc is None else splits_from_journal(doc, run_date)
+
+
+def apply_splits_to_prior_positions(
+    prior_positions: MutableMapping[str, MutableMapping[str, object]],
+    splits: Sequence[Split],
+) -> list[str]:
+    """Restate ``prior_positions`` in place to the post-split share basis; returns the tickers restated.
+
+    Shares x ratio; ``closing_price`` and ``avg_cost`` / ratio; ``market_value``
+    and the IB mark are unchanged (a split moves no value). Raises
+    :class:`V2SplitError` for a split whose ticker has no prior position, or
+    whose ratio is neither stated nor derivable.
+    """
+    restated: list[str] = []
+    for split in splits:
+        pos = prior_positions.get(split.ticker)
+        try:
+            prior_shares = float(cast(float, pos.get("shares", 0) or 0)) if pos is not None else 0.0
+        except (TypeError, ValueError):
+            prior_shares = 0.0
+        if pos is None or prior_shares <= 0:
+            raise V2SplitError(
+                f"v2 journal split for {split.ticker} (+{split.delta_shares:g} shares) has no matching "
+                "prior-day position in the v1 snapshot; refusing to drop it"
+            )
+        derived = (prior_shares + split.delta_shares) / prior_shares
+        ratio = split.ratio if split.ratio is not None else derived
+        if not math.isfinite(ratio) or ratio <= 0:
+            raise V2SplitError(f"v2 journal split for {split.ticker}: no usable ratio (delta {split.delta_shares:g})")
+        if abs(prior_shares * ratio - (prior_shares + split.delta_shares)) > 0.5:
+            logger.warning(
+                "v2 split %s: v1 prior shares %g x ratio %g != ledger post-split %g; v1 snapshot and ledger disagree",
+                split.ticker, prior_shares, ratio, prior_shares + split.delta_shares,
+            )
+        pos["shares"] = prior_shares * ratio
+        for field in ("closing_price", "avg_cost"):
+            value = pos.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                pos[field] = float(value) / ratio
+        pos["split_ratio_applied"] = ratio
+        restated.append(split.ticker)
+        logger.info("v1 prior position %s restated for the %g:1 split (%g -> %g shares)", split.ticker, ratio, prior_shares, prior_shares * ratio)
+    return restated
