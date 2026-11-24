@@ -2115,6 +2115,13 @@ def run(
     from executor.v2_fills import v2_trade_rows
 
     trades_today_rows.extend(v2_trade_rows(run_date or "", trades_today_rows))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+    # A v2 journal `split` restates a held name's shares and per-share prices;
+    # the prior snapshot is pre-split, so restate it before any sleeve reads it
+    # (alpha-engine-config-I14106: SNDK 8:1 on 2026-11-20, +$159,821 residual).
+    if prior_snapshot_loaded:
+        from executor.v2_fills import apply_splits_to_prior_positions, v2_splits
+
+        apply_splits_to_prior_positions(prior_positions, v2_splits(run_date or ""))  # pyright: ignore[reportUnknownArgumentType]
     buy_entry_px = _buy_entry_prices(trades_today_rows)
 
     # ── Fill provenance (alpha-engine-config-I10800) ─────────────────────────

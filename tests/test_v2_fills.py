@@ -193,3 +193,102 @@ def test_the_2026_11_05_residual_is_explained_by_the_journal() -> None:
 
     assert round(rotation, 2) == -26665.12
     assert abs(unattributed) < 50.0, unattributed  # was +$33,154; the bound is $5,000
+
+
+# ── Splits (alpha-engine-config-I14106) ──────────────────────────────────────
+DAY_1120 = "2026-11-20"
+
+
+def _split(ticker: str, delta: int, ratio: float | None = 8.0) -> dict[str, Any]:
+    return {
+        "event_ref": f"split/{ticker}/{ratio!r}",
+        "kind": "split",
+        "postings": [{"account": f"assets:securities:{ticker}", "amount_cents": 0, "quantity": delta}],
+        "evidence": {"source": "polygon_corporate_actions", **({} if ratio is None else {"ratio": ratio})},
+    }
+
+
+def _realized_sale(ref: str, ticker: str, shares: int, proceeds_cents: int, cost_cents: int) -> dict[str, Any]:
+    """A sale as the ledger books it once IB states realized P&L: the securities
+    posting is the holding relieved AT COST, the cash posting is the proceeds."""
+    return {
+        "event_ref": ref,
+        "kind": "fill",
+        "postings": [
+            {"account": "assets:cash:USD", "amount_cents": proceeds_cents, "quantity": None},
+            {"account": f"assets:securities:{ticker}", "amount_cents": -cost_cents, "quantity": -shares},
+            {"account": f"income:realized_gains:{ticker}", "amount_cents": -(proceeds_cents - cost_cents), "quantity": None},
+        ],
+    }
+
+
+# SNDK 8:1 on 2026-11-20: 262 -> 2,096 shares, then all 2,096 sold at $89.00
+# (proceeds $186,544, relieved at a $170,000 cost).
+JOURNAL_1120 = _journal(
+    [_split("SNDK", 1834), _realized_sale("s.01", "SNDK", 2096, 18654400, 17000000), _commission("s.01", 700)],
+    day=DAY_1120,
+)
+PRIOR_CLOSE = 712.0  # pre-split close; the real value does not matter to the identity below
+
+
+def _prior_1120() -> dict[str, dict[str, Any]]:
+    return {"SNDK": {"shares": 262, "closing_price": PRIOR_CLOSE, "avg_cost": 600.0, "market_value": 262 * PRIOR_CLOSE}}
+
+
+def _rotation_1120(prior: dict[str, dict[str, Any]]) -> float:
+    rows = v2_fills.v2_trade_rows(DAY_1120, store=_store({DAY_1120: JOURNAL_1120}))
+    return compute_rotation_realized({}, prior, rows)
+
+
+def test_the_2026_11_20_split_day_attributes_the_sale_to_the_rotation_sleeve() -> None:
+    """262 pre-split shares worth $712 each are sold as 2,096 post-split shares at $89.00.
+
+    The NAV effect of the name is proceeds minus the prior market value; with
+    the prior position restated the rotation sleeve carries all of it and the
+    residual is ~0. Without the restatement (current main) the sleeve is short
+    by ~$163k, the 11-20 residual.
+    """
+    nav_effect = 2096 * 89.0 - 262 * PRIOR_CLOSE
+
+    unrestated = _rotation_1120(_prior_1120())
+    assert abs((nav_effect - unrestated) - 163_226.0) < 1.0  # the residual this fixes
+
+    prior = _prior_1120()
+    splits = v2_fills.v2_splits(DAY_1120, store=_store({DAY_1120: JOURNAL_1120}))
+    assert v2_fills.apply_splits_to_prior_positions(prior, splits) == ["SNDK"]
+    assert prior["SNDK"]["shares"] == 2096
+    assert prior["SNDK"]["closing_price"] == PRIOR_CLOSE / 8
+    assert prior["SNDK"]["avg_cost"] == 75.0
+    assert prior["SNDK"]["market_value"] == 262 * PRIOR_CLOSE
+    assert abs(nav_effect - _rotation_1120(prior)) < 1.0
+
+
+def test_a_split_without_a_stated_ratio_derives_it_from_the_prior_position() -> None:
+    prior = _prior_1120()
+    v2_fills.apply_splits_to_prior_positions(prior, [v2_fills.Split("SNDK", 1834, None)])
+    assert prior["SNDK"]["shares"] == 2096
+
+
+def test_a_split_with_no_matching_prior_position_raises_by_name() -> None:
+    import pytest
+
+    with pytest.raises(v2_fills.V2SplitError, match="SNDK"):
+        v2_fills.apply_splits_to_prior_positions({}, [v2_fills.Split("SNDK", 1834, 8.0)])
+
+
+def test_a_split_entry_without_a_securities_posting_raises() -> None:
+    import pytest
+
+    bad = _journal([{"event_ref": "split/X", "kind": "split", "postings": []}], day=DAY_1120)
+    with pytest.raises(v2_fills.V2SplitError):
+        v2_fills.splits_from_journal(bad, DAY_1120)
+
+
+def test_a_day_without_splits_or_a_journal_changes_nothing() -> None:
+    assert v2_fills.v2_splits(DAY, store=_store({DAY: JOURNAL_1105})) == []
+    assert v2_fills.v2_splits("2026-11-06", store=_store({DAY: JOURNAL_1105})) == []
+
+
+def test_a_sale_with_realized_pnl_is_priced_at_proceeds_not_at_cost() -> None:
+    rows = v2_fills.v2_trade_rows(DAY_1120, store=_store({DAY_1120: JOURNAL_1120}))
+    assert abs(float(rows[0]["fill_price"]) - 89.0) < 1e-9  # type: ignore[arg-type]
