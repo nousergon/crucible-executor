@@ -1432,10 +1432,15 @@ def run(
         except Exception:  # noqa: BLE001 — flow-doctor optional / not configured
             _fd_early = None
         try:
-            from executor.reconcile_audit import audit_window, resolve_self_heal_window
+            from executor.reconcile_audit import audit_window
+            from executor.self_heal_window import resolve_self_heal_window
             # Start at the oldest day still carrying an integrity breach
             # (capped), not only the trailing 5 (alpha-engine-config-I14373).
-            _heal = resolve_self_heal_window(exclude_dates=frozenset({f"{run_date}"}))
+            _heal = resolve_self_heal_window(
+                db_path=f"{load_config()['db_path']}",
+                end=f"{today_trading_day}",
+                exclude_dates=frozenset({f"{run_date}"}),
+            )
             audit_window_start = _heal.start
             audit_window_reason = _heal.reason
             audit_window_left_out = list(_heal.left_out)

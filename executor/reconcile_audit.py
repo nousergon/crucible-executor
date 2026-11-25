@@ -69,12 +69,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sqlite3
-from collections.abc import Collection
-from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from decimal import Decimal
-from typing import cast
 
 import boto3
 import pandas as pd
@@ -101,17 +96,6 @@ logger = logging.getLogger(__name__)
 # every trading day; see CLASSIFICATION_SOURCE_SUBSTITUTION below.
 DEFAULT_TOLERANCE_BPS = 1.0
 DEFAULT_TRAILING_DAYS = 5
-# Post-close self-heal window extension (alpha-engine-config-I14373). The
-# trailing window is fixed, so a day that broke and aged out of it was never
-# repaired and its breach stood in the cumulative-residual gate for the whole
-# 63-session window. The self-heal now starts at the OLDEST day inside that
-# gate's own window that still carries an integrity breach, but never reaches
-# further back than SELF_HEAL_MAX_WINDOW_DAYS trading days in total. Only the
-# START date moves: no tolerance, bound, gate or refusal is read or changed.
-SELF_HEAL_BREACH_LOOKBACK_SESSIONS = 63
-SELF_HEAL_MAX_WINDOW_DAYS = 21
-WINDOW_REASON_TRAILING = "trailing"
-WINDOW_REASON_OLDEST_OPEN_BREACH = "oldest_open_breach"
 AUDIT_KEY_TEMPLATE = "trades/eod_corrections/{run_date}.json"
 
 # A correction at/above this magnitude is a statistical outlier vs. the normal
@@ -446,7 +430,7 @@ def _settled_close_for_ticker(
 
 
 def _detect_stale_legs(
-    conn: sqlite3.Connection,
+    conn,
     run_date: str,
     config: dict,
     *,
@@ -563,9 +547,7 @@ def _detect_stale_legs(
     return row, legs
 
 
-def _row_view(
-    conn: sqlite3.Connection, run_date: str,
-) -> tuple[dict[str, Decimal] | None, dict[str, object] | None]:
+def _row_view(conn, run_date: str) -> tuple[dict | None, dict | None]:
     """``(balance view, raw columns)`` of the stored row, or ``(None, None)``."""
     row = conn.execute(
         "SELECT portfolio_nav, total_cash, accrued_interest, positions_snapshot, "
@@ -584,11 +566,11 @@ def _row_view(
 
 
 def _post_restrike_entry(
-    conn: sqlite3.Connection,
+    conn,
     *,
     run_date: str,
-    before_view: dict[str, Decimal] | None,
-    before_cols: dict[str, object] | None,
+    before_view: dict | None,
+    before_cols: dict | None,
     classification: str,
     reasons: list[str],
     trades_bucket: str | None,
@@ -649,96 +631,6 @@ def _write_audit_record(
     except Exception as e:  # noqa: BLE001 — audit-trail write is best-effort observability
         logger.warning("[reconcile_audit] correction-record write failed (non-fatal): %s", e)
         return None
-
-
-@dataclass(frozen=True)
-class SelfHealWindow:
-    """Where the post-close self-heal audit starts, and why.
-
-    ``audit_start`` is ``None`` for the plain trailing window (the audit then
-    runs exactly as it did before this existed) and an ISO date when an open
-    breach pulled the start back. ``start`` is always the first date audited.
-    ``left_out`` lists breached dates older than the cap, which this run did
-    not reach.
-    """
-
-    start: str
-    reason: str
-    audit_start: str | None
-    left_out: tuple[str, ...] = ()
-
-
-def _has_open_breach(raw: object) -> bool:
-    """True when an ``integrity_breach_json`` value is non-empty."""
-    if raw is None:
-        return False
-    text = str(raw).strip()
-    return text not in ("", "[]", "{}", "null")
-
-
-def resolve_self_heal_window(
-    *,
-    db_path: str | None = None,
-    end: str | None = None,
-    exclude_dates: Collection[object] = frozenset(),
-    trailing_days: int = DEFAULT_TRAILING_DAYS,
-) -> SelfHealWindow:
-    """Start of the post-close self-heal: the earlier of the trailing start and
-    the oldest ``eod_pnl`` date (last 63 sessions) with a non-empty
-    ``integrity_breach_json``, never more than 21 trading days back.
-
-    Dates still run oldest to newest inside ``audit_window``, so a repaired
-    day cascades into the next through ``prior_corrected``. A breach older than
-    the cap is NOT silently dropped: the dates left out are logged at WARNING.
-    A failure to read the table falls back to the trailing window (the
-    self-heal is secondary and must not lose its default coverage).
-    """
-    trailing_start = _window_dates(start=None, end=end, trailing_days=trailing_days)[0]
-    trailing = SelfHealWindow(start=trailing_start, reason=WINDOW_REASON_TRAILING, audit_start=None)
-    try:
-        store_path: str | None = db_path
-        if store_path is None:
-            loaded = cast("dict[str, object]", load_config())
-            store_path = str(loaded["db_path"])
-        lookback_start = _window_dates(
-            start=None, end=end, trailing_days=SELF_HEAL_BREACH_LOOKBACK_SESSIONS)[0]
-        cap_start = _window_dates(start=None, end=end, trailing_days=SELF_HEAL_MAX_WINDOW_DAYS)[0]
-        # Read-only: resolving the window must never create or migrate a store.
-        conn = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
-        try:
-            rows = conn.execute(
-                "SELECT date, integrity_breach_json FROM eod_pnl "
-                "WHERE date >= ? AND date < ? ORDER BY date ASC",
-                (lookback_start, trailing_start),
-            ).fetchall()
-        finally:
-            conn.close()
-    except Exception as e:  # noqa: BLE001 — fail soft to the trailing window, never to no window
-        logger.warning(
-            "[reconcile_audit] open-breach window lookup FAILED (%s: %s) — "
-            "falling back to the trailing %d-day window.",
-            e.__class__.__name__, e, trailing_days)
-        return trailing
-    breached: list[str] = [
-        str(r[0]) for r in rows if str(r[0]) not in exclude_dates and _has_open_breach(r[1])
-    ]
-    in_cap = [d for d in breached if d >= cap_start]
-    left_out = tuple(d for d in breached if d < cap_start)
-    if left_out:
-        logger.warning(
-            "[reconcile_audit] integrity breach(es) older than the %d-trading-day self-heal "
-            "cap (window floor %s) were NOT reached by this run and are left as stored: %s",
-            SELF_HEAL_MAX_WINDOW_DAYS, cap_start, list(left_out))
-    if not in_cap:
-        return SelfHealWindow(start=trailing_start, reason=WINDOW_REASON_TRAILING,
-                              audit_start=None, left_out=left_out)
-    oldest = in_cap[0]
-    logger.warning(
-        "[reconcile_audit] self-heal window extended back to %s (oldest day still carrying an "
-        "integrity breach; trailing start was %s): breached dates in reach: %s",
-        oldest, trailing_start, in_cap)
-    return SelfHealWindow(start=oldest, reason=WINDOW_REASON_OLDEST_OPEN_BREACH,
-                          audit_start=oldest, left_out=left_out)
 
 
 def audit_window(

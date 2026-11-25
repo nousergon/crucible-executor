@@ -15,13 +15,13 @@ from unittest.mock import patch
 import pytest
 
 from executor import reconcile_audit
-from executor.reconcile_audit import (
+from executor.reconcile_audit import DEFAULT_TRAILING_DAYS, _window_dates, audit_window
+from executor.self_heal_window import (
     SELF_HEAL_MAX_WINDOW_DAYS,
+    TRAILING_DAYS,
     WINDOW_REASON_OLDEST_OPEN_BREACH,
     WINDOW_REASON_TRAILING,
     SelfHealWindow,
-    _window_dates,
-    audit_window,
     resolve_self_heal_window,
 )
 from executor.trade_logger import init_db
@@ -57,6 +57,9 @@ def _back(k: int) -> str:
 
 
 class TestResolveWindow:
+    def test_trailing_constant_mirrors_reconcile_audit(self) -> None:
+        assert TRAILING_DAYS == DEFAULT_TRAILING_DAYS
+
     def test_no_breach_rows_is_exactly_trailing_5(self, tmp_path: Path) -> None:
         db = str(tmp_path / "t.db")
         _seed(db)
@@ -84,7 +87,7 @@ class TestResolveWindow:
         db = str(tmp_path / "t.db")
         old1, old2 = _back(30), _back(25)
         _seed(db, {old1: BREACH, old2: BREACH})
-        with caplog.at_level(logging.WARNING, logger="executor.reconcile_audit"):
+        with caplog.at_level(logging.WARNING, logger="executor.self_heal_window"):
             w = resolve_self_heal_window(db_path=db, end=END)
         # Nothing in reach: the run stays trailing, and says what it left out.
         assert w.reason == WINDOW_REASON_TRAILING and w.audit_start is None
@@ -169,7 +172,7 @@ class TestRunsOldestFirstAndClears:
         db = str(tmp_path / "t.db")
         old = _back(30)
         _seed(db, {old: BREACH})
-        with caplog.at_level(logging.WARNING, logger="executor.reconcile_audit"):
+        with caplog.at_level(logging.WARNING, logger="executor.self_heal_window"):
             w = resolve_self_heal_window(db_path=db, end=END, exclude_dates={END})
         settled = dict.fromkeys(_sessions(70), 700.0)
         res, order = self._run(db, settled, w)
