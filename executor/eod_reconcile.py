@@ -1422,6 +1422,9 @@ def run(
     # clean). Fail-soft: a correction-pass error must never block today's EOD.
     # ``run_audit=False`` on the live run is how the audit's own re-reconciles
     # avoid recursing back into the audit.
+    audit_window_start: str | None = None
+    audit_window_reason: str | None = None
+    audit_window_left_out: list[str] = []
     if run_audit:
         from nousergon_lib.logging import get_flow_doctor as _get_flow_doctor_early
         try:
@@ -1430,7 +1433,18 @@ def run(
             _fd_early = None
         try:
             from executor.reconcile_audit import audit_window
-            _audit = audit_window(exclude_dates={run_date}, send_email=False)
+            from executor.self_heal_window import resolve_self_heal_window
+            # Start at the oldest day still carrying an integrity breach
+            # (capped), not only the trailing 5 (alpha-engine-config-I14373).
+            _heal = resolve_self_heal_window(
+                db_path=f"{load_config()['db_path']}",
+                end=f"{today_trading_day}",
+                exclude_dates=frozenset({f"{run_date}"}),
+            )
+            audit_window_start = _heal.start
+            audit_window_reason = _heal.reason
+            audit_window_left_out = list(_heal.left_out)
+            _audit = audit_window(exclude_dates={run_date}, start=_heal.audit_start, send_email=False)
             if _audit.get("corrected"):
                 logger.warning(
                     "[reconcile_audit] corrected %d prior day(s) against settled "
@@ -3622,6 +3636,9 @@ def run(
                 "alpha_pct": round(alpha, 4) if alpha is not None else None,
                 "trades_today": trades_today_count,
                 "roundtrip_stats": roundtrip_stats,
+                "audit_window_start": audit_window_start,
+                "audit_window_reason": audit_window_reason,
+                "audit_window_left_out": audit_window_left_out,
             },
         )
     except Exception as _me:
