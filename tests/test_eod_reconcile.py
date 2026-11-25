@@ -641,6 +641,37 @@ class TestSelfHealOrdering:
         _, audit_kwargs = mock_audit.call_args
         assert audit_kwargs["exclude_dates"] == {"2026-04-28"}
 
+    @pytest.mark.parametrize("audit_start", [None, "2026-04-17"])
+    def test_self_heal_start_comes_from_oldest_open_breach_window(self, audit_start):
+        """alpha-engine-config-I14373: the post-close self-heal starts where
+        ``resolve_self_heal_window`` says (None = the plain trailing window)."""
+        from executor.reconcile_audit import SelfHealWindow
+        window = SelfHealWindow(
+            start=audit_start or "2026-04-22", reason="x", audit_start=audit_start)
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
+             patch("executor.eod_reconcile.load_config") as mock_cfg, \
+             patch("executor.preflight.ExecutorPreflight") as mock_preflight, \
+             patch("executor.eod_reconcile.init_db") as mock_db, \
+             patch("executor.reconcile_audit.resolve_self_heal_window",
+                   return_value=window) as mock_resolve, \
+             patch("executor.reconcile_audit.audit_window") as mock_audit, \
+             patch("executor.snapshot_capturer.load_snapshot", return_value=None):
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28")
+            mock_cfg.return_value = {
+                "db_path": "/tmp/x.db", "trades_bucket": "alpha-engine-research",
+                "aws_region": "us-east-1", "email_sender": "x@x.com",
+                "email_recipients": "y@y.com",
+            }
+            mock_preflight.return_value.run.return_value = None
+            mock_db.return_value = MagicMock()
+            mock_audit.return_value = {"checked": 0, "corrected": []}
+            with pytest.raises(RuntimeError, match="No snapshot at s3://"):
+                run(run_date="2026-04-28", run_audit=True)
+        assert mock_resolve.call_args.kwargs["exclude_dates"] == {"2026-04-28"}
+        assert mock_audit.call_args.kwargs["start"] == audit_start
+        assert mock_audit.call_args.kwargs["exclude_dates"] == {"2026-04-28"}
+
     def test_audit_window_skipped_when_run_audit_false(self):
         """Historical correction passes (run_audit=False) must not recurse
         into their own self-heal."""
