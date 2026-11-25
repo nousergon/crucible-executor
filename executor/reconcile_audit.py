@@ -69,7 +69,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import boto3
 import pandas as pd
@@ -389,11 +391,11 @@ def _settled_close(run_date: str, config: dict) -> float | None:
         return None
 
 
-#: ``(ticker, run_date)`` -> the ``reference_restated`` record of the most recent
+#: ``"<ticker>|<run_date>"`` -> the ``reference_restated`` record of the most recent
 #: ``_settled_close_for_ticker`` call that restated that ticker's bars for a later split.
 #: A side table, not a wider return value: the function's tuple is patched by name in the
 #: audit's tests and unpacked by its callers.
-_REFERENCE_RESTATED: dict[tuple[str, str], dict[str, object]] = {}
+_REFERENCE_RESTATED: dict[str, dict[str, object]] = {}
 
 
 def _settled_close_for_ticker(
@@ -431,24 +433,24 @@ def _settled_close_for_ticker(
     # The same restatement eod_reconcile applies when it re-prices this day: a split
     # journaled AFTER run_date back-adjusts these bars, but the stored close is on the
     # share basis the broker held that day (alpha-engine-config-I14285).
-    from executor.split_reference import reference_bars_on_trade_basis
+    from executor.split_reference import restate_reference_in_place
     from executor.v2_fills import v2_forward_splits
 
-    df, restated = reference_bars_on_trade_basis(ticker, run_date, df, v2_forward_splits(run_date))
+    restated = restate_reference_in_place(ticker, run_date, df, v2_forward_splits(run_date))  # pyright: ignore[reportUnknownArgumentType]
     target = pd.Timestamp(run_date).normalize()
     idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
     match = df[idx == target]
     if match.empty:
         return None
     if restated is None:
-        _REFERENCE_RESTATED.pop((ticker, run_date), None)
+        _REFERENCE_RESTATED.pop(f"{ticker}|{run_date}", None)
     else:
-        _REFERENCE_RESTATED[(ticker, run_date)] = restated
+        _REFERENCE_RESTATED[f"{ticker}|{run_date}"] = restated
     return float(match["Close"].iloc[-1]), _row_close_source(match)
 
 
 def _detect_stale_legs(
-    conn,
+    conn: sqlite3.Connection,
     run_date: str,
     config: dict,
     *,
@@ -532,12 +534,12 @@ def _detect_stale_legs(
             stored_cp = pos.get("closing_price")
             if stored_cp is None:
                 continue
-            _REFERENCE_RESTATED.pop((ticker, run_date), None)
+            _REFERENCE_RESTATED.pop(f"{ticker}|{run_date}", None)
             settled = _settled_close_for_ticker(ticker, run_date, config)
             if settled is None:
                 continue
             settled_cp, settled_source = settled
-            reference_restated = _REFERENCE_RESTATED.get((ticker, run_date))
+            reference_restated = _REFERENCE_RESTATED.get(f"{ticker}|{run_date}")
             cp_div_bps = abs(settled_cp / float(stored_cp) - 1.0) * 1e4 if stored_cp else float("inf")
             if cp_div_bps > tolerance_bps:
                 legs.append({"leg": f"position_close:{ticker}", "divergence_bps": cp_div_bps,
@@ -570,7 +572,7 @@ def _detect_stale_legs(
     return row, legs
 
 
-def _row_view(conn, run_date: str) -> tuple[dict | None, dict | None]:
+def _row_view(conn: sqlite3.Connection, run_date: str) -> tuple[dict[str, Decimal] | None, dict[str, object] | None]:
     """``(balance view, raw columns)`` of the stored row, or ``(None, None)``."""
     row = conn.execute(
         "SELECT portfolio_nav, total_cash, accrued_interest, positions_snapshot, "
@@ -589,7 +591,7 @@ def _row_view(conn, run_date: str) -> tuple[dict | None, dict | None]:
 
 
 def _post_restrike_entry(
-    conn,
+    conn: sqlite3.Connection,
     *,
     run_date: str,
     before_view: dict | None,

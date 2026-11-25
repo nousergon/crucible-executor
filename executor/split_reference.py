@@ -109,3 +109,26 @@ def reference_bars_on_trade_basis(
         ticker, run_date, info["ratio"], [d["journal_ref"] for d in detail],
     )
     return out, info
+
+
+def restate_reference_in_place(
+    ticker: str,
+    run_date: str,
+    bars: object,
+    splits: Sequence[ForwardSplit],
+) -> dict[str, object] | None:
+    """``reference_bars_on_trade_basis`` for a frame the caller owns and re-reads on every call.
+
+    Writes the restated Close/Low/High back into ``bars`` and returns the
+    ``reference_restated`` record (None when nothing was restated and ``bars`` was not
+    touched). The two EOD callers read a fresh frame per ticker, and an in-place
+    restatement keeps their own variable's type, and so their strict-typing baseline, as
+    it was. Same rules as the copying form, which it calls.
+    """
+    restated, info = reference_bars_on_trade_basis(ticker, run_date, bars, splits)
+    if info is not None:
+        frame: Any = bars
+        for col in RESTATED_COLUMNS:
+            if col in frame.columns:
+                frame[col] = restated[col]  # pyright: ignore[reportUnknownVariableType]
+    return info
