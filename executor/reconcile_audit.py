@@ -389,13 +389,11 @@ def _settled_close(run_date: str, config: dict) -> float | None:
         return None
 
 
-class _SettledClose(tuple[float, str]):
-    """``(settled_close, vendor)``, plus ``reference_restated`` when the bars were restated for a later split."""
-
-    reference_restated: dict[str, object] | None = None
-
-    def __new__(cls, close: float, source: str) -> _SettledClose:
-        return super().__new__(cls, (close, source))
+#: ``(ticker, run_date)`` -> the ``reference_restated`` record of the most recent
+#: ``_settled_close_for_ticker`` call that restated that ticker's bars for a later split.
+#: A side table, not a wider return value: the function's tuple is patched by name in the
+#: audit's tests and unpacked by its callers.
+_REFERENCE_RESTATED: dict[tuple[str, str], dict[str, object]] = {}
 
 
 def _settled_close_for_ticker(
@@ -442,9 +440,11 @@ def _settled_close_for_ticker(
     match = df[idx == target]
     if match.empty:
         return None
-    settled = _SettledClose(float(match["Close"].iloc[-1]), _row_close_source(match))
-    settled.reference_restated = restated
-    return settled
+    if restated is None:
+        _REFERENCE_RESTATED.pop((ticker, run_date), None)
+    else:
+        _REFERENCE_RESTATED[(ticker, run_date)] = restated
+    return float(match["Close"].iloc[-1]), _row_close_source(match)
 
 
 def _detect_stale_legs(
@@ -532,11 +532,12 @@ def _detect_stale_legs(
             stored_cp = pos.get("closing_price")
             if stored_cp is None:
                 continue
+            _REFERENCE_RESTATED.pop((ticker, run_date), None)
             settled = _settled_close_for_ticker(ticker, run_date, config)
             if settled is None:
                 continue
             settled_cp, settled_source = settled
-            reference_restated = getattr(settled, "reference_restated", None)
+            reference_restated = _REFERENCE_RESTATED.get((ticker, run_date))
             cp_div_bps = abs(settled_cp / float(stored_cp) - 1.0) * 1e4 if stored_cp else float("inf")
             if cp_div_bps > tolerance_bps:
                 legs.append({"leg": f"position_close:{ticker}", "divergence_bps": cp_div_bps,
