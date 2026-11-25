@@ -1779,6 +1779,14 @@ def run(
     prior_closes: dict[str, float] = {}
     prior_close_dates: dict[str, date] = {}
     missing: list[str] = []
+    # Splits journaled AFTER run_date (a deliberate lookahead: this may be a re-run of
+    # a past day). ArcticDB is back-adjusted for them while the broker's mark and share
+    # count on run_date are not, so the reference bars are restated to the broker's
+    # basis below (alpha-engine-config-I14285). Empty for a same-day run.
+    from executor.split_reference import restate_reference_in_place
+    from executor.v2_fills import v2_forward_splits
+
+    forward_splits = v2_forward_splits(run_date or "")  # pyright: ignore[reportUnknownArgumentType]
     for ticker in positions.keys():
         if ticker in _MACRO_SYMBOLS:
             if macro_lib is None:
@@ -1794,6 +1802,9 @@ def run(
         if df.empty or "Close" not in df.columns:
             missing.append(f"{ticker} (no Close column)")
             continue
+        reference_restated = restate_reference_in_place(ticker, run_date or "", df, forward_splits)  # pyright: ignore[reportUnknownArgumentType]
+        if reference_restated is not None:
+            positions[ticker]["reference_restated"] = reference_restated
         idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
         match = df[idx == target_ts]
         if match.empty:
