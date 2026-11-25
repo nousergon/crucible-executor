@@ -436,7 +436,7 @@ def _settled_close_for_ticker(
     from executor.split_reference import restate_reference_in_place
     from executor.v2_fills import v2_forward_splits
 
-    restated = restate_reference_in_place(ticker, run_date, df, v2_forward_splits(run_date))  # pyright: ignore[reportUnknownArgumentType]
+    restated = restate_reference_in_place(ticker, run_date, df, v2_forward_splits(run_date))
     target = pd.Timestamp(run_date).normalize()
     idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
     match = df[idx == target]
