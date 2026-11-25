@@ -438,7 +438,9 @@ def _settled_close_for_ticker(
 
     restated = restate_reference_in_place(ticker, run_date, df, v2_forward_splits(run_date))
     target = pd.Timestamp(run_date).normalize()
-    idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
+    # `df` is ArcticDB's untyped read, so this pre-existing line is partially unknown;
+    # it was a baseline entry on main until this PR's baseline shrink (alpha-engine-config-I14285).
+    idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index  # pyright: ignore[reportUnknownVariableType]
     match = df[idx == target]
     if match.empty:
         return None
@@ -490,7 +492,8 @@ def _detect_stale_legs(
         return None, []
 
     stored_close, stored_spy_return = row[0], row[1]
-    legs: list[dict] = []
+    # Pre-existing untyped leg dicts; a baseline entry on main until this PR's shrink (I14285).
+    legs: list[dict] = []  # pyright: ignore[reportUnknownVariableType]
 
     own_close_div_bps = (
         float("inf") if stored_close is None
