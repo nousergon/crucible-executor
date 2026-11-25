@@ -24,13 +24,16 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, TypeVar
 
 import pandas as pd
 
 from executor.v2_fills import ForwardSplit
 
 logger = logging.getLogger(__name__)
+
+#: The caller's frame type, passed through untouched so its own type inference is unchanged.
+BarsT = TypeVar("BarsT")
 
 #: The price columns a split restates (Open and Volume are never read by the gates).
 RESTATED_COLUMNS = ("Close", "Low", "High")
@@ -62,9 +65,9 @@ def _series_is_back_adjusted(bars: Any, split: ForwardSplit) -> bool:
 def reference_bars_on_trade_basis(
     ticker: str,
     run_date: str,
-    bars: Any,
+    bars: BarsT,
     splits: Sequence[ForwardSplit],
-) -> tuple[Any, dict[str, object] | None]:
+) -> tuple[BarsT, dict[str, object] | None]:
     """``(bars, reference_restated)`` with Close/Low/High restated by each later split's ratio.
 
     For every split journaled for ``ticker`` with an effective date AFTER

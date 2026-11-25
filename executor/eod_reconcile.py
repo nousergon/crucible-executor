@@ -1772,7 +1772,7 @@ def run(
     from executor.split_reference import reference_bars_on_trade_basis
     from executor.v2_fills import v2_forward_splits
 
-    forward_splits = v2_forward_splits(run_date or "")
+    forward_splits = v2_forward_splits(run_date or "")  # pyright: ignore[reportUnknownArgumentType]
     for ticker in positions.keys():
         if ticker in _MACRO_SYMBOLS:
             if macro_lib is None:
@@ -1788,7 +1788,7 @@ def run(
         if df.empty or "Close" not in df.columns:
             missing.append(f"{ticker} (no Close column)")
             continue
-        df, reference_restated = reference_bars_on_trade_basis(ticker, run_date or "", df, forward_splits)
+        df, reference_restated = reference_bars_on_trade_basis(ticker, run_date or "", df, forward_splits)  # pyright: ignore[reportUnknownArgumentType]
         if reference_restated is not None:
             positions[ticker]["reference_restated"] = reference_restated
         idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
