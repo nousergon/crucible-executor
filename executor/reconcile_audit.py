@@ -389,6 +389,15 @@ def _settled_close(run_date: str, config: dict) -> float | None:
         return None
 
 
+class _SettledClose(tuple[float, str]):
+    """``(settled_close, vendor)``, plus ``reference_restated`` when the bars were restated for a later split."""
+
+    reference_restated: dict[str, object] | None = None
+
+    def __new__(cls, close: float, source: str) -> _SettledClose:
+        return super().__new__(cls, (close, source))
+
+
 def _settled_close_for_ticker(
     ticker: str, run_date: str, config: dict,
 ) -> tuple[float, str] | None:
@@ -421,12 +430,21 @@ def _settled_close_for_ticker(
         return None
     if df.empty or "Close" not in df.columns:
         return None
+    # The same restatement eod_reconcile applies when it re-prices this day: a split
+    # journaled AFTER run_date back-adjusts these bars, but the stored close is on the
+    # share basis the broker held that day (alpha-engine-config-I14285).
+    from executor.split_reference import reference_bars_on_trade_basis
+    from executor.v2_fills import v2_forward_splits
+
+    df, restated = reference_bars_on_trade_basis(ticker, run_date, df, v2_forward_splits(run_date))
     target = pd.Timestamp(run_date).normalize()
     idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
     match = df[idx == target]
     if match.empty:
         return None
-    return float(match["Close"].iloc[-1]), _row_close_source(match)
+    settled = _SettledClose(float(match["Close"].iloc[-1]), _row_close_source(match))
+    settled.reference_restated = restated
+    return settled
 
 
 def _detect_stale_legs(
@@ -518,6 +536,7 @@ def _detect_stale_legs(
             if settled is None:
                 continue
             settled_cp, settled_source = settled
+            reference_restated = getattr(settled, "reference_restated", None)
             cp_div_bps = abs(settled_cp / float(stored_cp) - 1.0) * 1e4 if stored_cp else float("inf")
             if cp_div_bps > tolerance_bps:
                 legs.append({"leg": f"position_close:{ticker}", "divergence_bps": cp_div_bps,
@@ -526,7 +545,10 @@ def _detect_stale_legs(
                              # freeze time; a snapshot written before I10360
                              # has none, and classifies strictly.
                              "stored_source": pos.get("close_source") or _SOURCE_UNKNOWN,
-                             "settled_source": settled_source})
+                             "settled_source": settled_source,
+                             # Present only when the reference bars were restated for
+                             # a later split, so the leg says what basis "settled" is on.
+                             **({"reference_restated": reference_restated} if reference_restated else {})})
 
     # ── NAV basis (ground-truth ruling 2026-10-22, alpha-engine-config-I10052).
     # A windowed row still struck on the broker's marks while the configured

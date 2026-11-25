@@ -55,6 +55,7 @@ import logging
 import math
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -226,6 +227,7 @@ class Split:
     ticker: str
     delta_shares: float
     ratio: float | None
+    event_ref: str | None = None
 
 
 def _ratio(entry: Mapping[str, object]) -> float | None:
@@ -249,7 +251,8 @@ def splits_from_journal(doc: Mapping[str, object], run_date: str) -> list[Split]
         if leg is None:
             raise V2SplitError(f"v2 journal for {run_date}: split entry {entry.get('event_ref')!r} has no securities posting")
         ticker, delta, _ = leg
-        splits.append(Split(ticker, delta, _ratio(entry)))
+        ref = entry.get("event_ref")
+        splits.append(Split(ticker, delta, _ratio(entry), ref if isinstance(ref, str) else None))
     return splits
 
 
@@ -265,6 +268,84 @@ def v2_splits(run_date: str, *, store: Store | None = None, env_file: Path = TRA
         logger.warning("v2 splits for %s unreadable: %s: %s", run_date, type(exc).__name__, exc)
         return []
     return [] if doc is None else splits_from_journal(doc, run_date)
+
+
+@dataclass(frozen=True)
+class ForwardSplit:
+    """A journaled split whose effective (journal) day is AFTER the run date being re-run.
+
+    ``journal_ref`` names the journal object and entry it came from, so a
+    restatement that used it can say where the evidence is.
+    """
+
+    ticker: str
+    effective: date
+    ratio: float
+    journal_ref: str
+
+
+#: Forward-scan results by ``(run_date, through)``, default store only: the audit
+#: asks once per held ticker per day and each answer is the same journal scan.
+_FORWARD_SPLIT_CACHE: dict[tuple[str, str], list[ForwardSplit]] = {}
+
+
+def v2_forward_splits(
+    run_date: str,
+    *,
+    through: date | None = None,
+    store: Store | None = None,
+    env_file: Path = TRADER_ENV,
+) -> list[ForwardSplit]:
+    """Journaled splits effective AFTER ``run_date``, read through ``through`` (default today).
+
+    A deliberate lookahead (alpha-engine-config-I14285): re-running a past day
+    needs to know whether a split booked LATER makes the reference bars (restated
+    to the post-split basis) differ from the share count the broker held that day.
+    A split with no stated ratio is skipped. An unreadable store, a bad run date or an unreadable
+    journal day gives no split for that day, which leaves the caller on the unrestated
+    bars exactly as before.
+    """
+    try:
+        start = date.fromisoformat(run_date)
+    except (TypeError, ValueError):
+        return []
+    end = through if through is not None else datetime.now(UTC).date()
+    if end <= start:
+        return []
+    cache_key = (run_date, end.isoformat())
+    if store is None:
+        if cache_key in _FORWARD_SPLIT_CACHE:
+            return list(_FORWARD_SPLIT_CACHE[cache_key])
+        try:
+            if not env_file.exists():
+                return []
+            store = open_store(read_env_file(env_file))
+        except Exception as exc:  # noqa: BLE001 - no evidence leaves the bars unrestated
+            logger.warning("v2 forward splits for %s: store unreadable: %s: %s", run_date, type(exc).__name__, exc)
+            return []
+        cache = True
+    else:
+        cache = False
+    found: list[ForwardSplit] = []
+    day = start + timedelta(days=1)
+    while day <= end:
+        if day.weekday() < 5:
+            key = journal_key(day.isoformat())
+            try:
+                doc = store.read_json(key)
+                splits = [] if doc is None else splits_from_journal(doc, day.isoformat())
+            except Exception as exc:  # noqa: BLE001 - one bad day must not hide the others
+                logger.warning("v2 forward splits: journal %s unreadable: %s: %s", key, type(exc).__name__, exc)
+                splits = []
+            for split in splits:
+                if split.ratio is None:
+                    logger.warning("v2 forward splits: %s %s states no ratio; not used", key, split.event_ref)
+                    continue
+                found.append(ForwardSplit(split.ticker, day, split.ratio, f"{key}#{split.event_ref}"))
+        day += timedelta(days=1)
+    if cache:
+        _FORWARD_SPLIT_CACHE[cache_key] = found
+    return list(found)
 
 
 def apply_splits_to_prior_positions(
