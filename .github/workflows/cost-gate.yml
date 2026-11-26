@@ -106,5 +106,5 @@ jobs:
   notify-main-failure:
     needs: [cost-gate]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@46ff3292bcc2b12fad884ca19c3b461fb51b7373
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@1b40bc3e22c59152f76294d3515b293d48d35518
     secrets: inherit
