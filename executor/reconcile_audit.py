@@ -69,7 +69,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import boto3
 import pandas as pd
@@ -389,6 +391,13 @@ def _settled_close(run_date: str, config: dict) -> float | None:
         return None
 
 
+#: ``"<ticker>|<run_date>"`` -> the ``reference_restated`` record of the most recent
+#: ``_settled_close_for_ticker`` call that restated that ticker's bars for a later split.
+#: A side table, not a wider return value: the function's tuple is patched by name in the
+#: audit's tests and unpacked by its callers.
+_REFERENCE_RESTATED: dict[str, dict[str, object]] = {}
+
+
 def _settled_close_for_ticker(
     ticker: str, run_date: str, config: dict,
 ) -> tuple[float, str] | None:
@@ -421,16 +430,29 @@ def _settled_close_for_ticker(
         return None
     if df.empty or "Close" not in df.columns:
         return None
+    # The same restatement eod_reconcile applies when it re-prices this day: a split
+    # journaled AFTER run_date back-adjusts these bars, but the stored close is on the
+    # share basis the broker held that day (alpha-engine-config-I14285).
+    from executor.split_reference import restate_reference_in_place
+    from executor.v2_fills import v2_forward_splits
+
+    restated = restate_reference_in_place(ticker, run_date, df, v2_forward_splits(run_date))
     target = pd.Timestamp(run_date).normalize()
-    idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
+    # `df` is ArcticDB's untyped read, so this pre-existing line is partially unknown;
+    # it was a baseline entry on main until this PR's baseline shrink (alpha-engine-config-I14285).
+    idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index  # pyright: ignore[reportUnknownVariableType]
     match = df[idx == target]
     if match.empty:
         return None
+    if restated is None:
+        _REFERENCE_RESTATED.pop(f"{ticker}|{run_date}", None)
+    else:
+        _REFERENCE_RESTATED[f"{ticker}|{run_date}"] = restated
     return float(match["Close"].iloc[-1]), _row_close_source(match)
 
 
 def _detect_stale_legs(
-    conn,
+    conn: sqlite3.Connection,
     run_date: str,
     config: dict,
     *,
@@ -470,7 +492,8 @@ def _detect_stale_legs(
         return None, []
 
     stored_close, stored_spy_return = row[0], row[1]
-    legs: list[dict] = []
+    # Pre-existing untyped leg dicts; a baseline entry on main until this PR's shrink (I14285).
+    legs: list[dict] = []  # pyright: ignore[reportUnknownVariableType]
 
     own_close_div_bps = (
         float("inf") if stored_close is None
@@ -514,10 +537,12 @@ def _detect_stale_legs(
             stored_cp = pos.get("closing_price")
             if stored_cp is None:
                 continue
+            _REFERENCE_RESTATED.pop(f"{ticker}|{run_date}", None)
             settled = _settled_close_for_ticker(ticker, run_date, config)
             if settled is None:
                 continue
             settled_cp, settled_source = settled
+            reference_restated = _REFERENCE_RESTATED.get(f"{ticker}|{run_date}")
             cp_div_bps = abs(settled_cp / float(stored_cp) - 1.0) * 1e4 if stored_cp else float("inf")
             if cp_div_bps > tolerance_bps:
                 legs.append({"leg": f"position_close:{ticker}", "divergence_bps": cp_div_bps,
@@ -526,7 +551,10 @@ def _detect_stale_legs(
                              # freeze time; a snapshot written before I10360
                              # has none, and classifies strictly.
                              "stored_source": pos.get("close_source") or _SOURCE_UNKNOWN,
-                             "settled_source": settled_source})
+                             "settled_source": settled_source,
+                             # Present only when the reference bars were restated for
+                             # a later split, so the leg says what basis "settled" is on.
+                             **({"reference_restated": reference_restated} if reference_restated else {})})
 
     # ── NAV basis (ground-truth ruling 2026-10-22, alpha-engine-config-I10052).
     # A windowed row still struck on the broker's marks while the configured
@@ -547,7 +575,7 @@ def _detect_stale_legs(
     return row, legs
 
 
-def _row_view(conn, run_date: str) -> tuple[dict | None, dict | None]:
+def _row_view(conn: sqlite3.Connection, run_date: str) -> tuple[dict[str, Decimal] | None, dict[str, object] | None]:
     """``(balance view, raw columns)`` of the stored row, or ``(None, None)``."""
     row = conn.execute(
         "SELECT portfolio_nav, total_cash, accrued_interest, positions_snapshot, "
@@ -566,7 +594,7 @@ def _row_view(conn, run_date: str) -> tuple[dict | None, dict | None]:
 
 
 def _post_restrike_entry(
-    conn,
+    conn: sqlite3.Connection,
     *,
     run_date: str,
     before_view: dict | None,

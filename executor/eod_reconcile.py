@@ -1422,6 +1422,9 @@ def run(
     # clean). Fail-soft: a correction-pass error must never block today's EOD.
     # ``run_audit=False`` on the live run is how the audit's own re-reconciles
     # avoid recursing back into the audit.
+    audit_window_start: str | None = None
+    audit_window_reason: str | None = None
+    audit_window_left_out: list[str] = []
     if run_audit:
         from nousergon_lib.logging import get_flow_doctor as _get_flow_doctor_early
         try:
@@ -1430,7 +1433,18 @@ def run(
             _fd_early = None
         try:
             from executor.reconcile_audit import audit_window
-            _audit = audit_window(exclude_dates={run_date}, send_email=False)
+            from executor.self_heal_window import resolve_self_heal_window
+            # Start at the oldest day still carrying an integrity breach
+            # (capped), not only the trailing 5 (alpha-engine-config-I14373).
+            _heal = resolve_self_heal_window(
+                db_path=f"{load_config()['db_path']}",
+                end=f"{today_trading_day}",
+                exclude_dates=frozenset({f"{run_date}"}),
+            )
+            audit_window_start = _heal.start
+            audit_window_reason = _heal.reason
+            audit_window_left_out = list(_heal.left_out)
+            _audit = audit_window(exclude_dates={run_date}, start=_heal.audit_start, send_email=False)
             if _audit.get("corrected"):
                 logger.warning(
                     "[reconcile_audit] corrected %d prior day(s) against settled "
@@ -1765,6 +1779,14 @@ def run(
     prior_closes: dict[str, float] = {}
     prior_close_dates: dict[str, date] = {}
     missing: list[str] = []
+    # Splits journaled AFTER run_date (a deliberate lookahead: this may be a re-run of
+    # a past day). ArcticDB is back-adjusted for them while the broker's mark and share
+    # count on run_date are not, so the reference bars are restated to the broker's
+    # basis below (alpha-engine-config-I14285). Empty for a same-day run.
+    from executor.split_reference import restate_reference_in_place
+    from executor.v2_fills import v2_forward_splits
+
+    forward_splits = v2_forward_splits(run_date or "")  # pyright: ignore[reportUnknownArgumentType]
     for ticker in positions.keys():
         if ticker in _MACRO_SYMBOLS:
             if macro_lib is None:
@@ -1780,6 +1802,9 @@ def run(
         if df.empty or "Close" not in df.columns:
             missing.append(f"{ticker} (no Close column)")
             continue
+        reference_restated = restate_reference_in_place(ticker, run_date or "", df, forward_splits)  # pyright: ignore[reportUnknownArgumentType]
+        if reference_restated is not None:
+            positions[ticker]["reference_restated"] = reference_restated
         idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
         match = df[idx == target_ts]
         if match.empty:
@@ -3611,6 +3636,9 @@ def run(
                 "alpha_pct": round(alpha, 4) if alpha is not None else None,
                 "trades_today": trades_today_count,
                 "roundtrip_stats": roundtrip_stats,
+                "audit_window_start": audit_window_start,
+                "audit_window_reason": audit_window_reason,
+                "audit_window_left_out": audit_window_left_out,
             },
         )
     except Exception as _me:
