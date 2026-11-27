@@ -64,6 +64,7 @@ UNIT_PATTERNS = (
     "alpha-engine-trader-reconcile.service",
     "alpha-engine-trader-pin-smoke.service",
     "alpha-engine-trader-shadow-books.service",
+    "alpha-engine-trader-order-book-plan.service",
     "alpha-engine-trader-failed@*.service",
     "alpha-engine-v2-*.service",
     "boot-pull.service",
